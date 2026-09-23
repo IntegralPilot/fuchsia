@@ -63,6 +63,7 @@
 #define PDEV_DID_FAKE_AC                0x37  // Fake ac for test
 #define PDEV_DID_HRTIMER                0x38  // High resolution timers
 // #define PDEV_DID_VIRTUAL_AUDIO was 0x39 // Virtual audio for test
+#define PDEV_DID_BOOT_FRAMEBUFFER       0x3A  // Firmware-provided framebuffer
 
 // QEMU emulator
 #define PDEV_VID_QEMU               0x01

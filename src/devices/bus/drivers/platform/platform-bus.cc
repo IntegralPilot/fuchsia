@@ -32,6 +32,7 @@
 #include <fbl/algorithm.h>
 
 #include "src/devices/bus/drivers/platform/node-util.h"
+#include "src/graphics/display/lib/framebuffer-display/boot-framebuffer.h"
 #include "src/devices/bus/drivers/platform/platform_bus_config.h"
 
 namespace platform_bus {
@@ -799,6 +800,30 @@ zx::result<> PlatformBus::Start(fdf::DriverContext context) {
     device.vid() = PDEV_VID_GENERIC;
     device.pid() = PDEV_PID_GENERIC;
     device.did() = config.software_device_ids()[i];
+    if (device.did() == PDEV_DID_BOOT_FRAMEBUFFER) {
+      auto item = GetBootItemArray(ZBI_TYPE_FRAMEBUFFER, {});
+      if (item.is_error()) {
+        if (item.status_value() != ZX_ERR_NOT_FOUND) {
+          fdf::warn("Cannot read optional boot framebuffer: {}", item.status_value());
+        }
+        continue;
+      }
+      if (item->size() != sizeof(zbi_swfb_t)) {
+        fdf::warn("Ignoring malformed boot framebuffer");
+        continue;
+      }
+      zbi_swfb_t info;
+      memcpy(&info, item->data(), sizeof(info));
+      auto size = framebuffer_display::BootFramebufferSize(info);
+      if (!size) {
+        fdf::warn("Ignoring unsupported or invalid boot framebuffer");
+        continue;
+      }
+      fhpb::Mmio mmio;
+      mmio.base() = info.base;
+      mmio.length() = *size;
+      device.mmio() = std::vector<fhpb::Mmio>{std::move(mmio)};
+    }
     if (zx::result result = NodeAddInternal(device); result.is_error()) {
       return result.take_error();
     }
