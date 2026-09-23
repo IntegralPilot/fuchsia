@@ -27,6 +27,9 @@ typedef uint32_t zbi_kernel_driver_t;
 // 'GIC2'
 #define ZBI_KERNEL_DRIVER_ARM_GIC_V2 ((zbi_kernel_driver_t)(0x32434947u))
 
+// 'AIC3'
+#define ZBI_KERNEL_DRIVER_APPLE_AIC3 ((zbi_kernel_driver_t)(0x33434941u))
+
 // 'GIC3'
 #define ZBI_KERNEL_DRIVER_ARM_GIC_V3 ((zbi_kernel_driver_t)(0x33434947u))
 
@@ -35,6 +38,9 @@ typedef uint32_t zbi_kernel_driver_t;
 
 // 'ATMM'
 #define ZBI_KERNEL_DRIVER_ARM_GENERIC_TIMER_MMIO ((zbi_kernel_driver_t)(0x4d4d5441u))
+
+// 'AS5U'
+#define ZBI_KERNEL_DRIVER_APPLE_S5L_UART ((zbi_kernel_driver_t)(0x55355341u))
 
 // 'PL0U'
 #define ZBI_KERNEL_DRIVER_PL011_UART ((zbi_kernel_driver_t)(0x55304c50u))
@@ -468,6 +474,13 @@ typedef struct {
   uint32_t opp_count;
   zbi_cpu_energy_model_opp_t opps[32];
 } zbi_cpu_energy_model_domain_t;
+
+// T8122 AIC3 core MMIO range and event-register offset within that range.
+typedef struct {
+  uint64_t mmio_phys;
+  uint32_t mmio_size;
+  uint32_t event_offset;
+} zbi_dcfg_apple_aic3_t;
 
 #if defined(__cplusplus)
 }
