@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include <lib/arch/arm64/apple-aic.h>
 #include <lib/devicetree/matcher.h>
 #include <lib/fit/function.h>
 #include <lib/fit/result.h>
@@ -136,11 +137,42 @@ std::optional<IrqConfig> GetPlicIrq(devicetree::PropertyValue interrupt_bytes,
   return IrqConfig{.irq = static_cast<uint32_t>(*cells[0][0]), .flags = flags};
 }
 
+#ifdef EXPERIMENTAL_APPLE
+std::optional<IrqConfig> GetAppleIrq(devicetree::PropertyValue bytes, uint32_t interrupt_cells) {
+  if (interrupt_cells != 3) {
+    return std::nullopt;
+  }
+  devicetree::PropEncodedArray<devicetree::PropEncodedArrayElement<3>> cells(bytes.AsBytes(), 1, 1,
+                                                                             1);
+  const auto type = *cells[0][0];
+  const auto number = *cells[0][1];
+  if (*cells[0][2] != 4) {
+    return std::nullopt;
+  }
+  uint32_t vector;
+  if (type == 0 && number < arch::apple::kAicMaxExternalIrqs) {
+    vector = static_cast<uint32_t>(number) + arch::apple::kAicExternalBase;
+  } else if (type == 1 && (number == 2 || number == 3)) {
+    vector = number == 2 ? arch::apple::kAicPhysTimer : arch::apple::kAicVirtTimer;
+  } else {
+    return std::nullopt;
+  }
+  return IrqConfig{.irq = vector,
+                   .flags = ZBI_KERNEL_DRIVER_IRQ_FLAGS_LEVEL_TRIGGERED |
+                            ZBI_KERNEL_DRIVER_IRQ_FLAGS_POLARITY_HIGH};
+}
+#endif
+
 IrqResolver GetIrqResolver(devicetree::StringList<> compatibles) {
   auto is_compatible = [&compatibles](const auto& bindings) {
     return std::find_first_of(compatibles.begin(), compatibles.end(), bindings.begin(),
                               bindings.end()) != compatibles.end();
   };
+#ifdef EXPERIMENTAL_APPLE
+  if (is_compatible(std::to_array<std::string_view>({"apple,t8122-aic3"}))) {
+    return &GetAppleIrq;
+  }
+#endif
   if (is_compatible(ArmDevicetreeGicItem::kGicV2CompatibleDevices)) {
     return &GetGicIrq<GicVersion::kV2>;
   }

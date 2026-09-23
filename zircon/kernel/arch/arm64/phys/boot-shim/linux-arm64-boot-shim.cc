@@ -5,6 +5,10 @@
 // https://opensource.org/licenses/MIT
 
 #include <lib/boot-shim/devicetree-boot-shim.h>
+#ifdef EXPERIMENTAL_APPLE
+#include <lib/boot-shim/apple-aic.h>
+#include <lib/boot-shim/apple-platform.h>
+#endif
 
 #include <phys/boot-shim/devicetree.h>
 
@@ -17,7 +21,13 @@ constexpr ShimOptions kOptions = {
     .enable_mmu = true,
 };
 
+#ifdef EXPERIMENTAL_APPLE
+using Shim = Arm64StandardBootShimItems::Add<
+    boot_shim::AppleDevicetreeAic3Item,
+    boot_shim::AppleDevicetreePlatformItem>::type::Shim<boot_shim::DevicetreeBootShim>;
+#else
 using Shim = Arm64StandardBootShimItems::Shim<boot_shim::DevicetreeBootShim>;
+#endif
 
 constexpr const char* kShimName = "linux-arm64-boot-shim";
 
