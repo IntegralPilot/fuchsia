@@ -615,6 +615,11 @@ impl ViewAssistant for VirtualConsoleViewAssistant {
                 .round_scene_corners(self.round_scene_corners)
                 .mutable(false);
 
+            #[cfg(feature = "boot_framebuffer_demo")]
+            if let Err(error) = crate::logo::add_logo(&mut builder, context.size) {
+                eprintln!("Failed to load framebuffer logo: {error}");
+            }
+
             let textgrid = {
                 let scale_factor = if let Some(info) = context.display_info.as_ref() {
                     // Use 1.0 scale factor when fallback sizes are used as opposed
@@ -633,7 +638,17 @@ impl ViewAssistant for VirtualConsoleViewAssistant {
                 };
                 let cell_height = self.font_size * scale_factor;
 
-                self.resize_terminals(&context.size, cell_height);
+                #[cfg(feature = "boot_framebuffer_demo")]
+                let (text_origin, text_size) = {
+                    let margin = Point::new(64.0, 64.0);
+                    (margin, Size::new(
+                        (context.size.width - 2.0 * margin.x).max(cell_height * 2.0),
+                        (context.size.height - 2.0 * margin.y).max(cell_height * 2.0),
+                    ))
+                };
+                #[cfg(not(feature = "boot_framebuffer_demo"))]
+                let (text_origin, text_size) = (Point::zero(), context.size);
+                self.resize_terminals(&text_size, cell_height);
 
                 let active_term =
                     self.terminals.get(&self.active_terminal_id).map(|(t, _)| t.clone_term());
@@ -651,14 +666,14 @@ impl ViewAssistant for VirtualConsoleViewAssistant {
                 let cell_size = cell_size_from_cell_height(&self.font_set, cell_height);
 
                 // Add the text grid to the scene.
-                let textgrid = builder.facet(Box::new(TextGridFacet::new(
+                let textgrid = builder.facet_at_location(Box::new(TextGridFacet::new(
                     self.font_set.clone(),
                     &cell_size,
                     self.color_scheme,
                     active_term,
                     status,
                     tab_width,
-                )));
+                )), text_origin);
 
                 self.cell_size = cell_size;
                 self.tab_width = tab_width;

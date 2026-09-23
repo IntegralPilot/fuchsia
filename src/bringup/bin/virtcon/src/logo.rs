@@ -73,3 +73,76 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(feature = "boot_framebuffer_demo")]
+mod graphic {
+    use anyhow::Error;
+    use carnelian::color::Color;
+    use carnelian::render::rive::{RenderCache, load_rive};
+    use carnelian::render::{Context, Fill};
+    use carnelian::scene::LayerGroup;
+    use carnelian::scene::facets::Facet;
+    use carnelian::scene::scene::{SceneBuilder, SceneOrder};
+    use carnelian::{Point, Size, ViewAssistantContext};
+
+    struct LogoFacet {
+        file: rive_rs::File,
+        cache: RenderCache,
+        size: Size,
+    }
+
+    impl Facet for LogoFacet {
+        fn update_layers(
+            &mut self,
+            _size: Size,
+            layers: &mut dyn LayerGroup,
+            context: &mut Context,
+            _view: &ViewAssistantContext,
+        ) -> Result<(), Error> {
+            let artboard =
+                self.file.artboard().ok_or_else(|| anyhow::anyhow!("missing logo artboard"))?;
+            let artboard = artboard.as_ref();
+            artboard.advance(0.0);
+            self.cache.with_renderer(context, |renderer| {
+                artboard.draw(
+                    renderer,
+                    rive_rs::layout::align(
+                        rive_rs::layout::Fit::Contain,
+                        rive_rs::layout::Alignment::center(),
+                        rive_rs::math::Aabb::new(0.0, 0.0, self.size.width, self.size.height),
+                        artboard.bounds(),
+                    ),
+                );
+            });
+            layers.clear();
+            for (i, mut layer) in self.cache.layers.drain(..).enumerate() {
+                if let Fill::Solid(color) = &mut layer.style.fill {
+                    *color = Color { r: 237, g: 29, b: 127, a: color.a };
+                }
+                layers.insert(SceneOrder::try_from(i)?, layer);
+            }
+            Ok(())
+        }
+
+        fn calculate_size(&self, _available: Size) -> Size {
+            self.size
+        }
+    }
+
+    pub fn add_logo(builder: &mut SceneBuilder, screen: Size) -> Result<(), Error> {
+        let side = 320.0_f32.min(screen.width / 3.0).min(screen.height / 3.0);
+        let logo = LogoFacet {
+            file: load_rive("/pkg/data/fuchsia-logo.riv")?,
+            cache: RenderCache::new(),
+            size: Size::new(side, side),
+        };
+        builder.facet_at_location(
+            Box::new(logo),
+            Point::new((screen.width - side) / 2.0, (screen.height - side) / 2.0),
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "boot_framebuffer_demo")]
+pub use graphic::add_logo;
