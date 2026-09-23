@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
@@ -44,6 +45,8 @@ struct DisplayProperties {
   int32_t height_px;
   int32_t row_stride_px;
   display::PixelFormat pixel_format;
+  // Zero preserves the existing direct-copy path. Otherwise, input is BGRA8888.
+  uint32_t framebuffer_format = 0;
 };
 
 class FramebufferDisplay final : public display::DisplayEngineInterface {
@@ -131,6 +134,7 @@ class FramebufferDisplay final : public display::DisplayEngineInterface {
   // Note that the underlying framebuffer is in regular RAM, not a device register window.
   const fdf::MmioBuffer framebuffer_mmio_;
   const DisplayProperties properties_;
+  std::unique_ptr<uint32_t[]> conversion_row_;
 
   const fuchsia_images2::wire::PixelFormatModifier kFormatModifier =
       fuchsia_images2::wire::PixelFormatModifier::kLinear;

@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "src/graphics/display/lib/framebuffer-display/framebuffer-display.h"
+#include "src/graphics/display/lib/framebuffer-display/boot-framebuffer.h"
 
 #include <fidl/fuchsia.images2/cpp/wire.h>
 #include <lib/driver/logging/cpp/logger.h>
@@ -287,7 +288,24 @@ void FramebufferDisplay::SubmitConfiguration(display::DisplayId display_id,
   const size_t total_bytes = row_bytes * static_cast<size_t>(properties_.height_px);
   const size_t copy_bytes =
       std::min({total_bytes, it->second.size(), framebuffer_mmio_.get_size()});
-  framebuffer_mmio_.WriteBuffer(0, it->second.start(), copy_bytes);
+  if (properties_.framebuffer_format != 0) {
+    if (copy_bytes < total_bytes) {
+      fdf::error("Framebuffer image is shorter than its declared layout");
+      return;
+    }
+    const auto* pixels = static_cast<const uint32_t*>(it->second.start());
+    for (int32_t y = 0; y < properties_.height_px; ++y) {
+      const size_t row = static_cast<size_t>(y) * properties_.row_stride_px;
+      for (int32_t x = 0; x < properties_.width_px; ++x) {
+        conversion_row_[x] = PackBgra8888(pixels[row + x], properties_.framebuffer_format);
+      }
+      // This is framebuffer RAM; one bulk write avoids a memory barrier per pixel.
+      framebuffer_mmio_.WriteBuffer(row * sizeof(uint32_t), conversion_row_.get(),
+                                    properties_.width_px * sizeof(uint32_t));
+    }
+  } else {
+    framebuffer_mmio_.WriteBuffer(0, it->second.start(), copy_bytes);
+  }
 
   has_image_ = true;
   {
@@ -404,6 +422,9 @@ FramebufferDisplay::FramebufferDisplay(
       initialized_(false),
       framebuffer_mmio_(std::move(framebuffer_mmio)),
       properties_(properties),
+      conversion_row_(properties.framebuffer_format != 0
+                          ? std::make_unique<uint32_t[]>(properties.width_px)
+                          : nullptr),
       next_vsync_time_(zx::clock::get_monotonic()),
       engine_events_(*engine_events) {
   ZX_DEBUG_ASSERT(dispatcher != nullptr);
