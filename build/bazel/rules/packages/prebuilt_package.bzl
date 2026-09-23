@@ -4,6 +4,7 @@
 
 """Rule for prebuilt packages for platform testing."""
 
+load("@fuchsia_build_config//:defs.bzl", "build_config")
 load("@fuchsia_rules_common//packages:prebuilt_package.bzl", "unpack_prebuilt_package_impl")
 
 def _prebuilt_package_impl(ctx):
@@ -21,7 +22,7 @@ prebuilt_package = rule(
             mandatory = True,
         ),
         "_package_tool": attr.label(
-            default = "@gn_targets//toolchain_host_x64/src/sys/pkg/bin/package-tool",
+            default = "@gn_targets//toolchain_host_%s/src/sys/pkg/bin/package-tool" % build_config.host_arch,
             executable = True,
             cfg = "exec",
         ),

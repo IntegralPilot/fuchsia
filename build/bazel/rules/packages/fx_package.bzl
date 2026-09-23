@@ -4,6 +4,7 @@
 
 """Non-SDK version of fuchsia_package rule for platform building."""
 
+load("@fuchsia_build_config//:defs.bzl", "build_config")
 load("@bazel_skylib//rules:common_settings.bzl", "BuildSettingInfo")
 load(
     "@fuchsia_rules_common//debug_symbols:debug_symbols.bzl",
@@ -50,13 +51,13 @@ _build_fuchsia_package = rule(
     attrs = COMMON_BUILD_FUCHSIA_PACKAGE_ATTRIBUTES | {
         "_package_tool": attr.label(
             # TODO(b/519244675): Replace with a Bazel label once `package-tool` is migrated to Bazel.
-            default = "@gn_targets//toolchain_host_x64/src/sys/pkg/bin/package-tool",
+            default = "@gn_targets//toolchain_host_%s/src/sys/pkg/bin/package-tool" % build_config.host_arch,
             executable = True,
             cfg = "exec",
         ),
         "_cmc_tool": attr.label(
             # TODO(b/519243783): Replace with a Bazel label once `cmc` is migrated to Bazel.
-            default = "@gn_targets//toolchain_host_x64/tools/cmc",
+            default = "@gn_targets//toolchain_host_%s/tools/cmc" % build_config.host_arch,
             allow_single_file = True,
         ),
         "_current_api_level": attr.label(

@@ -2,6 +2,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+load("@fuchsia_build_config//:defs.bzl", "build_config")
 load("@fuchsia_build_info//:args.bzl", "build_info_version", "target_cpu")
 load("@fuchsia_rules_common//:local_actions.bzl", "LOCAL_ONLY_ACTION_KWARGS")
 load(
@@ -108,31 +109,31 @@ platform_artifacts = rule(
             doc = "List of AIB targets to include.",
         ),
         "_assembly_tool": attr.label(
-            default = "@gn_targets//toolchain_host_x64/build/assembly/tools/assembly:assembly",
+            default = "@gn_targets//toolchain_host_%s/build/assembly/tools/assembly:assembly" % build_config.host_arch,
             allow_single_file = True,
         ),
         "_blobfs_tool": attr.label(
-            default = "@gn_targets//toolchain_host_x64/src/storage/blobfs/tools:blobfs",
+            default = "@gn_targets//toolchain_host_%s/src/storage/blobfs/tools:blobfs" % build_config.host_arch,
             allow_single_file = True,
         ),
         "_fvm_tool": attr.label(
-            default = "@gn_targets//toolchain_host_x64/src/storage/bin/fvm:fvm",
+            default = "@gn_targets//toolchain_host_%s/src/storage/bin/fvm:fvm" % build_config.host_arch,
             allow_single_file = True,
         ),
         "_zbi_tool": attr.label(
-            default = "@gn_targets//toolchain_host_x64/zircon/tools/zbi:zbi",
+            default = "@gn_targets//toolchain_host_%s/zircon/tools/zbi:zbi" % build_config.host_arch,
             allow_single_file = True,
         ),
         "_cmc_tool": attr.label(
-            default = "@gn_targets//toolchain_host_x64/tools/cmc:cmc",
+            default = "@gn_targets//toolchain_host_%s/tools/cmc:cmc" % build_config.host_arch,
             allow_single_file = True,
         ),
         "_fxfs_pbtool": attr.label(
-            default = "@gn_targets//toolchain_host_x64/src/storage/fxfs/fxfs_pbtool:fxfs_pbtool",
+            default = "@gn_targets//toolchain_host_%s/src/storage/fxfs/fxfs_pbtool:fxfs_pbtool" % build_config.host_arch,
             allow_single_file = True,
         ),
         "_tool": attr.label(
-            default = "@gn_targets//toolchain_host_x64/build/assembly/tools/assembly_config:assembly_config",
+            default = "@gn_targets//toolchain_host_%s/build/assembly/tools/assembly_config:assembly_config" % build_config.host_arch,
             executable = True,
             cfg = "exec",
         ),

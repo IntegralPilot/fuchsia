@@ -2,6 +2,7 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+load("@fuchsia_build_config//:defs.bzl", "build_config")
 load("@fuchsia_rules_common//assembly:json_utils.bzl", "extract_labels")
 load(
     "@fuchsia_rules_common//assembly:product_configuration.bzl",
@@ -37,7 +38,7 @@ _product_configuration = rule(
             default = False,
         ),
         "_assembly_config": attr.label(
-            default = "@gn_targets//toolchain_host_x64/build/assembly/tools/assembly_config:assembly_config",
+            default = "@gn_targets//toolchain_host_%s/build/assembly/tools/assembly_config:assembly_config" % build_config.host_arch,
         ),
     },
 )

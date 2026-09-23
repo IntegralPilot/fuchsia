@@ -73,7 +73,7 @@ REPROXY_WRAP = _SCRIPT_DIR_REL / "fuchsia-reproxy-wrap.sh"
 def _prebuilt_platform_subdir() -> str:
     """Naming convention of prebuilt tools."""
     os_name = {"linux": "linux", "darwin": "mac"}[sys.platform]
-    arch = {"x86_64": "x64", "arm64": "arm64"}[platform.machine()]
+    arch = {"x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}[platform.machine()]
     return f"{os_name}-{arch}"
 
 

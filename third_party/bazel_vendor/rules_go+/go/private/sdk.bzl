@@ -518,6 +518,10 @@ def _detect_sdk_platform(ctx, goroot):
     if len(platforms) == 0:
         fail("Could not detect SDK platform: found no platforms in %s" % path)
     if len(platforms) > 1:
+        goos, goarch = detect_host_platform(ctx)
+        host_platform = goos + "_" + goarch
+        if host_platform in platforms:
+            return host_platform
         fail("Could not detect SDK platform: found multiple platforms %s in %s" % (platforms, path))
     return platforms[0]
 

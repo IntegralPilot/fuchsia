@@ -9,6 +9,7 @@ load("@platforms//host:constraints.bzl", "HOST_CONSTRAINTS")
 
 _SUPPORTED_HOST_CPU_PLATFORMS = [
     "@platforms//cpu:x86_64",
+    "@platforms//cpu:aarch64",
 ]
 _SUPPORTED_HOST_OS_PLATFORMS = [
     "@platforms//os:linux",
