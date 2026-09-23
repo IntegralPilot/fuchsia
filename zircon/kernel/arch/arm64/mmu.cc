@@ -667,9 +667,9 @@ class ArmArchVmAspace::ConsistencyManager {
 
 uint64_t ArmArchVmAspace::Tcr() const {
   if (IsRestricted()) {
-    return MMU_TCR_FLAGS_USER_RESTRICTED;
+    return Arm64MmuTcrFlags(MMU_TCR_FLAGS_USER_RESTRICTED);
   }
-  return MMU_TCR_FLAGS_USER;
+  return Arm64MmuTcrFlags(MMU_TCR_FLAGS_USER);
 }
 
 arch_mmu_flags_t ArmArchVmAspace::MmuFlagsFromPte(pte_t pte) {
@@ -2378,7 +2378,7 @@ void ArmArchVmAspace::ContextSwitch(ArmArchVmAspace* old_aspace, ArmArchVmAspace
   } else {
     // Switching to the null aspace, which means kernel address space only.
     // Load a null TTBR0 and disable page table walking for user space.
-    tcr = MMU_TCR_FLAGS_KERNEL;
+    tcr = Arm64MmuTcrFlags(MMU_TCR_FLAGS_KERNEL);
     __arm_wsr64("tcr_el1", tcr);
     __isb(ARM_MB_SY);
 

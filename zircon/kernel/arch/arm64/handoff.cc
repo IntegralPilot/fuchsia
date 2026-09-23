@@ -13,12 +13,19 @@
 #include <phys/handoff.h>
 #include <vm/handoff-end.h>
 
+uint64_t arm64_tcr_ips;
+
 void ArchPostHandoffBootstrap(const ArchPhysHandoff* arch_handoff) {
+  const auto ips = arch::ArmTcrEl1::Read().ips();
+  ZX_ASSERT(ips <= arch::ArmPhysicalAddressSize::k48Bits);
+  ZX_ASSERT(ips <= arch::ArmIdAa64Mmfr0El1::Read().pa_range());
+  arm64_tcr_ips = MMU_TCR_IPS(static_cast<uint64_t>(ips));
+
   // Clear any phys exception handlers.
   arch::ArmVbarEl1::Write(uintptr_t{0});
 
   // Disable trampoline page-table in ttbr0
-  arch::ArmTcrEl1::Write(MMU_TCR_FLAGS_KERNEL);
+  arch::ArmTcrEl1::Write(Arm64MmuTcrFlags(MMU_TCR_FLAGS_KERNEL));
 
   // Invalidate the entire TLB
   arch::InvalidateLocalTlbs();

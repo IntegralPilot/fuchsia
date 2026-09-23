@@ -415,6 +415,14 @@
 #include <arch/arm64.h>
 #include <ktl/tuple.h>
 
+// Keep physboot's physical-address width when changing address spaces.
+// Set once on the boot CPU before secondary CPUs or address spaces are started.
+extern "C" uint64_t arm64_tcr_ips;
+
+inline uint64_t Arm64MmuTcrFlags(uint64_t flags) {
+  return (flags & ~MMU_TCR_IPS(7)) | arm64_tcr_ips;
+}
+
 using pte_t = uint64_t;
 
 #define ARM64_TLBI_NOADDR(op)        \

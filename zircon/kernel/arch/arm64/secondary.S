@@ -89,7 +89,15 @@ resume_context          .req x24
   // set cacheable attributes on translation walk
   // (SMP extensions) non-shareable, inner write-back write-allocate
   // both aspaces active, current ASID in TTBR1
-  movlit tmp, MMU_TCR_FLAGS_IDENT
+  // Use the boot CPU's address-size policy, including when resuming.
+  ldr_global x10, arm64_tcr_ips
+  mrs x11, id_aa64mmfr0_el1
+  and x11, x11, #0xf
+  lsr x12, x10, #32
+  cmp x12, x11
+  b.hi .Lunsupported_cpu_trap
+  movlit tmp, (MMU_TCR_FLAGS_IDENT & ~MMU_TCR_IPS(7))
+  orr tmp, tmp, x10
   msr tcr_el1, tmp
   isb
 
@@ -115,7 +123,9 @@ resume_context          .req x24
 
 .Lmmu_on_vaddr:
   // Disable trampoline page-table in ttbr0
-  movlit tmp, MMU_TCR_FLAGS_KERNEL
+  ldr_global x10, arm64_tcr_ips
+  movlit tmp, (MMU_TCR_FLAGS_KERNEL & ~MMU_TCR_IPS(7))
+  orr tmp, tmp, x10
   msr tcr_el1, tmp
   isb
 
