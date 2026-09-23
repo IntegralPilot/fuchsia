@@ -276,9 +276,14 @@ enum arm64_microarch midr_to_microarch(uint64_t midr) {
     }
   } else if (implementer == 0x61) {
     // Apple
-    // For the moment, qemu via HVF does not seem to return
-    // a meaningful part number.
-    return APPLE_UNKNOWN;
+    switch (partnum) {
+      case 0x42:
+        return APPLE_M3_SAWTOOTH;
+      case 0x43:
+        return APPLE_M3_EVEREST;
+      default:
+        return APPLE_UNKNOWN;
+    }
   } else if (implementer == 0xc0) {
     // Ampere
     switch (partnum) {
@@ -415,6 +420,12 @@ void midr_to_core_string(uint64_t midr, char* str, size_t len) {
       break;
     case CAVIUM_CN99XX:
       partnum_str = "Cavium CN99XX";
+      break;
+    case APPLE_M3_SAWTOOTH:
+      partnum_str = "Apple M3 Sawtooth";
+      break;
+    case APPLE_M3_EVEREST:
+      partnum_str = "Apple M3 Everest";
       break;
     case APPLE_UNKNOWN:
       partnum_str = "Unknown Apple Silicon";
