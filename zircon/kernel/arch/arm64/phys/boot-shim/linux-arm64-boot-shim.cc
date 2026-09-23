@@ -8,6 +8,7 @@
 #ifdef EXPERIMENTAL_APPLE
 #include <lib/boot-shim/apple-aic.h>
 #include <lib/boot-shim/apple-platform.h>
+#include <lib/boot-shim/devicetree-framebuffer.h>
 #endif
 
 #include <phys/boot-shim/devicetree.h>
@@ -24,7 +25,7 @@ constexpr ShimOptions kOptions = {
 #ifdef EXPERIMENTAL_APPLE
 using Shim = Arm64StandardBootShimItems::Add<
     boot_shim::AppleDevicetreeAic3Item,
-    boot_shim::AppleDevicetreePlatformItem>::type::Shim<boot_shim::DevicetreeBootShim>;
+    boot_shim::AppleDevicetreePlatformItem, boot_shim::DevicetreeFramebufferItem>::type::Shim<boot_shim::DevicetreeBootShim>;
 #else
 using Shim = Arm64StandardBootShimItems::Shim<boot_shim::DevicetreeBootShim>;
 #endif
