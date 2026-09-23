@@ -30,6 +30,9 @@ where {
             fuchsia_runtime::process_self().koid().expect("failed to get koid for process");
 
         fasync::Task::local(async move {
+            // The parser does not reflow existing rows when its width changes.
+            #[cfg(feature = "boot_framebuffer_demo")]
+            terminal.wait_for_layout().await;
             loop {
                 let on_signal = OnSignals::new(&read_only_debuglog, zx::Signals::LOG_READABLE);
                 on_signal.await.expect("failed to wait for log readable");

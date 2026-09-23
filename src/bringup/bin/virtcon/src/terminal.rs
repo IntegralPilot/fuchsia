@@ -20,6 +20,8 @@ pub struct Terminal {
     pty: Option<ServerPty>,
     /// Lazily initialized if `pty` is set.
     pty_fd: Option<File>,
+    #[cfg(feature = "boot_framebuffer_demo")]
+    layout_ready: Rc<zx::Event>,
 }
 
 impl Terminal {
@@ -50,7 +52,11 @@ impl Terminal {
         );
         let term = Rc::new(RefCell::new(term_inner));
 
-        Self { term: Rc::clone(&term), title, pty, pty_fd: None }
+        Self {
+            term: Rc::clone(&term), title, pty, pty_fd: None,
+            #[cfg(feature = "boot_framebuffer_demo")]
+            layout_ready: Rc::new(zx::Event::create()),
+        }
     }
 
     #[cfg(test)]
@@ -67,7 +73,11 @@ impl Terminal {
         let title = self.title.clone();
         let pty = self.pty.clone();
         let pty_fd = None;
-        Ok(Self { term, title, pty, pty_fd })
+        Ok(Self {
+            term, title, pty, pty_fd,
+            #[cfg(feature = "boot_framebuffer_demo")]
+            layout_ready: Rc::clone(&self.layout_ready),
+        })
     }
 
     pub fn resize(&mut self, size_info: &SizeInfo) {
@@ -75,6 +85,17 @@ impl Terminal {
         let columns = (size_info.width / size_info.cell_width) as u16;
         let rows = (size_info.height / size_info.cell_height) as u16;
         term.screen_mut().set_size(rows, columns);
+        #[cfg(feature = "boot_framebuffer_demo")]
+        {
+            self.layout_ready.signal(zx::Signals::NONE, zx::Signals::USER_0)
+                .expect("signal terminal layout");
+        }
+    }
+
+    #[cfg(feature = "boot_framebuffer_demo")]
+    pub async fn wait_for_layout(&self) {
+        fuchsia_async::OnSignals::new(self.layout_ready.as_ref(), zx::Signals::USER_0)
+            .await.expect("wait for terminal layout");
     }
 
     pub fn title(&self) -> &str {
