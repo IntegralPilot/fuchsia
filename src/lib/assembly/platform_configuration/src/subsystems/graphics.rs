@@ -167,9 +167,18 @@ impl DefineSubsystemConfiguration<(&GraphicsConfig, &PlatformUiConfig)>
             builder.set_config_capability("fuchsia.virtcon.DotsPerInch", Config::new_void())?;
         }
 
-        builder.set_config_capability("fuchsia.virtcon.FontSize", Config::new_void())?;
-        builder.set_config_capability("fuchsia.virtcon.KeepLogVisible", Config::new_void())?;
-        builder.set_config_capability("fuchsia.virtcon.ShowLogo", Config::new_bool(true))?;
+        if context.board_config.provides_feature(BoardFeature::BootFramebuffer) {
+            builder.set_config_capability(
+                "fuchsia.virtcon.FontSize",
+                Config::new(ConfigValueType::String { max_size: 10 }, "32.0".into()),
+            )?;
+            builder.set_config_capability("fuchsia.virtcon.KeepLogVisible", Config::new_bool(true))?;
+            builder.set_config_capability("fuchsia.virtcon.ShowLogo", Config::new_bool(false))?;
+        } else {
+            builder.set_config_capability("fuchsia.virtcon.FontSize", Config::new_void())?;
+            builder.set_config_capability("fuchsia.virtcon.KeepLogVisible", Config::new_void())?;
+            builder.set_config_capability("fuchsia.virtcon.ShowLogo", Config::new_bool(true))?;
+        }
         if let Some(keymap) = &virtcon_config.keymap {
             builder.set_config_capability(
                 "fuchsia.virtcon.KeyMap",

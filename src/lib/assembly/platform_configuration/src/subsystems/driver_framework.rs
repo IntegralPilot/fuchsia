@@ -163,6 +163,10 @@ impl
 
         let mut software_names = Vec::new();
         let mut software_ids = Vec::new();
+        if context.board_config.provides_feature(BoardFeature::BootFramebuffer) {
+            software_names.push("boot-framebuffer");
+            software_ids.push(bind_fuchsia_platform::BIND_PLATFORM_DEV_DID_BOOT_FRAMEBUFFER);
+        }
         if storage.filesystems.image_mode == FilesystemImageMode::Ramdisk {
             software_names.push("ram-disk");
             software_ids.push(bind_fuchsia_platform::BIND_PLATFORM_DEV_DID_RAM_DISK);
