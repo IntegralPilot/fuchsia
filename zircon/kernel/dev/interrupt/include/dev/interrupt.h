@@ -11,13 +11,13 @@
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
+#include <dev/interrupt-limits.h>
 #include <kernel/cpu.h>
 #include <kernel/mp.h>
 
 __BEGIN_CDECLS
 
 constexpr uint32_t MAX_MSI_IRQS = 32;
-constexpr uint32_t MAX_INTERRUPTS = 1024;
 
 using interrupt_vector_t = uint32_t;
 

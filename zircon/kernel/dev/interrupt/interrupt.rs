@@ -5,7 +5,7 @@
 // https://opensource.org/licenses/MIT
 
 /// The maximum number of interrupts supported in the system.
-pub const MAX_INTERRUPTS: usize = 1024;
+pub const MAX_INTERRUPTS: usize = interrupt_limits::MAX_INTERRUPTS as usize;
 
 /// The maximum number of MSI IRQs.
 pub const MAX_MSI_IRQS: usize = 32;
