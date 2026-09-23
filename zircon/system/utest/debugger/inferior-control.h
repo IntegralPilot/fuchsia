@@ -1,0 +1,108 @@
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef ZIRCON_SYSTEM_UTEST_DEBUGGER_INFERIOR_CONTROL_H_
+#define ZIRCON_SYSTEM_UTEST_DEBUGGER_INFERIOR_CONTROL_H_
+
+#include <lib/zx/exception.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <zircon/syscalls.h>
+#include <zircon/syscalls/debug.h>
+#include <zircon/syscalls/exception.h>
+
+#include <test-utils/test-utils.h>
+
+struct thread_data_t {
+  zx_koid_t tid;
+  zx_handle_t handle;
+};
+
+// Result of |watch_inferior()|.
+struct inferior_data_t {
+  // Koid of the inferior process.
+  zx_koid_t pid;
+  // Borrowed handle of the inferior process.
+  zx_handle_t inferior;
+  // Borrowed handle of the port listening for signals.
+  zx_handle_t port;
+  // Owned handle of the exception channel.
+  zx_handle_t exception_channel;
+  // #entries in |threads|.
+  size_t max_num_threads;
+  // The array is unsorted, and there can be holes (tid,handle = invalid).
+  thread_data_t* threads;
+};
+
+typedef void(wait_inferior_exception_handler_t)(inferior_data_t* data,
+                                                const zx_port_packet_t* packet, void* handler_arg);
+
+void dump_gregs(zx_handle_t thread_handle, const zx_thread_state_general_regs_t* regs);
+
+void dump_inferior_regs(zx_handle_t thread);
+
+void read_inferior_gregs(zx_handle_t thread, zx_thread_state_general_regs_t* regs);
+
+void write_inferior_gregs(zx_handle_t thread, const zx_thread_state_general_regs_t* regs);
+
+size_t read_inferior_memory(zx_handle_t proc, uintptr_t vaddr, void* buf, size_t len);
+
+size_t write_inferior_memory(zx_handle_t proc, uintptr_t vaddr, const void* buf, size_t len);
+
+void setup_inferior(const char* name, zx_handle_t job, springboard_t** out_sb,
+                    zx_handle_t* out_inferior, zx_handle_t* out_channel);
+
+// Starts watching |inferior| process.
+//
+// Uses wait_async() to route the following signals through |port|:
+//   * process TERMINATED
+//   * child thread TERMINATED, RUNNING, and SUSPENDED
+// Packet keys are the corresponding object KOIDs.
+//
+// Returns a newly allocated inferior_data_t, which must be destroyed by
+// calling detach_inferior(). On failure, exits the process.
+inferior_data_t* watch_inferior(zx_handle_t inferior, zx_handle_t port, size_t max_threads);
+
+// Claims the exception channel of |task| and uses wait_async() to route the READABLE signal through
+// |port|. |options| are passed directly to the zx_task_create_exception_channel syscall.
+void claim_exception_channel(zx_handle_t task, zx_handle_t port, zx_handle_t* channel, int options);
+
+void expect_debugger_attached_eq(zx_handle_t inferior, bool expected, const char* msg);
+
+// Detaches and deletes |data|.
+//
+// If |close_exception_channel| is false, the exception channel will remain
+// open. In this case the caller must have copied |data->exception_channel|
+// before calling this function and manually close it when finished.
+void detach_inferior(inferior_data_t* data, bool close_exception_channel);
+
+// Closes |data|'s exception channel.
+void unbind_inferior(inferior_data_t* data);
+
+bool start_inferior(springboard_t* sb);
+
+void shutdown_inferior(zx_handle_t channel, zx_handle_t inferior);
+
+void read_packet(zx_handle_t port, zx_port_packet_t* packet);
+
+// Blocks using the given port until the process/thread is in the given state. This function can
+// wait for TERMINATED, RUNNING, or SUSPENDED states. The thread is assumed to be wait-async'd on
+// the given port. Returns true on success.
+//
+// For code that transitions between states multiple times, be sure to wait for each transition
+// before doing the next one. Otherwise there can be races in delivering the notifications on the
+// port and the actual thread state.
+void wait_thread_state(zx_handle_t proc, zx_handle_t thread, zx_handle_t port,
+                       zx_signals_t wait_until);
+
+void handle_thread_exiting(zx_handle_t inferior, const zx_exception_info_t* info,
+                           zx::exception exception);
+
+thrd_t start_wait_inf_thread(inferior_data_t* inferior_data,
+                             wait_inferior_exception_handler_t* handler, void* handler_arg);
+
+void join_wait_inf_thread(thrd_t wait_inf_thread);
+
+#endif  // ZIRCON_SYSTEM_UTEST_DEBUGGER_INFERIOR_CONTROL_H_

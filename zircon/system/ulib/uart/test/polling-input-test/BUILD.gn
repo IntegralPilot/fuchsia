@@ -1,0 +1,101 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//boards/default_for_emulator.gni")
+import("//build/assembly/test_product_bundle.gni")
+import("//build/go/go_library.gni")
+import("//build/go/go_test.gni")
+import("//build/testing/boot_tests/zbi_test.gni")
+import("//zircon/kernel/phys/zbi_executable.gni")
+
+group("polling-input-test") {
+  testonly = true
+  deps = []
+  if (host_os == "linux") {
+    deps += [ ":uart-input-host-test($host_toolchain)" ]
+  }
+}
+
+phys_toolchain = "//zircon/kernel/phys:kernel.phys_${target_cpu}"
+is_phys_toolchain = phys_toolchain == toolchain_variant.base
+if (is_phys_toolchain) {
+  phys_toolchain = current_toolchain
+}
+
+if (is_phys_toolchain) {
+  phys_target_out_dir =
+      get_label_info(":anything($phys_toolchain)", "target_out_dir")
+  uart_input_zbi = "$phys_target_out_dir/uart-input-test-zbi.zbi"
+}
+
+if (is_phys_toolchain) {
+  zbi_executable("uart-input-test") {
+    testonly = true
+    sources = [ "uart-input-test.cc" ]
+    deps = [
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+      "//zircon/kernel/phys:main",
+      "//zircon/kernel/phys:stdio",
+      "//zircon/kernel/phys:uart-console",
+      "//zircon/kernel/phys/test:zbi-test-main",
+      "//zircon/system/ulib/uart",
+    ]
+  }
+}
+
+# In order for the assembly and product bundle to be generated, this must be
+# instantiated in the default_toolchain.
+zbi_test("uart-input-test-zbi") {
+  # TODO(https://fxbug.dev/42066527): This ZBI is not actually a ZBI test, but relies
+  # on the specification just for the `images` metadata implicitly set by
+  # `zbi_test()` and not `zbi()`. Investigate whether we can have `zbi()`
+  # targets set this metadata and update this target accordingly - and
+  # disable the ZBI from being booted as a ZBI test for now.
+  disabled = true
+  deps = [ ":uart-input-test($phys_toolchain)" ]
+}
+
+if (is_phys_toolchain) {
+  zbi_outputs = get_target_outputs(":uart-input-test-zbi.zbi")
+  assert(zbi_outputs + [ uart_input_zbi ] - [ uart_input_zbi ] != zbi_outputs)
+}
+
+if (current_toolchain == default_toolchain) {
+  test_product_bundle("uart-input-test-product-bundle") {
+    board_config = default_board_for_emulator
+    platform = {
+      build_type = "eng"
+      development_support = {
+        enable_userboot_next_component_manager = true
+      }
+    }
+    kernel_zbi = ":uart-input-test-zbi.zbi"
+  }
+}
+
+if (is_host && is_linux) {
+  go_library("lib") {
+    testonly = true
+    sources = [ "uart_input_host_test.go" ]
+    deps = [ "//tools/emulator/emulatortest" ]
+  }
+
+  _pb_label = ":uart-input-test-product-bundle($default_toolchain)"
+  _out_dir = get_label_info(_pb_label, "target_out_dir")
+
+  host_test_data("uart_input_test_data") {
+    sources = [ "${_out_dir}/uart-input-test-product-bundle" ]
+    deps = [ _pb_label ]
+  }
+
+  go_test("uart-input-host-test") {
+    embed = [ ":lib" ]
+    args = [
+      "--emulator.pb-path",
+      rebase_path("${_out_dir}/uart-input-test-product-bundle", root_build_dir),
+    ]
+    non_go_deps = [ ":uart_input_test_data" ]
+  }
+}

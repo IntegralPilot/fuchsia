@@ -1,0 +1,218 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+import("//src/lib/testing/expectation/generated_expectations_file.gni")
+import("//src/starnix/kernel/starnix.gni")
+import("//src/starnix/tests/starnix_test_subpackages.gni")
+import("rust_syscall_test.gni")
+
+rustc_library("fscrypt_shared") {
+  edition = "2024"
+  source_root = "src/fscrypt_shared.rs"
+  sources = [ "src/fscrypt_shared.rs" ]
+  deps = [
+    "//src/starnix/lib/linux_uapi",
+    "//third_party/rust_crates:serde",
+    "//third_party/rust_crates:zerocopy",
+  ]
+}
+
+rustc_binary("fscrypt_test_bin") {
+  name = "fscrypt_test"
+  edition = "2024"
+  emit_tool_path = false
+
+  deps = [
+    ":fscrypt_shared",
+    "//src/starnix/lib/linux_uapi",
+    "//third_party/rust_crates:argh",
+    "//third_party/rust_crates:hex",
+    "//third_party/rust_crates:libc",
+    "//third_party/rust_crates:rand",
+    "//third_party/rust_crates:serde_json",
+    "//third_party/rust_crates:zerocopy",
+  ]
+
+  source_root = "src/fscrypt_child.rs"
+  sources = [ source_root ]
+}
+
+resource("device_mapper_test_resources") {
+  sources = [
+    "data/corrupted_hashtree_sha256.txt",
+    "data/corrupted_hashtree_sha512.txt",
+    "data/corrupted_root_hash_sha256.txt",
+    "data/corrupted_root_hash_sha512.txt",
+    "data/hashtree_sha256.txt",
+    "data/hashtree_sha512.txt",
+    "data/root_hash_sha256.txt",
+    "data/root_hash_sha512.txt",
+    "data/valid_image_with_corrupted_hashtree_sha256.txt",
+    "data/valid_image_with_hashtree_sha256.txt",
+  ]
+  outputs = [ "data/{{source_file_part}}" ]
+}
+
+resource("device_mapper_ext4_img") {
+  sources = [ "data/device_mapper_ext4.img" ]
+  outputs = [ "data/{{source_file_part}}" ]
+}
+
+resource("ebpf_test_progs") {
+  sources = [ "data/ebpf/ebpf_test_progs.o" ]
+  outputs = [ "data/ebpf_test_progs.o" ]
+}
+
+_fscrypt_bin_label = ":fscrypt_test_bin($target_linux_toolchain)"
+_fscrypt_binary_path =
+    get_label_info(_fscrypt_bin_label, "root_out_dir") + "/fscrypt_test"
+
+resource("fscrypt_child_resource") {
+  deps = [ _fscrypt_bin_label ]
+  sources = [ _fscrypt_binary_path ]
+  outputs = [ "data/fscrypt_test" ]
+}
+
+group("syscall_test_deps") {
+  testonly = true
+  deps = [
+    # go/keep-sorted start
+    ":device_mapper_ext4_img",
+    ":device_mapper_test_resources",
+    ":ebpf_test_progs",
+    ":fscrypt_child_resource",
+
+    # go/keep-sorted end
+  ]
+}
+
+# List of decoupled test modules
+rust_syscall_tests = [
+  {
+    name = "device_mapper_test"
+    source_root = "src/device_mapper_test.rs"
+    resources = [
+      ":device_mapper_ext4_img",
+      ":device_mapper_test_resources",
+    ]
+    deps = [
+      "//src/starnix/lib/linux_uapi",
+      "//third_party/rust_crates:libc",
+      "//third_party/rust_crates:serial_test",
+      "//third_party/rust_crates:test-case",
+      "//third_party/rust_crates:zerocopy",
+    ]
+  },
+  {
+    name = "ebpf_test"
+    source_root = "src/ebpf.rs"
+    resources = [ ":ebpf_test_progs" ]
+    deps = [
+      "//src/starnix/lib/ebpf",
+      "//src/starnix/lib/ebpf_loader",
+      "//src/starnix/lib/linux_uapi",
+      "//third_party/rust_crates:bstr",
+      "//third_party/rust_crates:libc",
+      "//third_party/rust_crates:serial_test",
+      "//third_party/rust_crates:test-case",
+      "//third_party/rust_crates:zerocopy",
+    ]
+  },
+  {
+    name = "fscrypt_test"
+    source_root = "src/fscrypt_test.rs"
+    resources = [ ":fscrypt_child_resource" ]
+    deps = [
+      ":fscrypt_shared",
+      "//src/starnix/lib/linux_uapi",
+      "//third_party/rust_crates:hex",
+      "//third_party/rust_crates:libc",
+      "//third_party/rust_crates:rand",
+      "//third_party/rust_crates:serde_json",
+      "//third_party/rust_crates:serial_test",
+      "//third_party/rust_crates:zerocopy",
+    ]
+  },
+]
+
+generated_expectations_file("syscalls_rust_test_expectations") {
+  includes = [ "expectations/syscalls_rust_test.json5" ]
+}
+
+generated_expectations_file("linux_rust_test_expectations") {
+  includes = [ "expectations/linux_syscalls_rust_test.json5" ]
+}
+
+# Instantiate Starnix and Linux (Machina) components for each test module
+all_test_names = []
+foreach(test_def, rust_syscall_tests) {
+  all_test_names += [ test_def.name ]
+
+  # Starnix Kernel target: only bundle test-specific resources
+  rust_syscall_test(test_def.name) {
+    forward_variables_from(test_def, "*", [ "name" ])
+  }
+
+  # Machina Linux VM target
+  rust_syscall_test("linux_${test_def.name}") {
+    test_name = test_def.name
+    forward_variables_from(test_def,
+                           "*",
+                           [
+                             "name",
+                             "resources",
+                           ])
+    test_target_kernel = "linux"
+    custom_expectations = ":linux_rust_test_expectations"
+  }
+}
+
+# Package for running on Starnix kernel
+fuchsia_test_package("starnix_syscalls_rust_tests") {
+  test_components = []
+  foreach(test_name, all_test_names) {
+    test_components += [ ":${test_name}" ]
+  }
+  subpackages = starnix_test_subpackages
+  subpackages += [ "//src/starnix/containers/debian:debian_package" ]
+  deps = [ "//src/lib/testing/expectation:expectation_comparer" ]
+  test_specs = {
+    log_settings = {
+      # Tests exercise failure cases, so ERROR logs are expected.
+      max_severity = "ERROR"
+    }
+    package_resolution_timeout_secs = 660
+  }
+}
+
+# Package for running on Machina Debian guest VM
+fuchsia_test_package("linux_syscalls_rust_tests") {
+  test_components = []
+  foreach(test_name, all_test_names) {
+    test_components += [ ":linux_${test_name}" ]
+  }
+  subpackages = starnix_test_subpackages
+  subpackages += [ "//src/starnix/containers/debian:debian_package" ]
+  deps = [ "//src/lib/testing/expectation:expectation_comparer" ]
+  test_specs = {
+    log_settings = {
+      # Tests exercise failure cases, so ERROR logs are expected.
+      max_severity = "ERROR"
+    }
+    package_resolution_timeout_secs = 660
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [ ":starnix_syscalls_rust_tests" ]
+}
+
+group("linux_vm_tests") {
+  testonly = true
+  deps = [ ":linux_syscalls_rust_tests" ]
+}

@@ -1,0 +1,96 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Software delivery
+### lists package contents
+
+## usage: fx show-package [package name] [--subpackages|-s]
+##
+## show-package displays the contents of a fuchsia package.
+##
+##    --subpackages     (Optional) Whether or not to include subpackage contents. Defaults to false.
+##
+## Note that you may need to ensure your build is up to date to get correct
+## results (fx build).
+
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/updates.sh
+fx-config-read
+
+function dump_package_contents {
+  local merkle="$1"
+  local prefix="$2"
+  local show_subpackages=$3
+  if [ "$merkle" = "null" ]; then
+    echo "Failed to find package '$1'"
+    return
+  fi
+  fx-command-run far list --archive="$amber_repo/blobs/$merkle"
+  fx-command-run far cat --archive="$amber_repo/blobs/$merkle" --file=meta/contents
+  if $show_subpackages; then
+    local subpackages_json=$(\
+        fx-command-run far cat --archive="$amber_repo/blobs/$merkle" \
+        --file=meta/fuchsia.pkg/subpackages)
+    local subpackages=$(echo $subpackages_json | fx-command-run jq -r ".subpackages | keys[]")
+    for subpackage in $subpackages
+    do
+        echo "================================================================="
+        echo "Subpackage: $prefix$subpackage"
+        echo "================================================================="
+        local merkle=$(echo $subpackages_json | fx-command-run jq -r ".subpackages.\"$subpackage\"")
+        dump_package_contents "$merkle" "$prefix$subpackage/" ""
+    done
+  fi
+}
+
+function main {
+  local include_subpackages=false
+  local package_name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        fx-command-help
+        exit 0
+        ;;
+      --subpackages|-s)
+        include_subpackages=true
+        ;;
+      -*|--*)
+        echo "Unknown option $1"
+        fx-command-help
+        exit 1
+        ;;
+      *)
+        if ["$package_name" == ""]; then
+          package_name="$1"
+        else
+          echo "Only one package name should be provided"
+          fx-command-help
+          exit 1
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  if [ -z "$package_name" ]; then
+    fx-command-help
+    exit 1
+  fi
+
+  local merkle
+  local amber_repo
+
+  readonly amber_repo="$FUCHSIA_BUILD_DIR"/amber-files/repository
+  merkle=$(fx-command-run jq -r ".signed.targets.\"$package_name/0\".custom.merkle" \
+      "$amber_repo"/targets.json)
+
+  dump_package_contents "$merkle" "" $include_subpackages
+}
+
+main "$@"

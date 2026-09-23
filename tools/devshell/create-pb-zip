@@ -1,0 +1,104 @@
+#!/bin/bash
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Other
+### Create pb.zip suitable for flashing based on product_bundles.json file.
+## The created zip file will default to ${pwd}/pb.zip
+
+## usage: fx create-pb-zip [-b <product_bundle>] [-o <output>] [-c <compression_level>] [-g <artifacts_group>]
+##   -o     Output location of built zip file
+##   -b     Name of product bundle to zip
+##   -c     Compression level for zip. 0 for no compression -- this can be much faster.
+##   -g     Artifacts group to zip. One of flash, emu, update, bootloader, all, default is flash.
+
+set -o errexit
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh
+fx-config-read
+
+main() {
+    local output="$(pwd)"
+    local product_name=""
+    local product_bundle_path=""
+    local product_bundles_path="${FUCHSIA_BUILD_DIR}/product_bundles.json"
+    local compression_level=""
+    local artifacts_group="flash"
+
+    while [[ $# -ge 1 ]]; do
+        case "$1" in
+        -h|--help)
+            fx-command-help
+            exit 0
+            ;;
+        -o)
+            shift
+            output=$(realpath "$1")
+            ;;
+        -b)
+            shift
+            product_name="$1"
+            product_bundle_path=$(fx-command-run jq -r ".[] | select(.name==\"${product_name}\") | .path" ${product_bundles_path})
+            if [[ $product_bundle_path == "" ]]; then
+                fx-error "Invalid product bundle $product_name"
+                exit 1
+            fi
+            ;;
+        -c)
+            shift
+            compression_level="$1"
+            ;;
+        -g)
+            shift
+            artifacts_group="$1"
+            ;;
+        *)
+            fx-error "Unknown option $1"
+            fx-command-help
+            exit 1
+            ;;
+        esac
+        shift
+    done
+
+    if [[ -d $output ]]; then
+        output="${output}/pb.zip"
+    fi
+
+    if [[ ! -d ${FUCHSIA_BUILD_DIR}/${product_bundle_path} ]]; then
+        fx-error "Product bundle $product_name not found at path ${FUCHSIA_BUILD_DIR}/${product_bundle_path//\"}"
+        exit 1
+    fi
+
+    if [[ -z "${product_name}" ]]; then
+        product_bundle_path="$(fx-command-run get-main-pb-path)"
+    fi
+
+    fx-info "Start creating ${output} ..."
+    (
+        cd "${FUCHSIA_BUILD_DIR}/${product_bundle_path}/.."
+        local tmpfile_path="${FUCHSIA_BUILD_DIR}/tmp-pb-zip-$$"
+
+        # get the list of files needed for flashing
+        result=$(fx-command-run ffx --machine json product get-artifacts product_bundle -r -g ${artifacts_group})
+        echo "$result" | fx-command-run jq -r ".ok.paths[]" > "$tmpfile_path"
+        echo "product_bundle.json" >> "$tmpfile_path"
+        sed -i -e 's/^/product_bundle\//' "$tmpfile_path"
+
+        local compression_arg=""
+        if [[ -n "${compression_level}" ]]; then
+          compression_arg="-${compression_level}"
+        fi
+
+        zip ${compression_arg} pb.zip -@ < "$tmpfile_path"
+        rm -rf "$tmpfile_path"
+        if [[ $output != "$(pwd)/pb.zip" ]]; then
+            mv -f pb.zip "${output}"
+        fi
+    )
+
+    fx-info "Done! Output: ${output}"
+}
+
+main "$@"

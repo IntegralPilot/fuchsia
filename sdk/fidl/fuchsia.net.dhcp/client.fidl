@@ -1,0 +1,199 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.net.dhcp;
+
+using fuchsia.net;
+using fuchsia.net.interfaces.admin;
+
+/// The maximum possible number of DNS servers that can be included in an
+/// acquired DHCP configuration.
+///
+/// According to [RFC 2132 section
+/// 3.8](https://www.rfc-editor.org/rfc/rfc2132#section-3.8), the length of the
+/// DNS server list in bytes is represented in the protocol by an 8-bit unsigned
+/// integer:
+/// "[variable-length options have] a length octet following the tag octet. The
+/// value of the length octet does not include the two octets specifying the tag
+/// and length."
+/// 2^8 = 256, which divided by 4 bytes gives us 64 as an upper bound on the
+/// maximum possible number of DNS servers that can be included in an acquired
+/// DHCP configuration.
+const MAX_DNS_SERVERS uint8 = 64;
+
+/// The maximum possible number of routers that can be included in an acquired
+/// DHCP configuration.
+///
+/// According to [RFC 2132 section
+/// 3.5](https://www.rfc-editor.org/rfc/rfc2132#section-3.5), the length of the
+/// routers list in bytes is represented in the protocol by an 8-bit unsigned
+/// integer:
+/// "[variable-length options have] a length octet following the tag octet. The
+/// value of the length octet does not include the two octets specifying the
+/// tag and length."
+/// 2^8 = 256, which divided by 4 bytes gives us 64 as an upper bound on the
+/// maximum possible number of routers that can be included in an acquired
+/// DHCP configuration.
+const MAX_ROUTERS uint8 = 64;
+
+/// Describes the configuration information the DHCP client requests from DHCP
+/// servers.
+type ConfigurationToRequest = table {
+    /// Request a list of IP addresses for routers on the client's subnet,
+    /// in order of preference.
+    /// See [RFC 2132 section 3.5](https://www.rfc-editor.org/rfc/rfc2132#section-3.5).
+    ///
+    /// If not set, interpreted as false.
+    1: routers bool;
+    /// Request a list of available DNS servers.
+    /// See [RFC 2132 section 3.8](https://www.rfc-editor.org/rfc/rfc2132#section-3.8).
+    ///
+    /// If not set, interpreted as false.
+    2: dns_servers bool;
+};
+
+/// Provides a method to create new DHCP clients.
+@discoverable
+closed protocol ClientProvider {
+    /// Provides a DHCPv4 client.
+    ///
+    /// + request `params` the parameters to create the client with.
+    /// + request `request` grants control over the client.
+    strict NewClient(resource struct {
+        /// The ID of the interface the client runs on.
+        interface_id fuchsia.net.InterfaceId;
+
+        /// The parameters with which to create the DHCP client.
+        /// If `configuration_to_request` is unset and `request_ip_address` is
+        /// false, `request` is closed with terminal event `INVALID_PARAMS`.
+        params @generated_name("NewClientParams") table {
+            /// Parameters for describing the configuration information the DHCP
+            /// client requests from DHCP servers.
+            ///
+            /// If not set, interpreted as empty (no configuration information
+            /// is requested).
+            1: configuration_to_request ConfigurationToRequest;
+
+            /// Whether the client negotiates an IP address.
+            ///
+            /// If false or not set, the client asks only for local
+            /// configuration parameters.
+            /// See [RFC 2131 section 3.4](https://www.rfc-editor.org/rfc/rfc2131#section-3.4).
+            2: request_ip_address bool;
+        };
+        request server_end:Client;
+    });
+
+    /// No-op method that allows checking for presence.
+    ///
+    /// TODO(https://fxbug.dev/296283299): It's not currently possible for a
+    /// client with an optionally-provided protocol to check whether there's
+    /// someone on the other end without making a FIDL call . This method
+    /// provides a workaround by giving a client a method that it can call to
+    /// check for liveness.
+    ///
+    /// TODO(https://fxbug.dev/42076541): Remove this once the DHCP out-of-stack
+    /// client is always being used.
+    @deprecated("For DHCP client migration only, see https://fxbug.dev/42076541 for details")
+    strict CheckPresence() -> ();
+};
+
+/// Provides methods to watch for discovered network configurations and control
+/// the DHCP client discovering them.
+///
+/// This protocol encodes the DHCP client's lifetime in both directions;
+/// the DHCP client remains alive iff both ends of the protocol are open. That
+/// is:
+///
+/// - Closing the client end causes the DHCP client to be destroyed.
+/// - Observing a closure of the server end indicates the DHCP client no longer
+///   exists.
+closed protocol Client {
+    /// Returns acquired DHCP configuration.
+    ///
+    /// Yields a value whenever the client acquires new configuration. Notably,
+    /// does not yield a value upon DHCP lease expiry; instead, expiry of the IP
+    /// address is communicated via the `AddressStateProvider` (refer to
+    /// documentation of `fuchsia.net.interfaces.admin/AddressStateProvider` for
+    /// details). Non-address configuration does not expire, but is replaced by
+    /// new configuration once a new DHCP lease is obtained.
+    ///
+    /// It is invalid to call this method while a previous call is pending.
+    /// Doing so causes the server end of the protocol to be closed.
+    ///
+    /// - response `address` the assigned address. If set, the client has
+    ///     acquired a new lease on an IP address. If not set, then either the
+    ///     client has not requested an IP address (in which case this `Client`
+    ///     instance has never yielded an address), or the client continues to
+    ///     hold a lease on a previously-acquired IP address (whose lifetime is
+    ///     updated via `AddressStateProvider`).
+    /// - response `dns_servers` addresses of discovered DNS servers. If absent,
+    ///     must be interpreted as empty (the client's configuration indicates
+    ///     no DNS servers, even if previously-yielded configuration included
+    ///     DNS servers).
+    /// - response `routers` addresses of discovered routers on the client's
+    ///     subnet, in descending order of preference according to the DHCP
+    ///     server. If absent, must be interpreted as empty (the client's
+    ///     configuration indicates no routers, even if previously-yielded
+    ///     configuration included routers).
+    strict WatchConfiguration() -> (resource table {
+        1: address resource table {
+            /// The assigned address and prefix length.
+            1: address fuchsia.net.Ipv4AddressWithPrefix;
+            /// The parameters of the address.
+            2: address_parameters fuchsia.net.interfaces.admin.AddressParameters;
+            /// Provides address assignment state and enables updating address
+            /// properties; the DHCP client closes the client end if the address
+            /// becomes invalid (its valid lifetime expires and Renew and Rebind
+            /// have not succeeded).
+            /// The server end can be closed with a terminal OnAddressRemoved
+            /// value in order to signal to the DHCP client that an address is
+            /// rejected (e.g. due to failing duplicate address detection).
+            3: address_state_provider server_end:fuchsia.net.interfaces.admin.AddressStateProvider;
+        };
+        2: dns_servers vector<fuchsia.net.Ipv4Address>:MAX_DNS_SERVERS;
+        3: routers vector<fuchsia.net.Ipv4Address>:MAX_ROUTERS;
+    });
+
+    /// Instructs the client to shut down gracefully (releasing any DHCP lease
+    /// currently held). When the client is finished shutting down, it yields
+    /// the `ClientExitReason::GRACEFUL_SHUTDOWN` `OnExit` event.
+    strict Shutdown();
+
+    /// Terminal event yielded by the server before the server end is closed.
+    ///
+    /// - response `reason` the reason the DHCP client was closed.
+    strict -> OnExit(struct {
+        reason @generated_name("ClientExitReason") strict enum {
+            /// A client already exists on the interface.
+            CLIENT_ALREADY_EXISTS_ON_INTERFACE = 1;
+
+            /// More than one concurrent call to `WatchConfiguration` was made.
+            WATCH_CONFIGURATION_ALREADY_PENDING = 2;
+
+            /// The interface identified is invalid for acquiring configuration.
+            INVALID_INTERFACE = 3;
+
+            /// Invalid `NewClientParams` were provided.
+            INVALID_PARAMS = 4;
+
+            /// The network was, or became, unreachable over the interface
+            /// provided to the DHCP client.
+            NETWORK_UNREACHABLE = 5;
+
+            /// The client was unable to open a socket.
+            UNABLE_TO_OPEN_SOCKET = 6;
+
+            /// Graceful shutdown was performed.
+            GRACEFUL_SHUTDOWN = 7;
+
+            /// An address acquired by this client was removed by a user.
+            ADDRESS_REMOVED_BY_USER = 8;
+
+            /// The `AddressStateProvider` for an address acquired by this
+            /// client exited with an error (or without providing a reason for
+            /// the address removal).
+            ADDRESS_STATE_PROVIDER_ERROR = 9;
+        };
+    });
+};

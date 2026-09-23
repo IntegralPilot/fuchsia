@@ -1,0 +1,650 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/python/python_action.gni")
+import("//build/rust/rustc_library.gni")
+
+# Helper template to run the aidl compiler.
+#
+# Parameters
+#
+#   base (base or bases is required)
+#     Base path for the library
+#
+#   bases (base or bases is required)
+#     Base paths for the library
+#
+#   outputs (required)
+#     Outputs of the generator
+#
+#   args (required)
+#     Additional arguments
+#
+#   parcelables (optional)
+#     List of the sources of the parcelables defined by the library
+#
+#   interfaces (optional)
+#     List of the sources of the interfaces defined by the library
+#
+#   deps (optional)
+#     AIDL dependencies
+#
+#   stability (optional)
+#     The stability requirement of this interface.
+#
+#   structured (optional, defaults to true)
+#     Whether to use structured AIDL.
+#
+#   version (optional, if stability is not defined, mandatory otherwise)
+#     Which stable version; this being set also causes getInterfaceVersion code
+#     to be generated.
+#
+template("_aidl_gen") {
+  assert(!defined(invoker.stability) || defined(invoker.version),
+         "version must be defined when stability is defined")
+
+  aidl_sources = []
+  if (defined(invoker.parcelables)) {
+    aidl_sources += invoker.parcelables
+  }
+  if (defined(invoker.interfaces)) {
+    aidl_sources += invoker.interfaces
+  }
+  action_sources = aidl_sources
+  action_inputs = []
+
+  bases = []
+  if (defined(invoker.bases)) {
+    bases = invoker.bases
+  }
+  if (defined(invoker.base)) {
+    bases += [ invoker.base ]
+  }
+
+  dependency_dir = "$target_gen_dir/$target_name"
+  aidl_sources_file = "$dependency_dir/aidl_sources"
+  meta_files = [
+    "aidl_package",
+    "aidl_bases",
+    "aidl_rust_glue_args",
+  ]
+
+  write_file(aidl_sources_file, rebase_path(aidl_sources, root_build_dir))
+  action_inputs += [ aidl_sources_file ]
+
+  aidl_gen_target = "//src/lib/android/aidl:aidl_gen($host_toolchain)"
+  aidl_gen_output_name = get_label_info(aidl_gen_target, "name")
+  aidl_gen_output_dir = get_label_info(aidl_gen_target, "root_out_dir")
+  aidl_gen_executable = "$aidl_gen_output_dir/$aidl_gen_output_name"
+  action_inputs += [ aidl_gen_executable ]
+
+  raw_args = invoker.args
+  raw_args += [ "--min_sdk_version=31" ]
+  if (defined(invoker.stability)) {
+    raw_args += [ "--stability=${invoker.stability}" ]
+  }
+  if (!defined(invoker.structured) || invoker.structured) {
+    raw_args += [ "--structured" ]
+  }
+
+  action_args = [
+    "--aidl-path",
+    rebase_path(aidl_gen_executable, root_build_dir),
+    "--dependency-dir",
+    rebase_path(dependency_dir, root_build_dir),
+    "--inputs-path",
+    rebase_path(aidl_sources_file, root_build_dir),
+  ]
+
+  # The --version argument is necessary to generate getInterfaceVersion() and
+  # getInterfaceHash() code.
+  if (defined(invoker.version)) {
+    action_args += [
+      "--version",
+      "${invoker.version}",
+    ]
+  }
+
+  foreach(base, bases) {
+    action_args += [
+      "--base",
+      rebase_path(base, root_build_dir),
+    ]
+    if (defined(invoker.version)) {
+      action_inputs += [ "$base/.hash" ]
+    }
+  }
+
+  # This is the base directory for android/os/PersistableBundle.aidl.
+  persistable_bundle_dir =
+      "//third_party/android/platform/frameworks/native/aidl/binder"
+  action_args += [
+    "--base",
+    rebase_path(persistable_bundle_dir, root_build_dir),
+  ]
+
+  action_deps = [ aidl_gen_target ]
+  if (defined(invoker.deps)) {
+    foreach(dep, invoker.deps) {
+      dep_gen_dir = get_label_info(dep, "target_gen_dir")
+      dep_dir = get_label_info(dep, "dir")
+      dep_name = get_label_info(dep, "name")
+      dep_dep_dir = "$dep_gen_dir/${dep_name}_aidl"
+      foreach(meta_file, meta_files) {
+        action_inputs += [ "$dep_dep_dir/$meta_file" ]
+      }
+
+      action_args += [
+        "--deps",
+        rebase_path(dep_dep_dir, root_build_dir),
+      ]
+      action_deps += [ "$dep_dir:${dep_name}_aidl" ]
+    }
+  }
+
+  foreach(arg, raw_args) {
+    action_args += [
+      "--args",
+      arg,
+    ]
+  }
+
+  compiled_action(target_name) {
+    deps = action_deps
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    tool = "//src/lib/android/aidl:aidl_wrapper"
+    inputs = action_inputs
+    sources = action_sources
+    outputs = invoker.outputs
+    foreach(meta_file, meta_files) {
+      outputs += [ "$dependency_dir/$meta_file" ]
+    }
+    args = action_args
+    depfile = "$dependency_dir/deps.d"
+  }
+}
+
+# Generate AIDL binding for C++ using the ndk backend
+#
+# Parameters
+#
+#   base (base or bases is required)
+#     Base path for the library.
+#     The last path component usually ends in a number, representing the
+#     version of the AIDL library.
+#
+#   bases (base or bases is required)
+#     Base paths for the library.
+#     The last path component usually ends in a number, representing the
+#     version of the AIDL library.
+#
+#   parcelables (optional)
+#     List of the sources of the parcelables defined by the library.
+#     Their directory relative to the base path should correspond to the
+#     AIDL package name, e.g. "android/hardware/health".
+#
+#   interfaces (optional)
+#     List of the sources of the interfaces defined by the library.
+#     Their directory relative to the base path should correspond to the
+#     AIDL package name, e.g. "android/hardware/health".
+#
+#   deps (optional)
+#     AIDL dependencies
+#
+#   stability (optional)
+#     The stability requirement of this interface.
+#
+#   structured (optional)
+#     Whether to use structured AIDL.
+#
+#   version (optional)
+#     Which stable version; this being set also causes getInterfaceVersion code
+#     to be generated.
+template("aidl_ndk") {
+  main_target_name = target_name
+  cpp_aidl_gen_dir = "$target_gen_dir/${main_target_name}_aidl"
+
+  aidl_cpp_outputs = []
+
+  if (defined(invoker.parcelables)) {
+    foreach(parcelable, invoker.parcelables) {
+      relative_path = rebase_path(parcelable, invoker.base)
+      object_name = get_path_info(relative_path, "name")
+      sub_directory = get_path_info(relative_path, "dir")
+      aidl_cpp_outputs += [
+        "$cpp_aidl_gen_dir/include/aidl/${sub_directory}/${object_name}.h",
+        "$cpp_aidl_gen_dir/include/aidl/${sub_directory}/Bn${object_name}.h",
+        "$cpp_aidl_gen_dir/include/aidl/${sub_directory}/Bp${object_name}.h",
+        "$cpp_aidl_gen_dir/src/${sub_directory}/${object_name}.cpp",
+      ]
+    }
+  }
+
+  if (defined(invoker.interfaces)) {
+    foreach(interface, invoker.interfaces) {
+      relative_path = rebase_path(interface, invoker.base)
+      service = string_replace(get_path_info(relative_path, "name"), "I", "", 1)
+      sub_directory = get_path_info(relative_path, "dir")
+      aidl_cpp_outputs += [
+        "$cpp_aidl_gen_dir/include/aidl/${sub_directory}/I${service}.h",
+        "$cpp_aidl_gen_dir/include/aidl/${sub_directory}/Bn${service}.h",
+        "$cpp_aidl_gen_dir/include/aidl/${sub_directory}/Bp${service}.h",
+        "$cpp_aidl_gen_dir/src/${sub_directory}/I${service}.cpp",
+      ]
+    }
+  }
+
+  aidl_args = [
+    "--lang=ndk",
+    "-o",
+    rebase_path("$cpp_aidl_gen_dir/src", root_build_dir),
+    "-h",
+    rebase_path("$cpp_aidl_gen_dir/include", root_build_dir),
+  ]
+
+  _aidl_gen("${main_target_name}_aidl") {
+    forward_variables_from(invoker,
+                           [
+                             "base",
+                             "bases",
+                             "parcelables",
+                             "interfaces",
+                             "deps",
+                             "stability",
+                             "structured",
+                             "version",
+                           ])
+    args = aidl_args
+    outputs = aidl_cpp_outputs
+  }
+
+  config("${main_target_name}_include") {
+    include_dirs = [ "$cpp_aidl_gen_dir/include" ]
+    defines = [ "BINDER_STABILITY_SUPPORT" ]
+  }
+
+  source_set(main_target_name) {
+    sources = aidl_cpp_outputs
+    deps = [ ":${main_target_name}_aidl" ]
+
+    # TODO: Remove this once https://issuetracker.google.com/153746485 is fixed.
+    configs += [ "//build/config:Wno-deprecated-anon-enum-enum-conversion" ]
+    public_deps = [
+      "//src/lib/android/binder",
+      "//src/lib/android/core",
+      "//src/lib/android/libbase",
+    ]
+    if (defined(invoker.deps)) {
+      public_deps += invoker.deps
+    }
+    public_configs = [ ":${main_target_name}_include" ]
+  }
+}
+
+# Generate AIDL binding for C++ using the cpp backend
+#
+# Parameters
+#
+#   base (base or bases is required)
+#     Base path for the library.
+#     The last path component usually ends in a number, representing the
+#     version of the AIDL library.
+#
+#   bases (base or bases is required)
+#     Base paths for the library.
+#     The last path component usually ends in a number, representing the
+#     version of the AIDL library.
+#
+#   parcelables (optional)
+#     List of the sources of the parcelables defined by the library
+#     Their directory relative to the base path should correspond to the
+#     AIDL package name, e.g. "android/hardware/health".
+#
+#   interfaces (optional)
+#     List of the sources of the interfaces defined by the library
+#     Their directory relative to the base path should correspond to the
+#     AIDL package name, e.g. "android/hardware/health".
+#
+#   deps (optional)
+#     AIDL dependencies
+#
+#   stability (optional)
+#     The stability requirement of this interface.
+#
+#   structured (optional)
+#     Whether to use structured AIDL.
+#
+#   version (optional)
+#     Which stable version; this being set also causes getInterfaceVersion code
+#     to be generated.
+#
+#   is_bootstrap (optional)
+#     Whether this is a bootstrap library, needed for building the aidl runtime
+#     library. In that case, no code is compiled, and the user is expected to
+#     include the generated code in the support library itself.
+template("aidl_cpp") {
+  main_target_name = target_name
+  cpp_aidl_gen_dir = "$target_gen_dir/${main_target_name}_aidl"
+
+  aidl_cpp_outputs = []
+
+  if (defined(invoker.parcelables)) {
+    foreach(parcelable, invoker.parcelables) {
+      relative_path = rebase_path(parcelable, invoker.base)
+      object_name = get_path_info(relative_path, "name")
+      sub_directory = get_path_info(relative_path, "dir")
+      aidl_cpp_outputs += [
+        "$cpp_aidl_gen_dir/include/${sub_directory}/${object_name}.h",
+        "$cpp_aidl_gen_dir/include/${sub_directory}/Bn${object_name}.h",
+        "$cpp_aidl_gen_dir/include/${sub_directory}/Bp${object_name}.h",
+        "$cpp_aidl_gen_dir/src/${sub_directory}/${object_name}.cpp",
+      ]
+    }
+  }
+
+  if (defined(invoker.interfaces)) {
+    foreach(interface, invoker.interfaces) {
+      relative_path = rebase_path(interface, invoker.base)
+      service = string_replace(get_path_info(relative_path, "name"), "I", "", 1)
+      sub_directory = get_path_info(relative_path, "dir")
+      aidl_cpp_outputs += [
+        "$cpp_aidl_gen_dir/include/${sub_directory}/I${service}.h",
+        "$cpp_aidl_gen_dir/include/${sub_directory}/Bn${service}.h",
+        "$cpp_aidl_gen_dir/include/${sub_directory}/Bp${service}.h",
+        "$cpp_aidl_gen_dir/src/${sub_directory}/I${service}.cpp",
+      ]
+    }
+  }
+
+  aidl_args = [
+    "--lang=cpp",
+    "-o",
+    rebase_path("$cpp_aidl_gen_dir/src", root_build_dir),
+    "-h",
+    rebase_path("$cpp_aidl_gen_dir/include", root_build_dir),
+  ]
+
+  _aidl_gen("${main_target_name}_aidl") {
+    forward_variables_from(invoker,
+                           [
+                             "base",
+                             "bases",
+                             "parcelables",
+                             "interfaces",
+                             "deps",
+                             "stability",
+                             "structured",
+                             "version",
+                           ])
+    args = aidl_args
+    outputs = aidl_cpp_outputs
+  }
+
+  config("${main_target_name}_include") {
+    include_dirs = [ "$cpp_aidl_gen_dir/include" ]
+  }
+
+  if (defined(invoker.is_bootstrap) && invoker.is_bootstrap) {
+    group(main_target_name) {
+      public_deps = [ ":${main_target_name}_aidl" ]
+    }
+  } else {
+    source_set(main_target_name) {
+      sources = aidl_cpp_outputs
+      deps = [ ":${main_target_name}_aidl" ]
+
+      # TODO: Remove this once https://issuetracker.google.com/153746485 is fixed.
+      configs += [ "//build/config:Wno-deprecated-anon-enum-enum-conversion" ]
+      public_deps = [
+        "//src/lib/android/binder",
+        "//src/lib/android/core",
+        "//src/lib/android/libbase",
+      ]
+      if (defined(invoker.deps)) {
+        public_deps += invoker.deps
+      }
+      public_configs = [ ":${main_target_name}_include" ]
+    }
+  }
+}
+
+# Generate AIDL binding for Rust
+#
+# Parameters
+#
+#   base (base or bases is required)
+#     Base path for the library.
+#     The last path component usually ends in a number, representing the
+#     version of the AIDL library.
+#
+#   bases (base or bases is required)
+#     Base paths for the library.
+#     The last path component usually ends in a number, representing the
+#     version of the AIDL library.
+#
+#   parcelables (optional)
+#     List of the sources of the parcelables defined by the library.
+#     Their directory relative to the base path should correspond to the
+#     AIDL package name, e.g. "android/hardware/health".
+#
+#   interfaces (optional)
+#     List of the sources of the interfaces defined by the library.
+#     Their directory relative to the base path should correspond to the
+#     AIDL package name, e.g. "android/hardware/health".
+#
+#   deps (optional)
+#     AIDL dependencies
+#
+#   stability (optional)
+#     The stability requirement of this interface.
+#
+#   structured (optional)
+#     Whether to use structured AIDL.
+#
+#   version (optional)
+#     Which stable version; this being set also causes getInterfaceVersion code
+#     to be generated.
+#
+#   rust_crate_name (optional)
+#     Name of the generated Rust crate. If not set, derived from the directory path
+#     relative to the base.
+template("aidl_rust") {
+  main_target_name = target_name
+  rust_aidl_gen_dir = "$target_gen_dir/${main_target_name}_aidl"
+  rust_glue_args =
+      "$target_gen_dir/${main_target_name}_aidl/aidl_rust_glue_args_main"
+  rust_glue_include_args =
+      "$target_gen_dir/${main_target_name}_aidl/aidl_rust_glue_args"
+
+  objects = []
+  if (defined(invoker.parcelables)) {
+    objects += invoker.parcelables
+  }
+  if (defined(invoker.interfaces)) {
+    objects += invoker.interfaces
+  }
+
+  package = ""
+  aidl_rust_outputs = []
+  invoker_bases = []
+  if (defined(invoker.bases)) {
+    invoker_bases = invoker.bases
+  }
+  if (defined(invoker.base)) {
+    invoker_bases += [ invoker.base ]
+  }
+
+  foreach(object, objects) {
+    foreach(base, invoker_bases) {
+      # Check whether the object is relative to base
+      split = []
+      split = string_split(string_replace(object, base, "_MARKER_ "))
+      if (split[0] == "_MARKER_") {
+        relative_path = rebase_path(object, base)
+        object_name = get_path_info(relative_path, "name")
+        sub_directory = get_path_info(relative_path, "dir")
+        if (package == "" ||
+            string_replace(package, sub_directory, "", 1) != "") {
+          package = sub_directory
+        }
+        aidl_rust_outputs +=
+            [ "$rust_aidl_gen_dir/${sub_directory}/${object_name}.rs" ]
+      }
+    }
+  }
+
+  name = ""
+  if (defined(invoker.rust_crate_name)) {
+    name = invoker.rust_crate_name
+  } else if (package == "." || package == "") {
+    message = "Failed to infer AIDL package name. The base path may not be set correctly. "
+    message += "The `.aidl` files should be located under a path like "
+    message += "\${base}/my/package/name/SomeFile.aidl."
+    assert(package != "." && package != "", message)
+  } else {
+    name = string_replace(package, "/", "_")
+  }
+
+  aidl_args = [
+    "--lang=rust",
+    "-o",
+    rebase_path(rust_aidl_gen_dir, root_build_dir),
+  ]
+
+  _aidl_gen("${main_target_name}_aidl") {
+    forward_variables_from(invoker,
+                           [
+                             "base",
+                             "bases",
+                             "parcelables",
+                             "interfaces",
+                             "deps",
+                             "stability",
+                             "structured",
+                             "version",
+                           ])
+    args = aidl_args
+    outputs = aidl_rust_outputs
+  }
+
+  root_rust_file = "$target_gen_dir/${main_target_name}_aidl_rust_glue.rs"
+
+  write_file(rust_glue_args, rebase_path(aidl_rust_outputs, root_build_dir))
+
+  python_action("${main_target_name}_aidl_rust_glue") {
+    binary_label = "//src/lib/android/aidl:aidl_rust_glue"
+    deps = [ ":${main_target_name}_aidl" ]
+    sources = aidl_rust_outputs + [
+                rust_glue_args,
+                rust_glue_include_args,
+              ]
+    outputs = [ root_rust_file ]
+    args = [
+      rebase_path(root_rust_file, root_build_dir),
+      rebase_path(rust_aidl_gen_dir, root_build_dir),
+      "@" + rebase_path(rust_glue_args, root_build_dir),
+      "@" + rebase_path(rust_glue_include_args, root_build_dir),
+    ]
+  }
+
+  rustc_library(main_target_name) {
+    edition = "2024"
+    sources = [ root_rust_file ]
+    name = name
+    deps = [
+      ":${main_target_name}_aidl_rust_glue",
+      "//src/lib/android/binder/rust:binder",
+      "//third_party/rust_crates:async-trait",
+      "//third_party/rust_crates:static_assertions",
+    ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    source_root = root_rust_file
+    configs += [ "//src/lib/android:android_aidl_rust_config" ]
+    disable_clippy = true
+  }
+}
+
+# Generate AIDL bindings
+#
+# Parameters
+#
+#   base (base or bases is required)
+#     Base path for the library.
+#     The last path component usually ends in a number, representing the
+#     version of the AIDL library.
+#
+#   bases (base or bases is required)
+#     Base paths for the library.
+#     The last path component usually ends in a number, representing the
+#     version of the AIDL library.
+#
+#   parcelables (optional)
+#     List of the sources of the parcelables defined by the library.
+#     Their directory relative to the base path should correspond to the
+#     AIDL package name, e.g. "android/hardware/health".
+#
+#   interfaces (optional)
+#     List of the sources of the interfaces defined by the library.
+#     Their directory relative to the base path should correspond to the
+#     AIDL package name, e.g. "android/hardware/health".
+#
+#   deps (optional)
+#     AIDL dependencies
+#
+#   backends (optional)
+#     List of backends to generate bindings for. If not present, all backends are generated.
+#
+#   stability (optional)
+#     The stability requirement of this interface.
+#
+#   structured (optional)
+#     Whether to use structured AIDL.
+#
+#   version (optional)
+#     Which stable version; this being set also causes getInterfaceVersion code
+#     to be generated.
+#
+#   rust_crate_name (optional)
+#     Name of the generated Rust crate. If not set, derived from the directory path
+#     relative to the base. Only relevant for the "rust" backend.
+template("aidl") {
+  if (defined(invoker.backends)) {
+    backends = invoker.backends
+  } else {
+    backends = [
+      "cpp",
+      "rust",
+      "ndk",
+    ]
+  }
+  foreach(backend, backends) {
+    backend_target_name = "${target_name}_${backend}"
+    target("aidl_${backend}", backend_target_name) {
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "backends",
+                               "deps",
+                               "rust_crate_name",
+                             ])
+      deps = []
+      if (defined(invoker.deps)) {
+        foreach(dep, invoker.deps) {
+          dep_dir = get_label_info(dep, "dir")
+          dep_name = get_label_info(dep, "name")
+          deps += [ "$dep_dir:${dep_name}_${backend}" ]
+        }
+      }
+
+      if (backend == "rust" && defined(invoker.rust_crate_name)) {
+        rust_crate_name = invoker.rust_crate_name
+      }
+    }
+  }
+}

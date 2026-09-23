@@ -1,0 +1,165 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/testing/cc_test_executable.gni")
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":audio_lib_processing_death_unittests",
+    ":audio_lib_processing_unittests",
+  ]
+}
+
+source_set("coefficient_table") {
+  sources = [
+    "coefficient_table.cc",
+    "coefficient_table.h",
+  ]
+
+  public_deps = [
+    "//sdk/lib/stdcompat",
+    "//sdk/lib/syslog/cpp",
+    "//src/media/audio/lib/format2:fixed",
+  ]
+}
+
+source_set("processing") {
+  sources = [
+    "channel_strip.h",
+    "coefficient_table_cache.h",
+    "filter.cc",
+    "filter.h",
+    "flags.h",
+    "gain.h",
+    "point_sampler.cc",
+    "point_sampler.h",
+    "position_manager.cc",
+    "position_manager.h",
+    "sampler.cc",
+    "sampler.h",
+    "sinc_sampler.cc",
+    "sinc_sampler.h",
+  ]
+
+  public_deps = [ "//src/media/audio/lib/format2" ]
+
+  deps = [
+    ":coefficient_table",
+    "//sdk/fidl/fuchsia.audio:fuchsia.audio_cpp",
+    "//sdk/lib/syslog/cpp",
+    "//zircon/system/ulib/trace",
+  ]
+
+  # Building without optimizations causes significant slowdowns for these
+  # components; the additional CPU load may lead to audio glitches on debug
+  # builds. These config settings enable the needed code optimization while
+  # maintaining other 'debug' aspects (e.g. DCHECK is still enabled).
+  configs -= [ "//build/config:default_optimize" ]
+  configs += [ "//build/config:optimize_speed" ]
+
+  # Allow some of our loops to be vectorized by the compiler.
+  configs += [ "//build/config:fast-math" ]
+}
+
+# Any executable which uses `processing` (either directly or transitively) must
+# also include either `prebuilt_coefficient_tables` or
+# `empty_coefficient_tables` below. The decision of which tables to include is
+# usually left to the top-most build rule (i.e., the executable), since that
+# rule often has the most insight into system constraints, such as code size.
+shared_library("prebuilt_coefficient_tables") {
+  sources = [ "$target_gen_dir/coefficient_table_data_prebuilt.cc" ]
+  deps = [
+    ":build_coefficient_table_data_prebuilt_cc",
+    ":coefficient_table",
+  ]
+}
+
+shared_library("empty_coefficient_tables") {
+  sources = [ "coefficient_table_data_empty.cc" ]
+  deps = [ ":coefficient_table" ]
+}
+
+# This executable is run automatically as part of the build deps for
+# `prebuilt_coefficient_tables`. It can also be run manually - the binary can be
+# found adjacent to other host tools.
+executable("gen_audio_filter_coefficient_tables") {
+  sources = [
+    "coefficient_table.cc",
+    "coefficient_table.h",
+    "gen_coefficient_tables.cc",
+  ]
+  deps = [
+    "//sdk/lib/stdcompat",
+    "//src/media/audio/lib/format2:fixed",
+  ]
+  defines = [ "BUILDING_FUCHSIA_AUDIO_HOST_TOOL=1" ]
+}
+
+compiled_action("build_coefficient_table_data_prebuilt_cc") {
+  tool = ":gen_audio_filter_coefficient_tables"
+  outputs = [ "$target_gen_dir/coefficient_table_data_prebuilt.cc" ]
+  args = [ rebase_path(target_gen_dir, root_build_dir) +
+           "/coefficient_table_data_prebuilt.cc" ]
+}
+
+cc_test_executable("unittest-bin") {
+  visibility = [ ":*" ]
+  testonly = true
+  output_name = "audio_lib_processing_unittests"
+
+  sources = [
+    "channel_strip_unittest.cc",
+    "coefficient_table_cache_unittest.cc",
+    "coefficient_table_unittest.cc",
+    "filter_unittest.cc",
+    "gain_unittest.cc",
+    "point_sampler_unittest.cc",
+    "position_manager_unittest.cc",
+    "sampler_unittest.cc",
+    "sinc_sampler_unittest.cc",
+  ]
+
+  deps = [
+    ":coefficient_table",
+    ":prebuilt_coefficient_tables",
+    ":processing",
+    "//sdk/lib/syslog/cpp",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/media/audio/lib/format2",
+    "//third_party/googletest:gmock",
+    "//zircon/system/ulib/trace",
+  ]
+}
+
+fuchsia_unittest_package("audio_lib_processing_unittests") {
+  deps = [ ":unittest-bin" ]
+}
+
+cc_test_executable("death-unittest-bin") {
+  testonly = true
+  output_name = "audio_lib_processing_death_unittests"
+
+  sources = [ "sampler_death_unittest.cc" ]
+
+  deps = [
+    ":prebuilt_coefficient_tables",
+    ":processing",
+    "//sdk/lib/syslog/cpp",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/media/audio/lib/format2",
+    "//third_party/googletest:gmock",
+  ]
+}
+
+fuchsia_unittest_package("audio_lib_processing_death_unittests") {
+  deps = [ ":death-unittest-bin" ]
+  manifest = "meta/audio_libprocessing_death_unittests.cml"
+  test_specs = {
+    log_settings = {
+      max_severity = "FATAL"
+    }
+  }
+}

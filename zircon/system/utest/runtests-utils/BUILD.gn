@@ -1,0 +1,273 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/dist/generated_resource.gni")
+import("//build/dist/renamed_binary.gni")
+import("//build/dist/resource.gni")
+import("//build/test.gni")
+import("//build/testing/bootfs_test.gni")
+import("//build/toolchain/zircon/clang.gni")
+
+test("runtests-utils") {
+  sources = [
+    "fuchsia-run-test.cc",
+    "log-exporter-test.cc",
+    "runtests-utils-test-utils.cc",
+    "runtests-utils-test.cc",
+  ]
+  deps = [
+    "//sdk/lib/fidl_base",
+    "//third_party/re2",
+    "//zircon/system/ulib/fbl",
+    "//zircon/system/ulib/runtests-utils",
+    "//zircon/system/ulib/zxtest",
+  ]
+  data_deps = [
+    ":packaged-profile-helper",
+    ":packaged-publish-data-helper",
+    ":packaged-raw-profile",
+    ":test-data",
+    ":test-scripts",
+  ]
+}
+
+executable("publish-data-helper") {
+  testonly = true
+  visibility = [ ":*" ]
+  sources = [ "helper/publish-data-helper.cc" ]
+  deps = [
+    "//sdk/lib/fdio",
+    "//zircon/system/ulib/zx",
+    "//zircon/system/ulib/zxtest",
+  ]
+
+  # Don't use build configurations that implicitly publish debugdata, since
+  # that interferes with the helper's expected use of the protocol.
+  exclude_toolchain_tags = [ "debugdata" ]
+}
+
+executable("profile-helper") {
+  testonly = true
+  visibility = [ ":*" ]
+  sources = [ "helper/profile-helper.cc" ]
+
+  deps = [
+    "//sdk/lib/fdio",
+    "//zircon/system/ulib/fbl",
+    "//zircon/system/ulib/zx",
+    "//zircon/system/ulib/zxtest",
+  ]
+
+  # Don't use build configurations that implicitly publish debugdata, since
+  # that interferes with the helper's expected use of the protocol.
+  exclude_toolchain_tags = [ "debugdata" ]
+}
+
+renamed_binary("packaged-publish-data-helper") {
+  testonly = true
+  dest = "test/sys/runtests-utils-testdata/publish-data/publish-data-helper"
+  source = "$root_out_dir/publish-data-helper"
+  source_deps = [ ":publish-data-helper" ]
+}
+
+renamed_binary("packaged-profile-helper") {
+  testonly = true
+  dest = "test/sys/runtests-utils-testdata/profile/profile-helper"
+  source = "$root_out_dir/profile-helper"
+  source_deps = [ ":profile-helper" ]
+}
+
+resource("packaged-raw-profile") {
+  testonly = true
+  outputs = [
+    "test/sys/runtests-utils-testdata/profile/15822697145192797690.profraw",
+  ]
+
+  # TODO(https://fxbug.dev/539649726): To unblock the clang roll, we can upload
+  # the new profraw file with the updated llvm profdata header format. We can't
+  # replace it completely because the new format would break existing tests, so
+  # we can do a quick check to see which version of the toolchain we're using
+  # and dispatch to the appropriate file.
+  #
+  # "iqsK1xnW4IG8hxWRZ-n5R5CoS9b1wNf6pHZAqS0G4ccC" is the cipd ID for the older
+  # toolchain with the older format. We should remove this after rolling clang.
+  #
+  # This profile was generated via
+  #
+  # ``` $ clang
+  # -fprofile-instr-generate=/abspath/to/zircon/system/utest/runtests-utils/helper/15822697145192797690.profraw
+  # -Wl,--build-id -o code code.c $ ./code code.c is just an empty main
+  # function. Running it makes the profile. ```
+  if (clang_version_string == "iqsK1xnW4IG8hxWRZ-n5R5CoS9b1wNf6pHZAqS0G4ccC") {
+    sources = [ "helper/15822697145192797690.profraw" ]
+  } else {
+    sources = [ "helper/15822697145192797690.v11.profraw" ]
+  }
+}
+
+generated_resource("test-data") {
+  testonly = true
+  contents = [ "Hello world!" ]
+  outputs = [ "test/sys/runtests-utils-testdata/test-data" ]
+}
+
+# Generates a build script with a sensible #! depending on what our target is.
+# We used to generate these at runtime, but that design conflicts with our
+# goals around verified execution, so now we pregenerate them and include them
+# as part of a signed package.
+template("runtests_test_script") {
+  forward_variables_from(invoker,
+                         "*",
+                         [
+                           "contents",
+                           "subdirectory",
+                         ])
+  assert(defined(invoker.contents))
+
+  if (!defined(invoker.subdirectory)) {
+    subdirectory = ""
+  } else {
+    subdirectory = "${invoker.subdirectory}/"
+  }
+
+  genfile = "$target_out_dir/test/sys/runtests-utils-testdata/${subdirectory}${target_name}"
+  rebased_genfile = rebase_path(genfile, root_build_dir)
+
+  action("${target_name}.txt") {
+    testonly = true
+    script = "/bin/bash"
+    args = [ "-c" ]
+    shebang = "#!/boot/bin/sh"
+    args += [ "printf '${shebang}\n\n${invoker.contents}\n' > $rebased_genfile && chmod a+x $rebased_genfile" ]
+    outputs = [ "$genfile" ]
+  }
+
+  resource("${target_name}") {
+    testonly = true
+    deps = [ ":${target_name}.txt" ]
+    outputs =
+        [ "test/sys/runtests-utils-testdata/${subdirectory}${target_name}" ]
+    sources = [ genfile ]
+  }
+}
+
+runtests_test_script("succeed.sh") {
+  contents = "exit 0"
+}
+
+runtests_test_script("expect-this-success.sh") {
+  contents = "echo Expect this!"
+}
+
+runtests_test_script("expect-this-failure.sh") {
+  contents = "echo Expect this! 1>&2\nexit 77"
+}
+
+runtests_test_script("a.sh") {
+  contents = ""
+  subdirectory = "runtestsbasicpass"
+}
+
+runtests_test_script("b.sh") {
+  contents = ""
+  subdirectory = "runtestsbasicpass"
+}
+
+runtests_test_script("test-basic-succeed.sh") {
+  contents = "echo Success! \$@"
+  subdirectory = "runtestsbasicfail"
+}
+
+runtests_test_script("test-basic-fail.sh") {
+  contents = "echo Failure!  \$@ 1>&2\nexit 77"
+  subdirectory = "runtestsbasicfail"
+}
+
+runtests_test_script("test-globs-root.sh") {
+  contents = "echo Success! \$@"
+  subdirectory = "testglobs"
+}
+
+runtests_test_script("test-globs-one.sh") {
+  contents = "echo Success! \$@"
+  subdirectory = "testglobs/A/B/C"
+}
+
+runtests_test_script("test-globs-two.sh") {
+  contents = "echo Success! \$@"
+  subdirectory = "testglobs/A/D/C"
+}
+
+runtests_test_script("test-with-output-succeed.sh") {
+  contents = "echo Success! \$@"
+  subdirectory = "testwithoutput"
+}
+
+runtests_test_script("test-with-output-fail.sh") {
+  contents = "echo Failure!  \$@ 1>&2\nexit 77"
+  subdirectory = "testwithoutput"
+}
+
+runtests_test_script("succeed-with-echo.sh") {
+  contents = "echo Success! \$@"
+}
+
+runtests_test_script("test-root-dir.sh") {
+  # Used by RunTestRootDir.
+  contents = "read line < \$TEST_ROOT_DIR/test/sys/runtests-utils-testdata/test-data\necho \\\"\$line\\\"\n"
+}
+
+runtests_test_script("test-inf-loop.sh") {
+  # Used by RunTestTimeout
+  contents = "while true; do echo \"\"; done"
+}
+
+group("test-scripts") {
+  testonly = true
+  deps = [
+    # Used by RunTestRootDir in fuchsia-run-test.cc
+    ":test-root-dir.sh",
+
+    # Used by RunTestSuccess,
+    # DiscoverAndRunTestsFailsWithNoTestGlobsOrDefaultDirs,
+    # RunTestTimeout
+    ":succeed.sh",
+
+    # Used in RunTestTimeout
+    ":test-inf-loop.sh",
+
+    # Used by RunTestSuccessWithStdout
+    ":expect-this-success.sh",
+
+    # Used by RunTestFailureWithStderr
+    ":expect-this-failure.sh",
+
+    # Used by RunTestsWithVerbosity, RunTestsWithArguments, and
+    # DiscoverAndRunTestsFallsBackToDefaultDirs
+    ":succeed-with-echo.sh",
+
+    # Used in an isolated directory by DiscoverAndRunTestsBasicPass
+    ":a.sh",
+    ":b.sh",
+
+    # Used in an isolated directory by DiscoverAndRunTestsBasicFail
+    ":test-basic-fail.sh",
+    ":test-basic-succeed.sh",
+
+    # Used in an isolated tree by DiscoverAndRunTestsWithGlobs
+    ":test-globs-one.sh",
+    ":test-globs-root.sh",
+    ":test-globs-two.sh",
+
+    # Used in an isolated directory by DiscoverAndRunTestsWithOutput and
+    # DiscoverAndRunTestsWithSyslogOutput
+    ":test-with-output-fail.sh",
+    ":test-with-output-succeed.sh",
+  ]
+}
+
+bootfs_test("runtests-utils-bootfs-test") {
+  name = "runtests-utils"
+  deps = [ ":runtests-utils" ]
+}

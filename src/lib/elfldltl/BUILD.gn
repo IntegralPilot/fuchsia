@@ -1,0 +1,202 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/linker.gni")
+import("//build/cpp/library_headers.gni")
+import("//build/toolchain/zircon/user_basic_redirect.gni")
+
+has_fd = !is_kernel && toolchain_variant.tags + [ "standalone" ] -
+                       [ "standalone" ] == toolchain_variant.tags
+
+library_headers("headers") {
+  # These APIs are close to being universally portable.  They depend only on
+  # standard C++20, <lib/fit/result.h>, <lib/stdcompat/bit.h> and rely only on
+  # library features available in all environments.  This may include
+  # references to container and allocation APIs that cannot actually be used in
+  # special environments (without infallible allocation), but using the headers
+  # should be compatible as long as the specific functions and classes relying
+  # on those library features are not used.
+  headers = [
+    "lib/elfldltl/abi-ptr.h",
+    "lib/elfldltl/abi-span.h",
+    "lib/elfldltl/compat-hash.h",
+    "lib/elfldltl/constants.h",
+    "lib/elfldltl/container.h",
+    "lib/elfldltl/diagnostics-ostream.h",
+    "lib/elfldltl/diagnostics.h",
+    "lib/elfldltl/dwarf/cfi-entry.h",
+    "lib/elfldltl/dwarf/eh-frame-hdr.h",
+    "lib/elfldltl/dwarf/encoding.h",
+    "lib/elfldltl/dwarf/section-data.h",
+    "lib/elfldltl/dynamic.h",
+    "lib/elfldltl/field.h",
+    "lib/elfldltl/file.h",
+    "lib/elfldltl/gnu-hash.h",
+    "lib/elfldltl/init-fini.h",
+    "lib/elfldltl/internal/const-string.h",
+    "lib/elfldltl/internal/diagnostics-printf.h",
+    "lib/elfldltl/internal/dynamic-tag-error.h",
+    "lib/elfldltl/internal/load-segment-types.h",
+    "lib/elfldltl/internal/no_unique_address.h",
+    "lib/elfldltl/internal/phdr-error.h",
+    "lib/elfldltl/layout.h",
+    "lib/elfldltl/link.h",
+    "lib/elfldltl/load.h",
+    "lib/elfldltl/loadinfo-mapped-memory.h",
+    "lib/elfldltl/loadinfo-mutable-memory.h",
+    "lib/elfldltl/machine.h",
+    "lib/elfldltl/memory.h",
+    "lib/elfldltl/note.h",
+    "lib/elfldltl/perfect-symbol-table.h",
+    "lib/elfldltl/phdr.h",
+    "lib/elfldltl/preallocated-vector.h",
+    "lib/elfldltl/relocation.h",
+    "lib/elfldltl/relro.h",
+    "lib/elfldltl/resolve.h",
+    "lib/elfldltl/self.h",
+    "lib/elfldltl/static-pie-with-vdso.h",
+    "lib/elfldltl/static-pie.h",
+    "lib/elfldltl/static-vector.h",
+    "lib/elfldltl/svr4-abi.h",
+    "lib/elfldltl/symbol.h",
+    "lib/elfldltl/tls-layout.h",
+  ]
+  public_deps = [
+    "//sdk/lib/fit",
+    "//sdk/lib/stdcompat",
+  ]
+
+  # These APIs depend on some POSIX-like file-descriptor-based APIs.
+  if (has_fd) {
+    headers += [
+      "lib/elfldltl/fd.h",
+      "lib/elfldltl/mapped-fd-file.h",
+      "lib/elfldltl/mmap-loader.h",
+      "lib/elfldltl/posix.h",
+    ]
+  }
+
+  # These APIs depend on the corresponding <fbl/...> APIs.
+  headers += [
+    "lib/elfldltl/alloc-checker-container.h",
+    "lib/elfldltl/unique-fd.h",
+  ]
+  public_deps += [ "//zircon/system/ulib/fbl" ]
+
+  # These APIs depend on Fuchsia userland APIs (<lib/zx/...>, etc.).
+  if (is_fuchsia && !is_kernel) {
+    headers += [
+      "lib/elfldltl/mapped-vmo-file.h",
+      "lib/elfldltl/vmar-loader.h",
+      "lib/elfldltl/vmo.h",
+      "lib/elfldltl/segment-with-vmo.h",
+      "lib/elfldltl/zircon.h",
+    ]
+
+    # Make sure that there's no transitive deps on libzircon, so header-only
+    # use of the library doesn't affect dynamic linking dependencies.
+    if (zircon_toolchain == false) {
+      _headers = ""
+    } else {
+      _headers = ":headers"
+    }
+    public_deps += [
+      # <lib/elfldltl/vmo.h> has #include <lib/zx/vmo.h>.
+      "//zircon/system/ulib/zx$_headers",
+    ]
+  }
+
+  if (is_kernel) {
+    public_deps += [
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+    ]
+  }
+}
+
+# The implementation code is in the hermetic library, below.  This target is
+# used to link that into a final link where input linker scripts can have
+# dangling symbol references.
+source_set("elfldltl") {
+  public_deps = [ ":hermetic" ]
+  if (is_elf) {
+    if (is_gcc && linker == "") {
+      libs = [ "./self-base-bfd.ld" ]
+    } else {
+      libs = [ "./self-base.ld" ]
+    }
+  }
+}
+
+# This target is used to link the code into an hermetic_source_set() target.
+# It supplies metadata that directs hermetic_source_set() to do some post-link
+# shenanigans with the same effect as self-base.ld, which doesn't work as an
+# input to the hermetic partial link (ld -r).
+static_library("hermetic") {
+  output_name = "elfldltl"
+  complete_static_lib = true
+
+  public_deps = [ ":headers" ]
+
+  sources = [ "leb128.cc" ]
+  deps = []
+  if (is_elf) {
+    if (toolchain_base_environment == "user") {
+      deps += [ ":self.basic" ]
+    } else {
+      deps += [ ":self" ]
+    }
+    metadata = {
+      hermetic_source_set_objcopy_flags =
+          [ "--redefine-sym=elfldltl.kBase=__ehdr_start" ]
+    }
+  }
+
+  if (has_fd) {
+    sources += [ "mapped-fd-file.cc" ]
+    deps += [ "//sdk/lib/fit" ]
+  }
+
+  if (is_fuchsia && !is_kernel) {
+    sources += [
+      "mapped-vmo-file.cc",
+      "vmar-loader.cc",
+    ]
+    deps += [ "//zircon/system/ulib/zx" ]
+  }
+
+  if (is_linux) {
+    configs -= [ "//build/config/linux:implicit-host-libs" ]
+  }
+}
+
+if (is_elf) {
+  # When the elfldltl::Self<...> code is not fully inlined, it's still used in
+  # places where only the basic machine ABI is available.
+
+  if (toolchain_base_environment == "user") {
+    user_basic_redirect("self.basic") {
+      visibility = [ ":*" ]
+      public_deps = [ ":self" ]
+    }
+  }
+
+  source_set("self") {
+    visibility = [ ":*" ]
+    deps = [ ":headers" ]
+    sources = [ "self.cc" ]
+  }
+}
+
+group("tests") {
+  testonly = true
+
+  deps = [ "test:tests" ]
+}
+
+group("boot_tests") {
+  testonly = true
+
+  deps = [ "test:boot_tests" ]
+}

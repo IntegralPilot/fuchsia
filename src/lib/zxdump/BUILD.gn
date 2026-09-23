@@ -1,0 +1,389 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/host.gni")
+import("//build/test.gni")
+import("//build/testing/cc_test_executable.gni")
+import("//build/zircon/c_utils.gni")
+import("//build/zircon/migrated_targets.gni")
+
+zx_library("zxdump") {
+  sdk = "source"
+  sdk_headers = [
+    "lib/zxdump/buffer.h",
+    "lib/zxdump/dump.h",
+    "lib/zxdump/elf-search.h",
+    "lib/zxdump/fd-writer.h",
+    "lib/zxdump/task.h",
+    "lib/zxdump/types.h",
+    "lib/zxdump/zstd-writer.h",
+  ]
+
+  public_deps = [
+    # <lib/zxdump/types.h> has #include <zircon/types.h>.
+    "//zircon/system/public",
+
+    # <lib/zxdump/fd-writer.h> has #include <lib/fit/result.h>.
+    "//zircon/system/ulib/zx",
+
+    # <lib/zxdump/dump.h> has #include <lib/fit/function.h>.
+    "//sdk/lib/fit",
+
+    # <lib/zxdump/fd-writer.h> has #include <fbl/unique_fd.h>.
+    "//zircon/system/ulib/fbl",
+
+    # <lib/zxdump/elf-search.h> has #include <lib/elfldltl/layout.h>.
+    "//src/lib/elfldltl",
+  ]
+
+  if (is_fuchsia) {
+    public_deps += [
+      # <lib/zxdump/dump.h> has #include <lib/zx/process.h>.
+      "//zircon/system/ulib/zx",
+    ]
+  }
+
+  sources = [
+    "buffer-impl.cc",
+    "buffer-impl.h",
+    "core.h",
+    "dump-file-mmap.cc",
+    "dump-file-mmap.h",
+    "dump-file-stdio.cc",
+    "dump-file-stdio.h",
+    "dump-file-zstd.cc",
+    "dump-file-zstd.h",
+    "dump-file.cc",
+    "dump-file.h",
+    "dump.cc",
+    "elf-search.cc",
+    "error.cc",
+    "fd-writer.cc",
+    "job-archive.h",
+    "live-memory-cache.h",
+    "read-memory-string.cc",
+    "read-memory.cc",
+    "read.cc",
+    "rights.h",
+    "task.cc",
+    "zstd-writer.cc",
+  ]
+
+  # Test code can use private headers from sources.
+  friend = [ ":*" ]
+
+  defines = [ "ZSTD_STATIC_LINKING_ONLY" ]
+
+  deps = [
+    "//src/lib/elfldltl",
+    "//third_party/rapidjson",
+    "//third_party/zstd",
+    "//zircon/system/ulib/fbl",
+  ]
+
+  if (is_fuchsia) {
+    sources += [
+      "live-memory-cache.cc",
+      "root.cc",
+    ]
+    deps += [
+      "//sdk/fidl/fuchsia.boot:fuchsia.boot_cpp",
+      "//sdk/fidl/fuchsia.io:fuchsia.io_cpp",
+      "//sdk/fidl/fuchsia.kernel:fuchsia.kernel_cpp",
+      "//sdk/lib/component/incoming/cpp",
+      "//sdk/lib/fdio",
+      "//src/zircon/lib/zircon",
+      "//zircon/system/ulib/zx",
+    ]
+  } else {
+    sources += [ "not-fuchsia.cc" ]
+  }
+}
+
+source_set("piped-command") {
+  visibility = [ ":*" ]
+
+  public = [ "piped-command.h" ]
+  public_deps = [
+    "//zircon/system/ulib/fbl",
+    "//zircon/system/ulib/zx",
+  ]
+
+  sources = [ "piped-command.cc" ]
+  if (is_fuchsia) {
+    sources += [ "piped-command-fuchsia.cc" ]
+    public_deps += [ "//sdk/lib/fdio" ]
+    deps = [
+      "//sdk/lib/fdio",
+      "//zircon/system/ulib/zx",
+    ]
+  } else {
+    sources += [ "piped-command-posix.cc" ]
+  }
+}
+
+source_set("test-data-holder") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  public = [ "test-data-holder.h" ]
+  public_deps = [
+    ":zxdump",
+    "//third_party/googletest:gtest",
+  ]
+
+  sources = [ "test-data-holder.cc" ]
+}
+
+source_set("test-tool-process") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  public = [ "test-tool-process.h" ]
+  public_deps = [ "//zircon/system/ulib/fbl" ]
+
+  sources = [ "test-tool-process.cc" ]
+  deps = [
+    ":piped-command",
+    ":zxdump",
+    "//third_party/googletest:gtest",
+  ]
+
+  if (is_fuchsia) {
+    public_deps += [ "//zircon/system/ulib/zx" ]
+    deps += [
+      "//sdk/fidl/fuchsia.boot:fuchsia.boot_cpp",
+      "//sdk/fidl/fuchsia.kernel:fuchsia.kernel_cpp",
+      "//sdk/lib/async-loop:async-loop-cpp",
+      "//sdk/lib/async-loop:async-loop-default",
+      "//sdk/lib/component/outgoing/cpp",
+      "//src/storage/lib/vfs/cpp",
+    ]
+  }
+
+  data_deps = [ ":zstd-for-test" ]
+}
+
+template("test_children_data") {
+  # Depend on the base toolchain in case both the child and this target use
+  # the same variant, so that the copy under the expected name can be found
+  # at runtime.
+  children = []
+  foreach(child, invoker.deps) {
+    children += [ "$child(${toolchain_variant.base})" ]
+  }
+
+  if (is_host) {
+    host_test_data(target_name) {
+      visibility = [ ":*" ]
+      deps = children
+      sources = []
+      foreach(child, children) {
+        # The output_name can't be determined properly from the label, only
+        # guessed.
+        child_output_dir = get_label_info(child, "root_out_dir")
+        child_output_name = get_label_info(child, "name")
+        if (child_output_name == "zstdcli") {
+          # This one has output_name different from target_name.
+          child_output_name = "zstd"
+        }
+        sources += [ "$child_output_dir/$child_output_name" ]
+      }
+    }
+  } else {
+    group(target_name) {
+      visibility = [ ":*" ]
+      testonly = true
+      deps = children
+    }
+  }
+}
+
+test_children_data("zstd-for-test") {
+  deps = [ "//third_party/zstd:zstdcli" ]
+}
+
+test("zxdump-unittests") {
+  sources = [
+    "dump-file-tests.cc",
+    "error-tests.cc",
+    "fd-writer-tests.cc",
+    "gcore-tests.cc",
+    "piped-command-tests.cc",
+    "test-file.h",
+    "writer-tests.h",
+    "zstd-writer-tests.cc",
+  ]
+  deps = [
+    ":piped-command",
+    ":test-data-holder",
+    ":test-tool-process",
+    ":zxdump",
+    "//sdk/lib/fit",
+    "//sdk/lib/stdcompat",
+    "//src/lib/elfldltl",
+    "//src/lib/elfldltl/testing",
+    "//src/lib/fxl/test:gtest_main",
+    "//third_party/googletest:gmock",
+    "//zircon/system/ulib/fbl",
+  ]
+
+  data_deps = [ ":unittests-children" ]
+
+  if (is_fuchsia) {
+    sources += [
+      "dump-tests.cc",
+      "dump-tests.h",
+      "elf-search-tests.cc",
+      "read-tests.cc",
+      "task-tests.cc",
+    ]
+    include_dirs = [ target_gen_dir ]  # For test-child-elf-search.h
+    deps += [
+      ":test-child-elf-search",
+      "//sdk/lib/fdio",
+      "//sdk/lib/ld:remote",
+      "//sdk/lib/ld/testing",
+      "//zircon/system/ulib/zx",
+    ]
+
+    data_deps += [ "//sdk/lib/ld/test:remote-tests.test-data" ]
+  }
+}
+
+test_children_data("unittests-children") {
+  deps = [
+    ":gcore",
+    ":zxdump-test-child",
+  ]
+  if (is_fuchsia) {
+    deps += [ "//third_party/sbase:cat_bin" ]
+  }
+}
+
+cc_test_executable("zxdump-test-child") {
+  testonly = true
+
+  # Don't sanitize the test program in ways that give it too much accessible
+  # memory to fit into a reasonably-sized dump file.
+  exclude_toolchain_tags = [ "uses-shadow" ]
+
+  sources = [ "test-child.cc" ]
+  deps = [ "//zircon/system/ulib/fbl" ]
+
+  metadata = {
+  }
+
+  if (is_fuchsia) {
+    deps += [
+      ":zxdump-test-child-dso",
+      "//sdk/lib/fdio",
+      "//src/zircon/lib/zircon",
+      "//zircon/system/ulib/zx",
+    ]
+
+    # Let the rspfile target also collect the DSO name.
+    metadata.link_output_barrier = [ ":zxdump-test-child-dso" ]
+  }
+
+  if (is_host) {
+    base_out_dir = get_label_info(":$target_name(${toolchain_variant.base})",
+                                  "root_out_dir")
+    metadata.test_runtime_deps = [ "$base_out_dir/$target_name" ]
+  }
+}
+
+shared_library("zxdump-test-child-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+  public = [ "test-child-dso.h" ]
+  sources = [ "test-child-dso.cc" ]
+}
+
+# This will list the output paths for zxdump-test-child-dso as well.
+link_output_rspfile("test-child-elf-search.rsp") {
+  visibility = [ ":*" ]
+  testonly = true
+  outputs = [ "$target_gen_dir/$target_name" ]
+  deps = [ ":zxdump-test-child($default_toolchain)" ]
+}
+
+# Now use the rspfile to extract the build IDs from the test binaries.
+# elf-search-tests.cc uses the generated header to match them at runtime.
+action("test-child-elf-search") {
+  visibility = [ ":*" ]
+  testonly = true
+  script = "test-child-elf-search.sh"
+  deps = [ ":test-child-elf-search.rsp" ]
+  sources = get_target_outputs(deps[0])
+  outputs = [ "$target_gen_dir/test-child-elf-search.inc" ]
+  depfile = "$target_gen_dir/test-child-elf-search.d"
+  args = rebase_path(outputs + sources + [ depfile ], root_build_dir)
+}
+
+fuchsia_unittest_package("zxdump-tests") {
+  deps = [ ":zxdump-unittests" ]
+  manifest = "meta/zxdump-tests.cml"
+  test_type = "system"
+  disable_elf_binaries_checks = true
+
+  if (current_cpu == "riscv64") {
+    # TODO(https://fxbug.dev/42081271): Remove this once ZxdumpTests pass on RISC-V.
+    test_specs = {
+      build_only = true
+    }
+  }
+}
+
+group("tests") {
+  testonly = true
+
+  deps = [
+    ":zxdump-tests",
+    ":zxdump-unittests($host_toolchain)",
+
+    # TODO(mcgrathr): just to get them built for now
+    ":zxdump-tools",
+  ]
+}
+
+group("tools") {
+  deps = [ ":gcore" ]
+  data_deps = [ ":host-tools" ]
+}
+
+install_host_tools("host-tools") {
+  outputs = [ "gcore" ]
+  deps = [ ":gcore" ]
+}
+
+# This is not part of the library, but it's shared by the tools.
+source_set("cli") {
+  visibility = [ ":*" ]
+
+  sources = [ "cli.cc" ]
+  public = [ "cli.h" ]
+  public_deps = [ ":zxdump" ]
+}
+
+executable("gcore") {
+  sources = [ "gcore.cc" ]
+  deps = [
+    ":cli",
+    "//sdk/lib/fit",
+    "//third_party/rapidjson",
+    "//zircon/system/ulib/fbl",
+  ]
+}
+
+# To use this tool with a product, use developer overrides for assembly
+# to register it as a shell command and add the package to product image.
+#
+# https://fuchsia.dev/fuchsia-src/development/build/assembly_developer_overrides#add-shell-command
+# https://fuchsia.dev/fuchsia-src/development/build/assembly_developer_overrides#add-package
+#
+fuchsia_package("zxdump-tools") {
+  deps = [ ":tools" ]
+}

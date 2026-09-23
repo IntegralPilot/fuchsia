@@ -1,0 +1,127 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// This library complements the Topology Test Daemon, facilitating power topology testing by
+/// enabling communication between the test client and daemon to:
+/// - Specify the topology graph for the test daemon to create.
+/// - Instruct the test daemon to perform actions like holding or dropping leases.
+/// - Instruct the test daemon to start or stop system activity.
+/// The Topology Test Daemon creates and manages power topology graphs with individual elements
+/// running on separate components. It also interacts with the System Activity Governor for
+/// wake lease control.
+@available(added=HEAD)
+library fuchsia.power.topology.test;
+using fuchsia.power.broker;
+
+// Limitations on vector length for the sake of bounding request size.
+const MAX_ELEMENTS uint16 = 256;
+
+const MAX_ELEMENT_NAME_LEN uint16 = fuchsia.power.broker.MAX_ELEMENT_NAME_LEN;
+const MAX_VALID_POWER_LEVELS uint16 = fuchsia.power.broker.MAX_VALID_POWER_LEVELS;
+
+alias PowerLevel = fuchsia.power.broker.PowerLevel;
+
+// Limit the number of dependencies to the number of valid power levels.
+const MAX_DEPENDENCIES uint16 = MAX_VALID_POWER_LEVELS;
+
+alias ElementName = string:MAX_ELEMENT_NAME_LEN;
+
+/// Errors associated with TopologyControl.Create method.
+type CreateTopologyGraphError = strict enum : uint32 {
+    /// Indicates that the request failed due to an internal error.
+    INTERNAL = 1;
+    /// Indicates that the element topology provided in Create command is
+    /// invalid.
+    INVALID_TOPOLOGY = 2;
+};
+
+/// Errors associated with TopologyControl.AcquireLease and
+/// TopologyControl.DropLease methods.
+type LeaseControlError = strict enum : uint32 {
+    /// Indicates that the request failed due to an internal error.
+    INTERNAL = 1;
+    /// Indicates that an invalid power element name was provided in
+    /// AcquireLease or DropLease.
+    INVALID_ELEMENT = 2;
+};
+
+/// Errors associated with TopologyControl.OpenStatusChannel method.
+type OpenStatusChannelError = strict enum : uint32 {
+    /// Indicates that the request failed due to an internal error.
+    INTERNAL = 1;
+    /// Indicates that an invalid power element name was provided in
+    /// OpenStatusChannel
+    INVALID_ELEMENT = 2;
+};
+
+/// Errors associated with SystemActivityControl methods.
+type SystemActivityControlError = strict enum : uint32 {
+    /// Indicates that the request failed due to an internal error.
+    INTERNAL = 1;
+};
+
+/// Power Dependency information in Element. Used by a client to construct power topology.
+type LevelDependency = struct {
+    dependent_level PowerLevel;
+    requires_element ElementName;
+    requires_level PowerLevel;
+};
+
+/// Passed to TopologyControl.Create to construct power topology.
+type Element = struct {
+    element_name ElementName;
+    initial_current_level PowerLevel;
+    valid_levels vector<PowerLevel>:MAX_VALID_POWER_LEVELS;
+    dependencies vector<LevelDependency>:MAX_DEPENDENCIES;
+};
+
+/// The primary initial protocol used by a client tool to communiate with the topology-test-daemon.
+/// The client can create the whole topology, and then acquire or drop lease according to element
+/// names.
+@discoverable
+open protocol TopologyControl {
+    // Create a new topology graph. Replaces any previously created topology.
+    strict Create(struct {
+        /// List of elements to create.
+        elements vector<Element>:MAX_ELEMENTS;
+    }) -> () error CreateTopologyGraphError;
+
+    // Acquire a new lease. If an old lease exists, it will be dropped after the
+    // the new lease is created.
+    strict AcquireLease(struct {
+        element_name ElementName;
+        /// Power level of this element to be raised to.
+        level PowerLevel;
+        /// Returns immediately if this is set to Unknown.
+        /// Otherwise, waits for the lease to reach this status before returning.
+        wait_for_status fuchsia.power.broker.LeaseStatus;
+    }) -> () error LeaseControlError;
+
+    // Drop a previously acquired lease.
+    strict DropLease(struct {
+        element_name ElementName;
+    }) -> () error LeaseControlError;
+
+    /// Register a new Status channel on which Power Broker will send
+    /// read-only updates of the element's current power level.
+    strict OpenStatusChannel(resource struct {
+        element_name ElementName;
+        status_channel server_end:fuchsia.power.broker.Status;
+    }) -> () error OpenStatusChannelError;
+};
+
+/// Control system activity states by taking leases with the System Activity Governor.
+@discoverable
+open protocol SystemActivityControl {
+    /// Take a lease on Application Activity.
+    strict StartApplicationActivity() -> () error SystemActivityControlError;
+    /// Drop a held lease (if it exists) on Application Activity.
+    strict StopApplicationActivity() -> () error SystemActivityControlError;
+
+    /// Drop a held lease (if it exists) on Application Activity, wait, and then take it again.
+    strict RestartApplicationActivity(struct {
+        /// The time to wait after dropping the lease but before reclaiming it.
+        wait_time_ns uint64;
+    }) -> () error SystemActivityControlError;
+};

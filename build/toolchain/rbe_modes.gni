@@ -1,0 +1,374 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Defines the standard configurations for RBE and override options that can be
+# used by developers.
+
+# This file will be processed in every toolchain, so detect when it's being
+# processed in the default_toolchain.  As this file is imported by
+# BUILDCONFIG.gn, `default_toolchain` hasn't yet been set, and while
+# `current_toolchain` _is_ set, it's an empty string while in the context of
+# the default toolchain.
+_print_warnings = current_toolchain == ""
+
+declare_args() {
+  ###############################
+  ### RBE modes and overrides ###
+  ###############################
+
+  # The overall mode for RBE to be operating in.  The valid values are:
+  #  * 'off' => RBE is fully disabled. This is suitable for offline building
+  #             using only local resources.
+  #  * 'legacy_default' => The standard RBE configuration used if not otherwise
+  #                        specified. This contains a mix of enabled/disabled
+  #                        remote services.
+  #  * 'remote_full' => Run as many actions remotely as possible, including
+  #                  cache-misses, which reduces use of local resources.
+  #  * 'racing' => Race remote against local execution, for some action types.
+  #  * 'cloudtop' => An RBE configuration that's optimized for running on a
+  #                  cloudtop. Suitable for high-bandwidth connections to
+  #                  remote services and downloading remote outputs.
+  #  * 'workstation' => An RBE configuration that's optimized for running on a
+  #                  large workstation. Suitable for machines with a large
+  #                  number of fast cores and a high bandwidth connection to
+  #                  remote services.
+  #  * 'infra' => The RBE configuration recommended for CI/CQ bots.
+  #               Also uses high-bandwidth.
+  #  * 'remote_cache_only' => Use RBE only as a remote-cache: on cache-miss,
+  #                           execute locally instead of remotely.
+  #  * 'low_bandwidth_remote' => An RBE configuration for low network bandwidth.
+  #                              Saves bandwidth by avoiding downloading some
+  #                              intermediate results.
+  #  * 'nocache' => Force all cache-misses, and re-execute remotely.
+  rbe_mode = "off"
+
+  # Overridden settings for the RBE mode.  This is a set of override values for
+  # variables whose default values are set by the chosen RBE mode (above).
+  rbe_settings_overrides = {
+  }
+}
+
+# These are default values for experimental options (usually disabled)
+_all_experimental_option_defaults = {
+}
+
+# These are the values for _stable_ options that all RBE modes start with.
+_all_modes_defaults = {
+  forward_variables_from(_all_experimental_option_defaults, "*")
+
+  # cxx defaults
+  cxx_exec_strategy = "remote_local_fallback"
+  cxx_download_objects = true
+  cxx_minimalist_wrapper = false
+
+  # link defaults
+  link_exec_strategy = "remote_local_fallback"
+  link_download_unstripped_binaries = true
+
+  # rust defaults
+  rust_exec_strategy = "remote"
+  rust_download_rlibs = true
+  rust_download_unstripped_binaries = true
+
+  # bazel defaults
+  bazel_exec_strategy = "remote"
+
+  # bazel 7.1+ defaults downloads to toplevel only, which means
+  # that intermediate artifacts of remote builds won't be downloaded
+  # by default, which saves bandwidth.
+  # When debugging remote build issues, however, one may wish to
+  # fetch all intermedates by overriding this to "all".
+  bazel_download_outputs = "toplevel"
+}
+
+_default_rbe_settings = {
+  # Build entirely locally/offline.
+  off = {
+    forward_variables_from(_all_modes_defaults, "*")
+    cxx_enable = false
+    link_enable = false
+    rust_enable = false
+    bazel_enable = false
+  }
+
+  # For legacy reasons, this reflects the settings that developers
+  # were accustomed to seeing, which was C++ automatically remote-enabled
+  # via Goma (deprecated), has since been replaced by re-client.
+  # It is advised to choose one of the other options that
+  # best matches your development environment.
+  legacy_default = {
+    forward_variables_from(_all_modes_defaults, "*")
+    cxx_enable = true
+    link_enable = false
+    rust_enable = false
+    bazel_enable = false
+  }
+
+  # The "remote_full" mode builds the maximum set of actions remotely.
+  # This mode runs cache-misses remotely, and takes full advantage
+  # of fully parallelized remote execution (saving local resources),
+  # and will self-warm the remote caches.
+  # This is a good option when you expect a high number of cache-misses.
+  remote_full = {
+    forward_variables_from(_all_modes_defaults, "*")
+    cxx_enable = true
+
+    link_enable = true
+
+    rust_enable = true
+    rust_exec_strategy = "remote"
+
+    bazel_enable = true
+    bazel_exec_strategy = "remote"
+  }
+
+  # The "racing" mode runs both locally and remotely, taking the results
+  # of the first to succeed.  This will self-warm the remote caches.
+  # This is a good option when you expect a high number of cache-misses.
+  racing = {
+    forward_variables_from(_all_modes_defaults, "*")
+
+    # Racing is less beneficial for small actions, so leave C++ as-is.
+    cxx_enable = true
+
+    link_enable = true
+    rust_exec_strategy = "racing"
+
+    rust_enable = true
+    rust_exec_strategy = "racing"
+
+    # TODO: bazel does support "dynamic" execution strategies for racing, but it
+    # would be a good idea to spell out strategies per mnemonic (action type).
+    bazel_enable = true
+    bazel_exec_strategy = "remote"
+  }
+
+  # The "nocache" mode forces remote re-execution without using the cache.
+  # This mode is mostly intended for benchmarking remote execution,
+  # and is not intended for most users.
+  nocache = {
+    forward_variables_from(_all_modes_defaults, "*")
+    cxx_enable = true
+    cxx_exec_strategy = "nocache"
+
+    link_enable = true
+    link_exec_strategy = "nocache"
+
+    rust_enable = true
+    rust_exec_strategy = "nocache"
+
+    bazel_enable = true
+    bazel_exec_strategy = "nocache"
+  }
+
+  # The "cloudtop" development environment has very high
+  # network bandwidth, which makes for faster remote cache
+  # hits and downloading of cached artifacts.
+  # Cache hit rates are subject to differences in build
+  # configuration, commands, and local source modifications.
+  #
+  # This currently uses the same configuration as
+  # remote_cache_only, and thus does not self-warm the remote cache.
+  cloudtop = {
+    forward_variables_from(_all_modes_defaults, "*")
+    cxx_enable = true
+    cxx_exec_strategy = "local"
+
+    link_enable = true
+    link_exec_strategy = "local"
+
+    rust_enable = true
+    rust_exec_strategy = "local"
+
+    bazel_enable = true
+    bazel_exec_strategy = "local"
+  }
+
+  # The "workstation" and "cloudtop" are currently the same, but
+  # defining workstation separately heads off questions of
+  # "why is my workstation using the cloudtop config?" (a
+  # valid question on the surface).
+  workstation = cloudtop
+
+  # The build infrastructure environment is also expected
+  # to have high-bandwidth connections.
+  # Note: infra configurations exist elsewhere and are not
+  # actually controlled here.
+  # This merely expresses intent and recommendations.
+  infra = {
+    forward_variables_from(_all_modes_defaults, "*")
+    cxx_enable = true
+    link_enable = true
+    rust_enable = true
+    rust_exec_strategy = "remote"
+
+    bazel_enable = true
+    bazel_exec_strategy = "remote"
+  }
+
+  # Enable remote execution only as a cache, but on cache-misses,
+  # execute build actions locally, thereby consuming no remote execution
+  # worker slots.
+  # This can be an attractive option if in your development cycle:
+  #   * The vast majority of your build actions are cache-hits.
+  #   * Your local machine is faster than remote workers, and has
+  #     enough resources to handle the cache-misses.
+  remote_cache_only = {
+    forward_variables_from(_all_modes_defaults, "*")
+    cxx_enable = true
+    cxx_exec_strategy = "local"
+
+    link_enable = true
+    link_exec_strategy = "local"
+
+    rust_enable = true
+    rust_exec_strategy = "local"
+
+    bazel_enable = true
+    bazel_exec_strategy = "local"
+  }
+
+  # This mode itself is experimental.
+  #
+  # Relative to "Cloudtop" this enables the same set of
+  # remote builds, but skips downloading many intermediate
+  # build artifacts, in an effort to reduce bandwidth.
+  # Every not-downloaded artifact leaves a download-stub
+  # in its place, which can be downloaded later as-needed.
+  low_bandwidth_remote = {
+    forward_variables_from(_all_modes_defaults, "*")
+    cxx_enable = true
+    cxx_download_objects = false
+    cxx_minimalist_wrapper = false
+
+    link_enable = true
+
+    # TODO(b/339694617): explore skipping more unstripped binaries
+    link_download_unstripped_binaries = true
+
+    rust_enable = true
+    rust_exec_strategy = "remote"
+    rust_download_rlibs = false
+    rust_download_unstripped_binaries = false
+
+    bazel_enable = true
+
+    # bazel-7.1 already defaults to --remote_download_outputs=toplevel
+    bazel_download_outputs = "toplevel"
+  }
+}
+
+# Validate that the chosen RBE mode is one of the valid modes
+assert(
+    defined(_default_rbe_settings[rbe_mode]),
+    "The specified RBE mode (${rbe_mode}) is not a valid option. They are: 'off', 'legacy_default', 'cloudtop', 'infra', 'remote_cache_only', 'nocache', and 'low_bandwidth_remote' (*).  (*) denotes an experimental mode.")
+
+# Set the RBE settings to use based on the chosen RBE mode
+_settings_defaults = _default_rbe_settings[rbe_mode]
+
+if (_print_warnings) {
+  # Warn about using experimental modes.
+  _experimental_rbe_modes = [ "low_bandwidth_remote" ]
+  if (_experimental_rbe_modes + [ rbe_mode ] - [ rbe_mode ] !=
+      _experimental_rbe_modes) {
+    print("WARNING: You're using an experimental 'rbe_mode':  \"${rbe_mode}\"")
+  }
+
+  # Warn if the overridden settings are not at their default value for this
+  # compilation mode, or are using experimental flags
+  _experimental_options = [
+    "cxx_download_objects",
+    "link_download_unstripped_binaries",
+    "rust_download_unstripped_binaries",
+    "rust_download_rlibs",
+  ]
+
+  foreach(_setting_name,
+          [
+            "cxx_enable",
+            "cxx_download_objects",
+            "cxx_exec_strategy",
+            "link_enable",
+            "link_download_unstripped_binaries",
+            "link_exec_strategy",
+            "rust_enable",
+            "rust_download_rlibs",
+            "rust_download_unstripped_binaries",
+            "rust_exec_strategy",
+            "bazel_enable",
+          ]) {
+    if (defined(rbe_settings_overrides[_setting_name]) &&
+        rbe_settings_overrides[_setting_name] ==
+        _settings_defaults[_setting_name]) {
+      _default_value = _settings_defaults[_setting_name]
+      print(
+          "  WARNING:  You are setting '${_setting_name}' to the default value (${_default_value}) for this RBE mode (${rbe_mode}). This is unncessary.")
+    }
+  }
+
+  foreach(_setting_name, _experimental_options) {
+    if (defined(rbe_settings_overrides[_setting_name])) {
+      _value = rbe_settings_overrides[_setting_name]
+      print(
+          "  WARNING:  You are using an experimental RBE setting: ${_setting_name} = ${_value}")
+    }
+  }
+}
+
+# Construct the actual (exported from this file) 'rbe_settings' struct.
+rbe_settings = {
+  forward_variables_from(_settings_defaults, "*")
+
+  # cxx overrides
+  if (defined(rbe_settings_overrides["cxx_enable"])) {
+    cxx_enable = rbe_settings_overrides["cxx_enable"]
+  }
+  if (defined(rbe_settings_overrides["cxx_download_objects"])) {
+    cxx_download_objects = rbe_settings_overrides["cxx_download_objects"]
+  }
+  if (defined(rbe_settings_overrides["cxx_minimalist_wrapper"])) {
+    cxx_minimalist_wrapper = rbe_settings_overrides["cxx_minimalist_wrapper"]
+  }
+  if (defined(rbe_settings_overrides["cxx_exec_strategy"])) {
+    cxx_exec_strategy = rbe_settings_overrides["cxx_exec_strategy"]
+  }
+
+  # link overrides
+  if (defined(rbe_settings_overrides["link_enable"])) {
+    link_enable = rbe_settings_overrides["link_enable"]
+  }
+  if (defined(rbe_settings_overrides["link_download_unstripped_binaries"])) {
+    link_download_unstripped_binaries =
+        rbe_settings_overrides["link_download_unstripped_binaries"]
+  }
+  if (defined(rbe_settings_overrides["link_exec_strategy"])) {
+    link_exec_strategy = rbe_settings_overrides["link_exec_strategy"]
+  }
+
+  # rust overrides
+  if (defined(rbe_settings_overrides["rust_enable"])) {
+    rust_enable = rbe_settings_overrides["rust_enable"]
+  }
+  if (defined(rbe_settings_overrides["rust_download_rlibs"])) {
+    rust_download_rlibs = rbe_settings_overrides["rust_download_rlibs"]
+  }
+  if (defined(rbe_settings_overrides["rust_download_unstripped_binaries"])) {
+    rust_download_unstripped_binaries =
+        rbe_settings_overrides["rust_download_unstripped_binaries"]
+  }
+  if (defined(rbe_settings_overrides["rust_exec_strategy"])) {
+    rust_exec_strategy = rbe_settings_overrides["rust_exec_strategy"]
+  }
+
+  # bazel overrides
+  if (defined(rbe_settings_overrides["bazel_enable"])) {
+    bazel_enable = rbe_settings_overrides["bazel_enable"]
+  }
+  if (defined(rbe_settings_overrides["bazel_exec_strategy"])) {
+    bazel_exec_strategy = rbe_settings_overrides["bazel_exec_strategy"]
+  }
+  if (defined(rbe_settings_overrides["bazel_download_outputs"])) {
+    bazel_download_outputs = rbe_settings_overrides["bazel_download_outputs"]
+  }
+}

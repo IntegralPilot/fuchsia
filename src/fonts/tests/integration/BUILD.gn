@@ -1,0 +1,188 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/rust/rustc_test.gni")
+import("//tools/cmc/build/cmc.gni")
+
+# All components derived from the fonts provider, but possibly with a
+# different configuration.
+ALL_COMPONENTS = [
+  "fonts_with_aliases_fonts",
+  "fonts_with_large_fonts",
+  "fonts_with_medium_fonts",
+  "fonts_with_small_fonts",
+]
+
+declare_args() {
+  # By default, log verbose font messages in tests.
+  integration_tests_verbose_logging = true
+}
+
+group("integration") {
+  testonly = true
+  deps = [ ":font_provider_integration_tests" ]
+}
+
+# Integration tests without a `main()` function.
+rustc_test("font_provider_integration_tests_bin") {
+  name = "font_provider_integration_tests"
+  edition = "2024"
+  deps = [
+    "//sdk/fidl/fuchsia.fonts:fuchsia.fonts_rust",
+    "//sdk/fidl/fuchsia.fonts.experimental:fuchsia.fonts.experimental_rust",
+    "//sdk/fidl/fuchsia.intl:fuchsia.intl_rust",
+    "//sdk/rust/zx",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-component",
+    "//src/lib/fuchsia-component-test",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:futures",
+    "//third_party/rust_crates:itertools",
+    "//third_party/rust_crates:log",
+  ]
+  visibility = [ ":*" ]
+
+  sources = [
+    "src/experimental_api/get_typeface_by_id.rs",
+    "src/experimental_api/get_typefaces_by_family.rs",
+    "src/experimental_api/list_typefaces.rs",
+    "src/experimental_api/mod.rs",
+    "src/experimental_api/util/mod.rs",
+    "src/lib.rs",
+    "src/old_api/mod.rs",
+    "src/reviewed_api/get_font_family_info.rs",
+    "src/reviewed_api/get_typeface.rs",
+    "src/reviewed_api/mod.rs",
+    "src/reviewed_api/util/mod.rs",
+    "src/util.rs",
+  ]
+}
+
+# Generate arg-specialized manifests for font_provider_integration_test
+
+cmc_merge("fonts_with_aliases_fonts_cml") {
+  sources = [
+    rebase_path("../../meta/fonts.cml"),
+    rebase_path("meta/aliases_fonts_shard.cml"),
+  ]
+  output_name = "fonts_with_aliases_fonts.cml"
+}
+
+cmc_merge("fonts_with_small_fonts_cml") {
+  sources = [
+    rebase_path("../../meta/fonts.cml"),
+    rebase_path("meta/small_fonts_shard.cml"),
+  ]
+  output_name = "fonts_with_small_fonts.cml"
+}
+
+cmc_merge("fonts_with_medium_fonts_cml") {
+  sources = [
+    rebase_path("../../meta/fonts.cml"),
+    rebase_path("meta/medium_fonts_shard.cml"),
+  ]
+  output_name = "fonts_with_medium_fonts.cml"
+}
+
+cmc_merge("fonts_with_large_fonts_cml") {
+  sources = [
+    rebase_path("../../meta/fonts.cml"),
+    rebase_path("meta/large_fonts_shard.cml"),
+  ]
+  output_name = "fonts_with_large_fonts.cml"
+}
+
+# Integration test font collections
+resource("testdata") {
+  sources = [ "aliases.font_manifest.json" ]
+  outputs = [ "data/testdata/{{source_file_part}}" ]
+}
+
+# Create identical structured configs for all the
+# components.
+foreach(comp, ALL_COMPONENTS) {
+  fuchsia_component_manifest("${comp}_manifest") {
+    component_name = comp
+    manifest = "${target_out_dir}/${comp}.cml"
+    deps = [ ":${comp}_cml" ]
+  }
+
+  fuchsia_component(comp) {
+    testonly = true
+    cm_label = ":${comp}_manifest"
+    deps = [
+      # deps will need fixups for different components.
+      ":testdata",
+      "//src/fonts:font_provider",
+    ]
+
+    if (comp == "fonts_with_aliases_fonts") {
+      # No change.
+    } else if (comp == "fonts_with_large_fonts") {
+      deps += [ "//src/fonts/collections:test-fonts-large-collection" ]
+      deps -= [ ":testdata" ]
+    } else if (comp == "fonts_with_medium_fonts") {
+      deps += [ "//src/fonts/collections:test-fonts-medium-collection" ]
+      deps -= [ ":testdata" ]
+    } else if (comp == "fonts_with_small_fonts") {
+      deps += [ "//src/fonts/collections:test-fonts-small-collection" ]
+      deps -= [ ":testdata" ]
+    } else {
+      assert(false, "component $comp does not have defined deps")
+    }
+  }
+}
+
+# Generate a manifest that provides the config for these components.
+fuchsia_structured_config_values2("test_config_values") {
+  testonly = true
+
+  # One of the test cms was picked, they all use the same values.
+  cm_label = ":fonts_with_aliases_fonts_manifest"
+  output_component_name = "test_config_values"
+  values = {
+    verbose_logging = integration_tests_verbose_logging
+    font_manifest = ""
+  }
+}
+
+# Main integration test driver and capability providers
+fuchsia_component("font_provider_integration_tests_driver") {
+  testonly = true
+  component_name = "test_driver"
+  manifest = "meta/font_provider_integration_tests_driver.cml"
+  deps = [ ":font_provider_integration_tests_bin" ]
+}
+
+fuchsia_component("mock_font_resolver_cm") {
+  testonly = true
+  component_name = "mock_font_resolver"
+  manifest =
+      "//src/fonts/testing/mock_font_resolver/meta/mock_font_resolver.cml"
+  deps = [ "//src/fonts/testing/mock_font_resolver:mock_font_resolver_bin" ]
+}
+
+fuchsia_component("font_provider_integration_tests_cmp") {
+  testonly = true
+  component_name = "font_provider_integration_tests"
+  manifest = "meta/font_provider_integration_tests.cml"
+}
+
+# Integration test package
+fuchsia_test_package("font_provider_integration_tests") {
+  test_components = [ ":font_provider_integration_tests_cmp" ]
+  deps = [
+    ":font_provider_integration_tests_driver",
+    ":mock_font_resolver_cm",
+    ":test_config_values",
+  ]
+  foreach(comp, ALL_COMPONENTS) {
+    deps += [ ":${comp}" ]
+  }
+  test_specs = {
+    environments = basic_envs
+  }
+}

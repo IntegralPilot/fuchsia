@@ -1,0 +1,660 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.io;
+
+using zx;
+
+type DirectoryInfo = table {
+    /// Requested attributes for the directory. This is only populated if requested.
+    @available(added=18)
+    1: attributes NodeAttributes2;
+};
+
+// Legacy protocol identifier. Use generated discoverable protocol name instead.
+@available(removed=29)
+const DIRECTORY_PROTOCOL_NAME string = "fuchsia.io/Directory";
+
+/// Flags used to specify how a node should be opened. Note that ranges of bits are reserved
+/// for specific use cases:
+///  * Bits  1-16: Permission flags `PERM_*` (e.g. [`Flags.PERM_READ_BYTES`]).
+///  * Bits 17-32: POSIX compatibile `O_*` flags (e.g. [`Flags.FILE_TRUNCATE`] or `O_TRUNC`).
+///  * Bits 33-64: Fuchsia-specific flags.
+type Flags = flexible bits : uint64 {
+    //
+    // Permissions
+    //
+    // *NOTE*: Prefer using the [`PERM_READABLE`], [`PERM_WRITABLE`], and [`PERM_EXECUTABLE`]
+    // constants instead of specifying individual permission flags.
+    //
+    // Permissions can only be granted if the current connection has them. If a permission is
+    // requested but not available, the request will fail with `ZX_ERR_ACCESS_DENIED`.
+    // Note that the `PERM_INHERIT_*` flags can be used to request permissions that the
+    // connection may lack without failing the request. Callers should not expect that these
+    // permissions are available if the request succeeds.
+
+    /// Allows opening child nodes with [`PROTOCOL_SERVICE`].
+    PERM_CONNECT = 0x0001;
+    /// Read byte contents of a file.
+    PERM_READ_BYTES = 0x0002;
+    /// Write byte contents to a file.
+    PERM_WRITE_BYTES = 0x0004;
+    /// Execute byte contents of a file.
+    PERM_EXECUTE = 0x0008;
+    /// Get/query attributes of a node.
+    PERM_GET_ATTRIBUTES = 0x0010;
+    /// Set/update attributes of a node.
+    PERM_UPDATE_ATTRIBUTES = 0x0020;
+    /// Enumerate (list) directory entries.
+    PERM_ENUMERATE = 0x0040;
+    /// Allow opening a child node with a node protocol. Must be specified with PERM_ENUMERATE
+    /// otherwise requests will fail with `ZX_ERR_INVALID_ARGS`.
+    PERM_TRAVERSE = 0x0080;
+    /// Modify directory entries (create/rename/link/unlink). Must be specified with
+    /// PERM_ENUMERATE otherwise requests will fail with `ZX_ERR_INVALID_ARGS`.
+    PERM_MODIFY_DIRECTORY = 0x0100;
+    /// Inherit write permissions when available (PERM_WRITE_BYTES, PERM_UPDATE_ATTRIBUTES,
+    /// PERM_MODIFY_DIRECTORY, /// PERM_ENUMERATE). Servers must ensure this flag is removed
+    /// if the parent connection lacks any of these rights. See [`INHERITED_WRITE_PERMISSIONS`]
+    /// for the exact set of permissions that will be inherited.
+    PERM_INHERIT_WRITE = 0x2000;
+    /// Inherit execute permission when available (PERM_EXECUTE).
+    /// Servers must ensure this flag is removed if the parent connection lacks PERM_EXECUTE.
+    PERM_INHERIT_EXECUTE = 0x4000;
+
+    //
+    // Protocols
+    //
+    // If several protocols are specified, the caller must be prepared to accept any protocol.
+    // If no protocols are specified, the server will negotiate a node protocol for the caller
+    // based on the protocols the target object supports. Caller can request an event with
+    // [`FLAG_SEND_REPRESENTATION`] to determine which protocol was negotiated.
+    //
+    // If the target node is not compatible with any specified protocols, the request will fail
+    // with the following precedence of errors:
+    //
+    //  * `ZX_ERR_NOT_DIR` if [`PROTOCOL_DIRECTORY`] was specified but no other protocol was
+    //     negotiated
+    //  * `ZX_ERR_NOT_FILE` if [`PROTOCOL_FILE`]` was specified but no other protocol was negotiated
+    //  * `ZX_ERR_WRONG_TYPE` for all other cases
+
+    /// Connect to the underlying protocol if this is a service node. The caller must determine the
+    /// correct protocol to use (e.g. based on path). Unless used with [`PROTOCOL_NODE`], specifying
+    /// other flags with the request will fail with `ZX_ERR_INVALID_ARGS`.
+    PROTOCOL_SERVICE = 0x000100000000;
+    /// Connect to the underlying node. Takes precedence over other protocols. If other `PROTOCOL_*`
+    /// are specified, they will be used to validate the target node type. Requests will fail with
+    /// `ZX_ERR_INVALID_ARGS` if flags other than `PROTOCOL_*` and [`FLAG_SEND_REPRESENTATION`] are
+    /// specified. Equivalent to POSIX `O_PATH`.
+    PROTOCOL_NODE = 0x00400000;
+    /// Caller accepts [`fuchsia.io/Directory`] protocol. Equivalent to POSIX `O_DIRECTORY`.
+    PROTOCOL_DIRECTORY = 0x00080000;
+    /// Caller accepts [`fuchsia.io/File`] protocol.
+    PROTOCOL_FILE = 0x000200000000;
+    /// Caller accepts [`fuchsia.io/Symlink`] protocol.
+    PROTOCOL_SYMLINK = 0x000400000000;
+
+    //
+    // Options
+    //
+
+    /// Caller requests a [`fuchsia.io/Node.OnRepresentation`] event on success.
+    FLAG_SEND_REPRESENTATION = 0x010000000000;
+    /// Create a new object if one doesn't exist, otherwise open an existing object. If set, a
+    /// single `PROTOCOL_*` flag must be set indicating the type of object to create. Equivalent
+    /// to POSIX `O_CREAT`.
+    FLAG_MAYBE_CREATE = 0x00010000;
+    /// Create a new object if one doesn't exist, otherwise fail the request with
+    /// `ZX_ERR_ALREADY_EXISTS`. If set, a single `PROTOCOL_*` flag must be set indicating the type
+    /// of object to create. Takes precedence over [`FLAG_MAYBE_CREATE`]. Equivalent to POSIX
+    /// `O_EXCL`.
+    FLAG_MUST_CREATE = 0x00020000;
+    /// Create a new unnamed temporary object. The object is temporary until it is linked to the
+    /// filesystem. If specified with `FLAG_TEMPORARY_AS_NOT_LINKABLE`, then the created object is
+    /// not linkable. If this flag is set:
+    ///  * `path` specified in [`fuchsia.io/Directory.Open`] refers to the path of the directory
+    ///    which the new object will be created in,
+    ///  * A `PROTOCOL_*` flag is set to indicate the type of object to be created. Currently, this
+    ///    is only supported when specified with `PROTOCOL_FILE`, in which case, it is equivalent
+    ///    to Linux `O_TMPFILE`.
+    ///  * `FLAG_MAYBE_CREATE` will be ignored.
+    @available(added=HEAD)
+    FLAG_CREATE_AS_UNNAMED_TEMPORARY = 0x800000000;
+
+    //
+    // File-Specific Options
+    //
+
+    /// Open the file in append mode. The seek pointer will be moved to end-of-file (EOF)
+    /// before all writes. Equivalent to POSIX `O_APPEND`.
+    FILE_APPEND = 0x00100000;
+    /// Truncate the file to zero length upon opening it. Equivalent to POSIX `O_TRUNC`.
+    FILE_TRUNCATE = 0x00040000;
+};
+
+const MASK_PERMISSION_FLAGS uint64 = 0x000000000000FFFF;
+
+const MASK_POSIX_FLAGS uint64 = 0x00000000FFFFFFFF;
+
+const MASK_KNOWN_PERMISSIONS Flags
+        = Flags.PERM_READ_BYTES | Flags.PERM_WRITE_BYTES | Flags.PERM_EXECUTE | Flags.PERM_UPDATE_ATTRIBUTES | Flags.PERM_ENUMERATE | Flags.PERM_MODIFY_DIRECTORY | Flags.PERM_CONNECT | Flags.PERM_GET_ATTRIBUTES | Flags.PERM_TRAVERSE | Flags.PERM_INHERIT_WRITE | Flags.PERM_INHERIT_EXECUTE;
+
+const MASK_KNOWN_PROTOCOLS Flags
+        = Flags.PROTOCOL_DIRECTORY | Flags.PROTOCOL_FILE | Flags.PROTOCOL_NODE | Flags.PROTOCOL_SYMLINK | Flags.PROTOCOL_SERVICE;
+
+/// Set of rights that [`Flags.PERM_INHERIT_WRITE`] will inherit from the parent connection if
+/// specified. Note that if any of these permissions are missing from the connection, none of these
+/// permissions will be inherited.
+const INHERITED_WRITE_PERMISSIONS Operations
+        = Operations.WRITE_BYTES | Operations.ENUMERATE | Operations.MODIFY_DIRECTORY | Operations.UPDATE_ATTRIBUTES;
+
+/// Set of permissions that are expected when opening a node as readable.
+const PERM_READABLE Flags
+        = Flags.PERM_CONNECT | Flags.PERM_ENUMERATE | Flags.PERM_TRAVERSE | Flags.PERM_READ_BYTES | Flags.PERM_GET_ATTRIBUTES;
+
+/// Set of permissions that are expected when opening a node as writable.
+const PERM_WRITABLE Flags
+        = Flags.PERM_CONNECT | Flags.PERM_ENUMERATE | Flags.PERM_TRAVERSE | Flags.PERM_WRITE_BYTES | Flags.PERM_MODIFY_DIRECTORY | Flags.PERM_UPDATE_ATTRIBUTES;
+
+/// Set of permissions that are expected when opening a node as executable.
+const PERM_EXECUTABLE Flags
+        = Flags.PERM_CONNECT | Flags.PERM_ENUMERATE | Flags.PERM_TRAVERSE | Flags.PERM_EXECUTE;
+
+/// Specifies that this object is not linkable. This is only intended to be used in the context of
+/// creating a temporary unnamed objects. When that is not the case, the node protocol defines if it
+/// is linkable (i.e. if it composes the `Linkable` protocol). When this flag is set along with
+/// `Flags.FLAG_CREATE_AS_UNNAMED_TEMPORARY`, an unnamed temporary object will be created that
+/// cannot be linked into the filesystem. This would be similar to Linux `O_TMPFILE | O_EXCL`.
+///
+/// CAUTION: if `Flags.FLAG_CREATE_AS_UNNAMED_TEMPORARY` is not specified,  then this is treated as
+/// a "must create" flag.
+///
+/// The reason for overloading `Flags.FLAG_MUST_CREATE` to mean "not linkable" in this context and
+/// "must create" in other contexts is due to the assumption that some POSIX flags are compatible
+/// with the members in `Flags`. In particular the POSIX `O_EXCL` has the same value as
+/// `Flags.FLAG_MUST_CREATE`. We are not able to define different bit members of the same value,
+/// hence it is defined separately outside of `Flags`.
+@available(added=HEAD)
+const FLAG_TEMPORARY_AS_NOT_LINKABLE Flags = Flags.FLAG_MUST_CREATE;
+
+/// Options which can be used when opening nodes. Unlike [`Flags`], these options are designed for
+/// specific use cases (e.g. to reduce round-trip latency when requesting attributes).
+type Options = table {
+    /// Request a set of attributes to be sent with the OnRepresentation response. Has no effect
+    /// if `Flags.FLAG_SEND_REPRESENTATION` is not set.
+    1: attributes NodeAttributesQuery;
+    /// Request a set of attributes to be set atomically when creating a new object. Requests will
+    /// fail with `ZX_ERR_INVALID_ARGS` if neither `Flags.FLAG_MAYBE_CREATE` nor
+    /// `Flags.FLAG_MUST_CREATE` are set (i.e. the creation is mode is Never).
+    2: create_attributes MutableNodeAttributes;
+};
+
+/// DEPRECATED - Use Flags instead.
+@strict_audit(bug="https://fxbug.dev/467128288", state="PENDING_REVIEW")
+type OpenFlags = strict bits : uint32 {
+    /// Can read from target object.
+    RIGHT_READABLE = 0x00000001;
+    /// Can write to target object.
+    RIGHT_WRITABLE = 0x00000002;
+    /// Connection can map target object executable.
+    RIGHT_EXECUTABLE = 0x00000008;
+
+    /// Create the object if it doesn't exist.
+    CREATE = 0x00010000;
+    /// (with Create) Fail if the object already exists.
+    CREATE_IF_ABSENT = 0x00020000;
+    /// Truncate the object before usage.
+    TRUNCATE = 0x00040000;
+    /// Assert that the object to be opened is a directory.
+    /// Return an error if the target object is not a directory.
+    DIRECTORY = 0x00080000;
+    /// Seek to the end of the object before all writes.
+    APPEND = 0x00100000;
+    /// Open a reference to the object, not the object itself.
+    /// It is ONLY valid to pass the following flags together with `NODE_REFERENCE`:
+    /// - `DIRECTORY`
+    /// - `NOT_DIRECTORY`
+    /// - `DESCRIBE`
+    /// otherwise an error is returned.
+    /// If an object is opened or cloned using this method, the resulting connection does not carry
+    /// any permission flags.
+    /// The resulting connection allows a limited set of operations: `GetAttr`, `Clone`, `Close`,
+    /// `Describe`, and `GetFlags`. The connection will speak the `Node` protocol. Calling `SetAttr`
+    /// or `SetFlags` will result in `ZX_ERR_BAD_HANDLE`.
+    NODE_REFERENCE = 0x00400000;
+    /// Requests that an "OnOpen" event is sent to the interface request.
+    ///
+    /// The event will contain a non-null `NodeInfoDeprecated` if the open/clone is successful. This
+    /// can be used to open a protocol that does not compose fuchsia.io/Node; the event is sent as
+    /// if the protocol is fuchsia.io/Node and then the target protocol is used exclusively.
+    DESCRIBE = 0x00800000;
+    /// Specify this flag to request POSIX-compatibility with respect to write permission handling.
+    /// Currently, it affects permission handling specifically during Open:
+    /// - If the target path is a directory, the rights on the new connection expand to include
+    ///   `WRITABLE` if and only if the current connection and all intermediate mount points
+    ///   are writable.
+    /// - Otherwise, this flag is ignored. It is an access denied error to request more rights
+    ///   than those on the current connection, or any intermediate mount points.
+    ///
+    /// If this flag is omitted, opening always uses the requested rights, failing the operation with
+    /// access denied error if requested rights exceeds the rights attached to the current connection.
+    ///
+    /// If the requesting connection is read-only and the requested rights are read-only, the flag
+    /// may be ignored by the server, and is not forwarded downstream. This is an implementation detail,
+    /// necessary to enforce hierarchical permissions across mount points, and should have no effect
+    /// on the expected behavior for clients.
+    POSIX_WRITABLE = 0x08000000;
+    /// Specify this flag to request POSIX-compatibility with respect to execute permission handling.
+    /// Currently, it affects permission handling specifically during Open:
+    /// - If the target path is a directory, the rights on the new connection expand to include
+    ///   `EXECUTABLE` if and only if the current connection and all intermediate mount
+    ///   points are executable.
+    /// - Otherwise, this flag is ignored. It is an access denied error to request more rights
+    ///   than those on the current connection, or any intermediate mount points.
+    ///
+    /// If this flag is omitted, opening always uses the requested rights, failing the operation with
+    /// access denied error if requested rights exceeds the rights attached to the current connection.
+    ///
+    /// If the requesting connection is read-only and the requested rights are read-only, the flag
+    /// may be ignored by the server, and is not forwarded downstream. This is an implementation detail,
+    /// necessary to enforce hierarchical permissions across mount points, and should have no effect
+    /// on the expected behavior for clients.
+    POSIX_EXECUTABLE = 0x10000000;
+    /// Assert that the object to be opened is not a directory.
+    /// Return an error if the target object is a directory.
+    NOT_DIRECTORY = 0x02000000;
+
+    /// When used during clone, the new connection inherits the rights on the source connection,
+    /// regardless if it is a file or directory. Otherwise, clone attempts to use the requested rights.
+    /// It is invalid to pass any of the `RIGHT_*` flags together with `OpenFlags.CLONE_SAME_RIGHTS`.
+    CLONE_SAME_RIGHTS = 0x04000000;
+
+    /// Open the target object as a block device.
+    // TODO(https://fxbug.dev/42071940): this form of protocol negotiation is unprincipled.
+    BLOCK_DEVICE = 0x01000000;
+};
+
+/// All known rights.
+const OPEN_RIGHTS OpenFlags
+        = OpenFlags.RIGHT_READABLE | OpenFlags.RIGHT_WRITABLE | OpenFlags.RIGHT_EXECUTABLE;
+
+/// Flags used when opening a node reference must fall within this mask.
+const OPEN_FLAGS_ALLOWED_WITH_NODE_REFERENCE OpenFlags
+        = OpenFlags.DIRECTORY | OpenFlags.NOT_DIRECTORY | OpenFlags.DESCRIBE | OpenFlags.NODE_REFERENCE;
+
+@strict_audit(bug="https://fxbug.dev/467128288", state="PENDING_REVIEW")
+type ModeType = strict bits : uint32 {
+    DO_NOT_USE = 0x80000000;
+};
+
+/// The maximal buffer size which can be transmitted for buffered operations.
+/// This capacity is currently set somewhat arbitrarily.
+const MAX_BUF uint64 = 8192;
+
+// Dirent type information associated with the results of ReadDirents.
+// The following values are aligned with the values from libc's "dirent.h" "DT_...".
+type DirentType = flexible enum : uint8 {
+    /// A dirent with an unknown type.
+    UNKNOWN = 0;
+    /// A dirent representing a directory object.
+    DIRECTORY = 4;
+    /// A dirent representing a block device object.
+    BLOCK_DEVICE = 6;
+    /// A dirent representing a file object.
+    FILE = 8;
+    /// A symbolic link.
+    @available(added=18)
+    SYMLINK = 10;
+    /// A dirent representing a service object.
+    SERVICE = 16;
+};
+
+/// Nodes which do not have ino values should return this value
+/// from Readdir and GetAttr.
+const INO_UNKNOWN uint64 = 0xFFFFFFFFFFFFFFFF;
+
+/// DirectoryWatcher transmits messages from a filesystem server
+/// about events happening in the filesystem. Clients can register
+/// new watchers using the `Directory.Watch` method, where they can
+/// filter which events they want to receive notifications for.
+///
+/// The DirectoryWatcher will send messages of the form:
+/// ```
+/// struct {
+///   uint8 event;
+///   uint8 len;
+///   char name[];
+/// };
+/// ```
+/// Where names are NOT null-terminated. The name is the relative
+/// path to the entry the event is refering to. It will be empty if
+/// the event isn't referencing a particular entry (e.g. for the
+/// `IDLE` event).
+closed protocol DirectoryWatcher {};
+
+@strict_audit(bug="https://fxbug.dev/467128288", state="PENDING_REVIEW")
+type WatchEvent = strict enum : uint8 {
+    /// Indicates the directory being watched has been deleted. The name returned for this event
+    /// will be `.` (dot), as it is refering to the directory itself.
+    DELETED = 0;
+    /// Indicates a node has been created (either new or moved) into a directory.
+    ADDED = 1;
+    /// Identifies a node has been removed (either deleted or moved) from the directory.
+    REMOVED = 2;
+    /// Identifies a node already existed in the directory when watching started.
+    EXISTING = 3;
+    /// Identifies that no more `EXISTING` events will be sent. The name returned for this event
+    /// will be empty, as it is not refering to a specific entry.
+    IDLE = 4;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128288", state="PENDING_REVIEW")
+type WatchMask = strict bits : uint32 {
+    /// Used by `Directory.Watch`. Requests transmission of `WatchEvent.DELETED`.
+    DELETED = 0x00000001;
+    /// Used by `Directory.Watch`. Requests transmission of `WatchEvent.ADDED`.
+    ADDED = 0x00000002;
+    /// Used by `Directory.Watch`. Requests transmission of `WatchEvent.REMOVED`.
+    REMOVED = 0x00000004;
+    /// Used by `Directory.Watch`. Requests transmission of `WatchEvent.EXISTING`.
+    EXISTING = 0x00000008;
+    /// Used by `Directory.Watch`. Requests transmission of `WatchEvent.IDLE`.
+    IDLE = 0x00000010;
+};
+
+/// Directory defines a node which is capable of containing other Objects.
+@discoverable
+open protocol Directory {
+    compose AdvisoryLocking;
+    compose Node;
+    @available(added=31)
+    compose Openable;
+
+    /// Opens a new object relative to this directory object.
+    ///
+    /// `path` may contain multiple segments, separated by "/" characters, and should never be
+    /// empty; i.e. "" is an invalid path. A trailing slash implies OpenFlags.DIRECTORY. Components
+    /// must not be empty (i.e. "foo//bar" is invalid). ".." is disallowed anywhere in the path. "."
+    /// is only allowed if the path is exactly ".", but not otherwise. A leading '/' is allowed (and
+    /// is treated the same way as if not present, i.e. "/foo/bar' and "foo/bar" are the same).
+    ///
+    /// If an unknown value is sent for flags the connection should be closed.
+    ///
+    /// `OpenFlags.RIGHT_*` flags provided in `flags` will restrict access rights on
+    /// the `object` channel which will be connected to the opened entity.
+    ///
+    /// Rights are never increased. When you open a nested entity within a directory, you may only
+    /// request the same rights as what the directory connection already has, or a subset of those.
+    /// Exceeding those rights causes an access denied error to be transmitted in the
+    /// `OnOpen` event if applicable, and the `object` connection closed.
+    ///
+    /// `mode` is ignored.
+    @available(replaced=27, renamed="DeprecatedOpen")
+    @selector("fuchsia.io1/Directory.Open")
+    flexible Open(resource struct {
+        flags OpenFlags;
+        mode ModeType;
+        path Path;
+        object server_end:Node;
+    });
+
+    /// DEPRECATED - Use `fuchsia.io/Directory.Open` instead.
+    //
+    // TODO(https://fxbug.dev/384994764): In an ideal world, we'd be able to say
+    // `removed=27, renamed="DeprecatedOpen"` on `Open` to get this for free,
+    // but unfortunately that doesn't work.
+    //
+    // TODO(https://fxbug.dev/324080864): Mark this as removed at NEXT when all out-of-tree servers
+    // and clients are using the latest FIDL definition.
+    @available(added=27, removed=32)
+    @selector("fuchsia.io1/Directory.Open")
+    flexible DeprecatedOpen(resource struct {
+        flags OpenFlags;
+        mode ModeType;
+        path Path;
+        object server_end:Node;
+    });
+
+    /// Open (or create) a node relative to this directory. Any errors are communicated via an
+    /// epitaph sent on the `object` channel.
+    ///
+    /// Errors:
+    /// * `ZX_ERR_BAD_PATH` if `path` is invalid
+    /// * See [`Flags`] for other errors which may be communicated based on `flags`
+    @available(replaced=27, renamed="Open")
+    @selector("fuchsia.io/Directory.Open3")
+    strict Open3(resource struct {
+        path Path;
+        flags Flags;
+        options Options;
+        object zx.Handle:CHANNEL;
+    });
+
+    /// Open (or create) a node relative to this directory. Any errors are communicated via an
+    /// epitaph sent on the `object` channel.
+    ///
+    /// Errors:
+    /// * `ZX_ERR_BAD_PATH` if `path` is invalid
+    /// * See [`Flags`] for other errors which may be communicated based on `flags`
+    @available(added=27, replaced=31)
+    @selector("fuchsia.io/Directory.Open3")
+    strict Open(resource struct {
+        path Path;
+        flags Flags;
+        options Options;
+        object zx.Handle:CHANNEL;
+    });
+
+    /// Reads a collection of variably sized dirents into a buffer.
+    /// The number of dirents in a directory may be very large: akin to
+    /// calling read multiple times on a file, directories have a seek
+    /// offset which is updated on subsequent calls to ReadDirents.
+    /// Each call to ReadDirents will only return whole dirent structures,
+    /// they will not get split across ReadDirent calls. When the seek
+    /// offset reaches the end, `dirents` will be empty.
+    ///
+    /// These dirents are of the form:
+    /// ```
+    /// struct dirent {
+    ///   // Describes the inode of the entry.
+    ///   uint64 ino;
+    ///   // Describes the length of the dirent name in bytes.
+    ///   uint8 size;
+    ///   // Describes the type of the entry. Aligned with the
+    ///   // POSIX d_type values. Use `DirentType` constants.
+    ///   uint8 type;
+    ///   // Unterminated name of entry.
+    ///   char name[0];
+    /// }
+    /// ```
+    ///
+    /// This method requires the following rights:
+    ///
+    /// * [`Rights.ENUMERATE`]
+    @selector("fuchsia.io1/Directory.ReadDirents")
+    strict ReadDirents(struct {
+        max_bytes uint64;
+    }) -> (struct {
+        s zx.Status;
+        dirents vector<uint8>:MAX_BUF;
+    });
+
+    /// Resets the directory seek offset.
+    ///
+    /// This method requires the following rights:
+    ///
+    /// * [`Rights.ENUMERATE`]
+    @selector("fuchsia.io1/Directory.Rewind")
+    strict Rewind() -> (struct {
+        s zx.Status;
+    });
+
+    /// Acquires a token to a Directory which can be used to identify access to it at a later point
+    /// in time. The token will remain valid for as long as the connection requesting the token
+    /// remains open.
+    ///
+    /// This method requires following rights: `OpenFlags.RIGHT_WRITABLE`, otherwise returns
+    /// `ZX_ERR_BAD_HANDLE`.
+    @selector("fuchsia.io1/Directory.GetToken")
+    strict GetToken() -> (resource struct {
+        s zx.Status;
+        token zx.Handle:optional;
+    });
+
+    /// Creates a link to an object named src by the name dst, within a directory represented by
+    /// token.
+    ///
+    /// `src` must be a resolved object name. Including "/" in the string will
+    /// return `ZX_ERR_INVALID_ARGS`.
+    ///
+    /// `dst` must be a resolved object name. Including "/" in the string will
+    /// return `ZX_ERR_INVALID_ARGS`.
+    ///
+    /// This method requires following rights: `OpenFlags.RIGHT_WRITABLE` and
+    /// `OpenFlags.RIGHT_READABLE`, otherwise returns `ZX_ERR_BAD_HANDLE`.
+    ///
+    /// This will be atomic with respect to renaming or unlinking the source concurrently e.g. if
+    /// there are two actors operating concurrently, and one actor performs a rename that affects
+    /// the source within this directory, and the other does a link, each will appear to occur
+    /// atomically in an unspecified order.
+    @selector("fuchsia.io1/Directory.Link")
+    strict Link(resource struct {
+        src Name;
+        dst_parent_token zx.Handle;
+        dst Name;
+    }) -> (struct {
+        s zx.Status;
+    });
+
+    /// Removes a child node from the this directory's list of entries.
+    ///
+    /// Note: this does not guarantee that the underlying object is destroyed.
+    /// Although the link will be removed from the containing directory,
+    /// objects with multiple references (such as files which are still open)
+    /// will not actually be destroyed until all references are closed.
+    ///
+    /// * error `ZX_ERR_ACCESS_DENIED` if the connection does not have
+    ///   [`Rights.WRITE_BYTES`].
+    /// * error `ZX_ERR_NOT_SUPPORTED` if the underlying filesystem does not
+    ///   support writing.
+    /// * error `ZX_ERR_BAD_PATH` if `name` is invalid.
+    /// * error `ZX_ERR_NOT_EMPTY` if `name` refers to a non-empty directory.
+    /// * error `ZX_ERR_UNAVAILABLE` if `name` refers to a mount point,
+    ///   containing a remote channel.
+    /// * error `ZX_ERR_NOT_DIR` if the options requested a directory but
+    ///     something other than a directory was found.
+    ///
+    /// Other errors may be returned for filesystem-specific reasons.
+    ///
+    /// This method requires the following rights:
+    ///
+    /// * [`Rights.ENUMERATE`]
+    /// * [`Rights.MODIFY_DIRECTORY`]
+    @selector("fuchsia.io/Directory.Unlink")
+    strict Unlink(struct {
+        name Name;
+        options @generated_name("UnlinkOptions") table {
+            1: flags @generated_name("UnlinkFlags") flexible bits : uint64 {
+                /// If set, the unlink will fail (with ZX_ERR_NOT_DIR) if the
+                /// object is not a directory.
+                MUST_BE_DIRECTORY = 0x01;
+            };
+        };
+    }) -> () error zx.Status;
+
+    /// Renames a node named `src` to the name `dst`, in a directory represented
+    /// by `dst_parent_token`.
+    ///
+    /// `src` and `dst` must be valid node names.
+    /// See [`Name`] for what constitutes a valid name.
+    ///
+    /// This method requires the following rights on both the current connection, and the connection
+    /// identified by `dst_parent_token`:
+    ///
+    /// * [`Rights.ENUMERATE`]
+    /// * [`Rights.MODIFY_DIRECTORY`]
+    ///
+    /// The following requirements are necessary to avoid rights escalations.
+    ///
+    /// If the source and destination directory differ, the source directory must also have the
+    /// maximal set of abilities supported for files, which would typically be
+    /// [`Rights.READ_BYTES`], [`Rights.WRITE_BYTES`], [`Rights.GET_ATTRIBUTES`] and
+    /// [`Rights.UPDATE_ATTRIBUTES`]. Some filesystems might also support the [`Rights.EXECUTE`]
+    /// right.
+    ///
+    /// If `src` refers to a directory, and differs from the destination directory, then the source
+    /// directory must have also have the [`Rights.CONNECT`] and [`Rights.TRAVERSE`] rights.
+    ///
+    /// * error `ZX_ERR_INVALID_ARGS` if `src` or `dst` is invalid.
+    /// * error `ZX_ERR_ACCESS_DENIED` for insufficient rights.
+    @selector("fuchsia.io/Directory.Rename")
+    strict Rename(resource struct {
+        src Name;
+        dst_parent_token Token;
+        dst Name;
+    }) -> () error zx.Status;
+
+    // TODO(https://fxbug.dev/42157659): uncomment and implement.
+    // /// Creates a link to a node named `src` by the name `dst`,
+    // /// in a directory represented by `dst_parent_token`.
+    // ///
+    // /// Directories cannot be linked, to prevent reference cycles.
+    // ///
+    // /// `src` and `dst` must be valid node names.
+    // /// See [`Name`] for what constitutes a valid name.
+    // ///
+    // /// This method requires the following rights on both the current
+    // /// connection, and the connection identified by `dst_parent_token`:
+    // ///
+    // /// * [`Rights.ENUMERATE`]
+    // /// * [`Rights.MODIFY_DIRECTORY`]
+    // ///
+    // /// * error `ZX_ERR_INVALID_ARGS` if `src` or `dst` is invalid.
+    // /// * error `ZX_ERR_INVALID_ARGS` if `src` is a directory.
+    // @selector("fuchsia.io/Directory.Link")
+    // Link2(resource struct {
+    //     src Name;
+    //     dst_parent_token Token;
+    //     dst Name;
+    // }) -> () error zx.Status;
+
+    /// Creates a symbolic link.
+    ///
+    /// `name` is the name to be given to the created symbolic link.
+    /// `target` is the target of the symbolic link, which has no meaning on the server. The server
+    /// will perform no validation of `target` except for a server chosen maximum length.
+    /// `connection` is an optional server end of a channel that will speak the Symlink protocol
+    /// on the successfully created node.
+    ///
+    /// * [`Rights.MODIFY_DIRECTORY`]
+    ///
+    /// * error `ZX_ERR_ALREADY_EXISTS` if `name` already exists.
+    /// * error `ZX_ERR_BAD_PATH` if `target` exceeds the server length limit for symbolic links.
+    /// * error `ZX_ERR_INVALID_ARGS` if `name` is not a valid [`Name`].
+    /// * error `ZX_ERR_NOT_SUPPORTED` if creating symbolic links is not supported by the server.
+    @available(added=18)
+    @selector("fuchsia.io/Directory.CreateSymlink")
+    strict CreateSymlink(resource struct {
+        name Name;
+        target SymlinkTarget;
+        connection server_end:<Symlink, optional>;
+    }) -> () error zx.Status;
+
+    /// Watches a directory, receiving events of added messages on the
+    /// watcher request channel.
+    ///
+    /// Options must be zero; it is reserved.
+    ///
+    /// This method requires the following rights:
+    ///
+    /// * [`Rights.ENUMERATE`]
+    @selector("fuchsia.io1/Directory.Watch")
+    strict Watch(resource struct {
+        mask WatchMask;
+        options uint32;
+        watcher server_end:DirectoryWatcher;
+    }) -> (struct {
+        s zx.Status;
+    });
+};

@@ -1,0 +1,579 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.display;
+
+using fuchsia.hardware.display.types;
+using fuchsia.math;
+using fuchsia.sysmem2;
+using zx;
+
+/// Provides updates from a `Coordinator` to one of its clients.
+///
+/// This protocol solely consists of one-way methods.
+open protocol CoordinatorListener {
+    /// Called when the set of connected displays changes.
+    ///
+    /// Also used to communicate the set of connected displays to a newly
+    /// connected client.
+    ///
+    /// After this method is called, all applied and draft configurations may no
+    /// longer be valid. The client must validate and apply a new configuration,
+    /// by calling [`Coordinator.CheckConfig`] and [`Coordinator.CommitConfig`].
+    ///
+    /// `added` and `removed` must not be both empty.
+    strict OnDisplaysChanged(struct {
+        added vector<Info>:MAX;
+        removed vector<fuchsia.hardware.display.types.DisplayId>:MAX;
+    });
+
+    /// Called on every display Vertical Synchronization (Vsync).
+    ///
+    /// Clients must acknowledge VSync events via the method
+    /// [`Coordinator.AcknowledgeVsync`].  The coordinator may throttle a client
+    /// that accumulates a certain number of unacknowledged VSync cookies.
+    /// Throttled clients do not receive VSync events.
+    ///
+    /// After a the client catches up on acknowledging cookies, the coordinator
+    /// will unthrottle it (resume sending VSync events). Throttled clients may
+    /// miss some VSync events, as the coordinator is allowed to drop VSync
+    /// event information for throttled clients.
+    ///
+    /// When dropping VSync event information for throttled clients, the
+    /// coordinator should prioritize retaining the information for newer
+    /// events. In other words, the oldest unreported events should be dropped
+    /// first.
+    strict OnVsync(struct {
+        /// The display associated with the VSync event.
+        display_id fuchsia.hardware.display.types.DisplayId;
+
+        /// The time when the VSync occurred.
+        ///
+        /// The accurrancy of this timestamp depends on the display hardware.
+        timestamp zx.InstantMono;
+
+        /// Identifies the configuration that was displayed by the hardware.
+        ///
+        /// Guaranteed to be a valid value.
+        ///
+        /// If a configuration contains images that are still waiting to be
+        /// ready, that configuration will not be submitted to the hardware,
+        /// and that configuration's stamp will not be reported here.
+        displayed_config_stamp ConfigStamp;
+
+        /// Used to acknowledge the receipt of VSync events.
+        ///
+        /// A value of zero means no acknowledgement is required by the
+        /// client.
+        ///
+        /// Each non-zero cookie must be acknowledged immediately, via a call to
+        /// [`Coordinator.AcknowledgeVsync`]. Cookies must be acknowledged even
+        /// if the client does not change the display's configuration.
+        cookie VsyncAckCookie;
+    });
+
+    /// Called when the corresponding `Coordinator` client gains or loses
+    /// ownership of the displays.
+    ///
+    /// A `Coordinator` client's displayed config is visible iff it holds the
+    /// ownership of the displays.
+    ///
+    /// A new `Coordinator` client should assume they do not have ownership
+    /// of the displays until this method informs them otherwise.
+    strict OnClientOwnershipChange(struct {
+        has_ownership bool;
+    });
+};
+
+/// Constrains the use of `Coordinator.SetLayerImage2`; see documentation there.
+const MAX_WAITING_IMAGES_PER_LAYER uint32 = 10;
+
+/// Interface for accessing the display hardware.
+///
+/// A display configuration can be separated into two parts: the layer layout and
+/// the layer contents. The layout includes all parts of a configuration other
+/// than the image handles. The submitted configuration is composed of the most
+/// recently committed layout and a ready image from each layer - see
+/// SetLayerImage2 for details on how the ready image is defined. Note the
+/// requirement that each layer has a ready image. Whenever a new submitted
+/// configuration is available, it is immediately given to the hardware. This
+/// allows the layout and each layer's contents to advance independently when
+/// possible.
+///
+/// Performing illegal actions on the interface will result in the interface
+/// being closed.  The channel closure epitaph will return one of 4 values:
+/// - ZX_ERR_INVALID_ARGS: for trivially-verifiable client errors, such as providing an ID for a
+///       nonexistent image/layer/event, or a non-monotonically-increasing config stamp to
+///       ApplyConfig, etc.
+/// - ZX_ERR_BAD_STATE: indicates that the client has violated other API invariants, such as reusing
+///       an event that hasn't been signaled yet.
+/// - ZX_ERR_NO_MEMORY: memory could not be allocated to satisfy the requested operation.
+/// - ZX_ERR_INTERNAL: catch-all used for any error that is not listed above.
+closed protocol Coordinator {
+    /// Imports a Buffer-Collection backed image.
+    ///
+    /// Returns `ZX_ERR_NOT_SUPPORTED` if the display hardware doesn't support
+    /// `image_metadata`.
+    /// Returns `ZX_ERR_ALREADY_EXISTS` if `image_id` was used in a successful
+    /// `ImportImage()` without a corresponding `ReleaseImage()`.
+    /// Returns `ZX_ERR_NO_MEMORY` if memory cannot be allocated for managing the image
+    /// Additionally, this method delegates internally to `fuchsia.hardware.display.engine/Engine`,
+    /// and will forward errors received from `ImportImage()` and `ImportImageForCapture()`.
+    ///
+    /// The implementation must ignore any Sysmem information around weak VMO
+    /// handles. Display stack consumers are responsible for ensuring that weak
+    /// VMOs are closed in a timely manner, which may involve calling
+    /// [`Coordinator.ReleaseImage`] and [`Coordinator.CommitConfig`].
+    // TODO(https://fxbug.dev/391698891): it's undesirable to expose the implementation dependency
+    //                                    on `fuchsia.hardware.display.engine/Engine`.
+    strict ImportImage(struct {
+        /// Must be compatible with the arguments passed to
+        /// [`Coordinator.SetBufferCollectionConstraints`] on the
+        /// `buffer_collection_id`.
+        image_metadata fuchsia.hardware.display.types.ImageMetadata;
+
+        /// Identifies a previously imported BufferCollection.
+        ///
+        /// The ID must be assigned to an imported BufferCollection, via a
+        /// successful [`Coordinator.ImportBufferCollection`] call.
+        buffer_collection_id BufferCollectionId;
+
+        /// Must be a valid index in the imported BufferCollection.
+        buffer_index uint32;
+
+        image_id ImageId;
+    }) -> () error zx.Status;
+
+    /// Releases an imported image.
+    ///
+    /// `image_id` must be already imported by
+    /// [`fuchsia.hardware.display/Coordinator.ImportImage`].
+    ///
+    /// The image must not be the capture target of an ongoing capture specified
+    /// in [`fuchsia.hardware.display/Coordinator.StartCapture`].
+    ///
+    /// When an image is released, it is immediately removed from any draft
+    /// configurations, and any fences associated with the image are dropped.
+    /// The resources associated with the image will be released as soon as the
+    /// image is no longer in use.
+    //
+    // TODO(https://fxbug.dev/42080380): The precondition on capture image
+    // exists because capture images have different constraints on image reuse
+    // compared with non-capture images. We should have a unified design on
+    // image reuse for both capture and non-capture images.
+    strict ReleaseImage(struct {
+        image_id ImageId;
+    });
+
+    /// Imports an event into the driver and associates it with the given id.
+    ///
+    /// It is illegal for id to be equal to INVALID_DISP_ID, and it is undefined to
+    /// import one event with two different ids or to import two different events
+    /// with the same id (note that ids map well to koids).
+    ///
+    /// If a client is reusing events, they must clear the signal
+    /// before referencing the id again.
+    strict ImportEvent(resource struct {
+        event zx.Handle:EVENT;
+        id EventId;
+    });
+
+    /// Releases the event imported with the given id.
+    ///
+    /// If any images are currently using the given event, the event
+    /// will still be waited up or signaled as appropriate before its
+    /// resources are released. It is an error to reuse an ID while the
+    /// submitted config has references to it.
+    strict ReleaseEvent(struct {
+        id EventId;
+    });
+
+    /// Creates a new layer.
+    ///
+    /// Layers are not associated with a particular display, but they can only be
+    /// shown on at most one display at any given time.  A layer is considered in
+    /// use from the time it is passed to SetDisplayLayers until a subsequent
+    /// configuration is committed which does not include the layer or until its
+    /// display is removed.
+    ///
+    /// * `layer_id` must be a valid ID (not equal to `INVALID_DISP_ID`).
+    /// * `layer_id` must not be in use (not equal to the ID of any currently
+    ///   existing layer in the same `Coordinator` session).
+    strict CreateLayer(struct {
+        layer_id LayerId;
+    }) -> () error zx.Status;
+
+    /// Destroys the given layer.
+    ///
+    /// It is illegal to destroy a layer which does not exist or which is in use.
+    strict DestroyLayer(struct {
+        layer_id LayerId;
+    });
+
+    /// Sets the mode for a display.
+    strict SetDisplayMode(struct {
+        /// The display whose mode is changed.
+        ///
+        /// The call is ignored if the display ID does not belong to a display
+        /// known by the Coordinator. This can happen if a client issues a call
+        /// to [`Coordinator.SetDisplayMode`] before it receives a notification
+        /// that the display was removed.
+        display_id fuchsia.hardware.display.types.DisplayId;
+
+        /// The new mode for the display.
+        ///
+        /// Must be one of the [`Info.modes`] entries for the display.
+        mode fuchsia.hardware.display.types.Mode;
+    });
+
+    /// Set the color conversion applied to the display. The conversion is applied to
+    /// to each pixel according to the formula:
+    ///
+    /// (coefficients * (pixel + preoffsets)) + postoffsets
+    ///
+    /// where pixel is a column vector consisting of the pixel's 3 components.
+    ///
+    /// `coefficients` is passed in row-major order. If the first entry of an array is NaN, the
+    /// array is treated as the identity element for the relevant operation.
+    /// Hardware that support color correction generally accept a limited range of coefficient
+    /// values. Coefficients in the range of [-2, 2] inclusive will be accepted by most
+    /// hardware. The hardware driver will clamp values that are outside its acceptable range.
+    ///
+    /// `preoffsets`, `postoffsets`: Clients are encourged to produce color correction values that
+    /// do not depend on pre and post offsets since some hardware do not have support for that.
+    /// For cases where pre and post offset values need to be used, the range should be limited to
+    /// (-1, 1) exclusive as confirmed by CheckConfig API. Values outside this range will be
+    /// rejected.
+    ///
+    /// Clients are encouraged to use the CheckConfig API to confirm support for correction and to
+    /// validate their color correction input values.
+    ///
+    /// This a stateful call. Once color conversion values have been succesfully applied via a call
+    /// to CommitConfig() they will remain in place until changed and another CommitConfig() call is
+    /// successful. If SetDisplayColorConversion() is called and then the config is discarded, then
+    /// the last successfully committed state is restored.
+    strict SetDisplayColorConversion(struct {
+        /// The display whose color coefficients are set.
+        ///
+        /// The call is ignored if the display ID does not belong to a display
+        /// known by the Coordinator. This can happen if a client issues a call
+        /// to [`Coordinator.SetDisplayColorConversion`] before it receives a
+        /// notification that the display was removed.
+        display_id fuchsia.hardware.display.types.DisplayId;
+
+        preoffsets array<float32, 3>;
+        coefficients array<float32, 9>;
+        postoffsets array<float32, 3>;
+    });
+
+    /// Assigns a list of layers to be composited on a display.
+    strict SetDisplayLayers(struct {
+        /// The display that will show the result of compositing the layers.
+        ///
+        /// The call is ignored if the display ID does not belong to a display
+        /// known by the Coordinator. This can happen if a client issues a call
+        /// to [`Coordinator.SetDisplayLayers`] before it receives a
+        /// notification that the display was removed.
+        display_id fuchsia.hardware.display.types.DisplayId;
+
+        // The layers to be composited on the display.
+        //
+        // The layers are listed in increasing Z-order.
+        //
+        // The list must not be empty, and each ID must be valid.
+        //
+        // Each layer ID must not be composited on any another display. Moving a
+        // layer between displays is accomplished by first removing the layer
+        // from its current display, via a call to
+        // [`Coordinator.SetDisplayLayers`] that does not include the layer's
+        // ID.
+        //
+        // The number of elements in `layer_ids` must not exceed the
+        // `max_layer_count` reported for the display in its [`Info`] struct.
+        layer_ids vector<LayerId>:MAX;
+    });
+
+    /// Configures the layer as a primary layer with no image and the default
+    /// config (no src_frame cropping, the identity transform, positioned in the
+    /// top-left corner of the composed output, and no scaling).
+    ///
+    /// See the documentation on SetLayerImage for details on how this method
+    /// affects the layer's contents.
+    ///
+    /// It is illegal to pass an invalid layer id.
+    strict SetLayerPrimaryConfig(struct {
+        layer_id LayerId;
+        image_metadata fuchsia.hardware.display.types.ImageMetadata;
+    });
+
+    /// Sets the layer transform, scaling, and positioning.
+    ///
+    /// CheckConfig() will return INVALID_CONFIG if any of the configuration
+    /// validity conditions specified here is violated.
+    ///
+    /// Calling this on a non-primary layer or passing an invalid transform is
+    /// illegal.
+    strict SetLayerPrimaryPosition(struct {
+        layer_id LayerId;
+
+        /// Applied to the input image pixels specified by `image_source`.
+        ///
+        /// `display_destination` must account for image dimensions changes
+        /// caused by rotations. For example, rotating a 600x300 pixel image by
+        /// 90 degrees would specify 300x600 pixel dimensions in
+        /// `display_destination`.
+        image_source_transformation fuchsia.hardware.display.types.CoordinateTransformation;
+
+        /// The associated image region whose pixels are drawn by the layer.
+        ///
+        /// The rectangle uses the Vulkan coordinate space. The origin is at the
+        /// image's top-left corner. The X axis points to the right, and the Y
+        /// axis points downwards.
+        ///
+        /// A valid layer definition requires a valid non-empty image source
+        /// rectangle that is entirely contained within the image.
+        ///
+        /// Hardware image cropping is requested implicitly, when the source
+        /// region's dimensions differ from the image's dimensions. Some display
+        /// hardware may not support cropping.
+        image_source fuchsia.math.RectU;
+
+        /// The display image (composited output) region occupied by the layer.
+        ///
+        /// The rectangle uses the Vulkan coordinate space. The origin is at the
+        /// display's top-left corner. The X axis points to the right, and the Y
+        /// axis points downwards.
+        ///
+        /// A valid layer definition requires a valid non-empty display
+        /// destination rectangle that is entirely contained within the display.
+        ///
+        /// Hardware image scaling is requested implicitly, when the output
+        /// region's dimensions differ from the dimensions of `image_source`.
+        /// Some display hardware may not support scaling. All display hardware
+        /// has limitations in scaling support.
+        display_destination fuchsia.math.RectU;
+    });
+
+    /// Sets the alpha mode of the plane.
+    ///
+    /// If `mode` == DISABLED, the layer is opaque and `val` is ignored.
+    ///
+    /// If `mode` == PREMULTIPLIED or HW_MULTIPLY and `val` is NaN, the alpha
+    /// used when blending is determined by the per-pixel alpha channel.
+    ///
+    /// If `mode` == PREMULTIPLIED or HW_MULTIPLY and `val` is not NaN, the
+    /// alpha used when blending is the product of `val` and any per-pixel
+    /// alpha. Additionally, if `mode` == PREMULTIPLIED, then the hardware
+    /// premultiplies the color channel with `val` before blending.
+    ///
+    /// It is illegal to call this on a non-primary layer, to pass an
+    /// invalid mode, or to pass a value of `val` which is not NaN or
+    /// in the range [0, 1].
+    strict SetLayerPrimaryAlpha(struct {
+        layer_id LayerId;
+        mode fuchsia.hardware.display.types.AlphaMode;
+        val float32;
+    });
+
+    /// Configures the layer as a solid color fill layer.
+    ///
+    /// It is illegal to call this on an invalid layer.
+    strict SetLayerColorConfig(struct {
+        layer_id LayerId;
+        color fuchsia.hardware.display.types.Color;
+
+        /// The display region occupied by the color fill layer.
+        ///
+        /// The rectangle uses the Vulkan coordinate space. The origin is at the
+        /// display's top-left corner. The X axis points to the right, and the Y
+        /// axis points downwards.
+        ///
+        /// A valid layer definition requires a valid non-empty display
+        /// destination rectangle that is entirely contained within the display.
+        display_destination fuchsia.math.RectU;
+    });
+
+    /// Sets the image for the layer's draft configuration.
+    ///
+    /// If wait_event_id corresponds to an imported event, the driver will
+    /// wait for ZX_EVENT_SIGNALED on the object before presenting the image.
+    ///
+    /// A layer's submitted image is the most recently committed image which either has
+    /// no wait event or whose wait event has been signaled. Whenever a new image
+    /// is committed, any older images which never got committed are dropped, and
+    /// their signal events will be fired as soon as their wait events are
+    /// signaled. The driver also does not have any concept like 'target vsync',
+    /// meaning that if multiple images are committed within one vsync period, then
+    /// only the last image will actually be displayed.
+    ///
+    /// By default, the driver retains a submitted image until a new image is
+    /// submitted. However, setting a layer's ImageConfig with SetLayerPrimaryConfig
+    /// resets the layer's submitted and waiting images, even if the new ImageConfig
+    /// matches the old ImageConfig.
+    ///
+    /// An image cannot be used for multiple layers simultaneously, nor can an
+    /// image be given back to the display coordinator while it is still in use.
+    /// An image is considered in use when it is part of a draft configuration
+    /// or from when its configuration is committed until it is replaced by a
+    /// subsequent configuration that is *displayed* (not merely committed).
+    ///
+    /// It is illegal to call this with an invalid layer or image id, to
+    /// call it on a color layer, or to call it with an image and layer whose
+    /// ImageConfigs do not match. It is illegal to commit a configuration
+    /// with an image layer that has no image (note that is is not illegal to
+    /// validate such a configuration). It is illegal to reuse a wait event which
+    /// another layer that has not been presented is waiting on.
+    ///
+    /// Each layer can track a maximum of `MAX_WAITING_IMAGES_PER_LAYER` waiting images.
+    /// An image becomes "waiting" when it is the most recent image set to a layer that appears in
+    /// a config that is committed via `CommitConfig()` or similar.  To avoid exceeding the maximum,
+    /// the client can infer that the image is no longer waiting by:
+    ///   - noting the config stamp when the config containing the layer/image is committed
+    ///   - watching for that same (or later) config stamp to be returned by
+    ///     `CoordinatorListener.OnVsync()`.
+    strict SetLayerImage2(struct {
+        layer_id LayerId;
+        image_id ImageId;
+        wait_event_id EventId;
+    });
+
+    /// Validates the draft configuration.
+    ///
+    /// Validation entails checking that the draft configuration can be used
+    /// by the system's display hardware.
+    ///
+    /// Most SetX operations require verifying the draft configuration. The
+    /// following operations do not require revalidation.
+    /// * SetLayerImage2()
+    ///
+    strict CheckConfig() -> (struct {
+        res fuchsia.hardware.display.types.ConfigResult;
+    });
+
+    /// Discard all draft configuration changes.
+    strict DiscardConfig();
+
+    // TODO(https://fxbug.dev/42152065): Deprecated; use CommitConfig() instead.
+    // This is a temporary solution to support old CommitConfig() with new OnVsync() events.
+    // Remove this once the migration is done.
+    //
+    /// Gets the stamp provided with the latest configuration the client
+    /// committed (by calling CommitConfig()) and the display core driver
+    /// accepted; the display configuration may not have been rendered yet
+    /// because of pending image availability or draft layer changes.
+    /// If no configuration was committed before, returns `INVALID_CONFIG_STAMP_VALUE`.
+    strict GetLatestCommittedConfigStamp() -> (struct {
+        stamp ConfigStamp;
+    });
+
+    /// Commits any draft changes to the current configuration. This will
+    /// not apply draft changes to layers which are not on any display.
+    ///
+    /// If the draft configuration cannot be committed, this call will silently
+    /// fail, so the client should ensure its configuration is valid by
+    /// calling [`Coordinator.CheckConfig`].
+    strict CommitConfig(resource table {
+        /// Required. Must be valid and strictly monotonically-increasing.
+        1: stamp ConfigStamp;
+    });
+
+    /// Acknowledges the receipt of one `OnVsync` message.
+    strict AcknowledgeVsync(struct {
+        /// The cookie received in the most recent `OnVsync` message.
+        ///
+        /// Must not be zero. Zero cookies do not require acknowledgement.
+        ///
+        /// Each cookie must be acknowledged exactly once. Cookies must
+        /// be acknowledged in the order of their receipt.
+        cookie uint64;
+    });
+
+
+    /// Import a sysmem buffer collection token. `buffer_collection_id` must not
+    /// already be in use.
+    strict ImportBufferCollection(resource struct {
+        buffer_collection_id BufferCollectionId;
+        buffer_collection_token client_end:fuchsia.sysmem2.BufferCollectionToken;
+    }) -> () error zx.Status;
+
+    /// Release an imported buffer collection.
+    strict ReleaseBufferCollection(struct {
+        buffer_collection_id BufferCollectionId;
+    });
+
+    /// Takes an imported buffer collection and sets the constraints
+    /// on it so that it can be imported with a specific config.
+    // TODO(https://fxbug.dev/42166207): Update this API to better support
+    // optional fields.
+    strict SetBufferCollectionConstraints(struct {
+        buffer_collection_id BufferCollectionId;
+        buffer_usage fuchsia.hardware.display.types.ImageBufferUsage;
+    }) -> () error zx.Status;
+
+    /// Returns true if Capture is supported on the platform.
+    strict IsCaptureSupported() -> (struct {
+        supported bool;
+    }) error zx.Status;
+
+    /// Starts capture. Client must provide a valid signal_event_id and
+    /// image_id. signal_event_id must have been imported into the driver
+    /// using ImportEvent FIDL API. Image_id is the id from ImportImageForCapture.
+    /// The client will get notified once capture is complete via signal_event_id.
+    /// Returns ZX_ERR_NOT_SUPPORTED if coordinator does not support capture
+    strict StartCapture(struct {
+        signal_event_id EventId;
+        image_id ImageId;
+    }) -> () error zx.Status;
+
+    /// Set the minimum value of rgb channels. Valid range [0 255] inclusive. Returns
+    /// ZX_ERR_NOT_SUPPORTED when the display hardware does not support this feature.
+    /// This API is meant to address backlight bleeding that may occur on some hardware
+    /// that have a specific type of panel and hardware assembly. The evolution of this
+    /// API is highly hardware and product dependant and therefore as products evolve, this
+    /// API may change or support for this API may become non-existent. Therefore, this
+    /// API should be used with caution.
+    ///
+    /// Unlike other calls in this API, SetMiniumRgb is applied immediately, and does not
+    /// wait for CommitConfig(). It is, however, still stateful.
+    strict SetMinimumRgb(struct {
+        minimum_rgb uint8;
+    }) -> () error zx.Status;
+
+    /// Sets the display panel power mode.
+    ///
+    /// This call takes effect immediately. Clients don't need to call
+    /// [`Coordinator.CommitConfig`].
+    ///
+    /// Fails with ZX_ERR_NOT_FOUND if `display_id` does not belong to a display
+    /// known by the Coordinator. This can happen if a client issues a call to
+    /// [`Coordinator.SetDisplayPowerMode`] before it receives a notification
+    /// that the display was removed.
+    ///
+    /// This method is not idempotent. Each [`Coordinator.SetDisplayPowerMode`]
+    /// call explicitly sets the power mode on the display hardware, though the
+    /// display hardware driver may choose to behave idempotently.
+    ///
+    /// Fails with ZX_ERR_NOT_SUPPORTED if the display drivers or the hardware
+    /// don't support the given `power_mode`.
+    strict SetDisplayPowerMode(struct {
+        display_id fuchsia.hardware.display.types.DisplayId;
+
+        /// The target power mode of the display hardware.
+        ///
+        /// Once `power_mode` is set to `OFF`, the hardware will not generate
+        /// new VSync events. However, the client should be prepared to handle
+        /// VSync events generated before the
+        /// [`Coordinator.SetDisplayPowerMode`] call reaches the hardware.
+        ///
+        /// Calls that impact draft configurations, such as
+        /// [`Coordinator.SetDisplayLayers`], still work while `power_mode` is
+        /// set to `OFF`.
+        ///
+        /// `CommitConfig` also works while the `power_mode` is
+        /// set to `OFF`. When the display is powered back on, the display will
+        /// show the latest committed configuration.
+        ///
+        /// Newly added displays has `ON` power mode.
+        power_mode fuchsia.hardware.display.types.PowerMode;
+    }) -> () error zx.Status;
+};

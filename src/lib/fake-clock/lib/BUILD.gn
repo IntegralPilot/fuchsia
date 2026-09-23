@@ -1,0 +1,202 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/testing/cc_test_executable.gni")
+import("//build/testing/environments.gni")
+
+# Local template for a library link config rule.
+#
+# Args:
+#   lib_name: (string) the shared library base name.
+template("_config") {
+  config(target_name) {
+    _dir = rebase_path(get_label_info(":lib($shlib_toolchain)", "root_out_dir"),
+                       root_build_dir)
+    _lib = "$_dir/link_stub/lib${invoker.lib_name}.so"
+
+    rustflags = [
+      # Use --no-as-needed to ensure libfake_clock.so is not dropped by
+      # --as-needed analysis if it occurs later in the link arguments.
+      "-Clink-args=--push-state",
+      "-Clink-args=--no-as-needed",
+      "-Clink-arg=$_lib",
+      "-Clink-args=--pop-state",
+    ]
+  }
+}
+
+_config("rust-link-fake-time") {
+  lib_name = "fake_clock"
+}
+
+_config("rust-link-fake-time-with-utc") {
+  lib_name = "fake_clock_with_utc"
+}
+
+# Permits the client code to get the UTC clock.
+config("allow_utc") {
+  defines = [ "FAKE_CLOCK_ALLOW_UTC" ]
+}
+
+# Builds shared library with varying configurations.
+#
+# Args:
+#   output_name: (string) Same as in regular shared_library_targets.
+#   public_configs: list(label) Same as in regular shared_library targets.
+template("_shared_library") {
+  shared_library(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "output_name",
+                             "public_configs",
+                           ])
+    testonly = true
+    sources = [ "fake_clock.cc" ]
+
+    deps = [
+      "//sdk/lib/component/incoming/cpp",
+      "//sdk/lib/syslog/cpp",
+      "//src/lib/fake-clock/fidl:fidl_cpp",
+      "//src/lib/fake-clock/named-timer:named-timer-headers",
+    ]
+  }
+}
+
+_shared_library("lib") {
+  output_name = "fake_clock"
+  public_configs = [ "//src/lib/fake-clock/lib:rust-link-fake-time" ]
+}
+
+_shared_library("lib_with_utc") {
+  output_name = "fake_clock_with_utc"
+  public_configs = [
+    "//src/lib/fake-clock/lib:rust-link-fake-time-with-utc",
+    "//src/lib/fake-clock/lib:allow_utc",
+  ]
+}
+
+cc_test_executable("test_bin") {
+  testonly = true
+  output_name = "fake_clock_lib_test"
+  sources = [ "fake_clock_test.cc" ]
+
+  deps = [
+    ":lib",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/sys/cpp",
+    "//src/lib/fake-clock/fidl:fidl_hlcpp",
+    "//src/lib/fxl",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/loop_fixture",
+  ]
+}
+
+executable("death_bin") {
+  testonly = true
+  sources = [ "death_main.cc" ]
+
+  deps = [
+    ":lib",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/sys/cpp",
+    "//src/lib/fake-clock/fidl:fidl_hlcpp",
+    "//src/lib/fxl",
+    "//src/lib/testing/loop_fixture",
+  ]
+}
+
+fuchsia_test_component("death_component") {
+  manifest = "meta/death.cml"
+  deps = [ ":death_bin" ]
+}
+
+cc_test_executable("death_test_bin") {
+  testonly = true
+  output_name = "fake_clock_lib_death_test"
+  sources = [ "fake_clock_death_test.cc" ]
+
+  deps = [
+    ":lib_with_utc",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/sys/cpp",
+    "//src/lib/fake-clock/fidl:fidl_hlcpp",
+    "//src/lib/fxl",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/loop_fixture",
+  ]
+}
+
+cc_test_executable("nodeath_test_bin") {
+  testonly = true
+  output_name = "fake_clock_lib_nodeath_test"
+  sources = [ "fake_clock_nodeath_test.cc" ]
+
+  deps = [
+    ":lib_with_utc",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/sys/cpp",
+    "//src/lib/fake-clock/fidl:fidl_hlcpp",
+    "//src/lib/fxl",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/loop_fixture",
+  ]
+}
+
+fuchsia_unittest_component("death_test_component") {
+  component_name = "fake_clock_lib_death_test"
+  manifest = "meta/fake_clock_lib_death_test.cml"
+  deps = [ ":death_test_bin" ]
+}
+
+# Same as above, except does not die.
+fuchsia_unittest_component("nodeath_test_component") {
+  component_name = "fake_clock_lib_nodeath_test"
+  manifest = "meta/fake_clock_lib_nodeath_test.cml"
+  deps = [ ":nodeath_test_bin" ]
+}
+
+fuchsia_unittest_component("test_component") {
+  component_name = "fake_clock_lib_test"
+  manifest = "meta/fake_clock_lib_test.cml"
+  deps = [ ":test_bin" ]
+}
+
+fuchsia_test_package("fake_clock_lib_test") {
+  test_components = [
+    ":test_component",
+    ":nodeath_test_component",
+  ]
+  deps = [ "//src/lib/fake-clock/svc" ]
+  test_specs = {
+    environments = [ emu_env ]
+  }
+}
+
+fuchsia_test_package("fake_clock_lib_death_test") {
+  test_components = [ ":death_test_component" ]
+  deps = [
+    ":death_component",
+    "//src/lib/fake-clock/svc",
+  ]
+  test_specs = {
+    environments = [ emu_env ]
+    log_settings = {
+      # It's a death test.
+      max_severity = "FATAL"
+    }
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":fake_clock_lib_death_test",
+    ":fake_clock_lib_test",
+  ]
+}

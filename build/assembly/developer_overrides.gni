@@ -1,0 +1,662 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/product_assembly_config_file_impl.gni")
+import("//build/bazel/bazel_inputs.gni")
+import("//build/components/fuchsia_package.gni")
+
+# Define developer overrides for product assembly
+#
+# Params (all are optional):
+#
+#   developer_only_options
+#     [scope] This is a set of flags and settings for product assembly that are
+#     only available as developer overrides, they are not available to products
+#     via the 'product_assembly_configuration()' template.  It's a scope with
+#     the following fields (all optional):
+#
+#     all_packages_in_base (optional; default=false)
+#       [bool] If set to true, all packages are moved from cache to base, and
+#       all platform-defined universe packages (such as shell commands) are as
+#       well.
+#
+#     netboot_mode (optional; default=false)
+#       [bool] If set to true, assembly tool will create a netbootable image.
+#       This is mostly used during the bringup process.
+#
+#   platform
+#     [scope] This is a set of values to override / overlay onto the platform
+#     configuration.
+#
+#   product
+#     [scope] This is a set of values to override / overlay onto the product's
+#     provided configuration.
+#
+#   board
+#     [scope] This is a set of values to override / overlay onto the boards's
+#     provided configuration.
+#
+#   kernel
+#     [scope] This is a set of flags and settings specifically for the kernel.
+#     It's a scope with the following fields (all optional):
+#
+#    command_line_args (optional; defauilt = [])
+#      [list, strings] A list of kernel command-line arguments to add to the
+#      zbi that's created by assembly.
+#
+#  base_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the base package set.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a package target, it will cause an error
+#    like:
+#      "no dependency provides the input <package_name>/package_manifest.json"
+#
+#  cache_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the cache package set.
+#
+#  flexible_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets that
+#    assembly may choose to put in base, cache, or elsewhere depending on the
+#    assembly context.
+#
+#  bootfs_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the bootfs package set.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a package target, it will cause an error
+#    like:
+#      "no dependency provides the input <package_name>/package_manifest.json"
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata. If the target isn't a bootfs_files_for_assembly target, it will
+#    cause an error like:
+#      "no dependency provides the input <package_name>/bootfs_files.json"
+#
+#   bootfs_files_labels [optional]
+#     [list, GN labels] A list of GN labels of bootfs_files_for_assembly()
+#     targets to include in bootfs_files provided by this AIB.
+#
+#  base_driver_packages [optional]
+#    [list of scopes] A list of scopes that describe the driver packages to
+#    include in the base package set.
+#
+#    Example:
+#    base_driver_packages = [
+#      {
+#        package_target = "//path/to/driver:package"
+#        driver_components = [ "meta/driver.cm" ]
+#      }
+#    ]
+#
+#  bootfs_driver_packages [optional]
+#    [list of scopes] A list of scopes that describe the driver packages to
+#    include in the bootfs package set.
+#
+#    Example:
+#    bootfs_driver_packages = [
+#      {
+#        package_target = "//path/to/driver:package"
+#        driver_components = [ "meta/driver.cm" ]
+#      }
+#    ]
+#
+#  shell_commands (optional; default: empty)
+#    [list of scopes] A list of scopes that describe the shell commands for each
+#    listed package (the packages need to be separately included in the desired
+#    package set).
+#
+#    Example:
+#    shell_commands = [
+#      {
+#        "package_name = "//third_party/sbase"
+#        components = [ "ls" ]
+#      },
+#    ]
+#
+#  compiled_packages [optional]
+#     [list of GN scopes] List of GN scopes of `CompiledPackageDefinition`s
+#     that describe packages that are to be built dynamically by Assembly, for
+#     example, the `core` package. This is passed directly through to the AIB
+#     config so all paths should be rebased by the caller.
+#
+#     Example:
+#
+#     # Add a core shard
+#     compiled_packages = [
+#       {
+#         name = "core"
+#         components = [
+#           {
+#             component_name = "core"
+#             shards = [
+#                     "//src/sys/process-resolver/meta/process_resolver.core_shard.cml",
+#             ]
+#           },
+#           ...
+#         ],
+#         contents = [ {
+#           label = "//some/gn/label"
+#           source = "//som/gn/file/path"
+#           destination = "foo/bar"
+#         } ]
+#       },
+#     ]
+#
+#     shards [optional]
+#       [list of GN file paths] List of CML files to merge together when
+#       compiling the component.
+#
+#     contents [optional]
+#       [list of GN scopes] List of GN scopes that describe a source/destination
+#       pair for a file to include in the package when it's compiled.  An
+#       optional 'label' field is required when the file is created by the
+#       build, and is the label of the target that creates the file.
+#
+template("assembly_developer_overrides") {
+  assert(
+      current_toolchain == default_toolchain,
+      "Assembly developer overrides can only be defined in the default toolchain.")
+
+  _valid_overrides_dirs = [ "//local/*" ]
+  if (!label_matches(":$target_name",
+                     # //build/assembly/overrides is an internal implementation
+                     # detail of the product_assembly_overrides_contents GN
+                     # arg, and so it's added separately from the list so that
+                     # the list can also be used to print the valid locations
+                     # that are allowlisted for defining overrides.
+                     _valid_overrides_dirs + [ "//build/assembly/overrides:*" ])) {
+    assert(
+        false,
+        "Assembly developer overrides can only be added to the following directories, as they are for local use only. Contact the software assembly team if you need to define overrides that are checked into the tree to discuss your use-case: $_valid_overrides_dirs")
+  }
+
+  labels = {
+    # So it can be reused.
+    target_name = target_name
+
+    assembly_overrides_intermediate =
+        "${target_name}.product_assembly_overrides.intermediate.json"
+
+    # This is a second target created by the product_assembly_config_file()
+    # template that wraps up all the input file labels found in the product and
+    # platform config with the deps that are passed to this template.
+    assembly_overrides_intermediate_inputs =
+        "${assembly_overrides_intermediate}.inputs"
+
+    # This is a third target created by the product_assembly_config_file()
+    # template that lists all the files that were found in the intermediate
+    assembly_overrides_intermediate_input_paths =
+        "${assembly_overrides_intermediate}.input_file_paths"
+
+    if (defined(invoker.bootfs_files_labels)) {
+      bootfs_files_package = "${target_name}.bootfs_files_package"
+    }
+  }
+
+  files = {
+    outdir = "${target_out_dir}/${target_name}"
+    assembly_config_file = "$outdir/product_assembly_overrides.json"
+    assembly_config_file_intermediate = "${target_out_dir}/${target_name}.product_assembly_overrides.intermediate.json"
+    assembly_config_file_intermediate_input_paths = "${target_out_dir}/${target_name}.product_assembly_overrides.intermediate.json.input_file_paths.json"
+  }
+
+  creation_inputs = []
+  creation_deps = []
+
+  # Gather up all the developer-specified packages
+  _packages = []
+
+  foreach(package_set,
+          [
+            "base",
+            "cache",
+            "flexible",
+            "bootfs",
+          ]) {
+    package_set_varname = "${package_set}_packages"
+    if (defined(invoker[package_set_varname])) {
+      foreach(package_target, invoker[package_set_varname]) {
+        _package_out_dir = get_label_info(package_target, "target_out_dir")
+        _package_name = get_label_info(package_target, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+
+        _packages += [
+          {
+            package = rebase_path(_manifest_path, root_build_dir)
+            set = package_set
+          },
+        ]
+        creation_inputs += [ _manifest_path ]
+        creation_deps += [ package_target ]
+      }
+    }
+  }
+
+  # Gather up all the developer-specified driver packages.
+  _drivers = []
+
+  if (defined(invoker.base_driver_packages)) {
+    foreach(driver_entry, invoker.base_driver_packages) {
+      assert(defined(driver_entry.package_target),
+             "package_target must be supplied for base_driver_packages")
+      assert(defined(driver_entry.driver_components),
+             "driver_components must be supplied for base_driver_packages")
+      driver_target = driver_entry.package_target
+      _package_out_dir = get_label_info(driver_target, "target_out_dir")
+      _package_name = get_label_info(driver_target, "name")
+      _manifest_path =
+          "${_package_out_dir}/${_package_name}/package_manifest.json"
+
+      _drivers += [
+        {
+          package = rebase_path(_manifest_path, root_build_dir)
+          set = "base"
+          components = driver_entry.driver_components
+        },
+      ]
+      creation_inputs += [ _manifest_path ]
+      creation_deps += [ driver_target ]
+    }
+  }
+
+  if (defined(invoker.bootfs_driver_packages)) {
+    foreach(driver_entry, invoker.bootfs_driver_packages) {
+      assert(defined(driver_entry.package_target),
+             "package_target must be supplied for bootfs_driver_packages")
+      assert(defined(driver_entry.driver_components),
+             "driver_components must be supplied for bootfs_driver_packages")
+      driver_target = driver_entry.package_target
+      _package_out_dir = get_label_info(driver_target, "target_out_dir")
+      _package_name = get_label_info(driver_target, "name")
+      _manifest_path =
+          "${_package_out_dir}/${_package_name}/package_manifest.json"
+
+      _drivers += [
+        {
+          package = rebase_path(_manifest_path, root_build_dir)
+          set = "bootfs"
+          components = driver_entry.driver_components
+        },
+      ]
+      creation_inputs += [ _manifest_path ]
+      creation_deps += [ driver_target ]
+    }
+  }
+
+  _compiled_packages = []
+  if (defined(invoker.compiled_packages)) {
+    foreach(package, invoker.compiled_packages) {
+      _package = {
+      }
+      _package = {
+        forward_variables_from(package,
+                               "*",
+                               [
+                                 "contents",
+                                 "components",
+                                 "component_includes",
+                               ])
+      }
+
+      # Rebase and gather inputs for the contents and component shards
+
+      # Gather the deps and inputs files for the package contents.
+      if (defined(package.contents)) {
+        print()
+        print(
+            "ERROR: 'contents' for 'compiled_packages' are not supported at this time in assembly developer overrides.")
+        print()
+        assert(false)
+
+        # _contents = []
+        # foreach(entry, package.contents) {
+        #   creation_inputs += [ entry.source ]
+        #   creation_deps += [ entry.label ]
+
+        #   _contents += [
+        #     {
+        #       destination = entry.destination
+        #       source = rebase_path("${entry.source}", root_build_dir)
+        #     },
+        #   ]
+        # }
+        # _package.contents = _contents
+      }
+
+      if (defined(package.component_includes)) {
+        print()
+        print(
+            "ERROR: 'component_includes' for 'compiled_packages' are not supported at this time in assembly developer overrides.")
+        print()
+        assert(false)
+      }
+
+      # Gather the core shards as input files
+      if (defined(package.components)) {
+        _components = []
+        foreach(entry, package.components) {
+          creation_inputs += entry.shards
+          _components += [
+            {
+              forward_variables_from(entry, "*", [ "shards" ])
+              shards = rebase_path(entry.shards, root_build_dir)
+            },
+          ]
+        }
+        _package.components = _components
+      }
+
+      _compiled_packages += [ _package ]
+    }
+  }
+
+  _shell_commands = []
+  if (defined(invoker.shell_commands)) {
+    foreach(shell_command, invoker.shell_commands) {
+      assert(
+          defined(shell_command.package),
+          "shell_command entries must specify a package name: ${shell_command}")
+      assert(
+          defined(shell_command.components),
+          "shell_command components must be a list of strings pointing to binaries that are components in the package that make up the package: ${shell_command}")
+      _package_name = get_label_info(shell_command.package, "name")
+      _shell_commands += [
+        {
+          package = _package_name
+          components = shell_command.components
+        },
+      ]
+    }
+  }
+
+  if (defined(invoker.bootfs_files_labels)) {
+    fuchsia_package(labels.bootfs_files_package) {
+      forward_variables_from(invoker, [ "testonly" ])
+      if (defined(invoker.bootfs_files_labels)) {
+        deps = invoker.bootfs_files_labels
+      }
+    }
+    bootfs_files_package_manifest =
+        "${target_out_dir}/${labels.bootfs_files_package}/package_manifest.json"
+  }
+
+  _assembly_overrides = {
+    target_name = get_label_info(":$target_name", "label_no_toolchain")
+    forward_variables_from(invoker,
+                           [
+                             "board",
+                             "developer_only_options",
+                             "platform",
+                             "product",
+                             "kernel",
+                           ])
+    packages = _packages
+    drivers = _drivers
+    packages_to_compile = _compiled_packages
+    shell_commands = _shell_commands
+
+    if (defined(labels.bootfs_files_package)) {
+      bootfs_files_package =
+          rebase_path(bootfs_files_package_manifest, files.outdir)
+    }
+  }
+
+  # Generate the overrides configuration file itself.
+  #
+  # This uses the product_assembly_config_file() template to properly convert
+  # any file paths in the 'platform' and 'product' sections that need to be
+  # converted from GN paths into rebased file paths.  See the template's file
+  # for more information on those paths.
+  #
+  product_assembly_config_file(labels.assembly_overrides_intermediate) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "public_deps",
+                             "testonly",
+                           ])
+    visibility = [ ":${labels.target_name}" ]
+    outputs = [ files.assembly_config_file_intermediate ]
+    product_assembly_config = _assembly_overrides
+  }
+
+  python_action(labels.target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    binary_label = "//build/assembly/scripts:developer_overrides"
+
+    inputs = [
+      files.assembly_config_file_intermediate,
+      files.assembly_config_file_intermediate_input_paths,
+    ]
+    public_deps = [
+      ":${labels.assembly_overrides_intermediate_inputs}",
+      ":${labels.assembly_overrides_intermediate}",
+    ]
+    deps = [ ":${labels.assembly_overrides_intermediate_input_paths}" ]
+
+    if (defined(labels.bootfs_files_package)) {
+      deps += [ ":${labels.bootfs_files_package}" ]
+    }
+
+    # The contents of these folders is dynamic, and managed entirely by this
+    # action.  Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    #
+    # These folders would grow in size forever, if it was not cleaned out on
+    # each incremental build.
+    hermetic_action_ignored_prefixes = [
+      "${files.outdir}/blobs",
+      "${files.outdir}/compiled_packages",
+      "${files.outdir}/packages",
+      "${files.outdir}/subpackages",
+      "${files.outdir}/resources",
+    ]
+
+    inputs += creation_inputs
+    deps += creation_deps
+    outputs = [ files.assembly_config_file ]
+    depfile = "${files.assembly_config_file}.d"
+
+    args = [
+      "--input",
+      rebase_path(files.assembly_config_file_intermediate, root_build_dir),
+      "--input-file-paths",
+      rebase_path(files.assembly_config_file_intermediate_input_paths,
+                  root_build_dir),
+      "--outdir",
+      rebase_path(files.outdir, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+
+    # Block all metadata walks for packages, distribution entries, etc.  These
+    # inputs should not exist in metadata walks, as they are added via the paths
+    # in the assembly config itself.
+    metadata = {
+      package_barrier = []
+      assembly_package_barrier = []
+      config_package_barrier = []
+      distribution_entries_barrier = []
+    }
+  }
+
+  bazel_input_directory("${labels.target_name}.bazel_input") {
+    forward_variables_from(invoker, [ "testonly" ])
+    generator = ":${labels.target_name}"
+    output_directory = files.outdir
+  }
+}
+
+declare_args() {
+  # This GN arg enables developer overrides for the given assembly targets
+  #
+  # This is a list of scopes that take two fields:
+  #  - assembly: (GN label pattern) the GN label(s) to apply the overrides to
+  #  - overrides (GN label) the label of a set of developer overrides
+  #
+  # Example:
+  #
+  #  product_assembly_overrides = [
+  #    {
+  #      assembly = "//products/core/*"
+  #      overrides = "//local:my_assembly_overrides"
+  #    }
+  #  ]
+  product_assembly_overrides = []
+
+  # This GN arg provides a short-hand mechanism for setting the developer
+  # overrides used by the "main" product assembly for a product. If this is set,
+  # and there isn't a "main" product assembly defined, then a GN error will be
+  # generated.
+  product_assembly_overrides_label = false
+
+  # This GN arg allows the overrides template to be specified in-line within
+  # args.gn. It is incompatible with the above
+  # 'product_assembly_overrides_label' argument.
+  #
+  # To use this, treat it like an 'assembly_developer_overrides()' template, and
+  # the corresponding template will be instantiated at
+  # `//build/assembly/overrides:inlined`, and set as the overrides for the
+  # "main" product assembly as if the following were set:
+  #
+  #   product_assembly_overrides_label = "//build/assembly/overrides:inlined"
+  #
+  product_assembly_overrides_contents = false
+}
+
+# If a value for 'product_assembly_overrides_contents' has been set, that will
+# be used to configure the //build/assembly/overrides:inlined target, so set
+# that as if it were the label configured via product_assembly_overrides_label.
+if (product_assembly_overrides_contents != false) {
+  # But not if 'product_assembly_overrides_label' has also been set. These are
+  # mutally-exclusive.
+  assert(
+      product_assembly_overrides_label == false,
+      "Only one of 'product_assembly_overrides_label' and 'product_assembly_overrides_contents' can be used")
+
+  product_assembly_overrides_label = "//build/assembly/overrides:inlined"
+}
+
+# This is the list of overrides labels and matching assembly label patterns that
+# are used by assembled_system() and bazel_product_bundle(). The GN args set by
+# the developer are used to populate this with the correct information.
+all_product_assembly_overrides = []
+
+# If the override label for the "main" assembly is set, add that to the list of
+# overrides.
+if (product_assembly_overrides_label != false) {
+  # create a temp scope for importing paths.gni into, so that we don't add
+  # 'labels' and 'files' to the places that import this (via
+  # assembled_system.gni).
+  _temp_scope = {
+    import("//build/images/paths.gni")
+  }
+
+  # extract 'labels' from the temp scope.
+  _temp_labels = _temp_scope.labels
+  if (_temp_labels.main_pb != "") {
+    # main_pb works only with bazel targets. See below.
+    _assembly_pattern = get_label_info(_temp_labels.main_pb, "dir") + "/*"
+  } else if (_temp_scope.bazel_product_bundle_target != "") {
+    # For Bazel-assembled products we directly set the assembly target that's
+    # matched against as a wildcard in the directory of the product bundle.
+    # This imposes restrictions on the product to define the product assembly
+    # in the same dir, or a subdir, of the one that the product bundle is
+    # defined in.
+    _assembly_pattern = get_label_info(_temp_labels.images, "dir") + "/*"
+  } else if (current_toolchain == default_toolchain) {
+    print()
+    print(
+        "WARNING:  Developer overrides specified but no main product assembly set.")
+    print("            If this is unexpected, set a main product bundle.")
+    print()
+  }
+
+  if (defined(_assembly_pattern)) {
+    all_product_assembly_overrides += [
+      {
+        assembly = _assembly_pattern
+        overrides = product_assembly_overrides_label
+      },
+    ]
+  }
+}
+
+# Add the other pairs of overrides and assembly labels set by the developer.
+foreach(overrides_def, product_assembly_overrides) {
+  assert(
+      defined(overrides_def.assembly),
+      "'product_assembly_overrides' must specify an assembly target to override using 'assembly'")
+  assert(
+      defined(overrides_def.overrides),
+      "'product_assembly_overrides' must specify an overrides target using 'overrides'")
+
+  all_product_assembly_overrides += [ overrides_def ]
+}
+
+template("developer_overrides_list") {
+  _override_source = false
+  _override_deps = []
+  _overrides_match_found = false
+
+  assert(defined(invoker.assembly_target), "assembly_target must be provided")
+  _assembly_target = invoker.assembly_target
+
+  _assembly_target_dir = get_label_info(_assembly_target, "dir")
+
+  foreach(override, all_product_assembly_overrides) {
+    if (label_matches(_assembly_target, [ override.assembly ]) ||
+        label_matches(_assembly_target_dir, [ override.assembly ])) {
+      assert(_overrides_match_found == false,
+             "Multiple matching overrides targets found for " +
+                 get_label_info(_assembly_target, "label_no_toolchain") +
+                 " ${override.assembly} and ${_overrides_match_found}")
+      _overrides_match_found = override.assembly
+
+      _target = override.overrides
+      _out_dir = get_label_info(_target, "target_out_dir")
+      _name = get_label_info(_target, "name")
+
+      _override_source = "$_out_dir/$_name/product_assembly_overrides.json"
+
+      _override_deps += [ _target ]
+    }
+  }
+
+  not_needed([
+               "_overrides_match_found",
+               "_assembly_target_dir",
+             ])
+
+  if (_override_source != false) {
+    copy(target_name) {
+      testonly = true
+      sources = [ _override_source ]
+      outputs = invoker.outputs
+      if (_override_deps != []) {
+        deps = _override_deps
+      }
+    }
+  } else {
+    _outputs = invoker.outputs
+    generated_file(target_name) {
+      testonly = true
+      outputs = [ _outputs[0] + ".empty" ]
+      contents = {
+      }
+      output_conversion = "json"
+      not_needed([ "_override_deps" ])
+    }
+  }
+}

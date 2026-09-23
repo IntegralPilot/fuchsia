@@ -1,0 +1,149 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/sanitizers/sanitizer_default_options.gni")
+import("//build/zircon/migrated_targets.gni")
+
+zx_library("trivial-allocator") {
+  sdk = "source"
+  sdk_headers = [
+    "lib/trivial-allocator/basic-leaky-allocator.h",
+    "lib/trivial-allocator/basic-owning-allocator.h",
+    "lib/trivial-allocator/new.h",
+    "lib/trivial-allocator/page-allocator.h",
+    "lib/trivial-allocator/posix.h",
+    "lib/trivial-allocator/sealed-page-allocator.h",
+    "lib/trivial-allocator/single-heap-allocator.h",
+    "lib/trivial-allocator/zircon.h",
+  ]
+
+  public_deps = [
+    # <lib/trivial-allocator/new.h> has #include <fbl/alloc_checker.h>.
+    "//zircon/system/ulib/fbl",
+  ]
+  if (is_fuchsia && !is_kernel) {
+    public_deps += [
+      # <lib/trivial-allocator/zircon.h> has #include <lib/zx/vmar.h>.
+      "//zircon/system/ulib/zx",
+    ]
+  }
+
+  sources = []
+  deps = []
+
+  if (is_kernel) {
+    deps += [
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+    ]
+  }
+}
+
+# This provides no-op `operator delete` and `operator delete[]` functions with
+# the signatures that are usually provided by the standard C++ library to call
+# the libc allocator or the like.  If instead the only allocators available are
+# from the trivial-allocator library, but pointers from the uses of `new` made
+# possible by <lib/trivial-allocator/new.h> can be passed to `delete`, such as
+# via std::unique_ptr or similar "smart pointer" types, then it's necessary to
+# provide no-op deallocation functions.  Unlike those special `new` forms,
+# there is no way to `delete` and indicate a specific allocator object.  So
+# using this library is a catch-all hammer that prevents `delete` from doing
+# any real deallocation regardless of what kind of `new` created the pointer.
+#
+# Note also: even without use of `delete`, C++ classes with virtual functions
+# can produce implicit references in dead code that need to be satisfied.
+#
+# This library has no associated header since <new> already declares all the
+# `operator delete` functions; even without that `delete` is always available.
+# It's only provided to satisfy any link-time references with the no-op calls.
+static_library("stub-delete") {
+  sources = [ "stub-delete.cc" ]
+  public_deps = [ ":suppress-lsan-for-stub-delete" ]
+
+  if (is_kernel) {
+    deps = [
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+    ]
+  }
+}
+
+# Everything is leaked when `delete` is a no-op.
+sanitizer_extra_options("suppress-lsan-for-stub-delete") {
+  visibility = [ ":*" ]
+  args = [ "detect_leaks=0" ]
+  sanitizer = "lsan"
+  tags = [ "lsan" ]
+}
+
+# This is very similar, but instead of no-ops that leak memory when called,
+# each entry point will panic (via ZX_PANIC) if it's ever called at runtime.
+static_library("panic-delete") {
+  sources = [ "panic-delete.cc" ]
+
+  if (is_kernel) {
+    deps = [
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+    ]
+  }
+}
+
+if (!is_kernel) {
+  import("//build/components.gni")
+  import("//build/cpp/cpp_fuzzer.gni")
+  import("//build/test.gni")
+
+  test("trivial-allocator-unittests") {
+    sources = [
+      "basic-leaky-allocator-tests.cc",
+      "basic-owning-allocator-tests.cc",
+      "new-tests.cc",
+      "page-allocator-tests.cc",
+      "sealed-page-allocator-tests.cc",
+      "single-heap-allocator-tests.cc",
+    ]
+    deps = [
+      ":trivial-allocator",
+      "//src/lib/fxl/test:gtest_main",
+    ]
+  }
+
+  fuchsia_unittest_package("trivial-allocator-tests") {
+    deps = [ ":trivial-allocator-unittests" ]
+    manifest = "meta/trivial-allocator-tests.cml"
+  }
+
+  # This test is isolated since it no-op's out the `delete` usage done by the
+  # test harness itself.  For the same reason it's not really possible to have a
+  # test for panic-delete.
+  test("stub-delete-unittests") {
+    deps = [
+      ":trivial-allocator",
+      "//src/lib/fxl/test:gtest_main",
+    ]
+
+    if ((is_fuchsia || current_os == "linux") &&
+        toolchain_variant.tags + [ "replaces-allocator" ] -
+        [ "replaces-allocator" ] == toolchain_variant.tags) {
+      sources = [ "delete-tests.cc" ]
+      deps += [ ":stub-delete" ]
+    }
+  }
+
+  fuchsia_unittest_package("stub-delete-tests") {
+    deps = [ ":stub-delete-unittests" ]
+  }
+
+  group("tests") {
+    testonly = true
+
+    deps = [
+      ":stub-delete-tests",
+      ":stub-delete-unittests($host_toolchain)",
+      ":trivial-allocator-tests",
+      ":trivial-allocator-unittests($host_toolchain)",
+    ]
+  }
+}

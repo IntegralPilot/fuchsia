@@ -1,0 +1,275 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.audio.device;
+
+using fuchsia.hardware.audio;
+using fuchsia.hardware.audio.signalprocessing;
+using zx;
+
+/// The length of the device's unique ID, in bytes.
+const UNIQUE_INSTANCE_ID_SIZE uint32 = fuchsia.hardware.audio.UNIQUE_ID_SIZE;
+
+/// When a device is detected (or added via `Provider/AddDevice`), it is
+/// queried for its properties and capabilities. Once this enumeration process
+/// completes, it is announced to clients that are watching for device arrivals
+/// via `Registry/WatchDevicesAdded`.
+///
+/// An `Info` table is returned for each audio device that has been added.
+type Info = table {
+    /// A device identifier that is guaranteed unique for this boot session, but
+    /// may change across reboots.
+    ///
+    /// Required.
+    1: token_id TokenId;
+
+    /// The protocol used by the driver.
+    ///
+    /// Required.
+    2: device_type DeviceType;
+
+    /// The device's high-level name, as received from devfs or the `Provider/AddDevice` caller.
+    /// This string must be non-empty.
+    ///
+    /// Required.
+    3: device_name string:MAX_STRING_SIZE;
+
+    /// The name of the device's manufacturer.
+    /// If present, this string must be non-empty.
+    ///
+    /// Optional.
+    4: manufacturer string:MAX_STRING_SIZE;
+
+    /// The device's high-level product name.
+    /// If present, this string must be non-empty.
+    ///
+    /// Optional.
+    5: product string:MAX_STRING_SIZE;
+
+    /// A 16-character ID provided by the driver that (if present) can be used
+    /// to differentiate instances of the same device. This value should not
+    /// change across system reboots.
+    ///
+    /// Optional.
+    6: unique_instance_id array<uint8, UNIQUE_INSTANCE_ID_SIZE>;
+
+    /// Whether the device is a source (is_input TRUE) or destination (is_input FALSE) of audio.
+    ///
+    /// Optional for Codec; absent for Composite.
+    7: is_input bool;
+
+    /// The union of all formats the device can support, across all combinations of device
+    /// configuration settings.
+    /// If the device exposes one or more RingBuffer elements, this field must be present
+    /// and its vector must contain exactly one entry for each relevant RingBuffer element.
+    /// If the device exposes NO RingBuffer elements, this field must be omitted (entirely
+    /// absent, rather than populated with an empty vector).
+    /// If present, must contain at least one element.
+    ///
+    /// Optional for Composite; absent for Codec.
+    8: ring_buffer_format_sets vector<ElementRingBufferFormatSet>:MAX_PROCESSING_ELEMENT_COUNT;
+
+    /// The union of all DAI formats the device can support, across all combinations
+    /// of device configuration settings.
+    /// If the device exposes one or more Dai elements, this field must be present and its
+    /// vector must contain exactly one entry for each relevant Dai element.
+    /// If the device exposes NO Dai elements, this field must be omitted (entirely absent,
+    /// rather than populated with an empty vector).
+    /// If present, must contain at least one element.
+    ///
+    /// Required for Codec; optional for Composite.
+    9: dai_format_sets vector<ElementDaiFormatSet>:MAX_PROCESSING_ELEMENT_COUNT;
+
+    /// The device's hot-plug capabilities.
+    ///
+    /// Required for Codec; absent for Composite.
+    10: plug_detect_caps PlugDetectCapabilities;
+
+    /// An identifier for the clock domain in which the device's clock hardware
+    /// operates. Devices in the same clock domain remain perfectly
+    /// synchronized. They may drift relative to some other clock domain, but
+    /// all clocks in that domain will do so perfectly  _together_. Although
+    /// their clocks have the same rate, their positions may be offset by an
+    /// arbitrary, fixed amount.
+    ///
+    /// There are two special values for clock domain:
+    ///
+    /// *  `CLOCK_DOMAIN_MONOTONIC` means the hardware is driven by the system
+    ///    montonic clock and will always be synchronized with that timeline.
+    ///
+    /// *  `CLOCK_DOMAIN_EXTERNAL` means the hardware is not synchronized with any
+    ///    other known clocks (even any other clocks in `CLOCK_DOMAIN_EXTERNAL`).
+    ///
+    /// Required for Composite; absent for Codec.
+    11: clock_domain ClockDomain;
+
+    /// The vector of supported signal-processing elements.
+    /// If present, must contain at least one element.
+    ///
+    /// Required for Composite; optional for Codec.
+    12: signal_processing_elements
+            vector<fuchsia.hardware.audio.signalprocessing.Element>:fuchsia.hardware.audio.signalprocessing.MAX_COUNT_PROCESSING_ELEMENTS;
+
+    /// The vector of supported signal-processing topologies.
+    /// If present, must contain at least one element.
+    ///
+    /// Required for Composite; optional for Codec.
+    13: signal_processing_topologies
+            vector<fuchsia.hardware.audio.signalprocessing.Topology>:fuchsia.hardware.audio.signalprocessing.MAX_COUNT_TOPOLOGIES;
+
+    /// The union of all PacketStream formats the device can support, across all combinations
+    /// of device configuration settings.
+    /// If the device exposes one or more PacketStream elements, this field must be present
+    /// and its vector must contain one entry for each relevant PacketStream element.
+    /// If the device exposes NO PacketStream elements, this field must be omitted
+    /// (entirely absent, rather than populated with an empty vector).
+    /// If present, must contain at least one element.
+    ///
+    /// Optional for Composite; absent for Codec.
+    @available(added=HEAD)
+    14: packet_stream_format_sets vector<ElementPacketStreamFormatSet>:MAX_PROCESSING_ELEMENT_COUNT;
+};
+
+/// The device's hot-plug capabilities.
+type PlugDetectCapabilities = flexible enum {
+    /// Device is always plugged in. Plug state cannot change.
+    HARDWIRED = 0;
+
+    /// Device can be un/plugged and can asynchronously notify of changes.
+    PLUGGABLE = 1;
+};
+
+/// The current plugged-in state for the device.
+type PlugState = flexible enum {
+    /// Connected and available for audio streaming.
+    PLUGGED = 1;
+
+    /// Not connected; unavailable for audio streaming.
+    UNPLUGGED = 2;
+};
+
+/// `Registry` instances notify clients as devices arrive and depart, and they
+/// create observers (see `Observer`) that notify of more detailed state changes.
+@discoverable
+open protocol Registry {
+    /// Register for notification when one or more devices are added.
+    /// The `devices` vector will always contain at least one `Info` entry.
+    flexible WatchDevicesAdded() -> (table {
+        /// Devices added since `WatchDevicesAdded` was last called. When called
+        /// for the first time, this method returns all available audio devices
+        /// (even an empty vector, if no audio devices are present). Subsequent
+        /// calls will pend until additional devices become available.
+        1: devices vector<Info>:MAX_DEVICE_COUNT;
+    }) error RegistryWatchDevicesAddedError;
+
+    /// Register for notification when an (active, added) device is removed.
+    /// Because the method only notifies of one removal, upon completion it
+    /// should immediately be re-called, in case other removals have occurred.
+    /// Calls to this method will pend until the removal of a device that was
+    /// included in a previous `WatchDevicesAdded` response.
+    flexible WatchDeviceRemoved() -> (table {
+        /// The token of the device least-recently removed.
+        1: token_id TokenId;
+    }) error RegistryWatchDeviceRemovedError;
+
+    /// Request an `Observer` for the specified device.
+    flexible CreateObserver(resource table {
+        /// The token of the device to be observed.
+        ///
+        /// Required.
+        1: token_id TokenId;
+
+        /// The server end of the `Observer` that will be created.
+        ///
+        /// Required.
+        2: observer_server server_end:Observer;
+    }) -> (table {}) error RegistryCreateObserverError;
+};
+
+/// Errors returned by `Registry/WatchDevicesAdded`.
+type RegistryWatchDevicesAddedError = flexible enum {
+    /// The previous `WatchDevicesAdded` call has not yet completed.
+    ALREADY_PENDING = 1;
+};
+
+/// Errors returned by `Registry/WatchDeviceRemoved`.
+type RegistryWatchDeviceRemovedError = flexible enum {
+    /// The previous `WatchDeviceRemoved` call has not yet completed.
+    ALREADY_PENDING = 1;
+};
+
+/// Errors returned by `Registry/CreateObserver`.
+type RegistryCreateObserverError = flexible enum {
+    /// The required `token_id` is missing.
+    INVALID_TOKEN_ID = 1;
+
+    /// The required `observer_server` is missing.
+    INVALID_OBSERVER = 2;
+
+    /// No device with `token_id` was found. Either this token has never been
+    /// used, or the device with `token_id` has been removed.
+    DEVICE_NOT_FOUND = 3;
+
+    /// The device with `token_id` has encountered an error and can no longer be observed.
+    DEVICE_ERROR = 4;
+};
+
+/// `Observer` instances are used to learn the capabilities and state of an
+/// audio device, and to stay informed as its state changes over time. Each
+/// `Observer` is associated with an initialized audio device. An audio device
+/// may be observed by multiple `Observer` instances.
+open protocol Observer {
+    /// Query the device's available processing topologies and individual
+    /// elements, and watch for changes to those elements.
+    ///
+    /// These methods must be supported by Composite devices,
+    /// but are optional for Codec devices.
+    compose fuchsia.hardware.audio.signalprocessing.Reader;
+
+    /// Request notification of any change to the device's plug state. When
+    /// called for the first time, it will return immediately.
+    ///
+    /// Should only be called for Codec devices.
+    flexible WatchPlugState() -> (table {
+        /// The device's current plug state.
+        1: state PlugState;
+
+        /// The time (in CLOCK_MONOTONIC) of the most-recent change in plug state.
+        2: plug_time zx.Time;
+    }) error ObserverWatchPlugStateError;
+
+    /// Retrieve the device's reference clock.
+    ///
+    /// This clock will be in the domain specified in the device's `Info` table.
+    ///
+    /// Should only be called for Composite devices.
+    flexible GetReferenceClock() -> (resource table {
+        /// The device's reference clock.
+        1: reference_clock zx.Handle:CLOCK;
+    }) error ObserverGetReferenceClockError;
+};
+
+/// Errors returned by `Observer/WatchPlugState`.
+type ObserverWatchPlugStateError = flexible enum {
+    /// This device has encountered an error and can no longer be observed.
+    DEVICE_ERROR = 1;
+
+    /// This device type does not support the method that was called.
+    WRONG_DEVICE_TYPE = 2;
+
+    /// The previous `WatchPlugState` call has not yet completed.
+    ALREADY_PENDING = 3;
+};
+
+/// Errors returned by `Observer/GetReferenceClock`.
+type ObserverGetReferenceClockError = flexible enum {
+    /// This device has encountered an error and can no longer be observed.
+    DEVICE_ERROR = 1;
+
+    /// This device type does not support the method that was called.
+    WRONG_DEVICE_TYPE = 2;
+
+    /// The device's reference clock could not be returned.
+    DEVICE_CLOCK_UNAVAILABLE = 3;
+};

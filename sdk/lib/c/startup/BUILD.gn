@@ -1,0 +1,396 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/zircon/c_utils.gni")
+import("../libc.gni")
+
+libc_source_set("startup") {
+  sources = []
+  libc_deps = [
+    ":processargs-preinit",
+    ":start-main",
+    ":startup-random-impl",
+  ]
+}
+
+libc_test("unittests") {
+  sources = []
+}
+
+# These are referenced by StartCompilerAbi in one basic_abi libc_source_set()
+# and defined in a different basic_abi libc_source_set() for modularity.
+startup_relocate_symbols = [
+  "${libc_namespace}_StartupRelocateCreate",
+  "${libc_namespace}_StartupRelocateProtectRelro",
+]
+
+libc_source_set("shared-only") {
+  visibility = [ "..:*" ]
+
+  basic_abi = true
+  global_symbols = startup_relocate_symbols
+
+  sources = [ "stub-relocate.cc" ]
+  deps = [ ":headers" ]
+}
+
+libc_source_set("static-only") {
+  visibility = [ "..:*" ]
+
+  sources = []
+  libc_deps = [
+    ":crt1",
+    ":static-pie-relocate",
+  ]
+}
+
+libc_source_set("static-pie-relocate") {
+  visibility = [ ":*" ]
+
+  basic_abi = true
+  global_symbols = startup_relocate_symbols + [ "_ld_abi" ]
+  undefined_symbols = [
+    "${libc_namespace}_gLog",
+
+    # These will be defined implicitly by the linker in the outer link.
+    "_DYNAMIC",
+    "_GLOBAL_OFFSET_TABLE_",
+    "__ehdr_start",
+    "_end",
+  ]
+
+  sources = [ "static-pie-relocate.cc" ]
+  libc_deps = [ "../ld:log-panic" ]
+  deps = [
+    ":headers",
+    "//sdk/lib/ld:headers",
+    "//src/lib/elfldltl:hermetic",
+  ]
+}
+
+# This doesn't go into libc, but becomes the Scrt1.o linked into executables.
+# It defines the _start entry point symbol the linker looks for, and calls
+# __libc_start_main using only the basic machine ABI.
+libc_source_set("crt1") {
+  visibility = [ ":*" ]
+
+  # This doesn't really need to be in an hermetic_source_set() or redirect to
+  # the user.basic environment, because it's just assembly code anyway.  But
+  # doing so does the explicit check on what it's defining and referencing, and
+  # also gives the output .o file a well-known path that can be copied around.
+  basic_abi = true
+  global_symbols = [ "_start" ]
+  undefined_symbols = [
+    "__libc_start_main",
+    "main",
+  ]
+  sources = [ "crt1.S" ]
+  deps = [ "//zircon/kernel/lib/arch:headers" ]
+
+  objfile_metadata = {
+    libc_startfiles =
+        [ rebase_path("$target_out_dir/$target_name.o", root_build_dir) ]
+  }
+}
+
+# This will be a response file of the path for the right user.basic toolchain's
+# $target_out_dir/crt1.o relative to $root_build_dir.
+crt1_rspfile = "$target_gen_dir/crt1.rsp"
+
+# The sysroot setup depends on this to populate the sysroot's crt1 file, and
+# direct dependents know the $outputs path to use as an input file.  It
+# provides transitive order-only deps on getting the real crt1.o built too,
+# though it doesn't directly contribute any link inputs by being in deps.  This
+# will be instantiated in every toolchain that needs a sysroot.
+toolchain_utils_action("startfiles") {
+  visibility = [
+    "//zircon/public/sysroot/*",
+    "//zircon/public/sysroot_sdk/*",
+  ]
+
+  sysroot_gen_dir = get_label_info("//zircon/public/sysroot", "target_gen_dir")
+  outputs = [ "$sysroot_gen_dir/lib/Scrt1.o" ]
+
+  # toolchain_utils_action() is really only being used here for its response
+  # file expansion, which a copy() target can't do.  No actual utils are
+  # needed, so there's no implied PROGRAM argument and instead ln is the
+  # program and found in the PATH.  Since it's a fundamental system command,
+  # there's no need for GN/Ninja to know about a dependency on it as with the
+  # toolchain utilities or scripts.
+  mnemonic = "COPY"
+  utils = []
+  script = true
+  deps = [ ":crt1.rsp" ]
+  args = [
+    "ln",
+    "-f",
+    "@" + rebase_path(crt1_rspfile, root_build_dir),
+    rebase_path(outputs[0], root_build_dir),
+  ]
+}
+
+# This collects metadata to produce $crt1_rspfile.  The crt1.basic.objfile
+# redirect propagates the order-only build deps along with the metadata.
+generated_file("crt1.rsp") {
+  visibility = [ ":*" ]
+  outputs = [ crt1_rspfile ]
+  output_conversion = "list lines"
+  data_keys = [ "libc_startfiles" ]
+  deps = [ ":crt1.basic.objfile" ]
+}
+
+# Add this to deps when using -nostartfiles to get a link input for libc's
+# startfiles that acts like it was first in the link as default startfiles are.
+user_basic_redirect("nostartfiles") {
+  public_deps = [ ":nostartfiles.basic" ]
+}
+
+# The subtargets are reached via the :nostartfiles redirect, so they're in the
+# same toolchain where the $target_out_dir/crt1.o is actually built.  This
+# input linker script finds that with a path relative to the script's own
+# location, but marked to tell the linker to move it first in the link order as
+# the sysroot's crt1 would be without -nostartfiles.
+generated_file("nostartfiles.ldscript") {
+  visibility = [ ":nostartfiles.basic" ]
+  outputs = [ "$target_gen_dir/nostartfiles.ld" ]
+  output_conversion = "list lines"
+
+  _label = get_label_info(":$target_name", "label_with_toolchain")
+  _crt1_path = rebase_path("$target_out_dir/crt1.o", target_gen_dir)
+  contents = [
+    "/* Generated by $_label. DO NOT EDIT!",
+    " * This is used as an explicit link input when using -nostartfiles.",
+    " */",
+  ]
+  if (linker == "lld") {
+    contents += [ "INPUT($_crt1_path)" ]
+  } else {
+    contents += [ "STARTUP($_crt1_path)" ]
+  }
+
+  # Propagate order-only deps on the referenced file.  The linker depfile will
+  # track it for triggering relinks, so it doesn't need to be a declared input.
+  data_deps = [ ":crt1.objfile" ]
+}
+
+# This is reached by the user_basic_redirect() to make that a link input.
+basic_source_set("nostartfiles.basic") {
+  visibility = [ ":*" ]
+
+  # This is required in deps to use the generated_file() output as an input via
+  # libs, but also serves to propagate the order-only deps on crt1.objfile so
+  # the underlying file gets built (and triggers relinks via depfile).
+  deps = [ ":nostartfiles.ldscript" ]
+  libs = get_target_outputs(deps[0])
+}
+
+# The headers for the things used across hermetic boundaries are in this
+# separate headers-only target to avoid deps from any hermetic_source_set() to
+# any other targets providing link inputs.  Each hermetic_source_set() can have
+# its own `public` list if it's in deps of other non-hermetic targets.  But no
+# hermetic_source_set()'s own deps list can need to include any code targets
+# that don't go into the same hermetic partial link.
+source_set("headers") {
+  visibility = [ "../*" ]
+
+  public = [
+    "start-main.h",
+    "startup-relocate.h",
+    "startup-trampoline.h",
+  ]
+  public_deps = [
+    "..:asm-linkage",
+    "../zircon:vmar.headers",
+    "//zircon/system/ulib/zx",
+  ]
+}
+
+# :startup-random-impl is a basic ABI hermetic_source_set() defining this
+# symbol.  It's directly in deps of :startup to get into the outer link.  The
+# symbol will be used by other basic ABI hermetic partial link targets but they
+# don't have deps on :startup-random-impl to get it into each hermetic link.
+# If they did, those hermetic links would need to include the undefined_symbols
+# list here and wouldn't distinguish where the references came from.  Instead,
+# they just need to add startup_random_symbols to undefined_symbols and the
+# expected references from startup-random.cc are checked by each separate
+# hermetic link.  Both hermetic and non-hermetic users of startup-random.h need
+# deps on :startup-random just for the header visibility.
+startup_random_symbols = [ "${libc_namespace}_InitStartupRandom" ]
+
+source_set("startup-random") {
+  visibility = [ "../*" ]
+  public = [ "startup-random.h" ]
+  deps = [ "..:asm-linkage" ]
+}
+
+libc_source_set("startup-random-impl") {
+  visibility = [ ":startup" ]
+
+  # This is called too early in startup to use the compiler ABI.
+  basic_abi = true
+  global_symbols = startup_random_symbols
+
+  # These will be defined implicitly by the linker in the outer link.
+  undefined_symbols = [
+    "__start_${libc_namespace}_StartupRandom",
+    "__stop_${libc_namespace}_StartupRandom",
+  ]
+
+  # This helps the legacy C code call the function declared only in C++.
+  public_configs = [ ":startup-random.musl-glue" ]
+  visibility += [ "//zircon/third_party/ulib/musl/src/env:start-main" ]
+
+  sources = [ "startup-random.cc" ]
+  deps = [
+    ":startup-random",
+    "//sdk/lib/ld:headers",
+    "//src/zircon/lib/zircon:zircon.as-needed",
+  ]
+}
+
+config("startup-random.musl-glue") {
+  visibility = [ ":*" ]
+  defines = [ "__libc_init_randoms=${startup_random_symbols[0]}" ]
+}
+
+# These parts go into libc: __libc_start_main and its call graph.
+libc_source_set("startup-trampoline") {
+  visibility = [ ":*" ]
+
+  public_deps = [ ":headers" ]
+
+  basic_abi = true
+  global_symbols = [ "__libc_start_main" ]
+  undefined_symbols = [
+                        "${libc_namespace}_SetStartHandles",
+                        "${libc_namespace}_gLog",
+                        "${libc_namespace}_start_main",
+                        "_zx_startup_get_handles",
+                      ] + startup_relocate_symbols + startup_random_symbols
+
+  undefined_symbols += [
+    # TODO(https://fxbug.dev/342469121): These won't be used anymore when
+    # ../threads:musl-tls is removed.
+    "${libc_namespace}_GetTlsLayout",
+    "${libc_namespace}_InitializeTls",
+
+    # TODO(https://fxbug.dev/342469121): This won't be used anymore when
+    # :musl-glue is removed.
+    "${libc_namespace}_InitialStackSize",
+  ]
+
+  sources = [ "startup-trampoline.S" ]
+  libc_deps = [
+    ":start-compiler-abi",
+    "../ld:log-panic",
+  ]
+  deps = [
+    "..:asm-linkage",
+    "//zircon/kernel/lib/arch",
+  ]
+}
+
+libc_source_set("start-compiler-abi") {
+  visibility = [ ":*" ]
+
+  public_deps = [ ":headers" ]
+
+  sources = [ "start-compiler-abi.cc" ]
+  libc_deps = [
+    "../threads:thread-storage",
+    "../threads:thread-storage-allocate",
+  ]
+  deps = [
+    ":startup-random",
+    "../ld:log.headers",
+    "../threads:stack-abi",
+    "../threads:zxr-tls",
+    "//zircon/system/ulib/zx",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+}
+
+# This the second half of __libc_start_main, outside the basic_abi bubble.
+# It's called by :startup-trampoline, but the deps go the other way, since
+# that target needs hermeticity that this target doesn't.
+libc_source_set("start-main") {
+  visibility = [ ":*" ]
+
+  public_deps = [ ":headers" ]
+
+  sources = [ "start-main.cc" ]
+  libc_deps = [
+    ":startup-trampoline",
+    "../stdlib:exit",
+    "../threads:thread-list",
+    "../threads:thread-storage",
+  ]
+  deps = [
+    "//sdk/lib/ld:fuchsia-debugdata",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+}
+
+# This is used in the first half of __libc_start_main, in the basic ABI.
+libc_source_set("processargs-get-handles") {
+  visibility = [ ":*" ]
+
+  public = [ "processargs.h" ]
+  public_deps = [
+    ":headers",
+    "..:asm-linkage",
+    "//sdk/lib/ld:processargs",
+    "//zircon/system/ulib/zx",
+  ]
+
+  basic_abi = true
+  global_symbols = [
+    "${libc_namespace}_ProcessargsGetHandles",
+    "_zx_startup_get_handles",
+  ]
+  undefined_symbols = [
+    "${libc_namespace}_gLog",
+    "__libc",
+  ]
+
+  sources = [ "processargs-get-handles.cc" ]
+  libc_deps = [
+    "../ld:log-panic",
+    "../zircon:vmar",
+  ]
+  deps = [
+    "//sdk/lib/ld:processargs",
+    "//zircon/system/ulib/zircon-internal",
+  ]
+
+  configs = [ "//build/config:Wno-vla-cxx-extension" ]
+}
+
+# This is used in the second half of __libc_start_main, with the full ABI.
+libc_source_set("processargs-preinit") {
+  visibility = [ ":*" ]
+
+  sources = [ "processargs-preinit.cc" ]
+  libc_deps = [ ":processargs-get-handles" ]
+  deps = [
+    "..:weak",
+    "../ld:log.headers",
+    "//sdk/lib/ld:headers",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+}
+
+libc_source_set("musl-glue") {
+  visibility = [ ":*" ]
+
+  basic_abi = true
+  global_symbols = [ "${libc_namespace}_InitialStackSize" ]
+  undefined_symbols = [ "_dl_stack_size" ]
+
+  sources = [ "musl-stack-size.cc" ]
+  deps = [
+    ":headers",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+}

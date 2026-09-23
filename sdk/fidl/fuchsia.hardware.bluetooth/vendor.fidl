@@ -1,0 +1,132 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.bluetooth;
+
+using zx;
+
+/// The maximum buffer length an encoded command might require.
+/// Update when adding new commands that might require a larger buffer.
+const BT_VENDOR_MAX_COMMAND_BUFFER_LEN uint16 = 16;
+
+/// Indicates support for Android Vendor Extensions
+/// If empty, Android HCI Extensions are supported but the version is unspecified.
+/// The version should be detected using the LE Get Vendor Capabilities Command.
+type AndroidVendorSupport = table {
+    1: major_version uint8;
+    2: minor_version uint8;
+};
+
+/// Various settings for audio offload data paths, which vary by controller
+/// manufacturer and firmware version.
+@available(added=28)
+type AudioOffloadSettings = table {
+    /// The index to use when SCO OFFLOAD DataPath is requested.
+    1: sco_offload_index uint8;
+};
+
+/// Table of features supported by the vendor.
+type VendorFeatures = table {
+    /// Supports the SetAclPriority command
+    /// If missing, the command is not supported.
+    1: acl_priority_command bool;
+    /// Supports Android Vendor Extensions
+    /// If missing, Android Vendor Extensions are not supported.
+    2: android_vendor_extensions AndroidVendorSupport;
+    /// Specify some alternative settings for audio offload paths.
+    /// If missing, use the reasonable defaults or configured settings.
+    @available(added=28)
+    3: audio_offload_settings AudioOffloadSettings;
+};
+
+type VendorAclPriority = flexible enum : uint8 {
+    NORMAL = 1;
+    HIGH = 2;
+};
+
+type VendorAclDirection = flexible enum : uint8 {
+    SOURCE = 1;
+    SINK = 2;
+};
+
+type VendorSetAclPriorityParams = table {
+    /// The ACL connection handle which is requested to be prioritized.
+    1: connection_handle uint16;
+    2: priority VendorAclPriority;
+    /// The direction data should be prioritized in. May not be supported by all
+    /// vendors. Ignored when priority is normal.
+    3: direction VendorAclDirection;
+};
+
+type VendorCommand = flexible union {
+    1: set_acl_priority VendorSetAclPriorityParams;
+};
+
+@available(added=31)
+alias VendorCrashEventPrefix = vector<byte>:8;
+
+/// Parameters for filing controller crash reports.
+@available(added=31)
+type VendorCrashParameters = table {
+    /// The prefixes of the vendor event payloads to match. For example, this could
+    /// be the subevent code. If the prefix is empty, all vendor debug events will be
+    /// treated as crash events.
+    /// Required. At least one prefix must be specified.
+    1: crash_events vector<VendorCrashEventPrefix>:MAX;
+    /// The program name to use in the crash report.
+    /// Required.
+    2: program_name string:1024;
+    /// The signature to use in the crash report.
+    /// Must match [a-z][a-z-]* i.e. only lowercase letters and hyphens.
+    /// Required.
+    3: crash_signature string:128;
+};
+
+/// The BtVendor protocol may be implemented by vendor drivers to support feature interrogation
+/// and vendor command encoding.
+open protocol Vendor {
+    /// Returns the Vendor Features supported by this controller.
+    flexible GetFeatures() -> (VendorFeatures);
+
+    /// Encode the vendor HCI command and return the encoded command.
+    /// See `VendorCommand` for possible commands and parameters.
+    /// * error `ZX_ERR_NOT_SUPPORTED` The command is not supported.
+    /// * error `ZX_ERR_INVALID_ARGS` The parameters of the command are invalid.
+    flexible EncodeCommand(VendorCommand) -> (struct {
+        encoded vector<uint8>:BT_VENDOR_MAX_COMMAND_BUFFER_LEN;
+    }) error zx.Status;
+
+    /// No longer supported - use OpenHciTransport() instead
+    /// Open the HCI protocol to the controller.  This call may block until the
+    /// controller has been initialized.
+    /// Returns ALREADY_BOUND if another client has already connected.
+    @available(removed=NEXT, note="use OpenHciTransport")
+    flexible OpenHci() -> (resource struct {
+        channel client_end:Hci;
+    }) error zx.Status;
+
+    /// Open the HciTransport protocol to the controller. This call may block until the
+    /// controller has been initialized.
+    /// Returns ALREADY_BOUND if another client has already connected.
+    flexible OpenHciTransport() -> (resource struct {
+        channel client_end:HciTransport;
+    }) error zx.Status;
+
+
+    /// Open the Snoop protocol to the transport driver.
+    /// Returns ALREADY_BOUND if another client has already connected.
+    flexible OpenSnoop() -> (resource struct {
+        channel client_end:Snoop;
+    }) error zx.Status;
+
+    /// Returns parameters used by bt-snoop to record and file Bluetooth controller crash reports.
+    /// Core dump events will be redacted from snoop logs.
+    /// Returns NOT_SUPPORTED if crash dumps are not supported by this vendor.
+    @available(added=31)
+    flexible GetCrashParameters() -> (VendorCrashParameters) error zx.Status;
+};
+
+// Added to allow service connection to replace devfs
+service Service {
+    vendor client_end:Vendor;
+};

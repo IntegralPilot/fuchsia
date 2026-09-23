@@ -1,0 +1,296 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/rust/rustc_artifact.gni")
+import("//build/rust/rustc_test.gni")
+import("//build/toolchain/restat.gni")
+
+# Defines a Rust procedural macro
+#
+# Parameters
+#
+#   output_name (optional)
+#   name (optional, deprecated)
+#     Name of the crate as defined in its manifest file. If not specified, it is
+#     assumed to be the same as the target name.
+#
+#   version (optional)
+#     Semver version of the crate as seen on crates.io.
+#
+#   edition
+#     Edition of the Rust language to be used. See
+#     https://doc.rust-lang.org/edition-guide/editions/index.html for more info on rust editions.
+#
+#   configs (optional)
+#     A list of config labels applying to this target.
+#
+#   enforce_source_listing (optional)
+#     When true, enforces that any source files used by the Rust compiler are
+#     listed in `sources`. Defaults to true.
+#
+#   sources (optional)
+#     List of source files which this crate is allowed to compile. Only
+#     allowed when `enforce_source_listing = true`.
+#     The Rust compiler discovers source files by following `mod` declarations
+#     starting at the `source_root`. The discovered source files must match this
+#     list.
+#
+#   inputs (optional)
+#     List of additional non-source files read by the compiler. These are typically
+#     configuration or test-data files included in the build with the `include_str!`
+#     macro. Only allowed when `enforce_source_listing = true`.
+#
+#   deps (optional)
+#     List of rust_library GN targets on which this crate depends.
+#     Third party crates can be included through paths like
+#     "//third_party/rust_crates:<cratename>".
+#
+#   test_deps (optional)
+#     List of rust_library GN targets on which this crate's tests depend.
+#
+#   non_rust_deps (optional)
+#     List of non-rust_library GN targets on which this crate depends.
+#     Obsolete. Please use deps instead.
+#
+#   data_deps (optional)
+#     List of GN targets that are only needed at runtime.
+#
+#   with_unit_tests (optional)
+#     Builds unit tests associated with the library. This will create a
+#     `<name>_test` test file in the output directory. Equivalent to adding a
+#     `rustc_test` target with that name and the same source_root.
+#
+#   source_root (optional)
+#     Location of the crate root (e.g. `src/main.rs` or `src/lib.rs`).
+#     This defaults to `./src/main.rs` for binaries and `./src/lib.rs` for libraries,
+#     and should only be changed when absolutely necessary
+#     (such as in the case of generated code).
+#
+#   rustenv (optional)
+#     A list of environment variables that will be set when running the rust
+#     compiler. These can be accessed at compile time with
+#     [`std::env!`](https://doc.rust-lang.org/stable/std/macro.env.html)
+#
+#   output_dir (optional)
+#     Directory that the resulting macro should be placed in.
+#     See: `gn help output_dir`
+#
+#   disable_rbe (optional)
+#     Set to true to force this target to build locally, overriding the global
+#     `rust_rbe_enable`.  This also applies to the unit-test unless
+#     overridden by `test_disable_rbe`.
+#
+#   test_disable_rbe (optional)
+#     Set to true to build the unit-test locally.
+#
+#   disable_clippy (optional)
+#     Don't run clippy on this target.
+#
+#   disable_rustdoc (optional)
+#     Don't add this target to https://fuchsia.dev/go/rustdoc
+#
+#   original_target_name (optional)
+#     The name of the target as it appears in the BUILD file. Enables tooling
+#     to find the template invocation in a BUILD file where this target was defined.
+#
+#
+#   The following fields are only used by Bazel-converted targets.
+#   See //build/tools/bazel2gn/README.md for details.
+#
+#      proc_macro_deps (optional)
+#        For proc_macro dependencies, has the same semantics as deps in GN,
+#        except that these are always built in `$host_toolchain`, since
+#        procedural macros run as compiler plugins on the build machine.
+#        Entries must not specify a toolchain.
+#
+# Example of usage:
+#
+#   rustc_macro("foo") {
+#     deps = [
+#       "//garnet/public/rust/bar",
+#       "//third_party/rust_crates:serde",
+#       "//third_party/rust_crates:slab",
+#     ]
+#     sources = [ "src/lib.rs" ]
+#   }
+template("rustc_macro") {
+  # Compiling procedural macros is... a bit awkward.
+  #
+  # Even though they're provided to crates that use them as if they were normal
+  # external crates, they're actually '.so'/'.dylib's that are compiled for the
+  # host machine and then linked into the compiler, so they and all their
+  # dependencies should be built for the host target.
+  #
+  # Once this is done, the resulting artifacts are copied into the Fuchsia
+  # target directories to act as if they had been built for Fuchsia. In order to
+  # avoid conflicts, the outputs of the original (host) artifact are built with
+  # a `_proc_macro` suffix added onto the end, which is removed when they're
+  # copied into the final target directory.
+
+  if (current_toolchain == host_toolchain) {
+    if (defined(invoker.original_target_name)) {
+      _original_target_name = invoker.original_target_name
+    } else {
+      _original_target_name = target_name
+    }
+
+    assert(!(defined(invoker.output_name) && defined(invoker.name)),
+           "Only one of output_name and name may be specified.")
+
+    # The 'is_host' var is true in situations that we don't want, such as
+    # cross-compiling for _other_ hosts.
+    #
+    # We only want this to be run in _this_ machine's host_toolchain.
+
+    # The actual host-target build of the proc macro crate.
+    if (defined(invoker.crate_name)) {
+      package_name = invoker.crate_name
+    } else if (defined(invoker.output_name)) {
+      package_name = invoker.output_name
+    } else if (defined(invoker.name)) {
+      package_name = invoker.name
+    } else {
+      package_name = target_name
+    }
+    crate_name = string_replace(package_name, "-", "_")
+
+    if (!defined(invoker.source_root)) {
+      source_root = "src/lib.rs"
+    } else {
+      source_root = invoker.source_root
+    }
+
+    rustc_artifact(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "aliased_deps",
+                               "applicable_licenses",
+                               "data_deps",
+                               "define_rustdoc_test_override",
+                               "disable_clippy",
+                               "disable_rustdoc",
+                               "edition",
+                               "enforce_source_listing",
+                               "features",
+                               "inputs",
+                               "lint_config",
+                               "output_dir",
+                               "output_name",
+                               "proc_macro_deps",
+                               "public_deps",
+                               "quiet_clippy",
+                               "rustdoc_args",
+                               "rustdoc_out_dir",
+                               "rustenv",
+                               "rustflags",
+                               "sources",
+                               "testonly",
+                               "validations",
+                               "visibility",
+                               "zip_rustdoc_to",
+                             ])
+
+      not_needed(invoker,
+                 [
+                   "version",
+                   "non_rust_deps",
+                   "force_opt",
+                 ])
+
+      if (defined(visibility)) {
+        # Make this target visible to redirection groups.
+        visibility += [ ":*" ]
+      }
+
+      target_type = "rust_proc_macro"
+      configs = []
+      configs = invoker.configs
+
+      crate_root = source_root
+      crate_type = "proc-macro"
+      original_target_name = _original_target_name
+      if (!defined(output_name)) {
+        output_name = crate_name
+      }
+
+      deps = []
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+
+      # TODO(https://fxbug.dev/42120123) remove "non_rust_deps"
+      if (defined(invoker.non_rust_deps)) {
+        deps += invoker.non_rust_deps
+      }
+
+      metadata = {
+        if (defined(invoker.metadata)) {
+          forward_variables_from(invoker.metadata, "*")
+        }
+        if (defined(invoker.disable_rustdoc)) {
+          disable_rustdoc = [ invoker.disable_rustdoc ]
+        }
+      }
+    }
+
+    # If "with_unit_tests" is set to true, generate an additional rust test
+    # target. Since the parent rule is used to compile macros, which only run on
+    # the host, only run the test code for the macros on the host.
+    # TODO(https://fxbug.dev/42152447): accept a string.
+    if (defined(invoker.with_unit_tests) && invoker.with_unit_tests) {
+      rustc_test("${target_name}_test") {
+        name = target_name
+        if (defined(invoker.name)) {
+          name = invoker.name + "_test"
+        }
+        original_target_name = _original_target_name
+
+        forward_variables_from(invoker,
+                               "*",
+                               [
+                                 "name",
+                                 "test_disable_rbe",
+                                 "validations",
+                               ])
+
+        if (defined(visibility)) {
+          # Make this target visible to redirection groups.
+          visibility += [ ":*" ]
+        }
+        configs += [ "//build/config/rust:proc_macro_test" ]
+        if (defined(invoker.test_disable_rbe)) {
+          disable_rbe = invoker.test_disable_rbe
+        }
+      }
+    }
+  } else {
+    # If not in this machine's host_toolchain, switch to it.
+    #
+    # Note that we also want to be in the base variant so we don't instrument
+    # our macros with sanitizers. That is handled by the lower-level
+    # rust_proc_macro template in BUILDCONFIG.gn.
+    group(target_name) {
+      public_deps = [ ":${target_name}($host_toolchain)" ]
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+    }
+
+    if (defined(invoker.with_unit_tests) && invoker.with_unit_tests) {
+      # For convenience, create a forwarding target that points to the on-host
+      # test target. This allows developers to list "${target_name}_test" in a
+      # test group instead of "${target_name}_test($host_toolchain)" to
+      # include the test target generated for this rule.
+      group("${target_name}_test") {
+        public_deps = [ ":${target_name}($host_toolchain)" ]
+        forward_variables_from(invoker, [ "visibility" ])
+        testonly = true
+      }
+    }
+
+    not_needed(invoker, "*")
+  }
+}

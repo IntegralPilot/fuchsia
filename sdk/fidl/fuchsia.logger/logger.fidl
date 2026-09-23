@@ -1,0 +1,206 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=7)
+library fuchsia.logger;
+
+using zx;
+using fuchsia.diagnostics;
+using fuchsia.diagnostics.types;
+
+/// Log levels used with log related filtering.
+/// Filtering uses a heuristic based on a threshold of
+/// minimum severity level - with any log equal to or
+/// greater than the threshold being included in the
+/// printable logs.
+// TODO(https://fxbug.dev/42055808): Change this from `strict` to `flexible` #strictaudit
+@strict_audit(bug="https://fxbug.dev/467128231", state="PENDING_REVIEW")
+type LogLevelFilter = strict enum : int8 {
+    TRACE = 0x10;
+    DEBUG = 0x20;
+    INFO = 0x30;
+    WARN = 0x40;
+    ERROR = 0x50;
+    FATAL = 0x60;
+    NONE = 0x7F;
+};
+
+/// The interval between discrete log severity levels
+const LOG_SEVERITY_STEP_SIZE uint8 = 0x10;
+
+/// Maximum available log severity.
+const LOG_SEVERITY_MAX_STEP uint8 = 6;
+
+/// The interval between discrete log verbosity levels
+const LOG_VERBOSITY_STEP_SIZE uint8 = 0x1;
+
+/// Default log level used to initialize loggers.
+const LOG_LEVEL_DEFAULT LogLevelFilter = LogLevelFilter.INFO;
+
+/// Max number of tags that can be passed to filter by listener.
+const MAX_TAGS uint8 = 16;
+
+/// Max tag length that can be passed to filter by listener.
+const MAX_TAG_LEN_BYTES uint8 = 63;
+
+type LogFilterOptions = struct {
+    filter_by_pid bool;
+    pid uint64;
+
+    filter_by_tid bool;
+    tid uint64;
+
+    /// If more than zero, logs would be filtered based on verbosity and
+    /// `min_severity` would be ignored.
+    verbosity uint8;
+
+    /// Severity used as threshold to determine logging level.
+    min_severity LogLevelFilter;
+
+    /// If non-empty, return all messages which contain at least one specified
+    /// tag.  If empty, messages will not be filtered by tag.
+    /// Passed tags should not be more than `MAX_TAG_LEN_BYTES` bytes in length
+    /// and max tags can be `MAX_TAGS`.
+    /// Listener would be discarded if the limit is not followed.
+    tags vector<string:MAX_TAG_LEN_BYTES>:MAX_TAGS;
+};
+
+/// Max tags that will be attached to a LogMessage.
+const MAX_TAGS_PER_LOG_MESSAGE uint8 = 5;
+
+/// Max byte size for message payload.
+const MAX_DATAGRAM_LEN_BYTES uint32 = 32768;
+
+type LogMessage = struct {
+    pid uint64;
+    tid uint64;
+
+    /// [zx_clock_get_monotonic](https://fuchsia.dev/fuchsia-src/reference/syscalls/clock_get_monotonic.md)
+    @available(replaced=25)
+    time zx.Time;
+
+    /// [zx_clock_get_boot](https://fuchsia.dev/fuchsia-src/reference/syscalls/clock_get_boot.md)
+    @available(added=25)
+    time zx.InstantBoot;
+
+    severity int32;
+
+    /// See [wire_format.h](https://cs.opensource.google/fuchsia/fuchsia/+/main:zircon/system/ulib/syslog/include/lib/syslog/wire_format.h).
+    /// As messages can be served out of order, this should only be logged if more than
+    /// last count.
+    dropped_logs uint32;
+    tags vector<string:MAX_TAG_LEN_BYTES>:MAX_TAGS_PER_LOG_MESSAGE;
+    msg string:MAX_DATAGRAM_LEN_BYTES;
+};
+
+/// Interface for LogListenerSafe to register to listen to logs.
+@discoverable(server="platform")
+closed protocol Log {
+    /// Dumps all cached logs by calling LogMany() in batches followed by Log() for each new log
+    /// message.
+    /// A null `options` indicates no filtering is requested.
+    strict ListenSafe(resource struct {
+        log_listener client_end:LogListenerSafe;
+        options box<LogFilterOptions>;
+    });
+
+    /// Dumps all cached logs by calling LogMany() followed by Done() on `log_listener`.
+    /// A null `options` indicates no filtering is requested.
+    @available(removed=27)
+    strict DumpLogsSafe(resource struct {
+        log_listener client_end:LogListenerSafe;
+        options box<LogFilterOptions>;
+    });
+
+    /// Listens to new log entries by calling Log() on `log_listener`.
+    /// A null `options` indicates no filtering is requested.
+    @available(removed=27)
+    strict ListenSafeWithSelectors(resource struct {
+        log_listener client_end:LogListenerSafe;
+        options box<LogFilterOptions>;
+        selectors
+                vector<fuchsia.diagnostics.LogInterestSelector>:fuchsia.diagnostics.MAX_LOG_SELECTORS;
+    });
+};
+
+// TODO(https://fxbug.dev/42055808): Change this from `strict` to `flexible`. #strictaudit
+@strict_audit(bug="https://fxbug.dev/467128231", state="PENDING_REVIEW")
+type InterestChangeError = strict enum : uint32 {
+    /// Incorrectly called WaitForInterestChange twice
+    /// without waiting for the first call to return.
+    CALLED_TWICE = 1;
+};
+
+/// Drains a program's logs.
+@discoverable(server="platform")
+closed(removed=26) open(added=26) protocol LogSink {
+    /// This event is sent whenever Archivist accepts a new connection. Clients may use
+    /// the returned IOBuffer to write logs.
+    @available(added=28)
+    flexible -> OnInit(resource table {
+        1: buffer zx.Handle:IOB;
+        2: interest fuchsia.diagnostics.types.Interest;
+    });
+
+    /// Send this socket to be drained.
+    ///
+    /// See [wire_format.h](https://cs.opensource.google/fuchsia/fuchsia/+/main:zircon/system/ulib/syslog/include/lib/syslog/wire_format.h)
+    /// for what is expected to be received over the socket.
+    @available(removed=26)
+    strict Connect(resource struct {
+        socket zx.Handle:SOCKET;
+    });
+
+    @available(replaced=27)
+    strict WaitForInterestChange() -> (struct {
+        data fuchsia.diagnostics.Interest;
+    }) error InterestChangeError;
+
+    /// LogSink implementers will return to this hanging-get whenever the scope of
+    /// their interest changes. Clients are expected to emit messages based on
+    /// the registered Interest. In the event that an empty interest is
+    /// conveyed, clients should emit messages based on their default
+    /// e.g. compile time configuration. Each client may only poll this once at a time.
+    /// Invoking WaitForInterestChange a second time before the first call returns will
+    /// result in an error being returned.
+    @available(added=27)
+    strict WaitForInterestChange() -> (struct {
+        data fuchsia.diagnostics.types.Interest;
+    }) error InterestChangeError;
+
+    /// Send this socket to be drained, using the structured logs format.
+    ///
+    /// See [Encoding structured records](https://fuchsia.dev/fuchsia-src/reference/platform-spec/diagnostics/logs-encoding)
+    /// for what is expected to be received over the socket.
+    @available(removed=29)
+    strict ConnectStructured(resource struct {
+        socket zx.Handle:SOCKET;
+    });
+};
+
+/// Max log bytes per call to a listener.
+const MAX_LOG_MANY_SIZE_BYTES uint64 = 16384;
+
+/// A listener who will notify the `Log` of the receipt of each message.
+closed protocol LogListenerSafe {
+    /// Called for single messages.
+    ///
+    /// The return value is used for flow control, and implementers should acknowledge receipt of
+    /// each message in order to continue receiving future messages.
+    strict Log(struct {
+        log LogMessage;
+    }) -> ();
+
+    /// Called when serving cached logs.
+    ///
+    /// Max logs size per call is `MAX_LOG_MANY_SIZE_BYTES` bytes.
+    ///
+    /// The return value is used for flow control, and implementers should acknowledge receipt of
+    /// each batch in order to continue receiving future messages.
+    strict LogMany(struct {
+        log vector<LogMessage>:MAX;
+    }) -> ();
+
+    /// Called when this listener was passed to `DumpLogsSafe()` and all cached logs have been sent.
+    strict Done();
+};

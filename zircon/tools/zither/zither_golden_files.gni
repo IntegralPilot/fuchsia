@@ -1,0 +1,162 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/testing/golden_files.gni")
+import("//zircon/tools/zither/zither_library.gni")
+
+# `zither_golden_files()` is a wrapper around `golden_files()`, where the
+# outputs to check against the provided goldens are implicitly given by a
+# zither backend.
+#
+# Parameters:
+#
+#  * fidl
+#    - Required: The label of a `fidl()` target, necessarily defined earlier in
+#      the same file (for `get_target_outputs` purposes).
+#    - Type: label
+#
+#  * backend
+#    - Required: The zither backend to test against the provided goldens. Must
+#      be one of `supported_zither_backend_names`.
+#    - Type: string
+#
+#  * sources
+#    - Optional: The list of golden files sources to test the backend against.
+#      For each golden, it is expected that the backend produces a file of the
+#      same basename: each such pair will be tested. Each golden is required to
+#      match an output, but each output is not required to match a golden. This
+#      parameter is mutually exclusive with `source_dir` and is required if the
+#      latter is not set.
+#    - Type: list(relative path).
+#
+#  * source_dir
+#    - Optional: The source directory under which all top-level files that
+#      match the basename of a backend output will be registered as a golden.
+#      This is useful in the case where a backend's outputs are not statically
+#      known in GN, but where we wish to check them all in as goldens (e.g.,
+#      syscall documentation). (Note: this is only really sensible if the
+#      backend outputs have a flat layout.) This parameter is mutually
+#      exclusive with `sources` and is required if the latter is not set.
+#
+template("zither_golden_files") {
+  assert(defined(invoker.fidl),
+         "zither_golden_files(\"$target_name\") requires `fidl`")
+  assert(defined(invoker.backend),
+         "zither_golden_files(\"$target_name\") requires `backend`")
+  assert(
+      defined(invoker.sources) || defined(invoker.source_dir),
+      "zither_golden_files(\"$target_name\") requires one of `sources` or `source_dir`")
+  assert(
+      !defined(invoker.sources) || !defined(invoker.source_dir),
+      "zither_golden_files(\"$target_name\") requires precisely one of `sources` or `source_dir`")
+
+  assert(
+      supported_zither_backends + [ invoker.backend ] - [ invoker.backend ] !=
+          supported_zither_backends,
+      "zither_golden_files(\"$target_name\"): unsupported `backend`: ${invoker.backend}")
+
+  if (current_toolchain == default_toolchain) {
+    # An internal means of accessing a backend's outputs.
+    backend_gen_label = "${invoker.fidl}_zither.${invoker.backend}.gen"
+    backend_outputs = get_target_outputs(backend_gen_label)
+
+    main_target = target_name
+
+    if (defined(invoker.source_dir)) {
+      # The output manifest is always first, per a private contract with
+      # zither_library().
+      outputs_json = backend_outputs[0]
+
+      dynamic_goldens_target =
+          "_zither_golden_files.${main_target}.dynamic_manifest"
+      golden_comparisons = "$target_gen_dir/$main_target.goldens.json"
+      action(dynamic_goldens_target) {
+        forward_variables_from(invoker,
+                               [
+                                 "testonly",
+                                 "visibility",
+                               ])
+        if (defined(visibility)) {
+          visibility += [ ":*" ]
+        }
+
+        deps = [ backend_gen_label ]
+
+        outputs = [ golden_comparisons ]
+        sources = [ outputs_json ]
+
+        script =
+            "//zircon/tools/zither/scripts/create-dynamic-golden-manifest.py"
+        args = [
+          "--source-dir",
+          rebase_path(invoker.source_dir, "//"),
+          "--candidates",
+          rebase_path(outputs_json, root_build_dir),
+          "--output",
+          rebase_path(golden_comparisons, root_build_dir),
+        ]
+      }
+      golden_deps = [ ":$dynamic_goldens_target" ]
+    } else {
+      # Cross-reference the given goldens with the backend outputs by name to
+      # figure out the intended golden comparisons.
+      unmatched = []
+      golden_comparisons = []
+      foreach(golden, invoker.sources) {
+        match = false
+        foreach(output, backend_outputs) {
+          if (!match &&
+              get_path_info(golden, "file") == get_path_info(output, "file")) {
+            golden_comparisons += [
+              {
+                golden = golden
+                candidate = output
+              },
+            ]
+            match = true
+          }
+        }
+        if (!match) {
+          unmatched += [ golden ]
+        }
+      }
+      assert(
+          unmatched == [],
+          "zither_golden_files(\"$target_name\"): Could not match the following goldens with zither outputs: $unmatched")
+
+      golden_deps = [ backend_gen_label ]
+    }
+
+    golden_files(main_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      comparisons = golden_comparisons
+
+      # Formatting is only allowed when the candidates are explicitly supplied.
+      if (defined(invoker.sources)) {
+        backend_info = supported_zither_backend_info[invoker.backend]
+        forward_variables_from(backend_info, [ "formatter" ])
+      }
+      deps = golden_deps
+    }
+  } else {
+    group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      deps = [ ":$target_name($default_toolchain)" ]
+    }
+    not_needed(invoker,
+               "*",
+               [
+                 "testonly",
+                 "visibility",
+               ])
+  }
+}

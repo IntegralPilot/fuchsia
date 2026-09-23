@@ -1,0 +1,456 @@
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main, kernel, next]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "7 7 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+name: CI
+jobs:
+  quality:
+    name: Quality Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      # Packages in ubuntu-latest can be old. Use nix to source newer tools.
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - run: sudo apt-get install -y linkchecker
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-rdme
+      - run: git config user.name "github-runner" && git config user.email "<>"
+
+      - name: Signed-off-by Tag Check
+        if: github.event_name == 'pull_request'
+        run: |
+          git rebase --exec \
+            'git log --no-merges -1 --pretty=format:%B | grep -q "^Signed-off-by:"' \
+            --root
+      - name: License Header Check
+        run: git rebase --exec 'nix run nixpkgs#reuse lint' --root
+      - name: Format Check
+        run: git rebase --exec 'cargo fmt --check --all' --root
+      - name: Documentation Build and Link Heartbeat Check
+        run: |
+          git rebase --exec \
+            'cargo doc --all-features --no-deps && linkchecker target/doc/*/*.html' \
+            --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+      - name: README Synchronization Check
+        run: git rebase --exec 'cargo rdme --check' --root
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      # examples and tests require `alloc`, since they make extensive use of `Box` etc.
+      - run: |
+          echo '#!/bin/bash
+          set -e
+          cargo hack \
+            --clean-per-run \
+            --feature-powerset \
+            clippy \
+            --all-targets \
+            --locked \
+            --features alloc
+          cargo clean' > exec.sh
+          git rebase --exec 'bash exec.sh' --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+      # the core lib does not, so also check that without the alloc feature.
+      - run: |
+          echo '#!/bin/bash
+          set -e
+          cargo hack \
+            --clean-per-run \
+            --feature-powerset \
+            clippy \
+            --lib \
+            --locked
+          cargo clean' > exec.sh
+          git rebase --exec "bash exec.sh" --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+  ui-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-expand
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      - run: git rebase --exec 'cargo test ui_ --locked --all-targets' --root
+        env:
+          RUSTFLAGS: >
+            -Dwarnings
+            --cfg UI_TESTS
+  nightly:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kind:
+          - "check --all-targets"
+          - "test --all-targets"
+          # doctests are strangely not included in --all-targets
+          - "--features default test --doc"
+    name: "nightly/${{matrix.kind}}"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-expand,cargo-hack
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      - run: |
+          echo '#!/bin/bash
+          set -e
+          cargo hack \
+            --clean-per-run \
+            --feature-powerset \
+            ${{matrix.kind}} \
+            --locked
+          cargo clean' > exec.sh
+          git rebase --exec "bash exec.sh" --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+  beta:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kind:
+          - "check --all-targets"
+          - "test --all-targets"
+          # doctests are strangely not included in --all-targets
+          - "--features default test --doc"
+    name: "beta/${{matrix.kind}}"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: beta
+          components: rust-src
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-expand,cargo-hack
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      - run: |
+          echo '#!/bin/bash
+          set -e
+          cargo hack \
+            --clean-per-run \
+            --feature-powerset \
+            ${{matrix.kind}} \
+            --locked
+          cargo clean' > exec.sh
+          git rebase --exec "bash exec.sh" --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+          RUSTC_BOOTSTRAP: 1
+  miri:
+    runs-on: ubuntu-latest
+    name: "miri (${{matrix.MIRIFLAGS}})"
+    strategy:
+      matrix:
+        MIRIFLAGS:
+          - ""
+          - "-Zmiri-tree-borrows"
+          - "-Zmiri-strict-provenance"
+          - "-Zmiri-tree-borrows -Zmiri-strict-provenance"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - run: |
+          echo "NIGHTLY=nightly-$(curl -s https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)" >> $GITHUB_ENV
+      - name: Install ${{env.NIGHTLY}}
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{env.NIGHTLY}}
+          components: miri, rust-src
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-expand
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      - run: git rebase --exec 'cargo miri test --locked --all-targets' --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+          MIRIFLAGS: ${{matrix.MIRIFLAGS}}
+      # doctests are strangely not included in --all-targets
+      - run: git rebase --exec 'cargo miri test --locked --doc' --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+          MIRIFLAGS: ${{matrix.MIRIFLAGS}}
+  sanitizers:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        targets: ["--doc", "--all-targets"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rust-src
+      - name: enable debug symbols
+        run: |
+          sudo apt install llvm
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      # sed because of https://github.com/japaric/rust-san#unrealiable-leaksanitizer
+      - run: |
+          echo "#!/bin/bash
+          set -e
+          sed -i '/\[features\]/i [profile.dev]' Cargo.toml \
+            && sed -i '/profile.dev/a opt-level = 1' Cargo.toml \
+            && cargo test --lib --tests --target x86_64-unknown-linux-gnu \
+            && git restore Cargo.toml" > exec.sh
+          git rebase --exec "bash exec.sh" --root
+        env:
+          ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
+          RUSTFLAGS: >
+            --cfg NO_ALLOC_FAIL_TESTS
+            -Z sanitizer=address
+            -Dwarnings
+      # sed because of https://github.com/japaric/rust-san#unrealiable-leaksanitizer
+      # doctests are strangely not included in --all-targets
+      - run: |
+          echo "#!/bin/bash
+          set -e
+          sed -i '/\[features\]/i [profile.dev]' Cargo.toml \
+            && sed -i '/profile.dev/a opt-level = 1' Cargo.toml \
+            && cargo test --doc --target x86_64-unknown-linux-gnu \
+            && git restore Cargo.toml" > exec.sh
+          git rebase --exec "bash exec.sh" --root
+        env:
+          ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
+          RUSTFLAGS: >
+            --cfg NO_ALLOC_FAIL_TESTS
+            -Z sanitizer=address
+            -Dwarnings
+      - run: |
+          git rebase --exec \
+            'cargo test --all-targets --target x86_64-unknown-linux-gnu' \
+            --root
+        env:
+          RUSTFLAGS: >
+            --cfg NO_ALLOC_FAIL_TESTS
+            -Z sanitizer=leak
+            -Dwarnings
+      # doctests are strangely not included in --all-targets
+      - run: |
+          git rebase --exec \
+            'cargo test --doc --target x86_64-unknown-linux-gnu' \
+            --root
+        env:
+          RUSTFLAGS: >
+            --cfg NO_ALLOC_FAIL_TESTS
+            -Z sanitizer=leak
+            -Dwarnings
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      - run: |
+          echo '#!/bin/bash
+          set -e
+          cargo hack \
+            --clean-per-run \
+            --feature-powerset \
+            --exclude-features alloc \
+            --exclude-features unsafe-pinned \
+            --exclude-features default \
+            --version-range 1.82.. \
+            --clean-per-version \
+            test \
+            --locked \
+            --all-targets
+          cargo clean' > exec.sh
+          git rebase --exec "bash exec.sh" --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+  nightly-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rust-src
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-expand,cargo-hack
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      - run: |
+          echo '#!/bin/bash
+          set -e
+          cargo hack \
+            --clean-per-run \
+            --feature-powerset \
+            --version-range 1.82.. \
+            --clean-per-version \
+            check \
+            --locked \
+            --all-targets
+          cargo clean' > exec.sh
+          git rebase --exec "bash exec.sh" --root
+        env:
+          RUSTC_BOOTSTRAP: 1
+          RUSTFLAGS: "-Dwarnings"
+  os-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{matrix.os}}
+    name: "os-check (${{matrix.os}})"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{github.event.pull_request.commits}}
+          ref: ${{github.event.pull_request.head.sha}}
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-expand
+      - run: git config user.name "github-runner" && git config user.email "<>"
+      - run: git rebase --exec 'cargo test --all-targets --locked' --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+      # doctests are strangely not included in --all-targets
+      - run: git rebase --exec 'cargo test --doc --locked' --root
+        env:
+          RUSTFLAGS: "-Dwarnings"
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: Rust-for-Linux/linux
+          path: "kernel"
+          ref: pin-init-next
+      - uses: actions/checkout@v6
+        with:
+          path: "pin-init"
+          fetch-depth: 0
+          ref: ${{github.event.pull_request.head.sha}}
+      - run: |
+          pushd kernel
+          git config user.name "github-runner" && git config user.email "<>"
+          popd # kernel
+
+          pushd pin-init
+          git config user.name "github-runner" && git config user.email "<>"
+          git fetch
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/next)" ]; then
+              # when there are no new commits, we can succeed directly
+              exit 0
+          fi
+          if ! yes | bash ./to-kernel.sh ../kernel origin/next; then
+              if ! git am --3way; then
+                  git am --show-current-patch=diff
+                  false
+              fi
+              false
+          fi
+
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-expand
+      - run: cargo update
+      - run: cargo test --locked
+        env:
+          RUSTFLAGS: "-Ddeprecated -Dwarnings"
+
+  # A single job to gate all required jobs.
+  check-pass:
+    if: always()
+    needs:
+      - quality
+      - clippy
+      - ui-tests
+      - nightly
+      - beta
+      - miri
+      - sanitizers
+      - msrv
+      - nightly-msrv
+      - os-check
+      - apply
+      - update
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check job status
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

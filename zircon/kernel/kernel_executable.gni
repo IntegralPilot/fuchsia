@@ -1,0 +1,234 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/current_target_tuple.gni")
+import("//build/rust/config.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//build/zircon/c_utils.gni")
+import("//zircon/kernel/kernel_rust_mod.gni")
+import("//zircon/kernel/params.gni")
+import("//zircon/kernel/phys/kernel_elf_binary.gni")
+
+_kernel_executable_deps = [
+  "//zircon/kernel/lib/syscalls:syscalls-rs",
+  "//zircon/kernel/top",
+]
+
+_kernel_executable_cpu_deps = {
+  arm64 = [ "//zircon/kernel/platform/generic-arm" ]
+  riscv64 = [ "//zircon/kernel/platform/generic-riscv64" ]
+  x64 = [ "//zircon/kernel/platform/pc" ]
+}
+
+# These the implicit subtargets kernel_rust_mod_crate_root() already produces.
+# So separate generated_file() targets aren't needed to plumb clippy switches.
+_clippy_rsp_inputs = [
+  {
+    switch = "--deps="
+    key = "kernel_rust_externs"
+  },
+  {
+    switch = "--transdeps="
+    key = "rust_aux_searchdir"
+  },
+]
+
+_static_checks_toolchain =
+    "//zircon/kernel/switch/set/static-checks:kernel_$current_cpu.static-checks"
+
+# Represents a kernel executable (i.e., a kernel in ELF form) evaluated under
+# the current switchset.
+#
+# Subtargets
+#
+#   * $target_name.clippy
+#     - The action() target that runs the clippy Rust code linter.  This is
+#     done implicitly via $validations on $target_name but can be done alone.
+#
+#   * $target_name.rsp
+#     - The link_output_rspfile() containing the output name of the kernel
+#     executable.
+#
+# Parameters
+#
+#   * configs
+#     - Required: Preset via set_defaults() and modifiable as usual.
+#     - Type: list(label_no_toolchain)
+#     - Default: via set_defaults()
+#
+#   * deps
+#    - Optional: Additional sources to link into the kernel.
+#    - Type: list(label)
+#    - Default: []
+#
+#   * data_deps
+#    - Optional: Can be used to bring extra files into the kernel package or
+#      extra ZBI items into the image.
+#    - Type: list(label)
+#    - Default: []
+#
+#   * testonly, visibility
+#     - Optional: Standard GN meanings.
+#
+template("kernel_executable") {
+  assert(toolchain_environment == "kernel",
+         "kernel_executable() can only be used in the kernel environment")
+
+  main_target = target_name
+  validate_symbols_target = "_kernel_executable.$target_name.validate"
+  crate_root_target = "_kernel_executable.$target_name.crate_root"
+  clippy_target = "$target_name.clippy"
+  rsp_target = "$target_name.rsp"
+
+  _kernel_deps =
+      _kernel_executable_deps + _kernel_executable_cpu_deps[current_cpu]
+  if (defined(invoker.deps)) {
+    _kernel_deps += invoker.deps
+  }
+
+  kernel_rust_mod_crate_root(crate_root_target) {
+    executable_target = main_target
+    visibility = [ ":*" ]
+    forward_variables_from(invoker, [ "testonly" ])
+    deps = _kernel_deps
+  }
+
+  _crate_vars = {
+    # GN makes an executable() use Rust if its $sources list any Rust files.
+    crate_type = "bin"
+    deps = [ ":$crate_root_target" ]
+    sources = [ "//zircon/kernel/main.rs" ]
+    crate_root = sources[0]
+    rustflags = [
+      "--edition=2024",
+
+      # Disambiguate rustc's intermediate object filenames across kernel
+      # executables that share crate name and source root.
+      "-Cmetadata=$main_target",
+    ]
+
+    # The binary crate is always called "kernel" in every target.
+    crate_name = "kernel"
+
+    forward_variables_from(invoker,
+                           [
+                             "configs",
+                             "testonly",
+                             "visibility",
+                           ])
+    if (defined(visibility)) {
+      visibility += [ ":*" ]
+    }
+  }
+
+  action(clippy_target) {
+    mnemonic = "CLIPPY"
+
+    forward_variables_from(_crate_vars, "*")
+    deps += [ "//zircon/kernel/lib/rust:rust-custom-target" ]
+
+    rustflags += [
+      "--crate-type=$crate_type",
+      "--crate-name=$crate_name",
+      "-Cmetadata=clippy",
+    ]
+
+    script = "//build/rust/clippy_wrapper.py"
+    outputs = [ "$target_gen_dir/$clippy_target" ]
+    args = [ "--output=" + rebase_path(outputs[0], root_build_dir) ]
+
+    depfile = "${outputs[0]}.d"
+    args += [ "--depfile=" + rebase_path(depfile, root_build_dir) ]
+
+    inputs = [ "//prebuilt/third_party/jq/${host_platform}/bin/jq" ]
+    args += [ "--jq=" + rebase_path(inputs[0], root_build_dir) ]
+
+    # Reuse the generated_file() targets kernel_rust_mod_crate_root() emitted.
+    foreach(rsp, _clippy_rsp_inputs) {
+      rsp.label = ":$crate_root_target.${rsp.key}.rsp"
+      _rsp_outputs = []  # Reset from last iteration.
+      _rsp_outputs = get_target_outputs(rsp.label)
+      assert(_rsp_outputs == [ _rsp_outputs[0] ])
+      deps += [ rsp.label ]
+      inputs += _rsp_outputs
+      args += [ rsp.switch + rebase_path(_rsp_outputs[0], root_build_dir) ]
+    }
+
+    if (clippy_cause_failure) {
+      args += [ "--fail" ]
+    }
+
+    if (clippy_ignore_rustc) {
+      args += [ "--clippy-only" ]
+    }
+
+    args += [
+      "--",
+      "env",
+      "{{rustenv}}",
+      "${rebased_rustc_prefix}/bin/clippy-driver",
+      rebase_path(crate_root, root_build_dir),
+      "{{rustflags}}",
+    ]
+  }
+
+  kernel_elf_binary(main_target) {
+    forward_variables_from(_crate_vars, "*")
+    deps += [ "//zircon/kernel/phys:physboot.kernel" ]
+
+    install_name = "vmzircon"
+
+    validations = [
+      ":$validate_symbols_target",
+
+      # Always do the Clippy checks to be sure that this exact configuration is
+      # fully checked.
+      ":$clippy_target",
+    ]
+
+    # Additionally run Clippy in the static-checks switchset (which maximizes
+    # checks and compiles in ktest unit tests). Only testonly executables can
+    # depend on the test libraries instantiated in static-checks.
+    if (defined(invoker.testonly) && invoker.testonly &&
+        current_toolchain != _static_checks_toolchain) {
+      validations += [ ":$clippy_target($_static_checks_toolchain)" ]
+    }
+  }
+
+  rspfile = "$target_gen_dir/$main_target.rsp"
+  link_output_rspfile(rsp_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    if (defined(visibility)) {
+      visibility += [ ":$validate_symbols_target" ]
+    }
+    deps = [ ":$main_target.binary" ]
+    outputs = [ rspfile ]
+  }
+
+  toolchain_utils_action(validate_symbols_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+    outputs = [ "$target_gen_dir/$target_name.stamp" ]
+    script = "//zircon/kernel/scripts/validate-kernel-symbols.py"
+    utils = [ "nm" ]
+    deps = [
+      ":$main_target.binary",
+      ":$rsp_target",
+    ]
+    sources = [ rspfile ]
+    depfile = "$target_gen_dir/$target_name.d"
+    args = rebase_path(sources + outputs + [ depfile ], root_build_dir)
+  }
+}
+
+set_defaults("kernel_executable") {
+  configs = default_executable_configs +
+            [ "//zircon/kernel/switch:kernel_executable.config" ]
+}

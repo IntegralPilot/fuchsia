@@ -1,0 +1,136 @@
+# Copyright 2020 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/compiler_config.gni")
+import("//build/zircon/zircon_cpu.gni")
+
+# 1 shadow byte covers 2^3 bytes.
+asan_mapping_scale = 3
+
+# asan_mapping_offset is obtained by substracting KERNEL_VA_BASE >> 3
+# from the place where we intend to put the asan shadow. This has the effect
+# of leaving the region from [0, KERNEL_VA_BASE) unmapped in the shadow, and
+# our mapped shadow covers everything from
+# [KERNEL_VA_BASE, KERNEL_VA_BASE+KERNEL_VA_SIZE)
+#
+# This is used by the compiler to calculate the location in the shadow
+# of a memory address by doing:
+# shadow_addr = asan_mapping_offset + (address >> asan_mapping_scale)
+asan_mapping_offset = "0xdffffff000000000"
+
+_asan_config = [ "//build/config/sanitizers:asan" ]
+_sancov_config = [ "//build/config/sanitiziers:sancov" ]
+_toolchain_configs = toolchain_variant.configs
+is_asan = _toolchain_configs + _asan_config - _asan_config != _toolchain_configs
+is_sancov =
+    _toolchain_configs + _sancov_config - _sancov_config != _toolchain_configs
+
+source_set("asan") {
+  if (is_asan) {
+    # The support code doesn't get compiled with instrumentation itself.
+    # Disabling it on the command-line not only saves adding NO_ASAN
+    # annotations to each function, but covers inline functions from shared
+    # header files that shouldn't all be annotated for their other callers.
+    # The former could be addressed via `#pragma clang attribute`, but the
+    # latter cannot be.
+    configs -= [ _asan_config ]
+    sources = []  # TODO(https://fxbug.dev/42105185): setup code, diagnostic
+                  # code, etc.
+    deps = [
+      ":stubs",
+      "..:headers",
+    ]
+  }
+
+  if (is_sancov) {
+    # We don't care about collecting coverage for asan checks.
+    configs -= [ _sancov_config ]
+  }
+}
+
+if (is_asan) {
+  source_set("stubs") {
+    # The actual instrumentation stubs called by compiler-generated calls all
+    # over also disable frame pointers to minimize their overhead.  All the
+    # hot paths from instrumented code should be here.  The cold paths taken
+    # from these calls when there is an actual error should be out of line in
+    # other files not in this source_set().
+    visibility = [ ":*" ]
+    configs -= [
+      _asan_config,
+      "//build/config:frame_pointers",
+    ]
+
+    if (is_sancov) {
+      # We don't care about collecting coverage for asan stubs.
+      configs -= [ _sancov_config ]
+    }
+
+    configs += [
+      ":kasan-defines",
+      "//build/config:frame_pointers",
+    ]
+    sources = [
+      "asan-init.cc",
+      "asan-poisoning.cc",
+      "asan-stubs.cc",
+    ]
+    sources += [ "asan-init-$zircon_cpu.cc" ]
+    deps = [
+      "..:headers",
+      "//zircon/kernel/lib/counters",
+      "//zircon/kernel/lib/init",
+      "//zircon/kernel/vm:headers",
+    ]
+  }
+}
+
+config("kasan-defines") {
+  defines = [
+    "ASAN_MAPPING_SCALE=$asan_mapping_scale",
+    "ASAN_MAPPING_OFFSET=${asan_mapping_offset}UL",
+  ]
+}
+
+compiler_config("kasan") {
+  configs = [ ":kasan-defines" ]
+
+  cflags = [
+    # This tells the instrumentation to treat user-defined operator
+    # new[] like the standard one and check that the array cookie is
+    # not clobbered.  fbl::AllocChecker new[] is the only user-defined
+    # operator new[] in the kernel, and it just wraps the normal
+    # allocation semantics.
+    "-fsanitize-address-poison-custom-array-cookie",
+  ]
+
+  llvm_flags = [
+    # TODO(https://fxbug.dev/42104852): Disable poisoning around stack allocations until later.
+    "-asan-stack=0",
+
+    "-asan-mapping-scale=$asan_mapping_scale",
+
+    "-asan-mapping-offset=$asan_mapping_offset",
+
+    # Avoid GOT-indirected weak symbol references used with
+    # __asan_register_elf_globals
+    "-asan-globals-live-support=false",
+  ]
+
+  # TODO(https://fxbug.dev/542709218): ASan instrumentation on globals are temporarily disabled
+  # for rust because we don't have an easy way of suppressing instrumentation on
+  # globals inside macros. Once we sort that out, we'll come back and turn this
+  # on.
+  rust_llvm_flags = [ "-asan-globals=0" ]
+
+  if (current_cpu == "arm64") {
+    llvm_flags += [
+      # TODO(https://fxbug.dev/42104852): Disable inline instrumentation on arm64 until we
+      # preallocate/pre-map the ASAN shadow.
+      "-asan-instrumentation-with-call-threshold=0",
+    ]
+  }
+}

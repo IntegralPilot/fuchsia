@@ -1,0 +1,320 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang.gni")
+import("//build/config/clang/clang_target_toolchain_info.gni")
+import("//build/config/compiler_config.gni")
+import("//build/config/profile/config.gni")
+import("//build/toolchain/variant.gni")
+
+# Common flags for all coverage-based variants defined below.
+# IMPORTANT: This should not include any rust or linker flags!
+_coverage_c_family_flags = [
+  "-fprofile-instr-generate",
+  "-fcoverage-mapping",
+]
+
+# File extensions of the supported filetypes should match:
+# https://gn.googlesource.com/gn/+/dfcbc6fed0a8352696f92d67ccad54048ad182b3/src/gn/source_file.cc#24
+_c_family_patterns = [
+  "*.c",
+  "*.cc",
+  "*.cpp",
+  "*.cxx",
+  "*.c++",
+  "*.h",
+  "*.hh",
+  "*.hpp",
+  "*.hxx",
+  "*.inc",
+  "*.ipp",
+  "*.inl",
+  "*.def",
+]
+_rust_patterns = [ "*.rs" ]
+
+# In CI, profile_source_files is the default ["//*"] (all checked-in sources).
+# In CQ, it is passed via profile_source_files GN arg by infra.
+_has_c_files =
+    filter_include(profile_source_files, _c_family_patterns) != [] ||
+    profile_source_files == [ "//*" ] || profile_source_files_list_files != []
+
+_has_rust_files = filter_include(profile_source_files, _rust_patterns) != [] ||
+                  profile_source_files == [ "//*" ]
+
+_profile_source_files_lines = []
+foreach(file, dont_profile_source_files) {
+  file = rebase_path(file, root_build_dir)
+
+  # See https://clang.llvm.org/docs/UsersManual.html#cmdoption-fprofile-list
+  # for supported prefixes and categories.
+
+  # When the "source:path=skip" format is used, Clang excludes the files that
+  # are under the provided path from instrumentation and adds the `skipprofile`
+  # attribute, which only prevents instrumentation, but does not restrict
+  # inlining
+  # between functions in the same way that the `noprofile` attribute does.
+
+  # Clang uses a glob pattern matcher described in:
+  # https://llvm.org/doxygen/classllvm_1_1GlobPattern.html
+  _profile_source_files_lines += [ "source:$file=skip" ]
+}
+foreach(file, profile_source_files) {
+  file = rebase_path(file, root_build_dir)
+
+  # See https://clang.llvm.org/docs/UsersManual.html#cmdoption-fprofile-list
+  # for supported prefixes and categories.
+
+  # When the "source:path" format is used without any of the supported
+  # categories (`allow`, `skip`, and `forbid`), Clang chooses the `allow`
+  # category as default
+  # to instrument the files that are under the provided path.
+
+  # Clang uses a glob pattern matcher described in:
+  # https://llvm.org/doxygen/classllvm_1_1GlobPattern.html
+  _profile_source_files_lines += [ "source:$file" ]
+}
+
+# This can't use a generated_file() target because there's no way to
+# express the deps to make GN accept the file in the inputs list if it's
+# the output of some target.
+_profile_source_files_file = "$root_out_dir/profile-source-files.list"
+write_file(_profile_source_files_file,
+           _profile_source_files_lines,
+           "list lines")
+profile_source_files_list_files += [ _profile_source_files_file ]
+
+_coverage_inputs = profile_source_files_list_files
+foreach(file, profile_source_files_list_files) {
+  _coverage_c_family_flags +=
+      [ "-fprofile-list=" + rebase_path(file, root_build_dir) ]
+}
+
+# A toolchain like user.basic that doesn't support the Fuchsia compiler ABI
+# can't be using the prebuilt runtime from the toolchain, so it shouldn't get
+# any implicit dependencies or configuration meant for that runtime.  If a
+# special-case runtime such as //src/lib/llvm-profdata is used it will be in
+# explicit deps and take care of those linking details for itself.
+_has_compiler_abi = toolchain_variant.tags + [ "no-compiler-abi" ] -
+                    [ "no-compiler-abi" ] == toolchain_variant.tags
+_fuchsia_prebuilt_runtime = _has_compiler_abi && is_fuchsia && !is_kernel
+
+compiler_config("variant-libprefix") {
+  visibility = [ ":*" ]
+
+  # Even specialized environments that don't use the prebuilt runtime still
+  # expect to use the libprefix-based placement of shared libraries.
+  if (is_fuchsia && !is_kernel) {
+    linker_flags = [ "-dynamic-linker=${toolchain_variant.libprefix}ld.so.1" ]
+  }
+}
+
+group("runtime-deps") {
+  visibility = [ ":*" ]
+
+  if (_fuchsia_prebuilt_runtime) {
+    # The statically-linked profiling runtime depends on libzircon.
+    # TODO(https://fxbug.dev/42139818): Ensure this works with
+    # shared_library() instances too!
+    deps = [ "//src/zircon/lib/zircon" ]
+  }
+}
+
+variant("coverage") {
+  configs = [ ":variant-libprefix" ]
+
+  # Only instrument C/C++ when C-family files are targeted.
+  # On Rust only CLs (*.rs), this is skipped.
+  if (_has_c_files) {
+    deps = [ ":runtime-deps" ]
+
+    c_family_flags = _coverage_c_family_flags
+    inputs = _coverage_inputs
+
+    cflags = [
+      # Enable binary profile correlation.
+      "-mllvm",
+      "-profile-correlate=binary",
+
+      # TODO(https://fxbug.dev/551939010): Re-enable single-byte coverage.
+      # "-mllvm",
+      # "-enable-single-byte-coverage=true",
+    ]
+
+    # Enable runtime counter relocation in Linux.
+    if (is_linux) {
+      cflags += [
+        "-mllvm",
+        "-runtime-counter-relocation",
+      ]
+    }
+
+    # Enable coverage from system headers in Fuchsia.
+    if (is_fuchsia) {
+      cflags += [
+        "-mllvm",
+        "-system-headers-coverage",
+      ]
+    }
+  }
+
+  # Only instrument Rust when Rust files are targeted.
+  # On C++ only CLs (*.c, *.cc, *.cpp, *.h), this is skipped.
+  if (_has_rust_files) {
+    # TODO(https://fxbug.dev/414673148): In the current experiment, Rust coverage
+    # is enabled alongside C/C++ in the unified coverage variant. The long-term
+    # plan is to remove the coverage-rust variant and fold its implementation
+    # directly into this variant.
+    configs += [ ":coverage-rust" ]
+  }
+}
+
+# This can be appended with:
+# ```
+#   configs += [ "//build/config/profile:no-coverage" ]
+# ```
+# in any particular target where the coverage information is never
+# worth collecting, such as certain kinds of generated code.
+config("no-coverage") {
+  if (toolchain_variant.tags + [ "coverage" ] - [ "coverage" ] !=
+      toolchain_variant.tags) {
+    cflags = [
+      "-fno-profile-instr-generate",
+      "-fno-coverage-mapping",
+    ]
+    rustflags = [ "-Cno-instrument-coverage" ]
+  }
+}
+
+# This variant is similar to `coverage` but only instruments sources that are
+# interesting for measuring CTS coverage.
+variant("coverage-cts") {
+  configs = [ ":variant-libprefix" ]
+  deps = [ ":runtime-deps" ]
+
+  c_family_flags = _coverage_c_family_flags
+  inputs = _coverage_inputs
+
+  c_family_flags +=
+      [ "-fprofile-list=" + rebase_path("profile-cts.list", root_build_dir) ]
+  inputs += [ "profile-cts.list" ]
+
+  cflags = [
+    # Enable binary profile correlation.
+    "-mllvm",
+    "-profile-correlate=binary",
+
+    # TODO(https://fxbug.dev/551939010): Re-enable single-byte coverage.
+    # "-mllvm",
+    # "-enable-single-byte-coverage=true",
+  ]
+
+  # Enable runtime counter relocation in Linux.
+  if (is_linux) {
+    cflags += [
+      "-mllvm",
+      "-runtime-counter-relocation",
+    ]
+  }
+
+  # Enable coverage from system headers in Fuchsia.
+  if (is_fuchsia) {
+    cflags += [
+      "-mllvm",
+      "-system-headers-coverage",
+    ]
+  }
+}
+
+# Only enable either "coverage-rust" or clang coverage (variant("profile") or
+# variant("coverage")), not both.
+#
+# DO NOT NAME THIS WITH PREFIX `rust-`. The prefix will be stripped in some
+# cases, and fail to work with other cases that do not expect the stripped
+# prefix.
+variant("coverage-rust") {
+  configs = [ ":variant-libprefix" ]
+  deps = [ ":runtime-deps" ]
+
+  rustflags = [ "-Cinstrument-coverage" ]
+
+  # Enable binary profile correlation.
+  rustflags += [ "-Cllvm-args=-profile-correlate=binary" ]
+
+  if (is_fuchsia) {
+    # TODO(https://fxbug.dev/42077482): Ensure this works for no_coverage Rust cases.
+    libs = [ "./llvm_profile_counter_bias.ld" ]
+  }
+
+  if (is_linux) {
+    rustflags += [ "-Cllvm-args=-runtime-counter-relocation" ]
+  }
+}
+
+# Enable PGO instrumentation to collect profiles.
+variant("profile") {
+  configs = [ ":variant-libprefix" ]
+  deps = [ ":runtime-deps" ]
+
+  c_family_flags = [ "-fprofile-generate" ]
+
+  rustflags = []
+
+  # LINT.IfChange
+  # We need to link the profile runtime manually into Rust binaries to satisfy
+  # compiler generated symbol references in the instrumented C++ code.
+  if (clang_target_toolchain_info.libclang_rt_profile_a != "") {
+    libclang_rt_profile = "${rebased_clang_dir}/${clang_target_toolchain_info.libclang_rt_profile_a}"
+    rustflags += [ "-Clink-arg=${libclang_rt_profile}" ]
+  }
+
+  # LINT.ThenChange(//build/config/clang/generate_config_json.py)
+
+  if (is_fuchsia || is_kernel) {
+    # TODO(https://fxbug.dev/42053322): Value profiling isn't supported by the runtime.
+    cflags = [
+      "-mllvm",
+      "-disable-vp",
+    ]
+  }
+}
+
+# Enable PGO instrumentation to collect profiles for Rust.
+variant("profile-rust") {
+  configs = [ ":variant-libprefix" ]
+  deps = [ ":runtime-deps" ]
+
+  rustflags = [ "-Cprofile-generate" ]
+
+  # TODO(https://fxbug.dev/42053322): Value profiling isn't supported by the runtime.
+  rustflags += [ "-Cllvm-args=-disable-vp" ]
+}
+
+# Enable PGO-optimized build that uses a profile.
+variant("profile-use") {
+  configs = [ ":variant-libprefix" ]
+  if (pgo_profile_path != "") {
+    cflags =
+        [ "-fprofile-use=" + rebase_path(pgo_profile_path, root_build_dir) ]
+
+    # TODO(https://fxbug.dev/336358027): Suppress the following warning in PGO
+    # optimized build: "Function control flow change detected (hash mismatch)"
+    cflags += [ "-Wno-backend-plugin" ]
+  }
+}
+
+# Enable PGO-optimized build that uses a profile collected for Rust.
+variant("profile-use-rust") {
+  configs = [ ":variant-libprefix" ]
+  if (pgo_profile_path != "") {
+    rustflags =
+        [ "-Cprofile-use=" + rebase_path(pgo_profile_path, root_build_dir) ]
+  }
+}
+
+variant("heapdump") {
+  configs = [ ":variant-libprefix" ]
+  executable_deps =
+      [ "//src/performance/memory/heapdump/instrumentation:autobind" ]
+}

@@ -1,0 +1,136 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_c_extension_shared_lib.gni")
+import("//build/python/python_library.gni")
+
+# Defines a python C extension library.
+#
+# This can be imported into a `.pyz` library, but the user must make sure the
+# .so that this is appending to the path is located in the output build
+# directory, as this will be appending to PYTHONPATH.
+#
+# Parameters
+#
+#   sources (required)
+#     Forwarded to python_c_extension_shared_lib.
+#     Type: list(path)
+#
+#   deps (optional)
+#     Forwarded to python_c_extension_shared_lib.
+#     Type: list(target)
+#
+#   assert_no_deps (optional)
+#     Forwarded to python_c_extension_shared_lib.
+#     Type: bool
+#     Default: False
+#
+#   configs (optional)
+#     Forwarded to python_c_extension_shared_lib.
+#     Type: list(target)
+#
+#   public_configs (optional)
+#     Forwarded to python_c_extension_shared_lib.
+#     Type: list(target)
+#
+#   stubs_root (optional)
+#     Base path for paths specified in `stubs`. This argument is required when `stubs` is
+#     provided.
+#     Type: path
+#
+#   stubs(optional)
+#     Paths to .pyi stub files relative to `stubs_root`. When providing this argument, `stubs_root`
+#     must be provided too. The stub files provided will be copied to the Python library generated
+#     by this template with the same directory structure relative to `stubs_root`.
+#     Type: list(path)
+#
+#   testonly
+#   visibility
+template("python_c_extension") {
+  assert(is_host, "python C extensions can only be built on the host")
+
+  main_target_name = target_name
+  shlib_target_name = "lib${target_name}"
+  python_c_extension_shared_lib(shlib_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "configs",
+                             "public_configs",
+                             "deps",
+                             "sources",
+                             "testonly",
+                           ])
+    if (defined(invoker.visibility)) {
+      visibility += invoker.visibility
+    }
+  }
+
+  if (defined(invoker.stubs)) {
+    assert(defined(invoker.stubs_root),
+           "stubs_root must be provided with stubs")
+    stub_target_names = []
+    stub_outputs = []
+    foreach(stub, invoker.stubs) {
+      stub_target_name = "${main_target_name}_stubs__${stub}"
+      stub_target_names += [ stub_target_name ]
+      stub = "${invoker.stubs_root}/${stub}"
+      stub_output = "${target_gen_dir}/${main_target_name}/" +
+                    rebase_path(stub, invoker.stubs_root)
+      stub_outputs += [ stub_output ]
+      copy(stub_target_name) {
+        sources = [ stub ]
+        outputs = [ stub_output ]
+      }
+    }
+  }
+
+  action("${main_target_name}_wrapper") {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "testonly",
+                           ])
+    deps = [ ":${shlib_target_name}" ]
+
+    script = "//build/python/create_c_extension_import_hook.py"
+    outputs = [ "${target_gen_dir}/${main_target_name}/__init__.py" ]
+    args = [
+      "--target_name",
+      main_target_name,
+      "--shlib",
+      rebase_path(get_label_info(":${shlib_target_name}", "root_out_dir"),
+                  root_build_dir) + "/${shlib_target_name}",
+      "--gen_dir",
+      rebase_path(target_gen_dir, root_build_dir),
+    ]
+  }
+
+  python_library(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "testonly",
+                           ])
+    if (defined(invoker.visibility)) {
+      visibility += invoker.visibility
+    }
+
+    deps = [ ":${main_target_name}_wrapper" ]
+    source_root = "${target_gen_dir}/${main_target_name}"
+    sources = [ "__init__.py" ]
+
+    _shlib_out_dir = get_label_info(":${shlib_target_name}", "root_out_dir")
+    _shlib_path = "${_shlib_out_dir}/${shlib_target_name}.so"
+    shared_libs = [ _shlib_path ]
+    if (defined(invoker.stubs)) {
+      foreach(stub_target_name, stub_target_names) {
+        deps += [ ":${stub_target_name}" ]
+      }
+      foreach(stub_output, stub_outputs) {
+        sources += [ rebase_path(stub_output, source_root) ]
+      }
+    }
+  }
+}

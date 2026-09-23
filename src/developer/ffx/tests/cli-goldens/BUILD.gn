@@ -1,0 +1,149 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/host.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/testing/golden_files.gni")
+import("//src/developer/ffx/config.gni")
+import("ffx_command_golden_file_test.gni")
+
+assert(is_host, "ffx cli-golden tests are only valid with the host toolchain.")
+
+if (has_board) {
+  rustc_binary("ffx_cli_goldens") {
+    edition = "2024"
+    testonly = true
+    with_unit_tests = true
+    output_name = "ffx_cli_goldens"
+    sources = [ "src/main.rs" ]
+    deps = [
+      "//src/developer/ffx/command:lib",
+      "//src/lib/fuchsia",
+      "//third_party/rust_crates:anyhow",
+      "//third_party/rust_crates:argh",
+      "//third_party/rust_crates:serde",
+      "//third_party/rust_crates:serde_json",
+    ]
+  }
+
+  # manifest of ffx subtools including sdk-category information.
+  _tool_list_label = "//src/developer/ffx:tool_manifest"
+  _tool_list = "${root_build_dir}/ffx_tools.json"
+  _ffx_path = "${host_tools_dir}/ffx"
+  _golden_dir = "${target_out_dir}/goldens"
+
+  # This breaks up the comparisons of the command lines into a
+  # collection of comparisons per top level command. This avoids
+  # hitting ulimit when building the stamp file command line.
+  #
+  # First a list of top level commands is created, and kept up
+  # to date with a golden_files test.
+  #
+  # Then each top level command creates a list of comparisons
+  # and the list of output files used by golden tests.
+  _command_list = "${_golden_dir}/commandlist.txt"
+  _src_command_list = "goldens/commandlist.txt"
+
+  golden_files("ffx-golden-command-list") {
+    testonly = true
+    comparisons = [
+      {
+        golden = _src_command_list
+        candidate = _command_list
+      },
+    ]
+    deps = [ ":generate_ffx_command_list" ]
+  }
+
+  compiled_action("generate_ffx_command_list") {
+    testonly = true
+    visibility = [ ":*" ]
+    depfile = "${target_out_dir}/$target_name.d"
+    inputs = [
+      "$root_build_dir/ffx-config.json",
+      _tool_list,
+      _ffx_path,
+    ]
+
+    # Avoid using the host tool coming from previous builds.
+    can_use_previously_built_tool = false
+    tool = ":ffx_cli_goldens"
+
+    outputs = [ _command_list ]
+    args = [
+      "--commandlist-only",
+      "--command-list",
+      rebase_path(_command_list, root_build_dir),
+      "--ffx-path",
+      rebase_path(_ffx_path, root_build_dir),
+      "--tool-list",
+      rebase_path(_tool_list, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+    deps = [
+      "//src/developer/ffx:ffx_build_dir_config_file($default_toolchain)",
+      "//src/developer/ffx:host(//build/toolchain:host_x64)",
+      _tool_list_label,
+    ]
+  }
+
+  command_test_deps = []
+
+  ffx_command_golden_file_test("ffx_ffx_command_golden_file_test") {
+    golden_source_dir = "goldens"
+    command_name = "ffx"
+    golden_processor_tool = ":ffx_cli_goldens"
+    visible_label =
+        get_label_info(":ffx-golden-command-list", "label_no_toolchain")
+    ffx_path = _ffx_path
+    tool_list = _tool_list
+
+    # Depend on generating the top level command list
+    # and the tool_list represents the latest ffx commands.
+    deps = [
+      ":generate_ffx_command_list",
+      _tool_list_label,
+    ]
+  }
+
+  command_test_deps += [ ":ffx_ffx_command_golden_file_test" ]
+
+  _command_name_list = read_file(_src_command_list, "list lines")
+  foreach(c, _command_name_list) {
+    ffx_command_golden_file_test("${c}_ffx_command_golden_file_test") {
+      golden_source_dir = "goldens"
+      command_name = c
+      golden_processor_tool = ":ffx_cli_goldens"
+      ffx_path = _ffx_path
+      tool_list = _tool_list
+      visible_label = get_label_info(":tests", "label_no_toolchain")
+
+      # Since we're iterating over the command list to generate
+      # these targets, add the command list as dependency
+      # so if the list changes, the targets change.
+      deps = [
+        ":generate_ffx_command_list",
+        _tool_list_label,
+      ]
+    }
+    command_test_deps += [ ":${c}_ffx_command_golden_file_test" ]
+  }
+
+  group("tests") {
+    testonly = true
+
+    # TODO(https://fxbug.dev/42075360): Support product bundle for testing on mac
+    # For now, just test on linux. Also check for has_board, since this test
+    # cannot run on a configuration without a board.
+    if (is_linux) {
+      deps = [ ":ffx-golden-command-list" ] + command_test_deps
+    }
+  }
+} else {
+  # no board, so no tests
+  group("tests") {
+  }
+}

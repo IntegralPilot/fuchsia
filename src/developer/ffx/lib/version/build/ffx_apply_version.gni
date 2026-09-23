@@ -1,0 +1,138 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/zircon/c_utils.gni")
+
+build_version_bin = get_label_info(
+                        "//src/developer/ffx/lib/version/build:build-version.bin($default_toolchain)",
+                        "target_out_dir") + "/build-version.bin"
+version_info_bin = get_label_info(
+                       "//src/developer/ffx/lib/version/build:version-info.bin($default_toolchain)",
+                       "target_out_dir") + "/version-info.bin"
+
+build_info_section = ".ffx_build"
+version_info_section = ".ffx_version"
+
+# Apply FFX version information after ffx has been linked.
+#
+# This template solves the problem that ffx, being the largest binary in the
+# build, takes a long time to link. It is desirable to minimize causes of cache
+# invalidations for builds of this binary, so as to save build time. One of the
+# causes of invalidations is changes in repository version information, that
+# will occur for every patch in CI/CQ, even if no source files for ffx or its
+# dependencies change. Applying the version post-link avoids these costs, as it
+# is cheap compared to re-linking the binary.
+#
+# This template works with both stripped and unstripped binaries as input, but
+# will always produce a stripped binary.  The build-id directory entry for the
+# stripped binary is not produced, if that's needed, it should be produced in a
+# separate action, and this template used with the resultant stripped binary.
+#
+# Parameters:
+#
+#   deps (required)
+#     [list of labels] This list should only contain one label, the target that
+#     produces the ffx binary to apply the version to.
+#
+#   ffx_unversioned_binary_path (required)
+#     [GN file path] This is the GN file path to the ffx binary that is to have
+#     the version applied to it.
+#
+#   runtime_files (optional)
+#     Files that should be listed in the `runtime_files` part of the
+#     tools_path.json entry for this binary, if any, as being files that
+#     are required to run it successfully. These files should be properly
+#     depended on by one or more of the labels listed in `deps`.
+#
+template("ffx_apply_version") {
+  main_target = target_name
+
+  # When building with build variants, executable targets will redirect to the
+  # target with the proper toolchain variant applied. Because of this, adding
+  # version metadata to a binary requires knowledge of this redirection.
+  # Otherwise the binary will be present twice in tool_paths.json, one for the
+  # variant-less target, and one with the variant.
+  variant_target("action") {
+    target_name = main_target
+    variant_shared_redirection = false
+
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "ffx_unversioned_binary_path",
+                             "output_name",
+                             "output_extension",
+                           ])
+
+    assert(defined(ffx_unversioned_binary_path),
+           "'ffx_unversioned_binary_path' is a required parameter")
+
+    if (defined(output_name)) {
+      output_file = output_name
+    } else {
+      output_file = main_target
+    }
+
+    if (defined(output_extension) && output_extension != "") {
+      output_file += ".${output_extension}"
+    }
+    outputs = [ "${root_out_dir}/${output_file}" ]
+    inputs = [
+      version_info_bin,
+      build_version_bin,
+      ffx_unversioned_binary_path,
+    ]
+
+    script = "${clang_prefix}/llvm-objcopy"
+
+    # do the real work
+    args = [
+      # -x applies a "strip" on the output. Strip is currently performed after
+      # the link step in the normal toolchain rules, and uses this same flag on
+      # most platforms (see clang_toolchain.gni). Note on macOS this is a
+      # "different strip", as at time of writing, binaries on macOS are normally
+      # stripped with xcrun strip -Sx. The outcome produces the same size binary
+      # as the stripped binary on macOS.
+      "-x",
+
+      "--update-section=${version_info_section}=" +
+          rebase_path(version_info_bin, root_build_dir),
+      "--update-section=${build_info_section}=" +
+          rebase_path(build_version_bin, root_build_dir),
+      rebase_path(ffx_unversioned_binary_path, root_build_dir),
+      rebase_path(outputs[0], root_build_dir),
+    ]
+
+    deps += [
+      "//src/developer/ffx/lib/version/build:build-version.bin($default_toolchain)",
+      "//src/developer/ffx/lib/version/build:version-info.bin($default_toolchain)",
+    ]
+
+    all_runtime_files = []
+    if (defined(invoker.runtime_files)) {
+      foreach(file, invoker.runtime_files) {
+        all_runtime_files += [ rebase_path(file, root_build_dir) ]
+      }
+    }
+
+    # Note: binaries metadata is not produced, as the build-id is not updated,
+    # and will match with the unversioned build.
+    metadata = {
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+
+      tool_paths = [
+        {
+          cpu = current_cpu
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          name = output_name
+          os = current_os
+          path = rebase_path(outputs[0], root_build_dir)
+          runtime_files = all_runtime_files
+        },
+      ]
+    }
+  }
+}

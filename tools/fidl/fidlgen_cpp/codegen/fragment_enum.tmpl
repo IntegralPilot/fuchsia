@@ -1,0 +1,250 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "Enum:CommonTypesHeader" }}
+{{ EnsureNamespace . }}
+{{ if .IsStrict }}
+{{ .Docs }}
+enum class {{ .Name }} : {{ .Type }} {
+  {{- range .Members }}
+    {{ .Docs }}
+    {{ .Name }} = {{ .Value }},
+  {{- end }}
+};
+{{ else }}
+{{ .Docs }}
+class {{ .Name }} final {
+ private:
+  enum class EnumForSwitching_ : {{ .Type }} {
+    {{- range .Members }}
+      {{ .Docs }}
+      {{ .Name }} = {{ .Value }},
+    {{- end }}
+
+    _do_not_handle_this__write_a_default_case_instead = {{ .UnusedEnumValueForTmpl | printf "%#x" }},
+  };
+
+  constexpr explicit {{ .Name }}(EnumForSwitching_ value) : value_(static_cast<{{ .Type }}>(value)) {}
+
+ public:
+  constexpr {{ .Name }}() : value_(static_cast<{{ .Type }}>(Unknown())) {}
+  constexpr explicit {{ .Name }}({{ .Type }} value) : value_(value) {}
+  constexpr operator EnumForSwitching_() const { return static_cast<EnumForSwitching_>(value_); }
+  constexpr explicit operator {{ .Type }}() const { return value_; }
+
+  constexpr bool IsUnknown() const {
+    {{ if .Members }}
+      switch (value_) {
+        {{ range .Members }}
+          {{- if not .IsUnknown }}
+            case {{ .Value }}:
+          {{ end }}
+        {{ end }}
+        return false;
+      }
+    {{- end }}
+    return true;
+  }
+
+  // Returns an enum corresponding to the member designated as @unknown in the
+  // FIDL schema if exists, or a compiler-reserved unknown value otherwise.
+  constexpr static {{ .Name }} Unknown() {
+    return {{ .Name }}({{ .UnknownValueForTmpl | printf "%#x" }});
+  }
+
+  {{- range .Members }}
+    {{ .Docs }}
+    static const {{ $.Name }} {{ .Name }};
+  {{- end }}
+
+ private:
+  {{ .Type }} value_;
+};
+
+{{- range $member := .Members }}
+constexpr const {{ $ }} {{ $.Name }}::{{ $member.Name }} =
+    {{ $ }}({{ $member.Value }});
+{{- end }}
+{{ end }}
+
+{{- if .IsCompatibleWithError }}
+{{ EnsureNamespace "" }}
+template <>
+struct fidl::internal::DisplayError<{{ . }}> {
+  static size_t Format(const {{ . }}& value, char* destination, size_t capacity);
+};
+
+{{- end }}
+
+{{ EnsureNamespace "fidl" }}
+constexpr inline auto ToUnderlying({{ . }} value) -> {{ .Type }} {
+  return static_cast<{{ .Type }}>(value);
+}
+
+{{ end }}
+
+
+{{- define "Enum:WireTypesSource" }}
+template <bool IsRecursive>
+void fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, IsRecursive>::Encode(
+  ::fidl::internal::WireEncoder* encoder, {{ . }}* value, ::fidl::internal::WirePosition position, ::fidl::internal::RecursionDepth<IsRecursive> recursion_depth) {
+  {{- if .Strictness }}
+  {{- $enumType := . }}
+  switch (*value) {
+    {{- range .Members }}
+    case {{ $enumType }}::{{ .Unified }}:
+    {{- end }}
+    {{- if .Members }}
+      break;
+    {{- end }}
+    default:
+      encoder->SetError(::fidl::internal::kCodingErrorUnknownEnumValue);
+      return;
+  }
+  {{- end }}
+  *position.As<{{ . }}>() = *value;
+}
+
+template <bool IsRecursive>
+void fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, IsRecursive>::Decode(
+  ::fidl::internal::WireDecoder* decoder, ::fidl::internal::WirePosition position, ::fidl::internal::RecursionDepth<IsRecursive> recursion_depth) {
+  {{- if .Strictness }}
+  [[maybe_unused]] {{ . }} value = *position.As<{{ . }}>();
+  {{- $enumType := . }}
+  switch (value) {
+    {{- range .Members }}
+    case {{ $enumType }}::{{ .Unified }}:
+    {{- end }}
+    {{- if .Members }}
+      break;
+    {{- end }}
+    default:
+      decoder->SetError(::fidl::internal::kCodingErrorUnknownEnumValue);
+      return;
+  }
+  {{- end }}
+}
+
+template struct ::fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, true>;
+template struct ::fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, false>;
+
+{{ end }}
+
+{{- define "Enum:Traits:WireTypesHeader" }}
+template <bool IsRecursive>
+struct internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, IsRecursive> {
+  static constexpr size_t kInlineSize = sizeof({{ .Type }});
+  static constexpr bool kIsMemcpyCompatible = {{ not .Strictness }};
+
+  static void Encode(internal::WireEncoder* encoder, {{ . }}* value, ::fidl::internal::WirePosition position, RecursionDepth<IsRecursive> recursion_depth);
+  static void Decode(internal::WireDecoder* decoder, ::fidl::internal::WirePosition position, RecursionDepth<IsRecursive> recursion_depth);
+};
+
+{{ end }}
+
+
+
+{{- define "Enum:CommonTypesSource" }}
+
+{{- if .IsCompatibleWithError }}
+{{ EnsureNamespace "" }}
+size_t fidl::internal::DisplayError<{{ . }}>::Format(
+    const {{ . }}& value, char* destination, size_t capacity
+) {
+  const char* member_name = [&] () -> const char* {
+    switch (static_cast<{{ .Type }}>(value)) {
+      {{- range .Members }}
+      case {{ .Value }}: return "{{ .EnumMember.Name }}";
+      {{- end }}
+      default: return "[UNKNOWN]";
+    }
+  }();
+  size_t written = snprintf(destination, capacity, "%s.%s (value: %u)",
+      "{{ .Enum.Name }}", member_name, static_cast<{{ .Type }}>(value));
+  return std::min(written, capacity - 1);
+}
+{{- end }}
+
+{{- end }}
+
+
+
+{{- define "Enum:Traits:CommonTypesHeader" }}
+
+template <>
+struct IsFidlType<{{ . }}> : public std::true_type {};
+template <>
+struct ContainsHandle<{{ . }}> : public std::false_type {};
+
+{{- end }}
+
+{{- define "Enum:WireTypesHeader" }}
+{{ EnsureNamespace . -}}
+using {{ .Name }} = {{ .Unified }};
+{{- end }}
+
+{{- define "Enum:Traits:NaturalTypesHeader" }}
+  template <>
+  struct internal::NaturalCodingTraits<{{ . }}, ::fidl::internal::NaturalCodingConstraintEmpty> {
+    static constexpr size_t kInlineSize = sizeof({{ .Type }});
+    static constexpr bool kIsMemcpyCompatible = {{ not .Strictness }};
+
+    static void Encode(internal::NaturalEncoder* encoder, {{ . }}* value, size_t offset, size_t recursion_depth);
+    static void Decode(internal::NaturalDecoder* decoder, {{ . }}* value, size_t offset, size_t recursion_depth);
+  };
+
+{{- end }}
+
+{{- define "Enum:NaturalTypesSource" }}
+  {{ EnsureNamespace "" }}
+
+  void fidl::internal::NaturalCodingTraits<{{ . }}, ::fidl::internal::NaturalCodingConstraintEmpty>::Encode(
+      fidl::internal::NaturalEncoder* encoder, {{ . }}* value, size_t offset, size_t recursion_depth) {
+    {{- if .Strictness }}
+      switch (*value) {
+        {{- range .Members }}
+          case {{ $ }}::{{ .Unified }}:
+        {{- end }}
+        {{- if .Members }}
+          break;
+        {{- end }}
+        default:
+          encoder->SetError(::fidl::internal::kCodingErrorUnknownEnumValue);
+          return;
+      }
+    {{- end }}
+    *encoder->template GetPtr<{{ . }}>(offset) = *value;
+  }
+
+  void fidl::internal::NaturalCodingTraits<{{ . }}, ::fidl::internal::NaturalCodingConstraintEmpty>::Decode(
+      fidl::internal::NaturalDecoder* decoder, {{ . }}* value, size_t offset, size_t recursion_depth) {
+    *value = *decoder->template GetPtr<{{ . }}>(offset);
+    {{- if .Strictness }}
+      switch (*value) {
+        {{- range .Members }}
+          case {{ $ }}::{{ .Unified }}:
+        {{- end }}
+        {{- if .Members }}
+          break;
+        {{- end }}
+        default:
+          decoder->SetError(::fidl::internal::kCodingErrorUnknownEnumValue);
+          return;
+      }
+    {{- end }}
+  }
+{{- end }}
+
+{{- define "Enums:Traits:TypeConversionsHeader" }}
+template <>
+struct NaturalTypeForWireType<{{ .Wire }}> {
+    using type = {{ .Unified }};
+};
+template <>
+struct WireTypeForNaturalType<{{ .Unified }}> {
+    using type = {{ .Wire }};
+};
+{{- end }}

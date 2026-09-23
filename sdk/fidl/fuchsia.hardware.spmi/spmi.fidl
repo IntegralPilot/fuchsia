@@ -1,0 +1,169 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.spmi;
+
+using fuchsia.power.system;
+
+/// Maximum length of the SPMI device name.
+const MAX_SPMI_NAME_LEN uint32 = 64;
+
+/// An arbitrary limit on the number of register writes that can be returned to
+/// `WatchControllerWriteCommands()`.
+const MAX_CONTROLLER_WRITE_COMMANDS uint32 = 256;
+
+/// Errors that this driver may return.
+type DriverError = flexible enum {
+    /// The driver encountered an otherwise unspecified error while performing the operation.
+    INTERNAL = 1;
+
+    /// The operation is not implemented, supported, or enabled.
+    NOT_SUPPORTED = 2;
+
+    /// An argument is invalid.
+    INVALID_ARGS = 3;
+
+    /// The operation failed because the current state of the driver does not allow it, or a
+    /// precondition of the operation is not satisfied.
+    BAD_STATE = 4;
+
+    /// The device returned a NACK (negative Acknowledgment).
+    /// The client may retry the operation after a NACK was sent for instance due to a parity error.
+    IO_REFUSED = 5;
+
+    /// The hanging-get method was canceled.
+    CANCELED = 6;
+
+    /// No pending hanging-get method was found for the given arguments.
+    NOT_FOUND = 7;
+};
+
+/// A single register read from or written to with an SPMI command that uses an 8-bit address.
+type Register8 = struct {
+    address uint8;
+    data uint8;
+};
+
+/// Each instance of `Device` represents a target/secondary SPMI device on a SPMI bus.
+/// To support multiple SPMI devices, multiple nodes must be instantiated.
+@discoverable
+open protocol Device {
+    /// Issue register read commands to the SPMI device.
+    /// The implementation may choose which SPMI variation (e.g. extended, long) to use.
+    /// When successful, it returns `size_bytes` in `data` read contiguously starting from
+    /// `address` in the device.
+    flexible RegisterRead(struct {
+        address uint16;
+        size_bytes uint32;
+    }) -> (struct {
+        data vector<uint8>:MAX;
+    }) error DriverError;
+
+    /// Issue register write commands to the SPMI device.
+    /// The implementation may choose which SPMI variation (e.g. extended, long) to use.
+    /// When this command is successful, `data` will be written contiguously starting from
+    /// `address` in the device.
+    flexible RegisterWrite(struct {
+        address uint16;
+        data vector<uint8>:MAX;
+    }) -> () error DriverError;
+
+    /// Get the properties of the SPMI device.
+    flexible GetProperties() -> (table {
+        /// Unique SPMI target/secondary identifier, corresponds to the SPMI specification sid.
+        /// Up to 16 secondaries are identifed with an id from 0 to 15 inclusive.
+        ///
+        /// Required.
+        1: sid uint8;
+
+        /// User friendly string for the device name. If not set, the device name is unknown.
+        /// If included, this string must be non-empty.
+        ///
+        /// Optional.
+        2: name string:MAX_SPMI_NAME_LEN;
+
+        /// Width in bytes of each register in the device. If not set, the register width
+        /// defaults to 1 byte.
+        ///
+        /// Optional.
+        3: register_width_bytes uint32;
+    });
+
+    /// Hanging-get method to receive controller write commands from the device. `address` and
+    /// `size` specify the register range to monitor for commands. Multiple overlapping calls to
+    /// this method are not allowed.
+    /// Returns `INVALID_ARGS` if `address` or `size` are invalid, or `BAD_STATE` if another call
+    /// is pending for this register range. Returns `CANCELED` if
+    /// `CancelWatchControllerWriteCommands()` was called for this register range.
+    ///
+    /// If this method is meant to keep the system awake (prevents suspension) while watch is setup,
+    /// use the passed-in `setup_wake_lease` `LeaseToken`. Then, when the watch is triggered this
+    /// method will return a second `wake_lease` `LeaseToken` to prevent suspension.
+    ///
+    /// These keep alive wake lease tokens are provided by the Power Framework's System Activity
+    /// Governor. A driver supporting keep alive must be able to get `wake_lease` from System
+    /// Activity Governor.
+    ///
+    /// When `wake_lease` is closed, then the created wake lease keeping the system from suspending
+    /// at the time of watch triggering is dropped. Hence, to guarantee that the system is not
+    /// suspended by the Power Framework a client must either keep this `wake_lease` for as long as
+    /// the system needs to stay awake, or a client must get its own wake lease from the Power
+    /// Framework before it drops `wake_lease` to prevent suspension.
+    flexible WatchControllerWriteCommands(resource struct {
+        address uint8;
+        size uint16;
+        setup_wake_lease fuchsia.power.system.LeaseToken:optional;
+    }) -> (resource struct {
+        writes vector<Register8>:MAX_CONTROLLER_WRITE_COMMANDS;
+        wake_lease fuchsia.power.system.LeaseToken:optional;
+    }) error DriverError;
+
+    /// Cancels an pending call to `WatchControllerWriteCommands`. `address` and `size` must
+    /// exactly match a previous call to `WatchControllerWriteCommands()`, otherwise `NOT_FOUND`
+    /// is returned.
+    flexible CancelWatchControllerWriteCommands(struct {
+        address uint8;
+        size uint16;
+    }) -> () error DriverError;
+};
+
+/// This service represents an SPMI target device. Clients have access to the entire SPMI register
+/// range.
+service TargetService {
+    device client_end:Device;
+};
+
+/// This service represents a sub-target device within an SPMI target. Clients have access to a
+/// subset of the SPMI register range as determined by the controller driver.
+service SubTargetService {
+    device client_end:Device;
+};
+
+open protocol Debug {
+    /// Connects to the target device with the given ID. Equivalent to connecting to `TargetService`
+    /// via the corresponding driver node.
+    ///
+    /// Returns `INVALID_ARGS` if `target_id` is greater than or equal to `MAX_TARGETS`.
+    /// May return an error if there is no such target on the bus; otherwise errors will be returned
+    /// when attempting to access the client.
+    strict ConnectTarget(resource struct {
+        target_id uint8;
+        server server_end:Device;
+    }) -> () error DriverError;
+
+    /// Returns the properties of the host SPMI controller.
+    strict GetControllerProperties() -> (table {
+        /// User friendly string for the controller name. If not set, the controller name is
+        /// unknown. If included, this string must be non-empty.
+        ///
+        /// Optional.
+        1: name string:MAX_SPMI_NAME_LEN;
+    });
+};
+
+/// This service can be used by command-line utilities and tests to connect to any target device on
+/// the SPMI bus. It is not exposed to drivers.
+service DebugService {
+    device client_end:Debug;
+};

@@ -1,0 +1,291 @@
+// Copyright 2021 The Fuchsia Authors.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.net.test.realm;
+
+using fuchsia.net;
+using fuchsia.net.interfaces;
+using fuchsia.net.dhcpv6;
+using fuchsia.url;
+using zx;
+
+// Arbitrarily chosen to satisfy testing use cases and avoid IP fragmentation.
+const MAX_UDP_POLL_LENGTH uint16 = 1024;
+
+/// Standard error codes for the `Controller` protocol.
+type Error = strict enum {
+    /// The controller encountered an unspecified error while performing the
+    /// desired operation.
+    INTERNAL = 1;
+    /// A hermetic network realm was expected to exist, but no such realm was
+    /// found to be running.
+    HERMETIC_NETWORK_REALM_NOT_RUNNING = 2;
+    /// A network interface was expected to exist, but was not found.
+    INTERFACE_NOT_FOUND = 3;
+    /// A stub was expected to exist, but was not found.
+    STUB_NOT_RUNNING = 4;
+    /// At least one argument was not valid.
+    INVALID_ARGUMENTS = 5;
+    /// The relevant component was not found.
+    COMPONENT_NOT_FOUND = 6;
+    /// The operation could not be performed within the specified timeout.
+    TIMEOUT_EXCEEDED = 7;
+    /// A ping unexpectedly failed.
+    PING_FAILED = 8;
+    /// The requested address is not available.
+    ADDRESS_NOT_AVAILABLE = 9;
+    /// The requested address is in use.
+    ADDRESS_IN_USE = 10;
+    /// The resource already exists.
+    ALREADY_EXISTS = 11;
+    /// The target address is unreachable (e.g. no route exists to it).
+    ADDRESS_UNREACHABLE = 12;
+    /// A DHCPv6 client was expected to be running, but none was found.
+    DHCPV6_CLIENT_NOT_RUNNING = 13;
+    /// A DHCPv4 client was expected to be running, but none was found.
+    DHCPV4_CLIENT_NOT_RUNNING = 14;
+    /// Failed to shutdown the DHCPv4 client.
+    DHCPV4_CLIENT_SHUTDOWN_FAILED = 15;
+};
+
+/// A controller for creating and manipulating the Network Test Realm.
+///
+/// The Network Test Realm corresponds to a hermetic network realm with a
+/// Netstack under test. The `Controller` protocol is responsible for:
+///
+///  * Configuring the Network Test Realm and its child components. This
+///    includes the Netstack under test and the other relevant network
+///    components (e.g. a DHCP server).
+///  * Coordinating interactions with the system's Netstack. This includes
+///    temporarily taking over and mutating system interfaces.
+@discoverable
+closed protocol Controller {
+    /// Starts a hermetic network realm corresponding to `netstack`.
+    ///
+    /// Any previously running hermetic network realm will be terminated before
+    /// the new realm is started. The configured realm will contain a subset of
+    /// the components in the standard network realm. In particular, it will
+    /// contain:
+    ///
+    ///  * A Netstack instance that corresponds to the provided `netstack`
+    ///  * A DHCP server
+    ///  * A DHCPv6 client
+    ///  * A DNS resolver
+    ///
+    /// + request `netstack` the type of Netstack that will be run.
+    /// * error `INTERNAL` for internal errors, including failure to start the
+    ///     specified `netstack`.
+    strict StartHermeticNetworkRealm(struct {
+        netstack strict enum {
+            /// Netstack2.
+            V2 = 1;
+            /// Netstack3.
+            V3 = 2;
+        };
+    }) -> () error Error;
+
+    /// Stops any running hermetic network realm.
+    ///
+    /// All components in the hermetic network realm will be stopped.
+    ///
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if a hermetic network realm
+    ///     is not running.
+    /// * error `INTERNAL` for internal errors, including failure to destroy the
+    ///     realm.
+    strict StopHermeticNetworkRealm() -> () error Error;
+
+    /// Attaches an interface to the hermetic Netstack.
+    ///
+    /// The interface that corresponds to `mac_address` will have its session
+    /// closed. As a result, the interface is removed from the system's
+    /// Netstack so that it can be installed on the hermetic Netstack.
+    ///
+    /// + request `mac_address` address of the interface to be added to the
+    ///     hermetic Netstack.
+    /// + request `name` the name to assign to the new interface.
+    /// + request `wait_any_ip_address` whether to wait for any IP address to be
+    ///     assigned to the interface before returning. This is helpful for
+    ///     tests that want to ensure the autoconfigured IP address is assigned
+    ///     and has completed duplicate address detection before proceeding.
+    /// * error `ALREADY_EXISTS` if an interface with `name` already exists on
+    ///     the hermetic Netstack.
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if there is no running
+    ///     hermetic network realm.
+    /// * error `INTERFACE_NOT_FOUND` if an interface with `mac_address` could
+    ///     not be found on the system.
+    /// * error `INTERNAL` for internal errors, including failure to read the
+    ///     system's interfaces or configure an interface.
+    strict AddInterface(struct {
+        mac_address fuchsia.net.MacAddress;
+        name fuchsia.net.interfaces.Name;
+        wait_any_ip_address bool;
+    }) -> () error Error;
+
+    /// Starts a test stub.
+    ///
+    /// Any previously running stub will be terminated before the provided
+    /// stub corresponding to `component_url` is started.
+    ///
+    /// + request `component_url` the URL of the component to run.
+    /// * error `COMPONENT_NOT_FOUND` if a component correspodning to
+    ///     `component_url` could not be resolved.
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if there is no running
+    ///     hermetic network realm.
+    /// * error `INTERNAL` for internal errors, including failure to add the
+    ///     desired stub within the hermetic network realm.
+    /// * error `INVALID_ARGUMENTS` if the `component_url` is malformed.
+    strict StartStub(struct {
+        component_url fuchsia.url.Url;
+    }) -> () error Error;
+
+    /// Stops the currently running stub.
+    ///
+    /// Other existing hermetic network realm components will continue to be run
+    /// after this is invoked.
+    ///
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if there is no running
+    ///     hermetic network realm.
+    /// * error `STUB_NOT_RUNNING` if there is no running stub.
+    /// * error `INTERNAL` for internal errors, including failure to destroy the
+    ///     stub component.
+    strict StopStub() -> () error Error;
+
+    /// Sends an ICMP echo request to the `target` using a socket provided by
+    /// the hermetic Netstack.
+    ///
+    /// + request `target` the address to ping.
+    /// + request `payload_length` the body size of the ICMP packet.
+    ///     Specifically, the packet body will be filled with zeros of
+    ///     `payload_length`.
+    /// + request `interface_name` an optional interface to bind the socket to.
+    /// + request `timeout` a timeout in nanoseconds to wait for a reply. If
+    ///     less than or equal to 0, then returns success immediately after the
+    ///     ping is sent.
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if there is no running
+    ///     hermetic network realm.
+    /// * error `INTERFACE_NOT_FOUND` if `interface_name` does not exist in the
+    ///     hermetic Netstack.
+    /// * error `INTERNAL` for internal errors, including failure to create a
+    ///     socket or generate the ping request and response.
+    /// * error `INVALID_ARGUMENTS` if `target` corresponds to a link-local
+    ///     address and an `interface_name` is not specified or the
+    ///     `payload_length` exceeds the maximum allowable size.
+    /// * error `PING_FAILED` if there was an error sending or receiving the
+    ///     ping.
+    /// * error `TIMEOUT_EXCEEDED` if the ping reply is not received before the
+    ///     specifed `timeout`.
+    strict Ping(struct {
+        target fuchsia.net.IpAddress;
+        payload_length uint16;
+        interface_name string:<fuchsia.net.interfaces.INTERFACE_NAME_LENGTH, optional>;
+        timeout zx.Duration;
+    }) -> () error Error;
+
+    /// Polls the specified socket address with UDP datagrams containing the specified payload
+    /// using a socket provided by the hermetic Netstack.
+    ///
+    /// Waits for a single reply from the target address and returns it.
+    ///
+    /// + request `target` the socket address to poll.
+    /// + request `payload` the content to place in the UDP datagram.
+    /// + request `timeout` a timeout in nanoseconds to wait for a reply, per retry.
+    /// + request `num_retries` the number of poll attempts to make before giving up and returning
+    ///     an error.
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if there is no running
+    ///     hermetic network realm.
+    /// * error `ADDRESS_UNREACHABLE` if all poll attempts expire without successfully receiving
+    ///     a reply from the target address, and no route was found to the target address.
+    /// * error `TIMEOUT_EXCEEDED` if the target address was routable, but all of the retry
+    ///     attempts expire without successfully receiving a reply from the target address.
+    /// * error `INTERNAL` for internal errors, including failure to create a socket or other
+    ///     failures to send/receive datagrams from the target address.
+    strict PollUdp(struct {
+        target fuchsia.net.SocketAddress;
+        payload vector<uint8>:MAX_UDP_POLL_LENGTH;
+        timeout zx.Duration;
+        num_retries uint16;
+    }) -> (struct {
+        payload vector<uint8>:MAX_UDP_POLL_LENGTH;
+    }) error Error;
+
+    /// Joins a multicast group.
+    ///
+    /// Membership will be maintained until `LeaveMulticastGroup` or
+    /// `StopHermeticNetworkRealm` is invoked.
+    ///
+    /// + request `address` the group address to join.
+    /// + request `interface_id` the interface that should be used to join the
+    ///     group. A value of 0 indicates that any interface may be used.
+    /// * error `ADDRESS_IN_USE` if the provided `address` was previously
+    ///     joined.
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if there is no running
+    ///     hermetic network realm.
+    /// * error `INTERNAL` for internal errors.
+    /// * error `INVALID_ARGUMENTS` if the specified `interface_id` does not
+    ///     exist or the `address` does not correspond to a valid multicast
+    ///     address.
+    strict JoinMulticastGroup(struct {
+        address fuchsia.net.IpAddress;
+        interface_id fuchsia.net.InterfaceId;
+    }) -> () error Error;
+
+    /// Leaves a multicast group that was previously joined using the
+    /// `JoinMulticastGroup` method.
+    ///
+    /// + request `address` the group address to leave.
+    /// + request `interface_id` the interface that was previously used to join
+    ///     the multicast group.
+    /// * error `ADDRESS_NOT_AVAILABLE` if the provided `address` was not
+    ///     previously joined.
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if there is no running
+    ///     hermetic network realm.
+    /// * error `INTERNAL` for internal errors, including failure to connect
+    ///     to hermetic network realm services.
+    /// * error `INVALID_ARGUMENTS` if the specified `interface_id` does not
+    ///     exist or the `address` does not correspond to a valid multicast
+    ///     address.
+    strict LeaveMulticastGroup(struct {
+        address fuchsia.net.IpAddress;
+        interface_id fuchsia.net.InterfaceId;
+    }) -> () error Error;
+
+    /// Starts a DHCPv6 client with the provided parameters.
+    ///
+    /// + request `params` parameters to start this DHCPv6 client with.
+    ///     Required.
+    /// * error `HERMETIC_NETWORK_REALM_NOT_RUNNING` if there is no running
+    ///     hermetic network realm.
+    /// * error `INTERNAL` for internal errors, including failure to connect
+    ///     to hermetic network realm services.
+    /// * error `INVALID_ARGUMENTS` if any required parameters are omitted.
+    /// * error `ALREADY_EXISTS` if there is a client running on the interface
+    ///     identified by `params.interface_id` already.
+    strict StartDhcpv6Client(struct {
+        params fuchsia.net.dhcpv6.NewClientParams;
+    }) -> () error Error;
+
+    /// Stops all DHCPv6 clients.
+    ///
+    /// * error `DHCPV6_CLIENT_NOT_RUNNING` if no DHCPv6 client is running.
+    strict StopDhcpv6Client() -> () error Error;
+
+    /// Starts a DHCPv4 client on the provided interface.
+    ///
+    /// + request `interface_id` the interface to start a DHCPv4 client on.
+    ///     Required.
+    strict StartOutOfStackDhcpv4Client(table {
+        1: interface_id fuchsia.net.InterfaceId;
+    }) -> () error Error;
+
+    /// Stops the DHCPv4 client on the provided interface.
+    ///
+    /// + request `interface_id` the interface to stop a DHCPv4 client client on.
+    ///     Required.
+    /// * error `DHCPV4_CLIENT_NOT_RUNNING` if no DHCPv4 client is running.
+    /// * error `DHCPV4_CLIENT_SHUTDOWN_FAILED` if shutting down the DHCPv4 client
+    ///   failed.
+    strict StopOutOfStackDhcpv4Client(table {
+        1: interface_id fuchsia.net.InterfaceId;
+    }) -> () error Error;
+};

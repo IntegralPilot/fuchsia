@@ -1,0 +1,1153 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Instructions for CTF test authors.
+#
+# When adding a new CTF test, you must create a template below to ensure that
+# when the test is released in CTF and rolled back into Fuchsia, the build
+# knows how to expand the prebuilt test into a runnable Fuchsia package.
+#
+# The template name should follow the pattern "generate_${package_name}".
+# If you're unsure what package name to use, run this command and see which
+# missing template name causes the build to fail:
+#
+#   fx set core.x64 --with //sdk/ctf:check_test_templates && fx build
+#
+# The template must take a single `test_info` scope as input which has the
+# following attributes:
+#
+#    name
+#      The name of the prebuilt CTF test package.
+#      Type: string
+#
+#    target_label
+#      The absolute GN label of the prebuilt package.
+#      Type: string
+#
+#    target_api_level
+#      The API level validated by this test.
+#      Type: int
+#
+#    test_component_names (optional)
+#      Optional list of component names that are meant to be run directly
+#      as tests from the package.
+#      Type: list[string] (optional)
+#
+# If the template defines `fidl_coverage = true` then for the `in_development`
+# API level, a Lacewing test will be created that wraps the device test and
+# reports its FIDL activity in the test artifacts. See
+# `sdk/ctf/build/scripts/snoop_fidl.py` for more details.
+#
+# See generate_pkgdir-tests for an example.
+
+import("//sdk/ctf/build/internal/fuchsia_package_with_test.gni")
+import("//sdk/ctf/build/internal/generate_ctf_packages.gni")
+import("//src/lib/vulkan/vulkan.gni")
+
+# Tests in this list are not inflated into a real test, even if they are
+# present in a CTF download.
+IGNORED_CTF_TESTS = [
+  "flatland-auto-focus-integration-test-suite",
+  "flatland-child-focus-integration-test-suite",
+  "flatland-transformed-touch-integration-test-suite",
+  "flatland-mouse-hit-integration-test-suite",
+  "flatland-mouse-wheel-integration-test-suite",
+]
+
+# This template has the same input as other generate_* templates,
+# but it handles the common operation of treating an input
+# package + test_component_names as a group of pre-packaged tests.
+#
+# We cannot change the name of the downloaded package, but we can
+# subpackage it in a new test component with a generated manifest.
+template("pre_packaged_test_with_names") {
+  if (target_cpu != host_cpu) {
+    not_needed(invoker, "*")
+    group(target_name) {
+      testonly = true
+    }
+  } else {
+    test_info = invoker.test_info
+
+    # TODO (b/396759044): Decide whether to wrap these tests in the
+    # Lacewing FIDL snooper.
+    not_needed(invoker, [ "fidl_coverage" ])
+    package_name = test_info.name
+    assert(defined(test_info.test_component_names),
+           "Expected test_component_names for a pre-packaged test.")
+    test_component_names = test_info.test_component_names
+
+    generated_components = []
+
+    foreach(test_name, test_component_names) {
+      # Generate a simple manifest for this test that offers all diagnostics
+      # capabilities and simply exposes the test suite itself.
+      generated_manifest = "${target_name}_${test_name}_generated_manifest"
+      fuchsia_test_component_manifest(generated_manifest) {
+        metadata = {
+          test_component_manifest_cml = [
+            {
+              include = [
+                "//sdk/lib/syslog/offer.shard.cml",
+                "//sdk/lib/inspect/offer.shard.cml",
+              ]
+              children = [
+                {
+                  name = "test"
+                  url = "${package_name}#meta/${test_name}.cm"
+                },
+              ]
+              expose = [
+                {
+                  protocol = "fuchsia.test.Suite"
+                  from = "#test"
+                },
+              ]
+            },
+          ]
+        }
+        visibility = [ ":*" ]
+      }
+      manifest = get_target_outputs(":$generated_manifest")
+      manifest = manifest[0]
+      generated_component = "${target_name}_${test_name}_generated_component"
+      fuchsia_test_component(generated_component) {
+        component_name = test_name
+        manifest = manifest
+        deps = [ ":$generated_manifest" ]
+      }
+      generated_components += [ ":$generated_component" ]
+    }
+
+    # Package our wrapper component, and subpackage the test within
+    # the new package.
+    fuchsia_test_package(target_name) {
+      package_name = target_name
+      test_components = generated_components
+      subpackages = [ test_info.target_label ]
+    }
+  }
+}
+
+template("generate_scenic_test_base") {
+  forward_variables_from(invoker,
+                         [
+                           "test_component",
+                           "test_component_name",
+                           "target_test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+
+  fuchsia_package_with_test(target_name) {
+    test_component = test_component
+    test_component_name = test_component_name
+    subpackages = [
+      target_test_info.target_label,
+      "//src/ui/testing/scenic_realm_factory:pkg",
+    ]
+    test_specs = {
+      environments = vulkan_envs
+      log_settings = {
+        max_severity = "ERROR"
+      }
+    }
+  }
+}
+
+template("generate_archivist_integration_test_cases") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+
+  # TODO(https://fxbug.dev/383560524): This is disabled until we fix an error in the test.
+  if (defined(invoker.api_level) &&
+      (invoker.api_level == "25" || invoker.api_level == "27" ||
+       invoker.api_level == "28")) {
+    not_needed([
+                 "test_info",
+                 "fidl_coverage",
+               ])
+    group(target_name) {
+    }
+  } else {
+    fuchsia_package_with_test(target_name) {
+      # This test needs to override the default CTF realm.
+      device_test_realm = "/core/testing/system-tests"
+      test_component = "//src/diagnostics/archivist/tests/integration:test_root"
+      test_component_name = "test_root.cm"
+      subpackages = [
+        test_info.target_label,
+        "//src/diagnostics/archivist/tests/integration/realm_factory:pkg",
+      ]
+    }
+  }
+}
+
+template("generate_fuchsia-diagnostics-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      # These tests do not currently use a test realm factory.
+    ]
+    test_component = "//sdk/ctf/tests/fidl/fuchsia.diagnostics:fuchsia-diagnostics-tests-root"
+    test_component_name = "fuchsia-diagnostics-tests-root.cm"
+  }
+}
+
+template("generate_fuchsia-diagnostics-log-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      # These tests do not currently use a test realm factory.
+    ]
+    test_component = "//sdk/ctf/tests/fidl/fuchsia.diagnostics:fuchsia-diagnostics-log-tests-root"
+    test_component_name = "fuchsia-diagnostics-log-tests-root.cm"
+  }
+}
+
+template("generate_fidl-hlcpp-unit-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      # These tests do not currently use a test realm factory.
+    ]
+    test_component = "//sdk/ctf/tests/pkg/fidl/cpp:fidl-hlcpp-unit-tests-root"
+    test_component_name = "fidl-hlcpp-unit-tests-root.cm"
+  }
+}
+
+template("generate_fidl-hlcpp-conformance-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      # These tests do not currently use a test realm factory.
+    ]
+    test_component =
+        "//sdk/ctf/tests/pkg/fidl/cpp:fidl-hlcpp-conformance-tests-root"
+    test_component_name = "fidl-hlcpp-conformance-tests-root.cm"
+  }
+}
+
+template("generate_svc-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      # These tests do not currently use a test realm factory.
+    ]
+    test_component = "//sdk/ctf/tests/pkg/svc:svc-tests-root"
+    test_component_name = "svc-tests-root.cm"
+  }
+}
+
+template("generate_vulkan-loader-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      # These tests do not currently use a test realm factory.
+    ]
+    test_component = "//sdk/ctf/tests/pkg/vulkan:vulkan-loader-test-root"
+    test_component_name = "vulkan-loader-test-root.cm"
+    test_specs = {
+      environments = vulkan_envs
+      log_settings = {
+        max_severity = "WARN"
+      }
+    }
+  }
+}
+
+template("generate_fuchsia-intl-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//sdk/ctf/tests/fidl/fuchsia.intl:test-root"
+    test_component_name = "test-root.cm"
+    subpackages = [
+      test_info.target_label,
+      "//sdk/ctf/tests/fidl/fuchsia.intl/testing/realm-factory",
+    ]
+  }
+}
+
+template("generate_timekeeper-integration") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+
+  # TODO: b/365558387 - This CTF test should be completely
+  # retracted.
+  not_needed([
+               "test_info",
+               "fidl_coverage",
+             ])
+  group(target_name) {
+  }
+}
+
+template("generate_faketime-integration") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+
+  # TODO: b/365558387 - This CTF test should be completely
+  # retracted.
+  not_needed([
+               "test_info",
+               "fidl_coverage",
+             ])
+  group(target_name) {
+  }
+}
+
+template("generate_fdio-spawn-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//sdk/ctf/tests/pkg/fdio:test-root"
+    test_component_name = "test-root.cm"
+    subpackages = [
+      test_info.target_label,
+      # These tests do not currently use a test realm factory.
+    ]
+  }
+}
+
+template("generate_fuchsia-driver-test_tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      # These tests do not currently use a test realm factory.
+    ]
+    deps = [
+      "//sdk/lib/driver_test_realm:static",
+      "//src/devices/misc/drivers/test-parent",
+    ]
+    test_component = "//sdk/ctf/tests/fidl/fuchsia.driver.test:test-root"
+    test_component_name = "test-root.cm"
+  }
+}
+
+template("generate_fuchsia-settings-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//sdk/ctf/tests/fidl/fuchsia.settings:test-root"
+    test_component_name = "test-root.cm"
+    subpackages = [
+      test_info.target_label,
+      "//sdk/ctf/tests/fidl/fuchsia.settings/testing/realm-factory",
+    ]
+  }
+}
+
+template("generate_fuchsia-element-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      "//sdk/ctf/tests/fidl/fuchsia.element/testing/realm-factory:realm-factory",
+    ]
+    test_component = "//sdk/ctf/tests/fidl/fuchsia.element:test-root"
+    test_component_name = "test-root.cm"
+  }
+}
+
+template("generate_fuchsia-hwinfo-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [ test_info.target_label ]
+    test_component = "//sdk/ctf/tests/fidl/fuchsia.hwinfo:test-root"
+    test_component_name = "test-root.cm"
+  }
+}
+
+template("generate_pkgdir-tests") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    subpackages = [
+      test_info.target_label,
+      "//src/sys/pkg/tests/pkgdir/test_realm_proxy",
+    ]
+    test_component = "//src/sys/pkg/tests/pkgdir:test-root"
+    test_component_name = "test-root.cm"
+  }
+}
+
+template("generate_basic-driver-test") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component =
+        "//src/devices/tests/ctf/basic_driver:basic-driver-test-root"
+    test_component_name = "basic-driver-test-root.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/devices/testing/realm-factory",
+    ]
+  }
+}
+
+template("generate_nodegroup_test") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//src/devices/tests/v2/node_group:nodegroup_test_root"
+    test_component_name = "nodegroup_test_root.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/devices/testing/realm-factory",
+    ]
+  }
+}
+
+template("generate_realm_integration_tests-ctf") {
+  pre_packaged_test_with_names(target_name) {
+    forward_variables_from(invoker, "*")
+  }
+}
+
+template("generate_touch-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//src/ui/tests/conformance_input_tests:touch-conformance-test-component"
+    test_component_name = "touch-conformance-test.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/context:ui-context-factory",
+    ]
+    test_specs = {
+      log_settings = {
+        max_severity = "ERROR"
+      }
+      environments = [
+        {
+          dimensions = {
+            # Ensure the device has Vulkan.
+            device_type = "AEMU"
+          }
+        },
+      ]
+    }
+  }
+}
+
+template("generate_mouse-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//src/ui/tests/conformance_input_tests:mouse-conformance-test-component"
+    test_component_name = "mouse-conformance-test.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/context:ui-context-factory",
+    ]
+    test_specs = {
+      log_settings = {
+        max_severity = "ERROR"
+      }
+      environments = [
+        {
+          dimensions = {
+            # Ensure the device has Vulkan.
+            device_type = "AEMU"
+          }
+        },
+      ]
+    }
+  }
+}
+
+template("generate_key-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component =
+        "//src/ui/tests/conformance_input_tests:key-conformance-test-component"
+    test_component_name = "key-conformance-test.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/context:ui-context-factory",
+    ]
+    test_specs = {
+      log_settings = {
+        max_severity = "ERROR"
+      }
+      environments = [
+        {
+          dimensions = {
+            # Ensure the device has Vulkan.
+            device_type = "AEMU"
+          }
+        },
+      ]
+    }
+  }
+}
+
+template("generate_focus-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//src/ui/tests/conformance_input_tests:focus-conformance-test-component"
+    test_component_name = "focus-conformance-test.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/context:ui-context-factory",
+    ]
+    test_specs = {
+      log_settings = {
+        max_severity = "ERROR"
+      }
+      environments = [
+        {
+          dimensions = {
+            # Ensure the device has Vulkan.
+            device_type = "AEMU"
+          }
+        },
+      ]
+    }
+  }
+}
+
+template("generate_media-button-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//src/ui/tests/conformance_input_tests:media-button-conformance-test-component"
+    test_component_name = "media-button-conformance-test.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/context:ui-context-factory",
+    ]
+    test_specs = {
+      log_settings = {
+        max_severity = "ERROR"
+      }
+      environments = [
+        {
+          dimensions = {
+            # Ensure the device has Vulkan.
+            device_type = "AEMU"
+          }
+        },
+      ]
+    }
+  }
+}
+
+template("generate_flatland-allocation-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component = "//src/ui/scenic/tests:flatland-allocation-test-component"
+    test_component_name = "flatland-allocation-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-touch-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:flatland-touch-integration-test-component"
+    test_component_name = "flatland-touch-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-focus-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:flatland-focus-integration-test-component"
+    test_component_name = "flatland-focus-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-view-ref-installed-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//src/ui/scenic/tests:flatland-view-ref-installed-integration-test-component"
+    test_component_name = "flatland-view-ref-installed-integration-test.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/scenic_realm_factory:pkg",
+    ]
+    test_specs = {
+      environments = [
+        astro_env,
+        sherlock_env,
+        nelson_env,
+      ]
+      log_settings = {
+        max_severity = "ERROR"
+      }
+    }
+  }
+}
+
+template("generate_flatland-view-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:flatland-view-integration-test-component"
+    test_component_name = "flatland-view-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_cpu-renderer-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([
+               "test_info",
+               "fidl_coverage",
+             ])
+  group(target_name) {
+  }
+}
+
+template("generate_null-renderer-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:null-renderer-integration-test-component"
+    test_component_name = "null-renderer-integration-test.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/scenic_realm_factory:pkg",
+    ]
+    test_specs = {
+      log_settings = {
+        max_severity = "ERROR"
+      }
+    }
+  }
+}
+
+template("generate_observer-registry-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:observer-registry-integration-test-component"
+    test_component_name = "observer-registry-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_scoped-observer-registry-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component = "//src/ui/scenic/tests:scoped-observer-registry-integration-test-component"
+    test_component_name = "scoped-observer-registry-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-protected-memory-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//src/ui/scenic/tests:flatland-protected-memory-integration-test-component"
+    test_component_name = "flatland-protected-memory-integration-test.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/scenic_realm_factory:pkg",
+    ]
+    test_specs = {
+      environments = [
+        astro_env,
+        sherlock_env,
+        nelson_env,
+      ]
+      log_settings = {
+        max_severity = "ERROR"
+      }
+    }
+  }
+}
+
+template("generate_screen-capture-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:screen-capture-integration-test-component"
+    test_component_name = "screen-capture-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_screen-capture2-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:screen-capture2-integration-test-component"
+    test_component_name = "screen-capture2-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_display-ownership-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:display-ownership-integration-test-component"
+    test_component_name = "display-ownership-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_singleton-display-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:singleton-display-integration-test-component"
+    test_component_name = "singleton-display-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-mouse-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:flatland-mouse-integration-test-component"
+    test_component_name = "flatland-mouse-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-pixeltest-general-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:flatland-pixeltest-general-component"
+    test_component_name = "flatland-pixeltest-general.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-pixeltest-flip-and-orientation-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component = "//src/ui/scenic/tests:flatland-pixeltest-flip-and-orientation-component"
+    test_component_name = "flatland-pixeltest-flip-and-orientation.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-pixeltest-flip-and-orientation-rgba-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component = "//src/ui/scenic/tests:flatland-pixeltest-flip-and-orientation-rgba-component"
+    test_component_name = "flatland-pixeltest-flip-and-orientation-rgba.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-pixeltest-opacity-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:flatland-pixeltest-opacity-component"
+    test_component_name = "flatland-pixeltest-opacity.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-pixeltest-screenshot-format-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component =
+        "//src/ui/scenic/tests:flatland-pixeltest-screenshot-format-component"
+    test_component_name = "flatland-pixeltest-screenshot-format.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-pixeltest-srgb-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component = "//src/ui/scenic/tests:flatland-pixeltest-srgb-component"
+    test_component_name = "flatland-pixeltest-srgb.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+template("generate_flatland-pixeltest-yuv-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([ "fidl_coverage" ])
+  fuchsia_package_with_test(target_name) {
+    test_component = "//src/ui/scenic/tests:flatland-pixeltest-yuv-component"
+    test_component_name = "flatland-pixeltest-yuv.cm"
+    subpackages = [
+      test_info.target_label,
+      "//src/ui/testing/scenic_realm_factory:pkg",
+    ]
+    test_specs = {
+      # TODO(https://fxbug.dev/42137913): Skip this test for AEMU as YUV Sysmem images are not supported yet.
+      # TODO(b/321072153) - lavapipe can't create images with explicit
+      # multiplane formats
+      environments = vulkan_envs - vulkan_goldfish_envs - vulkan_lavapipe_envs
+      log_settings = {
+        max_severity = "ERROR"
+      }
+    }
+  }
+}
+
+template("generate_trusted-flatland-factory-integration-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  generate_scenic_test_base(target_name) {
+    test_component = "//src/ui/scenic/tests:trusted-flatland-factory-integration-test-component"
+    test_component_name = "trusted-flatland-factory-integration-test.cm"
+    target_test_info = test_info
+    fidl_coverage = fidl_coverage
+  }
+}
+
+# Expands to an empty test suite for tests that were removed from CTF testing,
+# but for which binaries are still present in CIPD.
+template("generate_disabled-ctf-test-suite") {
+  forward_variables_from(invoker,
+                         [
+                           "test_info",
+                           "fidl_coverage",
+                         ])
+  not_needed([
+               "test_info",
+               "fidl_coverage",
+             ])
+  group(target_name) {
+    deps = []
+  }
+}
+
+# Expands a prebuilt CTF test into a runnable fuchsia package.
+#
+# This template is called several times with every combination of ctf_test and
+# api_level, where api_level is a supported API level and ctf_test is a prebuilt
+# CTF package in the current checkout.
+#
+# CTF Test Authors: Do not modify this. See the comments at the top of this
+# file.
+template("generate_ctf_test") {
+  assert(defined(invoker.api_level), "api_level is required")
+  assert(defined(invoker.prebuilt_package), "prebuilt_package is required")
+
+  prebuilt_package = invoker.prebuilt_package
+  api_level = invoker.api_level
+
+  use_prebuilts_from_current_build = false
+  if (defined(invoker.use_prebuilts_from_current_build)) {
+    use_prebuilts_from_current_build = invoker.use_prebuilts_from_current_build
+  }
+
+  prebuilt_package_label = "//sdk/ctf/release/packages:$target_name"
+
+  if (use_prebuilts_from_current_build) {
+    prebuilt_package_name = ":${target_name}_prebuilt_from_current_build"
+    prebuilt_package_label = ":$prebuilt_package_name"
+
+    generate_ctf_package(prebuilt_package_name) {
+      testonly = true
+      package_name = prebuilt_package.package_name
+      archive_path = "$root_build_dir/cts/${prebuilt_package.archive_name}.far"
+      deps = [ "${prebuilt_package.archive_gn_label}($default_toolchain)" ]
+    }
+  }
+
+  target_for_downloaded_test = "generate_${prebuilt_package.package_name}"
+  if (IGNORED_CTF_TESTS + [ prebuilt_package.package_name ] -
+      [ prebuilt_package.package_name ] != IGNORED_CTF_TESTS) {
+    target_for_downloaded_test = "generate_disabled-ctf-test-suite"
+  }
+
+  target(target_for_downloaded_test, target_name) {
+    # fidl_coverage will be forwarded in each "generate_foo" target defined
+    # above. It can be un-forwarded to disable it for a specific test, or set to
+    # false here to disable it for all tests.
+    fidl_coverage = api_level == "_in_development"
+
+    # If you change these properties, change the docs at the top of this file.
+    test_info = {
+      name = prebuilt_package.package_name
+      target_label = prebuilt_package_label
+      target_api_level = api_level
+      if (defined(prebuilt_package.test_component_names)) {
+        test_component_names = prebuilt_package.test_component_names
+      }
+    }
+  }
+}
+
+# Generates test targets for prebuilt CTF tests at the given API level.
+#
+# Parameters
+#
+#    api_level (required)
+#      The target API level.
+#      Type: int
+#
+#    manifest (required)
+#      The path to package_archives.json
+#      Type: path
+#
+#    use_prebuilts_from_current_build
+#      Generates tests using the prebuilt CTF test packages generated by the
+#      current local build instead of ones from a previous CTF release. This
+#      should only be set to true as a presubmit check when new tests are added
+#      to CTF.
+#      Type: bool
+#      Default: false
+#
+# CTF Test Authors: Do not modify this. See the comments at the top of this
+# file.
+template("generate_ctf_tests") {
+  assert(defined(invoker.api_level))
+  assert(defined(invoker.manifest))
+
+  manifest = invoker.manifest
+  tests = []
+
+  foreach(prebuilt_package, read_file(manifest, "json")) {
+    test_name = "${prebuilt_package.package_name}_ctf${invoker.api_level}"
+    generate_ctf_test(test_name) {
+      forward_variables_from(invoker,
+                             [
+                               "api_level",
+                               "prebuilt_package",
+                               "use_prebuilts_from_current_build",
+                             ])
+    }
+    tests += [ ":$test_name" ]
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker, [ "deps" ])
+    if (!defined(deps)) {
+      deps = []
+    }
+    testonly = true
+    deps += tests
+  }
+}

@@ -1,0 +1,325 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/testing/config.gni")
+
+# Defines a set of golden file comparisons to be executed during the build.
+# Fails if one of the provided `golden`'s contents is not equal to the
+# associated `candidate`'s.
+#
+# If the `update_goldens` build arg is true, the goldens will be updated with
+# the candidate files rather than failing the action.
+#
+# Parameters:
+#
+#  * comparisons
+#    - Required: The list of golden file comparisons to perform - or optionally
+#      the path to a JSON file of such. A path may be supplied in cases where
+#      the set of golden files cannot statically be known in GN.
+#    - Type: list(scope) or path
+#
+#    Each scope contains:
+#      * golden
+#        - Required: The golden file against which to check.
+#        - Type: path
+#
+#      * candidate
+#        - Required: The file under test.
+#        - Type: path
+#
+#  * dir
+#    - Optional: If set, then all golden files must be within this directory.
+#      If any other files are present in this directory, the check will fail
+#      with instructions to remove obsolete files from this directory.
+#    - Type: path
+#
+#  * formatter
+#    - Optional: A formatting specification. This may be used to format the
+#      goldens before comparing with the candidates, making the diffs less
+#      sensitive to such changes. This parameter may only be passed in the
+#      case where `comparisons` is a GN list (as opposed to a filepath).
+#    - Type: scope
+#
+#    The scope contains:
+#
+#      * script
+#        - Required: The path to the formatting executable. (Called "script"
+#          because of the `action()` precedent and the fact that "executable"
+#          is a GN keyword). The formatter takes a file via stdin and outputs
+#          its contents to stdout.
+#        - Type: path
+#
+#      * args
+#        - Optional: The list of arguments to pass to the formatter. Any
+#          contained paths must be given relative to `root_build_dir`.
+#        - Type: list(string)
+#
+#      * extensions
+#        - Optional: The list of file extensions to which the formatter should
+#          be restricted in application. An empty list is taken to mean that
+#          the formatter should be applied to every golden.
+#        - Type: list(string)
+#        - Default: []
+#
+#      * inputs
+#        - Optional: Any additional files that serve as inputs to the
+#          formatting invocation. The formatter itself need not be listed here.
+#        - Type: list(string)
+#
+#      * deps
+#        - Optional: Any dependencies of the formatter.
+#        - Type: list(label)
+#
+#  * binary
+#    - Optional: If true, the files are compared as binary, which disables
+#      showing the diff if there is a mismatch.
+#    - Type: bool
+#    - Default: false
+#
+#  * warn_on_changes
+#    - Optional: If true, mismatches are treated as warnings rather than errors.
+#    - Type: bool
+#    - Default: false
+#
+#  * message
+#    - Optional: If set, an additional error message will be printed if the files
+#      don't match.
+#    - Type: string
+#    - Default: No message gets printed
+#
+#  * visible_label
+#    - Optional: If set, this label is used to print a message about which label
+#      should be added to the build to recreate the error. This allows golden
+#      file tests to have non-global visibility, but still have a visible label
+#      to use to run the test.
+#     - Type: string (label)
+#     - Default: Uses the label of the golden_files test.
+#
+#  * visibility, testonly, deps, public_deps
+#    - Optional: Usual GN meanings.
+#
+template("golden_files") {
+  assert_context = "golden_files(\"$target_name\")"
+  assert(defined(invoker.comparisons) && invoker.comparisons != [],
+         "$assert_context: `comparisons` is required")
+
+  main_target = target_name
+
+  verify_deps = []
+
+  # `x == "$x"` is a cheesy way in GN to check whether a given variable is of
+  # string type. In this case, it indicates that `comparisons` is the path to
+  # a JSON file of golden file comparisons instead of being a literal GN list
+  # of them.
+  if (invoker.comparisons == "${invoker.comparisons}") {
+    assert(
+        !defined(invoker.formatter),
+        "$assert_context: `formatter` may not be passed when `comparisons` points to a file")
+    comparison_manifest = invoker.comparisons
+  } else {
+    forward_variables_from(invoker, [ "formatter" ])
+    if (defined(formatter)) {
+      assert(
+          defined(formatter.script),
+          "$assert_context: `formatter.script` is required if `formatter` is supplied")
+
+      # Formatted versions of the goldens will be written to this directory and
+      # ultimately supplied to the diff action below, allowing for a degree of
+      # format-insensitivity.
+      formatted_goldens_dir = "$target_gen_dir/formatted-goldens"
+      not_needed([ "formatted_goldens_dir" ])
+    }
+
+    comparison_json_target = "_golden_files.$target_name.generated_file"
+
+    # In the actions below, we purposefully do not register the golden and
+    # candidate files as inputs; instead we record them within a depfile.
+    # Further the script will proactively create a blank golden file if the
+    # supplied one does not yet exist. These two measures allow (1) a user to
+    # not have to tediously create the files themselves when adding a new
+    # `golden_files()` target, and (2) ninja to execute this action without
+    # complaint before the
+    # files exist.
+
+    processed_comparisons = []
+    verify_deps = []
+    foreach(comparison, invoker.comparisons) {
+      assert(defined(comparison.golden),
+             "$assert_context: no `golden` given in comparison: $comparison")
+      assert(defined(comparison.candidate),
+             "$assert_context: no `candidate` given in comparison: $comparison")
+
+      # Forward the rest to ensure that nothing else was defined, in which case
+      # GN will provide an "unused" error.
+      forward_variables_from(comparison,
+                             "*",
+                             [
+                               "candidate",
+                               "golden",
+                             ])
+      golden = rebase_path(comparison.golden, "//")
+      candidate = rebase_path(comparison.candidate, root_build_dir)
+
+      formatted_golden = ""  # Clear from previous iteration.
+      if (defined(formatter)) {
+        extensions = []  # Clear from previous iteration.
+        if (defined(formatter.extensions)) {
+          extensions = formatter.extensions
+        }
+
+        golden_ext = get_path_info(golden, "extension")
+        if (extensions + [ golden_ext ] - [ golden_ext ] != extensions ||
+            extensions == []) {
+          format_golden_target = "_golden_files.$target_name.format.$golden"
+          formatted_golden = "$formatted_goldens_dir/$golden"
+          action(format_golden_target) {
+            forward_variables_from(invoker, [ "testonly" ])
+            visibility = [ ":$main_target" ]
+
+            depfile = "$target_gen_dir/$target_name.d"
+            outputs = [ formatted_golden ]
+
+            inputs = [ formatter.script ]
+            if (defined(formatter.inputs)) {
+              inputs += formatter.inputs
+            }
+
+            forward_variables_from(invoker,
+                                   [
+                                     "assert_no_deps",
+                                     "deps",
+                                     "public_deps",
+                                   ])
+            if (defined(formatter.deps)) {
+              if (!defined(deps)) {
+                deps = []
+              }
+              deps += formatter.deps
+            }
+
+            script = "//build/testing/format_golden.sh"
+            args = [
+              rebase_path(depfile, root_build_dir),
+              rebase_path(golden, root_build_dir, "//"),
+              rebase_path(formatted_golden, root_build_dir),
+              rebase_path(formatter.script, root_build_dir),
+            ]
+            if (defined(formatter.args)) {
+              args += formatter.args
+            }
+          }
+          verify_deps += [ ":$format_golden_target" ]
+        }
+      }
+
+      processed_comparisons += [
+        {
+          golden = golden
+          candidate = candidate
+
+          # We don't want to supply the formatted golden under the `golden` key
+          # as the diff script needs to know the original location in order to
+          # auto-update it when a diff is detected.
+          if (formatted_golden != "") {
+            formatted_golden = rebase_path(formatted_golden, root_build_dir)
+          }
+        },
+      ]
+    }
+
+    comparison_manifest = "$target_gen_dir/$target_name.comparisons.json"
+    generated_file(comparison_json_target) {
+      output_conversion = "json"
+      contents = processed_comparisons
+      outputs = [ comparison_manifest ]
+    }
+
+    verify_deps += [ ":$comparison_json_target" ]
+  }
+
+  action(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "visibility",
+                             "testonly",
+                             "deps",
+                             "public_deps",
+                           ])
+
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += verify_deps
+
+    script = "//build/testing/verify_golden_files.py"
+
+    stamp_file = "$target_gen_dir/$target_name.verified"
+    depfile = "${stamp_file}.d"
+    inputs = [ comparison_manifest ]
+    outputs = [ stamp_file ]
+
+    args = [
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+      "--stamp-file",
+      rebase_path(stamp_file, root_build_dir),
+      "--comparisons",
+      rebase_path(comparison_manifest, root_build_dir),
+      "--source-root",
+      rebase_path("//", root_build_dir),
+    ]
+
+    if (defined(invoker.visible_label)) {
+      args += [
+        "--label",
+        invoker.visible_label,
+      ]
+    } else {
+      args += [
+        "--label",
+        get_label_info(":${target_name}", "label_with_toolchain"),
+      ]
+    }
+
+    if (defined(invoker.dir)) {
+      args += [ "--golden-dir=" + rebase_path(invoker.dir, root_build_dir) ]
+    }
+
+    if (update_goldens) {
+      args += [ "--bless" ]
+    }
+
+    warn_on_changes =
+        defined(invoker.warn_on_changes) && invoker.warn_on_changes
+    if (warn_on_changes) {
+      args += [ "--warn" ]
+    }
+
+    if (defined(invoker.message)) {
+      args += [ "--err-msg=${invoker.message}" ]
+    }
+
+    if (defined(invoker.binary) && invoker.binary) {
+      args += [ "--binary" ]
+    }
+
+    metadata = {
+      # Metadata for //:golden_files.
+      golden_files = [
+        {
+          name = target_name
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          stamp = rebase_path(stamp_file, root_build_dir)
+          if (defined(processed_comparisons)) {
+            comparisons = processed_comparisons
+          } else {
+            comparison_manifest =
+                rebase_path(comparison_manifest, root_build_dir)
+          }
+        },
+      ]
+    }
+  }
+}

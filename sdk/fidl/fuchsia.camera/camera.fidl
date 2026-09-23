@@ -1,0 +1,132 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+// This file is being deprecated - please do not rely on any of the structs or
+// protocols here moving forward.
+
+library fuchsia.camera;
+
+using fuchsia.sysmem;
+using zx;
+
+const MAX_FORMATS_PER_RESPONSE uint32 = 16;
+
+/// A coarse set of capabilities.  This struct is used in the camera description
+/// to help filter out cameras which will not have the needed capabilities.
+/// This set of declarations would be the bitfield: CameraOutputCapabilities.
+const CAMERA_OUTPUT_UNKNOWN uint32 = 0;
+const CAMERA_OUTPUT_STILL_IMAGE uint32 = 0x01;
+const CAMERA_OUTPUT_BURST uint32 = 0x02;
+const CAMERA_OUTPUT_STREAM uint32 = 0x04;
+const CAMERA_OUTPUT_HDR uint32 = 0x08;
+const CAMERA_OUTPUT_DEPTH uint32 = 0x10;
+const CAMERA_OUTPUT_STEREO uint32 = 0x20;
+
+/// Identifying information about the device.
+type DeviceInfo = struct {
+    camera_id uint64; // Currently populated by the camera manager
+    vendor_id uint16;
+    vendor_name string;
+    product_id uint16;
+    product_name string;
+    /// The maximum number of stream interfaces that the device can support
+    /// simultaneously.
+    max_stream_count uint16;
+    output_capabilities uint32; // CameraOutputCapabilities
+    // TODO(https://fxbug.dev/42109224): Add CameraPose, when we can actually use it.
+};
+
+/// Status to be set when a frame is signalled available.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type FrameStatus = strict enum {
+    OK = 0;
+    /// An error occurred during the production of a frame.
+    /// No data will be available in the data buffer corresponding to this
+    /// notification.
+    ERROR_FRAME = 1;
+
+    /// No space was available in the data buffer, resulting in a dropped frame.
+    ERROR_BUFFER_FULL = 2;
+};
+
+type Metadata = struct {
+    timestamp int64;
+    @available(added=11)
+    data_size uint32;
+};
+
+/// Sent by the driver to the client when a frame is available for processing,
+/// or an error occurred.
+type FrameAvailableEvent = struct {
+    /// Non zero if an error occurred.
+    frame_status FrameStatus;
+
+    /// The index of the buffer in the buffer collection.
+    buffer_id uint32;
+
+    metadata Metadata;
+};
+
+type FrameRate = struct {
+    /// The frame rate is frames_per_sec_numerator / frames_per_sec_denominator.
+    frames_per_sec_numerator uint32;
+    frames_per_sec_denominator uint32;
+};
+
+type VideoFormat = struct {
+    format fuchsia.sysmem.ImageFormat;
+    rate FrameRate;
+};
+
+/// These are the original interfaces, which are being used for compatibility.
+/// The names are preserved from the ones in camera.h for porting ease.
+@discoverable
+closed protocol Control {
+    /// Get the available format types for this device
+    /// NOTE: The formats are paginated to `MAX_FORMATS_PER_RESPONSE`, multiple
+    /// GetFormats need to be issued until total_format_count are received
+    strict GetFormats(struct {
+        index uint32;
+    }) -> (struct {
+        formats vector<VideoFormat>;
+        total_format_count uint32;
+        status zx.Status;
+    });
+
+    /// Sent by the client to indicate desired stream characteristics.
+    /// If setting the format is successful, the stream request will be honored.
+    /// The stream token is used to provide additional control over the interface from the
+    /// Camera Manager.  The driver provides the guarantee that:
+    ///     1) If the stream token receives the `PEER_CLOSED` event, the driver will close
+    ///        the stream.
+    ///     2) If the Stream interface is closed, the driver will close the eventpair.
+    strict CreateStream(resource struct {
+        buffer_collection fuchsia.sysmem.BufferCollectionInfo;
+        rate FrameRate;
+        stream server_end:Stream;
+        stream_token zx.Handle:EVENTPAIR;
+    });
+
+    strict GetDeviceInfo() -> (struct {
+        device_info DeviceInfo;
+    });
+};
+
+closed protocol Stream {
+    /// Starts the streaming of frames.
+    strict Start();
+
+    /// Stops the streaming of frames.
+    strict Stop();
+
+    /// Unlocks the specified frame, allowing the driver to reuse the memory.
+    strict ReleaseFrame(struct {
+        buffer_id uint32;
+    });
+
+    /// Sent by the driver to the client when a frame is available for processing,
+    /// or an error occurred.
+    strict -> OnFrameAvailable(struct {
+        frame FrameAvailableEvent;
+    });
+};

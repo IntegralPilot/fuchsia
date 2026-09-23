@@ -1,0 +1,353 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/components.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/testing/golden_files.gni")
+
+# Defines a driver DML target that generates C++ parser, CML, and Bind rules.
+#
+# Parameters
+#
+#   dml (required)
+#     Path to the DML file.
+#
+#   driver_name (required)
+#     Name of the driver (used for parser class name and file names).
+#
+template("fuchsia_driver_dml") {
+  assert(defined(invoker.dml), "dml must be defined for fuchsia_driver_dml")
+  assert(defined(invoker.driver_name),
+         "driver_name must be defined for fuchsia_driver_dml")
+
+  _action_target = target_name
+  _driver_name = invoker.driver_name
+  _namespace = "${_driver_name}_metadata"
+  _namespace = string_replace(_namespace, "-", "_")
+  _namespace = string_replace(_namespace, ".", "_")
+
+  _disable_autobind = false
+  if (defined(invoker.disable_autobind)) {
+    _disable_autobind = invoker.disable_autobind
+  }
+
+  assert(
+      !_disable_autobind || !defined(invoker.golden_bind),
+      "Cannot specify golden_bind for '${_driver_name}' when disable_autobind = true")
+
+  compiled_action(_action_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    tool = "//src/devices/tools/dmlc:bin"
+    tool_output_name = "dmlc"
+
+    inputs = [ invoker.dml ]
+
+    outputs = [
+      "$target_gen_dir/${_driver_name}_parser.h",
+      "$target_gen_dir/${_driver_name}_parser.cc",
+      "$target_gen_dir/${_driver_name}.cml.raw",
+      "$target_gen_dir/${_driver_name}_parser.rs",
+    ]
+
+    args = [
+      "compile-driver",
+      rebase_path(invoker.dml, root_build_dir),
+      "--h-output",
+      rebase_path(outputs[0], root_build_dir),
+      "--cc-output",
+      rebase_path(outputs[1], root_build_dir),
+      "--cml-output",
+      rebase_path(outputs[2], root_build_dir),
+      "--rs-output",
+      rebase_path(outputs[3], root_build_dir),
+      "--namespace",
+      _namespace,
+    ]
+
+    if (!_disable_autobind) {
+      outputs += [ "$target_gen_dir/${_driver_name}.bind" ]
+      args += [
+        "--bind-output",
+        rebase_path("$target_gen_dir/${_driver_name}.bind", root_build_dir),
+      ]
+    }
+  }
+
+  compiled_action("${_action_target}_format_cml") {
+    forward_variables_from(invoker, [ "testonly" ])
+    tool = "//tools/cmc:cmc"
+    tool_output_name = "cmc"
+    inputs = [ "$target_gen_dir/${_driver_name}.cml.raw" ]
+    outputs = [ "$target_gen_dir/${_driver_name}.cml" ]
+    args = [
+      "format",
+      "-o",
+      rebase_path(outputs[0], root_build_dir),
+      rebase_path(inputs[0], root_build_dir),
+    ]
+    public_deps = [ ":${_action_target}" ]
+  }
+
+  _golden_cml = "meta/${_driver_name}.cml"
+  if (defined(invoker.golden_cml)) {
+    _golden_cml = invoker.golden_cml
+  }
+
+  _comparisons = [
+    {
+      golden = _golden_cml
+      candidate = "$target_gen_dir/${_driver_name}.cml"
+    },
+  ]
+
+  if (!_disable_autobind) {
+    _golden_bind = "meta/${_driver_name}.bind"
+    if (defined(invoker.golden_bind)) {
+      _golden_bind = invoker.golden_bind
+    }
+    _comparisons += [
+      {
+        golden = _golden_bind
+        candidate = "$target_gen_dir/${_driver_name}.bind"
+      },
+    ]
+  }
+
+  golden_files("${_action_target}_golden") {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [
+      ":${_action_target}_manifest",
+      ":${_action_target}_manifest_merge",
+    ]
+    comparisons = _comparisons
+    public_deps = [
+      ":${_action_target}",
+      ":${_action_target}_format_cml",
+    ]
+  }
+
+  # Generate manifest target
+  fuchsia_component_manifest("${_action_target}_manifest") {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    component_name = _driver_name
+    manifest = "$target_gen_dir/${_driver_name}.cml"
+    deps = [ ":${_action_target}_golden" ]
+  }
+}
+
+# Defines a C++ parser library generated from a driver DML target.
+#
+# Parameters
+#
+#   dml_label (required)
+#     The label of the fuchsia_driver_dml target.
+#
+template("fuchsia_driver_dml_cpp_parser") {
+  assert(defined(invoker.dml_label),
+         "dml_label must be defined for fuchsia_driver_dml_cpp_parser")
+
+  _dml_outputs = get_target_outputs(invoker.dml_label)
+  _sources = filter_include(_dml_outputs,
+                            [
+                              "*.cc",
+                              "*.h",
+                            ])
+  _gen_dir = get_label_info(invoker.dml_label, "target_gen_dir")
+
+  _config_name = "${target_name}_config"
+  config(_config_name) {
+    include_dirs = [ _gen_dir ]
+  }
+
+  source_set(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    sources = _sources
+
+    public_configs = [ ":${_config_name}" ]
+
+    deps = [ invoker.dml_label ]
+
+    public_deps = [
+      "//sdk/fidl/fuchsia.driver.metadata:fuchsia.driver.metadata_cpp",
+      "//sdk/lib/driver/metadata/cpp",
+    ]
+  }
+}
+
+# Defines a Rust parser library generated from a driver DML target.
+#
+# Parameters
+#
+#   dml_label (required)
+#     The label of the fuchsia_driver_dml target.
+#
+template("fuchsia_driver_dml_rust_parser") {
+  assert(defined(invoker.dml_label),
+         "dml_label must be defined for fuchsia_driver_dml_rust_parser")
+
+  _dml_outputs = get_target_outputs(invoker.dml_label)
+  _rs_sources = filter_include(_dml_outputs, [ "*.rs" ])
+  assert(_rs_sources != [], "No Rust sources found in dml_label outputs")
+
+  rustc_library(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    edition = "2024"
+    source_root = _rs_sources[0]
+    sources = _rs_sources
+
+    deps = [
+      "//sdk/fidl/fuchsia.driver.metadata:fuchsia.driver.metadata_rust",
+      "//src/lib/fidl/rust/fidl",
+      invoker.dml_label,
+    ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+}
+
+# Defines a board DML target that generates board config, CML, and Bind rules.
+#
+# Parameters
+#
+#   dml (required)
+#     Path to the DML file.
+#
+#   board_name (required)
+#     Name of the board (used for manifest and bind file names).
+#
+#   driver_dmls (required)
+#     List of driver DML files used to resolve metadata schemas.
+#
+template("fuchsia_board_dml") {
+  assert(defined(invoker.dml), "dml must be defined for fuchsia_board_dml")
+  assert(defined(invoker.board_name),
+         "board_name must be defined for fuchsia_board_dml")
+
+  _action_target = target_name
+  _board_name = invoker.board_name
+
+  compiled_action(_action_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "sources",
+                           ])
+
+    tool = "//src/devices/tools/dmlc:bin"
+    tool_output_name = "dmlc"
+
+    inputs = [ invoker.dml ]
+    if (defined(invoker.sources)) {
+      inputs += invoker.sources
+    }
+
+    _has_driver_dmls = defined(invoker.driver_dmls)
+    if (_has_driver_dmls) {
+      inputs += invoker.driver_dmls
+    }
+
+    outputs = [
+      "$target_gen_dir/board-config.fidl",
+      "$target_gen_dir/${_board_name}.bind",
+      "$target_gen_dir/${_board_name}.cml.raw",
+    ]
+
+    args = [
+      "compile-board",
+      rebase_path(invoker.dml, root_build_dir),
+      "--fidl-output",
+      rebase_path(outputs[0], root_build_dir),
+      "--bind-output",
+      rebase_path(outputs[1], root_build_dir),
+      "--cml-output",
+      rebase_path(outputs[2], root_build_dir),
+    ]
+    if (_has_driver_dmls) {
+      foreach(driver_dml, invoker.driver_dmls) {
+        args += [
+          "--driver-dml",
+          rebase_path(driver_dml, root_build_dir),
+        ]
+      }
+    }
+  }
+
+  compiled_action("${_action_target}_format_cml") {
+    forward_variables_from(invoker, [ "testonly" ])
+    tool = "//tools/cmc:cmc"
+    tool_output_name = "cmc"
+    inputs = [ "$target_gen_dir/${_board_name}.cml.raw" ]
+    outputs = [ "$target_gen_dir/${_board_name}.cml" ]
+    args = [
+      "format",
+      "-o",
+      rebase_path(outputs[0], root_build_dir),
+      rebase_path(inputs[0], root_build_dir),
+    ]
+    public_deps = [ ":${_action_target}" ]
+  }
+
+  _golden_bind = "meta/${_board_name}.bind"
+  if (defined(invoker.golden_bind)) {
+    _golden_bind = invoker.golden_bind
+  }
+  _golden_cml = "meta/${_board_name}.cml"
+  if (defined(invoker.golden_cml)) {
+    _golden_cml = invoker.golden_cml
+  }
+
+  golden_files("${_action_target}_golden") {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [
+      ":${_action_target}_manifest",
+      ":${_action_target}_manifest_merge",
+    ]
+    comparisons = [
+      {
+        golden = _golden_bind
+        candidate = "$target_gen_dir/${_board_name}.bind"
+      },
+      {
+        golden = _golden_cml
+        candidate = "$target_gen_dir/${_board_name}.cml"
+      },
+    ]
+    public_deps = [
+      ":${_action_target}",
+      ":${_action_target}_format_cml",
+    ]
+  }
+
+  # Generate manifest target
+  fuchsia_component_manifest("${_action_target}_manifest") {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    component_name = _board_name
+    manifest = "$target_gen_dir/${_board_name}.cml"
+    deps = [ ":${_action_target}_golden" ]
+  }
+}

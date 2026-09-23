@@ -1,0 +1,396 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components/fuchsia_test_package.gni")
+import("//build/components/fuchsia_unittest_component.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/test.gni")
+import("//build/testing/bootfs_test.gni")
+
+fdio_config = [ "//build/config/fuchsia:fdio_config" ]
+
+sanitizer_tests = []
+
+sanitizer_tests += [ "sanitizer-utils-test" ]
+test("sanitizer-utils-test") {
+  deps = [
+    ":debugdata",
+    ":memory-snapshot-test",
+    ":sanitizer-utils",
+  ]
+}
+
+source_set("debugdata") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "debugdata.cc" ]
+  deps = [
+    ":test-utils",
+    "//sdk/lib/async",
+    "//sdk/lib/async-default",
+    "//sdk/lib/async-loop",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/fdio",
+    "//sdk/lib/ld/testing",
+    "//zircon/system/ulib/fbl",
+    "//zircon/system/ulib/ldmsg",
+    "//zircon/system/ulib/zx",
+  ]
+  data_deps = [
+    ":debugdata-test-helper",
+    ":rust-debugdata-test-helper",
+  ]
+}
+
+source_set("test-utils") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  public = [ "test-utils.h" ]
+  public_deps = [
+    "//sdk/lib/fdio",
+    "//src/lib/fxl/test:gtest_main",
+    "//third_party/googletest:gmock",
+  ]
+
+  sources = [ "test-utils.cc" ]
+  deps = [
+    ":uses-spawn",
+    "//sdk/lib/fdio",
+    "//sdk/lib/fit",
+    "//src/lib/elfldltl/testing",
+    "//zircon/system/ulib/zx",
+  ]
+}
+
+source_set("sanitizer-utils") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "sanitizer-utils.cc" ]
+  deps = [
+    ":test-utils",
+    ":uses-spawn",
+    "//sdk/lib/fdio",
+    "//sdk/lib/fit",
+    "//zircon/system/ulib/fbl",
+    "//zircon/system/ulib/zx",
+  ]
+  data_deps = [
+    ":rust-sanitizer-log-test-helper",
+    ":sanitizer-exit-hook-test-helper",
+    ":sanitizer-log-test-helper",
+    ":sanitizer-module-loaded-test-helper",
+  ]
+}
+
+executable("sanitizer-exit-hook-test-helper") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "exit-hook-test-helper.cc" ]
+  exclude_toolchain_tags = [ "instrumentation-runtime" ]
+}
+
+executable("sanitizer-module-loaded-test-helper") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "module-loaded-test-helper.cc" ]
+  deps = [ ":sanitizer-module-loaded-test-needed-dso" ]
+  data_deps = [ ":sanitizer-module-loaded-test-dlopen-dso" ]
+
+  exclude_toolchain_tags = [ "instrumentation-runtime" ]
+
+  # The linker can omit some symbols from the .dynsym since it's an executable
+  # and might not be able to find instances it links against at build time where
+  # this symbol can be externally referenced. This forces it to be manifested so
+  # weakrefs in sanitizer-module-loaded-test-dlopen-dso can use the strong
+  # definition provided in this executable.
+  ldflags = [ "-rdynamic" ]
+}
+
+shared_library("sanitizer-module-loaded-test-dlopen-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "sanitizer-module-loaded-test-dlopen-dso.cc" ]
+  deps = [ ":sanitizer-module-loaded-test-dlopen-needed-dso" ]
+}
+
+shared_library("sanitizer-module-loaded-test-needed-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "sanitizer-module-loaded-test-needed-dso.cc" ]
+}
+
+shared_library("sanitizer-module-loaded-test-dlopen-needed-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  # This can just reuse the same source file as
+  # sanitizer-module-loaded-test-dlopen-dso since they check the same thing.
+  sources = [ "sanitizer-module-loaded-test-dlopen-dso.cc" ]
+}
+
+source_set("memory-snapshot-test") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "memory-snapshot-test.cc" ]
+  deps = [
+    ":sanitizer-memory-snapshot-test-needed-dso",
+    ":test-utils",
+    "//zircon/system/ulib/zx",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+  data_deps = [ ":sanitizer-memory-snapshot-test-dlopen-dso" ]
+
+  if (current_cpu == "arm64") {
+    cflags = [ "-ffixed-x28" ]
+  }
+
+  # This test needs to verify how stack allocations come out, which is
+  # incompatible with ASan fake-stack allocations.
+  deps += [ "//build/config/sanitizers:suppress-asan-stack-use-after-return" ]
+}
+
+shared_library("sanitizer-memory-snapshot-test-needed-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "sanitizer-memory-snapshot-test-needed-dso.cc" ]
+}
+
+shared_library("sanitizer-memory-snapshot-test-dlopen-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "sanitizer-memory-snapshot-test-dlopen-dso.cc" ]
+}
+
+# TODO(https://fxbug.dev/408003053): This should be replaced in dlfcn/dl/test.
+sanitizer_tests += [ "hwasan-ctor-order-test" ]
+test("hwasan-ctor-order-test") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "hwasan-ctor-order.cc" ]
+  data_deps = [
+    ":ctor-order-test-interposable-dso",
+    ":ctor-order-test-interposable-weak-dso",
+    ":ctor-order-test-interposing-dso",
+    ":ctor-order-test-no-deps-dso",
+    ":ctor-order-test-no-interposing-dso",
+  ]
+  deps = [ "//src/lib/fxl/test:gtest_main" ]
+}
+
+shared_library("ctor-order-test-no-deps-dso") {
+  visibility = [ ":*" ]
+
+  sources = [ "no-deps.cc" ]
+  testonly = true
+}
+
+shared_library("ctor-order-test-interposable-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "interposable.cc" ]
+}
+
+shared_library("ctor-order-test-interposable-weak-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "interposable-weak.cc" ]
+}
+
+shared_library("ctor-order-test-no-interposing-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "no-interposing.cc" ]
+  deps = [ ":ctor-order-test-interposable-dso" ]
+}
+
+shared_library("ctor-order-test-interposing-dso") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "interposing.cc" ]
+  deps = [ ":ctor-order-test-interposable-dso" ]
+}
+
+executable("debugdata-test-helper") {
+  testonly = true
+
+  sources = [ "debugdata-test-helper.cc" ]
+  deps = [ "//zircon/system/ulib/zx" ]
+
+  configs += fdio_config
+  configs -= fdio_config
+
+  # Don't use instrumentation that emits debugdata, so only the expected test
+  # data is published.
+  exclude_toolchain_tags = [ "debugdata" ]
+}
+
+rustc_binary("rust-debugdata-test-helper") {
+  testonly = true
+  edition = "2024"
+
+  source_root = "rust-debugdata-test-helper.rs"
+  sources = [ source_root ]
+  deps = [
+    "../../rust",
+    "//sdk/rust/zx",
+  ]
+
+  configs += fdio_config
+  configs -= fdio_config
+
+  # Don't use instrumentation that emits debugdata, so only the expected test
+  # data is published.
+  exclude_toolchain_tags = [ "debugdata" ]
+}
+
+executable("sanitizer-log-test-helper") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "log-test-helper.cc" ]
+
+  # Avoid anything that would do its own sanitizer logging.
+  exclude_toolchain_tags = [ "instrumentation-runtime" ]
+
+  # Making this a static PIE is the easiest way to get the test plumbing
+  # for a captured log socket to work right.
+  deps = [ "../..:static" ]
+  configs += fdio_config
+  configs -= fdio_config
+  configs += [ "//build/config:standalone" ]
+  ldflags = [ "-Wl,-z,stack-size=0x40000" ]
+}
+
+rustc_binary("rust-sanitizer-log-test-helper") {
+  testonly = true
+  edition = "2024"
+
+  source_root = "rust-log-test-helper.rs"
+  sources = [ source_root ]
+  deps = [ "../../rust" ]
+
+  # Avoid anything that would do its own sanitizer logging.
+  exclude_toolchain_tags = [ "instrumentation-runtime" ]
+
+  # Making this a static PIE is the easiest way to get the test plumbing
+  # for a captured log socket to work right.
+  deps += [ "../..:static" ]
+  configs += fdio_config
+  configs -= fdio_config
+  configs += [ "//build/config:standalone" ]
+  configs -= [ "//build/config/fuchsia:dynamic_rust_standard_library" ]
+}
+
+sanitizer_tests += [ "sanitizer-allocator-test" ]
+test("sanitizer-allocator-test") {
+  sources = [ "sanitizer-allocator-test.cc" ]
+  deps = [
+    ":test-utils",
+    "//sdk/lib/tbi",
+  ]
+}
+
+fp_related_configs = [
+  "//build/config:default_frame_pointers",
+  "//build/config:frame_pointers",
+  "//build/config:no_frame_pointers",
+]
+lsan_configs = [ "//build/config:frame_pointers" ]
+
+if (toolchain_variant.tags + [ "lsan" ] - [ "lsan" ] !=
+    toolchain_variant.tags) {
+  # The variant has lsan.
+} else if (toolchain_variant.tags + [ "replaces-allocator" ] -
+           [ "replaces-allocator" ] != toolchain_variant.tags) {
+  # The variant does not have lsan but replaces C/C++ memory allocation APIs.
+  # HWASan falls under this case.
+  lsan_configs = false
+} else {
+  # Neither replaces-allocator nor lsan is in tags.  We can just add the lsan
+  # config and build the test normally.
+  lsan_configs += [ "//build/config/sanitizers:lsan" ]
+}
+
+if (lsan_configs != false) {
+  sanitizer_tests += [ "lsan-test" ]
+  test("lsan-test") {
+    configs += fp_related_configs
+    configs -= fp_related_configs
+    configs += lsan_configs
+
+    sources = [ "lsan-test.cc" ]
+    deps = [
+      ":test-utils",
+      ":uses-spawn",
+      "//zircon/system/ulib/explicit-memory",
+    ]
+
+    data_deps = [ ":lsan-thread-race-test" ]
+  }
+
+  executable("lsan-thread-race-test") {
+    visibility = [ ":*" ]
+    testonly = true
+
+    configs += fp_related_configs
+    configs -= fp_related_configs
+    configs += lsan_configs
+    sources = [ "lsan-thread-race-test.cc" ]
+  }
+}
+
+group("uses-spawn") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  # There aren't really any gtest death tests here, but they also use
+  # fdio_spawn, so this is enough to get the right manifest plumbing.
+  deps = [ "//src/sys/test_runners/gtest:death_test" ]
+}
+
+foreach(test, sanitizer_tests) {
+  fuchsia_unittest_component("libc-$test") {
+    deps = [ ":$test" ]
+  }
+
+  bootfs_test("$test.bootfs") {
+    name = test
+    deps = [ ":$test" ]
+  }
+}
+
+fuchsia_test_package("libc-sanitizer-tests") {
+  test_components = []
+  foreach(test, sanitizer_tests) {
+    test_components += [ ":libc-$test" ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [ ":libc-sanitizer-tests" ]
+}
+
+group("bootfs-tests") {
+  testonly = true
+  deps = []
+  foreach(test, sanitizer_tests) {
+    deps += [ ":$test.bootfs" ]
+  }
+}

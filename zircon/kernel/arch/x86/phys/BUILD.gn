@@ -1,0 +1,455 @@
+# Copyright 2020 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/current_target_tuple.gni")
+import("//build/testing/boot_tests/zbi_test.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//build/toolchain/variant.gni")
+import("//build/toolchain/zircon/clang.gni")
+import("//build/toolchain/zircon/zircon_toolchain_suite.gni")
+import("//zircon/kernel/phys/phys_executable.gni")
+import("//zircon/kernel/phys/qemu_kernel_test.gni")
+import("//zircon/system/ulib/hwreg/hwreg_asm_header.gni")
+
+if (current_toolchain == default_toolchain) {
+  zircon_toolchain_suite("kernel.phys32") {
+    cpu = "x64"
+    os = "fuchsia"
+    environment = "kernel.phys32"
+    with_shared = false
+
+    toolchain_tags = [
+      "kernel",
+      "no-floating-point",
+      "standalone",
+    ]
+
+    configs = [ "//zircon/kernel/arch/x86/phys:phys32_config" ]
+
+    # Always enable frame pointers.
+    # NOTE: This works because frame_pointers is added in the
+    # phys32_config definition below.
+    remove_common_configs = [ "//build/config:default_frame_pointers" ]
+
+    exclude_variant_tags = [
+      # There is no possibility of fancy runtimes like ASan for phys.
+      "instrumentation-runtime",
+    ]
+  }
+} else if (current_cpu == "x64") {
+  if (toolchain_environment == "kernel.phys") {
+    # All the code gets built here in the phys environment.
+
+    static_library("phys") {
+      complete_static_lib = true
+
+      sources = [
+        "gdt.cc",
+        "start.S",
+      ]
+      deps = [
+        ":reset",
+        "//sdk/lib/fit",
+        "//zircon/kernel/lib/arch",
+        "//zircon/kernel/phys:main",
+      ]
+    }
+  } else if (toolchain_environment == "kernel.phys32") {
+    # ... or here in the other phys environment.
+
+    variant("phys32_config") {
+      configs = [
+        "//zircon/kernel/switch:standalone",
+        "//zircon/kernel/switch:warnings",
+        "//zircon/kernel/arch/x86:abi",
+        "//zircon/kernel/phys:defines",
+
+        # Don't emit extra code making static initializers thread-safe (we
+        # don't have threads or any of the corresponding library support.)
+        "//build/config/zircon:no_threadsafe_statics",
+
+        # All physmem code is inherently sensitive and in a position for any
+        # bug to be unusually dangerous.  So compile with undefined behavior
+        # checking in all builds, regardless of variant.  This is only the
+        # basic support that requires no runtime code.
+        "//build/config/zircon/instrumentation:ubsan-trap",
+
+        # This overrides some of the common settings (like PIE) that aren't
+        # broken out into removable configs, so it must come last.
+        ":x86-32",
+      ]
+
+      # NOTE: This works because default_frame_pointers is listed in
+      # remove_common_configs in the zircon_toolchain_suite() call above!
+      configs += [ "//build/config:frame_pointers" ]
+
+      deps = [ "//zircon/kernel/phys:phys_config_deps" ]
+      executable_deps = [ "//zircon/kernel/phys:phys_config_executable_deps" ]
+      link_deps = [ "//zircon/kernel/phys:phys_config_link_deps" ]
+      source_deps = [ "//zircon/kernel/phys:phys_config_source_deps" ]
+    }
+
+    # phys32 code is 32-bit (i686) and loaded at a fixed address.
+    config("x86-32") {
+      cflags = [
+        "-m32",
+        "-march=i686",
+        "-mno-sse",
+        "-mcx16",
+
+        "-fno-pic",
+        "-fno-pie",
+      ]
+      ldflags = cflags + [ "-Wl,-m,elf_i386" ]
+
+      if (is_gcc) {
+        cflags += [ "-mpreferred-stack-boundary=4" ]  # log2, i.e. 16
+      } else {
+        cflags += [
+          "-mstack-alignment=16",  # Same as GCC's -mpreferred-stack-boundary=4.
+          "-fsanitize=safe-stack",  # Enable all available paranoia for phys.
+        ]
+
+        # Clang defaults to PIE but lld has a switch to reverse that.  GNU
+        # linkers have no such switch, but GCC doesn't pass -pie by default.
+        ldflags += [ "-Wl,--no-pie" ]
+      }
+
+      asmflags = cflags
+    }
+
+    # This is used by phys_executable(), but we put nothing here so that
+    # each target has explicit deps for multiboot for linuxboot.
+    source_set("phys") {
+    }
+
+    # This is common to multiboot and linuxboot.
+    source_set("phys32") {
+      sources = [
+        "gdt32.cc",
+        "start32.S",
+      ]
+      deps = [
+        ":phys32.h",
+        ":reset",
+        "//zircon/kernel/lib/arch",
+        "//zircon/kernel/lib/ktl",
+        "//zircon/kernel/phys:symbolize",
+      ]
+
+      # Links use -nostdlib to avoid getting -lc et al.  But the "builtins"
+      # library (equivalent to the original libgcc) is needed for e.g. 64-bit
+      # division functions.  Note that though the normal x86-64 build is not
+      # usable for kernel due to lack of -mno-red-zone, the normal x86-32
+      # build is fine for phys32 both because x86-32 has no red zone to worry
+      # about and because the phys32 environment doesn't actually need to
+      # worry about interrupts at all; it's also OK if it happened to use SSE
+      # (though that won't come up in reality) because phys32 doesn't have
+      # that constraint either.  Note also that the need to use this library
+      # is the only reason the phys32 environment doesn't use -mregparm=3;
+      # that's a better calling convention, but the compiler-emitted library
+      # calls would expect that and the toolchain-supplied library is not
+      # compiled for it.
+      if (clang_tool_dir == "") {
+        clang_inputs = []
+        clang_exec = "clang++"
+      } else {
+        clang_inputs = [ "${clang_tool_dir}/clang++" ]
+        clang_exec = rebase_path(clang_inputs[0], root_build_dir)
+      }
+      clang_triple = string_replace(current_target_tuple, "x86_64", "i386")
+      libs = rebase_path(exec_script("/usr/bin/env",
+                                     [
+                                       clang_exec,
+                                       "-no-canonical-prefixes",
+                                       "--target=${clang_triple}",
+                                       "-print-libgcc-file-name",
+                                     ],
+                                     "trim list lines",
+                                     clang_inputs),
+                         ".",
+                         root_build_dir)
+    }
+
+    # Just putting this in deps of a phys_executable() in the kernel.phys32
+    # environment makes it a Multiboot-compatible kernel image.
+    source_set("multiboot") {
+      sources = [
+        "multiboot-header.S",
+        "multiboot-start.S",
+      ]
+      deps = [
+        ":multiboot-init",
+        ":phys32",
+        "//zircon/kernel/lib/arch",
+      ]
+
+      public_configs = [ ":load-1mb" ]
+    }
+
+    # This is a little library instead of a source_set() so it can be included
+    # implicitly by phys_executable() without adding bloat to the tiny tests
+    # that don't use it.
+    static_library("multiboot-init") {
+      complete_static_lib = true
+
+      sources = [ "multiboot-init.cc" ]
+      deps = [
+        "//src/lib/zbitl",
+        "//zircon/kernel/lib/arch",
+        "//zircon/kernel/phys:allocation",
+        "//zircon/kernel/phys:main",
+        "//zircon/kernel/phys:symbolize",
+        "//zircon/kernel/phys/lib/memalloc",
+        "//zircon/system/ulib/pretty",
+      ]
+      public_deps = [
+        ":legacy-boot",
+        "//zircon/kernel/lib/ktl",
+        "//zircon/kernel/lib/libc",
+      ]
+
+      # Allow the inclusion of <ktl/enforce.h> to bypass this check.
+      cflags = [ "-Wno-include-angled-in-module-purview" ]
+    }
+
+    # Just putting this in deps of a phys_executable() in the kernel.phys32
+    # environment makes it a Linux x86 (bzImage) compatible kernel image.
+    source_set("linuxboot") {
+      sources = [ "linuxboot-header.S" ]
+      libs = [
+        "./linuxboot.ld",
+        "./linuxboot32.ld",
+      ]
+      deps = [
+        ":linuxboot-asm",
+        ":linuxboot-init",
+        ":linuxboot.h",
+        ":phys32",
+        ":phys32.h",
+        "//zircon/kernel/lib/arch",
+      ]
+
+      configs += [ ":ikconfig.config" ]
+    }
+  }
+
+  source_set("legacy-boot") {
+    public = [ "legacy-boot.h" ]
+    public_deps = [
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+      "//zircon/kernel/phys/lib/boot-shim",
+      "//zircon/system/ulib/uart",
+    ]
+
+    sources = [ "legacy-boot.cc" ]
+    deps = [
+      "//src/lib/zbitl",
+      "//zircon/kernel/phys:acpi",
+      "//zircon/kernel/phys:address-space",
+      "//zircon/kernel/phys:allocation-init",
+      "//zircon/kernel/phys:symbolize",
+      "//zircon/kernel/phys:uart-console",
+      "//zircon/kernel/phys/lib/boot-shim",
+      "//zircon/kernel/phys/lib/memalloc",
+      "//zircon/system/ulib/hwreg",
+      "//zircon/system/ulib/pretty",
+    ]
+  }
+
+  # Just putting this in deps of a phys_executable() in the kernel.phys
+  # environment makes it a Linux/x86 (bzImage) compatible kernel image that
+  # requires a boot loader that prefers the 64-bit boot protocol.
+  source_set("linuxboot64") {
+    sources = [ "linuxboot64-header.S" ]
+    configs += [ ":ikconfig.config" ]
+    libs = [ "./linuxboot.ld" ]
+    deps = [
+      ":linuxboot-asm",
+      ":linuxboot-init",
+    ]
+  }
+
+  # Just putting this in deps of a phys_executable() in the kernel.phys
+  # environment makes it into a raw image that expects to be entered at the
+  # start of the image in memory, but with the Linux/x86 64-bit boot protocol.
+  # This won't be started by a Linux-compatible boot loader, which would enter
+  # at 0x200 past the start of the image.  Instead, it will be embedded by
+  # linuxbiboot.S into the outer phys32 image of a linuxbiboot_executable().
+  source_set("linuxbiboot64") {
+    public_configs = [ "//zircon/kernel/phys:load-pic" ]
+    deps = [
+      ":linuxboot-init",
+      "//zircon/kernel/phys:raw-header",
+    ]
+  }
+
+  config("ikconfig.config") {
+    visibility = [
+      ":linuxboot",
+      ":linuxboot64",
+    ]
+
+    # This input is a gzipped linux in-kernel config.
+    # To update this file, edit ikconfig.txt in this directory and run:
+    #   gzip --no-name --stdout zircon/kernel/arch/x86/phys/ikconfig.txt \
+    #        > zircon/kernel/arch/x86/phys/ikconfig.gz
+    inputs = [ "ikconfig.gz" ]
+    ikconfig_file = rebase_path("ikconfig.gz", root_build_dir)
+    defines = [ "IKCONFIG_FILE=\"$ikconfig_file\"" ]
+  }
+
+  # This is a little library instead of a source_set() so it can be included
+  # implicitly by phys_executable() without adding bloat to the tiny tests
+  # that don't use it.
+  static_library("linuxboot-init") {
+    visibility = [ ":*" ]
+
+    complete_static_lib = true
+
+    sources = [ "linuxboot-init.cc" ]
+    deps = [
+      ":linuxboot.h",
+      "//zircon/kernel/lib/arch",
+      "//zircon/kernel/phys:address-space",
+      "//zircon/kernel/phys:allocation",
+      "//zircon/kernel/phys:main",
+      "//zircon/kernel/phys:symbolize",
+      "//zircon/kernel/phys/lib/memalloc",
+      "//zircon/system/ulib/zircon-internal",
+    ]
+    public_deps = [
+      ":legacy-boot",
+      "//sdk/lib/zbi-format",
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+    ]
+  }
+
+  source_set("reset") {
+    sources = [ "reset.cc" ]
+    deps = [ "//zircon/kernel/phys:main" ]
+  }
+
+  # x86-specific definitions for things in <phys/address-space.h>.
+  static_library("address-space") {
+    visibility = [ "//zircon/kernel/phys:address-space" ]
+
+    complete_static_lib = true
+
+    sources = [ "address-space-install.cc" ]
+    if (toolchain_environment == "kernel.phys32") {
+      sources += [ "address-space-32.cc" ]
+    } else {
+      sources += [ "address-space-64.cc" ]
+    }
+    deps = [
+      "//sdk/lib/fit",
+      "//zircon/kernel/lib/arch",
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/phys:address-space.header",
+      "//zircon/kernel/phys:allocation",
+      "//zircon/kernel/phys:main",
+      "//zircon/kernel/phys:symbolize",
+      "//zircon/kernel/phys/lib/memalloc",
+    ]
+    include_dirs = [ "//." ]
+  }
+
+  source_set("arch-handoff-prep") {
+    sources = [ "arch-handoff-prep.cc" ]
+    deps = [
+      "//sdk/lib/zbi-format",
+      "//zircon/kernel/lib/code-patching",
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/phys:handoff",
+      "//zircon/kernel/phys:handoff-prep.h",
+    ]
+    include_dirs = [ "//zircon/kernel/phys" ]
+  }
+
+  source_set("arch-on-physload-handoff") {
+    sources = [ "arch-on-physload-handoff.cc" ]
+    include_dirs = [ "//zircon/kernel/phys" ]
+    deps = [
+      "//zircon/kernel/lib/arch",
+      "//zircon/kernel/phys:physload.header",
+    ]
+  }
+
+  source_set("arch-physload") {
+    sources = [ "arch-physload.cc" ]
+    include_dirs = [ "//zircon/kernel/phys" ]
+    deps = [ "//zircon/kernel/phys:physload.header" ]
+  }
+
+  source_set("arch-boot-zbi") {
+    if (toolchain_environment == "kernel.phys32") {
+      sources = [ "arch-boot-zbi-32.cc" ]
+    } else {
+      sources = [ "arch-boot-zbi-64.cc" ]
+    }
+    deps = [
+      "//zircon/kernel/lib/arch",
+      "//zircon/kernel/phys:boot-zbi.deps",
+    ]
+  }
+
+  # This is where code is actually loaded both for the Multiboot spec and for
+  # the original/legacy x86 ZBI booting spec.
+  config("load-1mb") {
+    ldflags = [ "-Wl,-defsym,PHYS_LOAD_ADDRESS=0x100000" ]
+  }
+}
+
+# Empty target, since there is no header or type required for x86.
+group("arch-phys-info") {
+}
+
+# This is evaluated differently in different environments, so outside the if.
+hwreg_asm_header("phys32.h") {
+  output_name = "phys32.h"
+  sources = [ "gdt32.cc" ]
+  defines = [
+    "GENERATE",
+    "LIB_ARCH_PRINTERS",
+  ]
+  deps = [ "//zircon/kernel/lib/arch" ]
+}
+
+source_set("linuxboot.h") {
+  public = [ "linuxboot.h" ]
+  public_deps = [
+    # linuxboot.h has #include <lib/zircon-internal/e820.h>
+    "//zircon/system/ulib/zircon-internal:headers",
+  ]
+}
+
+hwreg_asm_header("linuxboot-asm") {
+  output_name = "linuxboot-asm.h"
+  sources = [ "linuxboot-asm-gen.cc" ]
+  deps = [ ":linuxboot.h" ]
+}
+
+if (current_cpu == "x64") {
+  qemu_kernel_test("paging-test") {
+    sources = [ "paging-test.cc" ]
+    include_dirs = [ "//zircon/kernel/phys/test" ]
+    deps = [
+      ":legacy-boot",
+      "//zircon/kernel/phys:address-space",
+      "//zircon/kernel/phys:allocation",
+      "//zircon/kernel/phys:symbolize",
+      "//zircon/kernel/phys/test:test-main",
+    ]
+  }
+
+  group("tests") {
+    testonly = true
+    deps = [ ":paging-test" ]
+  }
+}

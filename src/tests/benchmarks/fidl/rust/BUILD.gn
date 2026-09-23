@@ -1,0 +1,113 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+import("//src/tests/benchmarks/fidl/benchmark_suite/benchmark_suite.gni")
+import("//tools/fidl/gidl/gidl.gni")
+
+gidl_lib_deps = []
+gidl_pkg_names = []
+
+gidl_rust_out_file_prefix = "$target_gen_dir/src"
+
+template("rust_gidl_benchmark_suite") {
+  output_file = "$gidl_rust_out_file_prefix/$target_name.rs"
+
+  gidl("${target_name}__gidl") {
+    type = "benchmark"
+    language = "rust"
+    inputs = invoker.gidl
+    fidl = invoker.fidl_target
+    output = output_file
+    extra_args = [
+      "-rust-benchmarks-fidl-library",
+      invoker.fidl_library_suffix,
+    ]
+  }
+
+  rustc_library(target_name) {
+    testonly = true
+    name = invoker.pkg_name
+    edition = "2024"
+    source_root = output_file
+
+    deps = [
+      "//src/developer/fuchsia-criterion",
+      "//src/lib/fidl/rust/fidl",
+      "//src/lib/fidl/rust/gidl_util",
+      "//src/lib/fuchsia-async",
+      "//sdk/rust/zx",
+      "//third_party/rust_crates:futures",
+      invoker.fidl_target + "_rust",
+    ]
+    non_rust_deps = [ ":${target_name}__gidl" ]
+
+    sources = [ output_file ]
+    disable_rustdoc = true
+  }
+}
+
+foreach(suite, benchmark_suites) {
+  gidl = []
+  gidl = suite.gidl
+  pkg_name = "benchmark_suite_${suite.name}"
+  gidl_pkg_names += [ pkg_name ]
+  suite_target = "benchmark_suite__${suite.name}"
+  gidl_lib_deps += [ ":" + suite_target ]
+
+  rust_gidl_benchmark_suite(suite_target) {
+    fidl_library_suffix = suite.fidl_library_suffix
+    pkg_name = pkg_name
+    fidl_target = suite.fidl_target
+  }
+}
+
+rust_target_gen_dir = get_label_info(":anything", "target_gen_dir")
+benchmark_suite_file =
+    "$rust_target_gen_dir/benchmark_suite-${toolchain_variant.name}.rs"
+
+action("benchmark_suite_rust_lib_gen") {
+  inputs = []
+  outputs = [ benchmark_suite_file ]
+
+  script = "gen_benchmark_suite_lib.py"
+
+  args = [ rebase_path(benchmark_suite_file, root_build_dir) ] + gidl_pkg_names
+}
+
+rustc_library("benchmark_suite_rust_lib") {
+  testonly = true
+  name = "benchmark_suite"
+  edition = "2024"
+  source_root = benchmark_suite_file
+
+  deps = [ "//src/developer/fuchsia-criterion" ] + gidl_lib_deps
+  non_rust_deps = [ ":benchmark_suite_rust_lib_gen" ]
+
+  sources = [ benchmark_suite_file ]
+  disable_rustdoc = true
+}
+
+rustc_binary("rust_fidl_microbenchmarks_bin") {
+  testonly = true
+  name = "rust_fidl_microbenchmarks"
+  edition = "2024"
+
+  deps = [
+    ":benchmark_suite_rust_lib",
+    "//src/developer/fuchsia-criterion",
+    "//third_party/rust_crates:criterion",
+  ]
+
+  sources = [ "src/main.rs" ]
+}
+
+fuchsia_package_with_single_component("fidl_microbenchmarks_rust") {
+  testonly = true
+  manifest = "meta/benchmark.cml"
+  component_name = "benchmark"
+  deps = [ ":rust_fidl_microbenchmarks_bin" ]
+}

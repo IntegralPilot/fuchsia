@@ -1,0 +1,215 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_DEVICES_NAND_DRIVERS_AML_RAWNAND_AML_RAWNAND_H_
+#define SRC_DEVICES_NAND_DRIVERS_AML_RAWNAND_AML_RAWNAND_H_
+
+#include <fidl/fuchsia.boot.metadata/cpp/fidl.h>
+#include <fuchsia/hardware/nandinfo/c/banjo.h>
+#include <fuchsia/hardware/rawnand/cpp/banjo.h>
+#include <lib/ddk/device.h>
+#include <lib/ddk/io-buffer.h>
+#include <lib/driver/mmio/cpp/mmio-buffer.h>
+#include <lib/zx/bti.h>
+#include <lib/zx/time.h>
+#include <string.h>
+#include <zircon/compiler.h>
+#include <zircon/types.h>
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <utility>
+
+#include <ddktl/device.h>
+#include <ddktl/metadata_server.h>
+#include <ddktl/suspend-txn.h>
+#include <ddktl/unbind-txn.h>
+#include <fbl/bits.h>
+#include <fbl/mutex.h>
+
+#include "src/devices/nand/drivers/aml-rawnand/onfi.h"
+
+namespace amlrawnand {
+
+struct AmlController {
+  int ecc_strength;
+  int user_mode;
+  int rand_mode;
+  int options;
+  int bch_mode;
+};
+
+// In the case where user_mode == 2 (2 OOB bytes per ECC page),
+// the controller adds one of these structs *per* ECC page in
+// the info_buf.
+struct AmlInfoFormat {
+  uint16_t info_bytes;
+  uint8_t zero_bits; /* bit0~5 is valid */
+  union ecc_sta {
+    uint8_t raw_value;
+    fbl::BitFieldMember<uint8_t, 0, 6> eccerr_cnt;
+    fbl::BitFieldMember<uint8_t, 7, 1> completed;
+  } ecc;
+  uint32_t reserved;
+};
+
+// gcc doesn't let us use __PACKED with fbl::BitFieldMember<>, but it shouldn't
+// make a difference practically in how the AmlInfoFormat struct is laid out
+// and this assertion will double-check that we don't need it.
+static_assert(sizeof(AmlInfoFormat) == 8, "sizeof(AmlInfoFormat) must be exactly 8 bytes");
+
+// This should always be the case, but we also need an array of AmlInfoFormats
+// to have no padding between the items.
+static_assert(sizeof(AmlInfoFormat[2]) == 16, "AmlInfoFormat has unexpected padding");
+
+class AmlRawNand;
+using DeviceType = ddk::Device<AmlRawNand, ddk::Unbindable, ddk::Suspendable>;
+
+class AmlRawNand : public DeviceType, public ddk::RawNandProtocol<AmlRawNand, ddk::base_protocol> {
+ public:
+  explicit AmlRawNand(zx_device_t* parent, fdf::MmioBuffer mmio_nandreg,
+                      fdf::MmioBuffer mmio_clockreg, zx::bti bti, std::unique_ptr<Onfi> onfi)
+      : DeviceType(parent),
+        onfi_(std::move(onfi)),
+        mmio_nandreg_(std::move(mmio_nandreg)),
+        mmio_clockreg_(std::move(mmio_clockreg)),
+        bti_(std::move(bti)) {}
+
+  static zx_status_t Create(void* ctx, zx_device_t* parent);
+
+  virtual ~AmlRawNand() = default;
+
+  void DdkRelease();
+  void DdkUnbind(ddk::UnbindTxn txn);
+  void DdkSuspend(ddk::SuspendTxn txn);
+
+  zx_status_t Bind();
+  zx_status_t Init();
+  zx_status_t RawNandReadPageHwecc(uint32_t nand_page, uint8_t* data, size_t data_size,
+                                   size_t* data_actual, uint8_t* oob, size_t oob_size,
+                                   size_t* oob_actual, uint32_t* ecc_correct);
+  zx_status_t RawNandWritePageHwecc(const uint8_t* data, size_t data_size, const uint8_t* oob,
+                                    size_t oob_size, uint32_t nand_page);
+  zx_status_t RawNandEraseBlock(uint32_t nand_page);
+  zx_status_t RawNandGetNandInfo(nand_info_t* nand_info);
+
+ protected:
+  // These functions require complicated hardware interaction so need to be
+  // overridden or called differently in tests.
+
+  // Reads a single status byte from a NAND register. Used during initialization
+  // to query the chip information and settings.
+  virtual uint8_t AmlReadByte();
+
+  // Tests can fake page read/writes by copying bytes to/from these buffers.
+  const ddk::IoBuffer& data_buffer() __TA_NO_THREAD_SAFETY_ANALYSIS {
+    return buffers_->data_buffer;
+  }
+  const ddk::IoBuffer& info_buffer() __TA_NO_THREAD_SAFETY_ANALYSIS {
+    return buffers_->info_buffer;
+  }
+  const zx::bti& bti() const { return bti_; }
+
+ private:
+  static constexpr uint32_t kMicrosecondsToNanoseconds = 1'000;
+
+  std::unique_ptr<Onfi> onfi_;
+
+  struct Buffers {
+    void *info_buf, *data_buf;
+    zx_paddr_t info_buf_paddr, data_buf_paddr;
+    ddk::IoBuffer data_buffer;
+    ddk::IoBuffer info_buffer;
+  };
+
+  fbl::Mutex mutex_;
+  std::optional<Buffers> buffers_ __TA_GUARDED(mutex_);
+  fdf::MmioBuffer mmio_nandreg_;
+  fdf::MmioBuffer mmio_clockreg_;
+
+  zx::bti bti_;
+
+  AmlController controller_params_;
+  uint32_t chip_select_ = 0;  // Default to 0.
+  int chip_delay_ = 100;      // Conservative default before we query chip to find better value.
+  uint32_t writesize_;        /* NAND pagesize - bytes */
+  uint32_t erasesize_;        /* size of erase block - bytes */
+  uint32_t erasesize_pages_;
+  uint32_t oobsize_;    /* oob bytes per NAND page - bytes */
+  uint32_t bus_width_;  /* 16bit or 8bit ? */
+  uint64_t chipsize_;   /* MiB */
+  uint32_t page_shift_; /* NAND page shift */
+  struct {
+    uint64_t ecc_corrected;
+    uint64_t failed;
+  } stats;
+
+  polling_timings_t polling_timings_ = {};
+  nand_timings nand_timings_ = {};
+
+  // The duration of a single NAND bus cycle based on the controller clock rate and timing settings.
+  // Initialized by AmlClockInit().
+  zx::duration nand_cycle_time_;
+
+  // Issues an idle command for one NAND cycle, using chip_select_ to assert CE_n.
+  void SelectChip() { AmlCmdIdle(0); }
+  void AmlCmdCtrl(int32_t cmd, uint32_t ctrl);
+  void NandctrlSetCfg(uint32_t val);
+  void NandctrlSetTimingAsync(int bus_tim, int bus_cyc);
+  void NandctrlSendCmd(uint32_t cmd);
+  void AmlCmdIdle(uint32_t nand_bus_cycles);
+  void AmlCmdIdle(zx::duration duration);
+  void AmlQueueRB();
+  // Waits for all outstanding commands to be sent to the controller. More commands may be enqueued
+  // after this returns successfully, but the bus may not be idle at that point.
+  zx_status_t AmlWaitCmdQueueEmpty(zx::duration timeout, zx::duration first_interval,
+                                   zx::duration polling_interval);
+  // Waits for all outstanding commands to be sent to the controller and for the controller and bus
+  // to be idle. This is safe to call even if the command queue is full.
+  zx_status_t AmlWaitCmdFinish(zx::duration timeout, zx::duration first_interval,
+                               zx::duration polling_interval);
+  void AmlCmdSeed(uint32_t seed);
+  void AmlCmdN2M(uint32_t ecc_pages, uint32_t ecc_pagesize);
+  void AmlCmdM2N(uint32_t ecc_pages, uint32_t ecc_pagesize);
+  void AmlCmdM2NPage0();
+  void AmlCmdN2MPage0();
+  // Returns the AmlInfoFormat struct corresponding to the i'th
+  // ECC page. THIS ASSUMES user_mode == 2 (2 OOB bytes per ECC page).
+  void* AmlInfoPtr(int i) __TA_REQUIRES(mutex_);
+  zx_status_t AmlGetOOBByte(uint8_t* oob_buf, size_t* oob_actual) __TA_REQUIRES(mutex_);
+  zx_status_t AmlSetOOBByte(const uint8_t* oob_buf, size_t oob_size, uint32_t ecc_pages)
+      __TA_REQUIRES(mutex_);
+  // Returns the maximum bitflips corrected on this NAND page
+  // (the maximum bitflips across all of the ECC pages in this page).
+  // erased will indicate whether the page was registered as an erased page, as
+  // those should completely fail ECC.
+  zx_status_t AmlGetECCCorrections(int ecc_pages, uint32_t nand_page, uint32_t* ecc_corrected,
+                                   bool* erased) __TA_REQUIRES(mutex_);
+  zx_status_t AmlCheckECCPages(int ecc_pages) __TA_REQUIRES(mutex_);
+  void AmlSetClockRate(uint32_t clk_freq);
+  void AmlClockInit();
+  void AmlAdjustTimings(uint32_t tRC_min, uint32_t tREA_max, uint32_t RHOH_min);
+  zx_status_t AmlGetFlashType();
+  void AmlSetEncryption();
+  zx_status_t AmlReadPage0(uint8_t* data, size_t data_size, uint8_t* oob, size_t oob_size,
+                           uint32_t nand_page, uint32_t* ecc_correct, int retries);
+  // Reads one of the page0 pages, and use the result to init
+  // ECC algorithm and rand-mode.
+  zx_status_t AmlNandInitFromPage0();
+  zx_status_t AmlRawNandAllocBufs() __TA_REQUIRES(mutex_);
+  zx_status_t AmlNandInit();
+
+  // If true, the driver is the process of being stopped, and no attempts to access the NAND
+  // controller or device should be made.
+  bool shutdown_ __TA_GUARDED(mutex_) = false;
+
+  async_dispatcher_t* dispatcher_{fdf::Dispatcher::GetCurrent()->async_dispatcher()};
+  ddk::MetadataServer<fuchsia_boot_metadata::PartitionMap> partition_map_metadata_server_;
+  component::OutgoingDirectory outgoing_{dispatcher_};
+};
+
+}  // namespace amlrawnand
+
+#endif  // SRC_DEVICES_NAND_DRIVERS_AML_RAWNAND_AML_RAWNAND_H_

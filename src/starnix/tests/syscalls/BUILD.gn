@@ -1,0 +1,117 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+import("//build/dist/resource.gni")
+import("//src/starnix/kernel/starnix.gni")
+import("//src/virtualization/buildtools/romfs_image.gni")
+
+group("tests") {
+  testonly = true
+  deps = [
+    "cpp:tests",
+    "rust:tests",
+  ]
+}
+
+group("linux_vm_tests") {
+  testonly = true
+  deps = [
+    "cpp:linux_vm_tests",
+    # TODO(https://fxbug.dev/553922248): Temporarily disabling due to flakey infrastructure.
+    # "rust:linux_vm_tests",
+  ]
+}
+
+# For the time being, the Rust and C++ syscall tests all share a singular
+# Machina VM instance for performance considerations. As such, we need to
+# combine all of the various test dependencies into a singular disk image, to be
+# mounted by Machina. The test binaries themselves are stripped from the Fuchsia
+# package at runtime, which allows quicker iteration when working on tests.
+_target_linux_out_dir =
+    get_label_info("cpp:syscall_test_deps($target_linux_toolchain)",
+                   "root_out_dir")
+
+_fuse_overlayfs = []
+if (target_cpu == "x64") {
+  _fuse_overlayfs = [ "//prebuilt/starnix/fuse-overlayfs-amd64/fuse-overlayfs" ]
+} else if (target_cpu == "arm64") {
+  _fuse_overlayfs = [ "//prebuilt/starnix/fuse-overlayfs-arm64/fuse-overlayfs" ]
+}
+
+_syscall_deps_inputs =
+    _fuse_overlayfs + [
+      # C++ static resources
+      "cpp/data/hello_world.txt",
+      "cpp/data/mount_ext4.img",
+      "//src/storage/erofs/testing/data/simple.erofs",
+      "//src/storage/erofs/testing/data/simple/file1",
+
+      # C++ executable helpers (built with target_linux_toolchain)
+      "$_target_linux_out_dir/clone_exec_helper",
+      "$_target_linux_out_dir/custom_pt_interp_child",
+      "$_target_linux_out_dir/exit_zero",
+      "$_target_linux_out_dir/extended_pstate_initial_state_child",
+      "$_target_linux_out_dir/print_helper",
+      "$_target_linux_out_dir/print_uid_gid_exec_child",
+      "$_target_linux_out_dir/procfs_test_exec_child",
+      "$_target_linux_out_dir/ptrace_test_exec_child",
+      "$_target_linux_out_dir/signal_handling_test_exec_child",
+      "$_target_linux_out_dir/signal_handling_test_exec_parent_after_exit",
+      "$_target_linux_out_dir/signal_handling_test_exec_parent_before_exit",
+      "$_target_linux_out_dir/syscall_test_exec_child",
+
+      # Rust static resources & fixtures
+      "rust/data/corrupted_hashtree_sha256.txt",
+      "rust/data/corrupted_hashtree_sha512.txt",
+      "rust/data/corrupted_root_hash_sha256.txt",
+      "rust/data/corrupted_root_hash_sha512.txt",
+      "rust/data/device_mapper_ext4.img",
+      "rust/data/ebpf/ebpf_test_progs.o",
+      "rust/data/hashtree_sha256.txt",
+      "rust/data/hashtree_sha512.txt",
+      "rust/data/root_hash_sha256.txt",
+      "rust/data/root_hash_sha512.txt",
+      "rust/data/valid_image_with_corrupted_hashtree_sha256.txt",
+      "rust/data/valid_image_with_hashtree_sha256.txt",
+
+      # Rust executable helper
+      "$_target_linux_out_dir/fscrypt_test",
+    ]
+
+_test_helper_executables = [
+  "cpp:extended_pstate_initial_state_child",
+  "cpp:print_uid_gid_exec_child",
+  "cpp:procfs_test_exec_child",
+  "cpp:ptrace_test_exec_child",
+  "cpp:signal_handling_test_exec_child",
+  "cpp:syscall_test_exec_child",
+  "cpp/test_programs:clone_exec_helper",
+  "cpp/test_programs:custom_pt_interp_child",
+  "cpp/test_programs:exit_zero",
+  "cpp/test_programs:print_helper",
+  "cpp/test_programs:signal_handling_test_exec_parent_after_exit",
+  "cpp/test_programs:signal_handling_test_exec_parent_before_exit",
+  "rust:fscrypt_test_bin",
+]
+
+# Builds a ROMFS image for the syscall test dependencies.
+romfs_image("unified_syscall_deps_img") {
+  testonly = true
+  deps = [
+    "cpp:syscall_test_deps",
+    "rust:syscall_test_deps",
+  ]
+  foreach(exe, _test_helper_executables) {
+    deps += [ "${exe}($target_linux_toolchain)" ]
+  }
+  inputs = _syscall_deps_inputs
+  output = "$target_out_dir/syscall_test_deps.romfs"
+}
+
+# Package the unified ROMFS image as a package resource
+resource("unified_syscall_deps") {
+  testonly = true
+  sources = [ "$target_out_dir/syscall_test_deps.romfs" ]
+  outputs = [ "data/syscall_test_deps.romfs" ]
+  deps = [ ":unified_syscall_deps_img" ]
+}

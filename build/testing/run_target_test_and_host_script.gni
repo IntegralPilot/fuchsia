@@ -1,0 +1,156 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+import("//build/host.gni")
+import("//build/python/python_host_test.gni")
+
+# Defines a host test that runs a target test using `ffx test`, then triggers
+# a host side script after the target test completes.
+#
+# NOTE: This test template enforces that all target interactions should happen
+# on the target side via a `fuchsia_test_package`. And only post processing
+# should happen on the host. Do not use this template if you want to run a
+# host-side test, where target interaction happens on the host side, and the
+# test target is a `host_test`.
+#
+# Parameters
+#   test_url  (required)
+#     test url for running the target test.
+#
+#   test_package  (required)
+#     path to the `fuchsia_test_package` target.
+#
+#   ffx_test_args (optional)
+#     List of args to pass to `ffx test run`.
+#     Run `ffx test run --help` to see list of supported args.
+#
+#   run_host_script_on_fail (optional)
+#     If true, will run host script even if test fails. Default to false.
+#
+#   host_script (required)
+#     Path to host executible/binary target.
+#
+#   host_script_args (optional)
+#     List of args to pass to host_script.
+#
+#   host_script_bin_name (optional)
+#     Host scripts binary name if different than the containing dir name.
+#
+#   environments (optional)
+#   deps (optional)
+#   visibility (optional)
+#     Forwarded to `python_host_test`.
+#
+# Variable substitution:
+#   {{test_artifact_dir}}
+#     Will be substituted with the path where the test artifacts are stored on host
+#     after `ffx test` completes.
+#
+# Example of usage:
+#
+#   run_target_test_and_host_script("system_validation_test") {
+#     test_url = "fuchsia-pkg://fuchsia.com/system_validation#meta/test.cm"
+#     test_package = "//src/testing/system-validation/ui:test_pkg(${target_toolchain})"
+#     host_script = "//src/performance/trace2json:bin"
+#     host_script_bin_name = "trace2json"
+#     host_script_args = [
+#       "--input-file=" + "{test_artifact_dir}/custom-0/trace.fxt",
+#       "--output-file=" + "{test_artifact_dir}/trace_from_host.json",
+#     ]
+#   }
+#
+# To build this test, use `--with-host` ex:
+# fx set <product> --with-base </path/to/test/package> \
+#   --with-host </path/to/run_target_test_and_host_script>
+template("run_target_test_and_host_script") {
+  assert(is_host, "run_target_test_and_host_script runs on the host")
+  assert(defined(invoker.test_url), "test url must be defined")
+  assert(defined(invoker.test_package), "test package must be defined")
+  assert(defined(invoker.host_script), "host script must be defined")
+
+  run_host_script_on_fail = false
+  if (defined(invoker.run_host_script_on_fail) &&
+      invoker.run_host_script_on_fail) {
+    run_host_script_on_fail = true
+  }
+  _data_deps = [ invoker.test_package ]
+
+  # Default test output, this will be overwritten by environment var:
+  # 'FUCHSIA_TEST_OUTDIR' when the test is running on Infra.
+  _test_outdir = "${target_out_dir}/${target_name}"
+
+  host_test_data("ffx_for_${target_name}") {
+    sources = [ "${root_out_dir}/ffx-test_unversioned" ]
+    deps = [ "//src/developer/ffx/plugins/test:ffx_test_tool_unversioned" ]
+  }
+  _data_deps += [ ":ffx_for_${target_name}" ]
+  _args = [
+    "--ffx-bin",
+    rebase_path("${root_out_dir}/ffx-test_unversioned", root_build_dir),
+    "--test-url",
+    invoker.test_url,
+    "--test-outdir",
+    rebase_path(_test_outdir, root_build_dir),
+  ]
+
+  if (defined(invoker.ffx_test_args)) {
+    foreach(_ffx_test_arg, invoker.ffx_test_args) {
+      _args += [ "--ffx-test-args=$_ffx_test_arg" ]
+    }
+  }
+
+  _script_bin_name =
+      get_path_info(get_label_info(invoker.host_script, "dir"), "name")
+
+  # Use `host_script_bin_name` if the output_name is not the same as the
+  # containing dir.
+  if (defined(invoker.host_script_bin_name)) {
+    _script_bin_name = invoker.host_script_bin_name
+  }
+  _script_src = "${root_out_dir}/${_script_bin_name}"
+  host_test_data("host_script_for_${target_name}") {
+    sources = [ _script_src ]
+    deps = [ invoker.host_script ]
+  }
+  _data_deps += [ ":host_script_for_${target_name}" ]
+  _args += [
+    "--host-script-bin",
+    rebase_path(_script_src, root_build_dir),
+  ]
+
+  if (defined(invoker.host_script_args)) {
+    foreach(_host_script_arg, invoker.host_script_args) {
+      _args += [ "--host-script-args=$_host_script_arg" ]
+    }
+  }
+
+  if (run_host_script_on_fail) {
+    _args += [ "--run-host-script-on-fail" ]
+  }
+
+  python_host_test(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "environments",
+                             "visibility",
+                             "deps",
+                           ])
+    main_source = "//build/testing/run_target_test_and_host_script.py"
+    extra_args = _args
+    main_callable = "main"
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += _data_deps
+
+    metadata = {
+      # Since <target_name> is added automatically to tests.json and will invoke
+      # <test_package> at runtime, ensure that the latter does not appear in
+      # that file too. This prevents the test package from being run twice when
+      # all tests are run on infra.
+      #
+      # This is used by the //:tests build_api_module() target.
+      tests_barrier = []
+    }
+  }
+}

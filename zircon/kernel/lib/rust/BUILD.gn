@@ -1,0 +1,363 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/dist/distribution_manifest.gni")
+import("//build/dist/distribution_manifest_copy.gni")
+import("//build/rust/config.gni")
+import("//build/toolchain/toolchain_environment.gni")
+
+# This file implements the Rust custom target support for the kernel.  There
+# are two components of this: populating the JSON spec; populating the sysroot.
+#
+# The JSON target spec is populated by starting with the normal userland
+# Fuchsia target for the machine, and modifying it.  These edits are directed
+# by compiler_config() instances in the tree from //zircon/kernel/switch:abi.
+#
+# The sysroot needs to be populated with the `target.json` file and then with
+# the few essential crates (`.rlib` files) to which the compiler always refers.
+# For out-of-the-box targets, these come in a prebuilt sysroot provided with
+# the compiler.  For the custom target, we provide a custom sysroot.
+#
+# Some complications conspire to produce some exacting requirements for how the
+# `.rlib` files can get built and delivered to the custom sysroot.
+#
+#   * The layout is fixed by rustc based on --sysroot and --target values.
+#     There is no way to insist these crates be found elsewhere.
+#
+#   * When rustc finds the `lib*.rlib` file, it will not tolerate an adjacent
+#     `lib*.rmeta` file existing at the same time.
+#
+#   * The build system's RBE Rust integration has found it necessary and best
+#     to instruct rustc to emit `.rmeta` files in all cases.  This is baked
+#     into the tool() definition in the toolchain and hard to avoid.
+#
+# These lead to compiling to an intermediate build directory ($target_out_dir)
+# and then making copies (actually hard links) to the sysroot directory.
+#
+#  * Anomalous filesystem behavior is sometimes observed in incremental builds
+#    on bots with individual files / links like this seeing stale versions
+#    after the link was updated.
+#
+#  * These anomalies are thought to be mitigated by starting every time with a
+#    freshly-`mkdir`d directory and populating _that_ with new links.
+#
+#  * Predicting when rustc might look for one of the special crates while
+#    building another of them is subtle and fragile to rely on.
+#
+#  * The --target string is embedded in each crate's metadata; rustc enforces
+#    that the string found in each already-built crate must match the string
+#    used in the current invocation.  This is precludes using different custom
+#    targets within the same sysroot as a means just to separate the `lib`
+#    directories.  It also serves a useful purpose of catching crosstalk
+#    anomalies; so its worth exploiting that to avoid crosstalk between the
+#    different kernel toolchains (switchsets and variants).
+#
+# All this leads to an approach whereby the custom target sysroot crates are
+# built in separate stages that use disjoint Rust `--sysroot` directories.
+# Each stage uses the same --target string (based on the $current_toolchain
+# name), but finds its files in a different place.  The same `target.json`
+# contents must be placed in each directory.
+#
+# Each stage produces a sysroot directory that can be used by later stages.
+# The first stage is empty except for `target.json` and never gets any `lib`
+# contents.  Each stage builds crates using the previous stage as the
+# `--sysroot` setting, so only previous stages' crates are available to it.
+# Its `lib` directory gets those crates along with all previous stages' crates.
+
+assert(toolchain_environment == "kernel",
+       "This file should not be reached by deps in $current_toolchain")
+
+# Where the Rust library sources are found in the toolchain package.
+rustc_library_dir = "$rustc_prefix/lib/rustlib/src/rust/library"
+
+# The --target string used in this toolchain.  This dictates the subdirectory
+# path used inside the Rust --sysroot directory.
+custom_target = get_label_info(current_toolchain, "name")
+custom_target_relpath = "lib/rustlib/$custom_target"
+
+# These are configs that might be in the toolchain / variant's default list but
+# must be disabled for building the empty pseudo-crates.
+rust_instrumentation_configs = [
+  "//build/config/profile:coverage",
+
+  # TODO(https://fxbug.dev/414673148): Remove when coverage-rust is removed.
+  "//build/config/profile:coverage-rust",
+  "//build/config/profile:profile-rust",
+]
+
+stages = [
+  {
+    name = "rust-bootstrap-empty"
+
+    # This is the initial stage that never has any crates, just `target.json`.
+    crates = []
+    remove_configs = []
+  },
+  {
+    name = "rust-bootstrap-builtins"
+
+    # The two empty crates are built in this stage.  Neither needs any rlib.
+    crates = [
+      {
+        # This is implicitly used by all compilations.
+        name = "compiler_builtins"
+
+        # This is actually an empty crate with just a local stub source file.
+        crate_root = "src/lib.rs"
+        rust_sources = [ crate_root ]
+      },
+      {
+        # This is used only when coverage / profile instrumentation is enabled.
+        name = "profiler_builtins"
+
+        # This just an empty crate, but upstream provides the stub source file.
+        # The upstream build.rs is adding in a copy of compiler-rt/lib/profile.
+        # But in the kernel //src/lib/llvm-profdata handles that instead.
+        crate_root = "$rustc_library_dir/$name/src/lib.rs"
+        rust_sources = [ crate_root ]
+      },
+    ]
+
+    # Disable instrumentation switches that require extra crates to exist
+    # already, like profiler_builtins itself.
+    remove_configs = rust_instrumentation_configs
+  },
+  {
+    name = "rust-bootstrap-core"
+
+    # The core crate is built in this stage.  It may need the earlier crates.
+    crates = [
+      {
+        # This is implicitly used by all compilations.
+        name = "core"
+
+        crate_root = "$rustc_library_dir/$name/src/lib.rs"
+
+        # This needs all the sources from the toolchain package directory, but
+        # there is no ready list of all the names other than the crate_root
+        # file. The magic placeholder file tells the machinery that it just has
+        # to use rustc parsing of `mod` et al to discover all the source files
+        # used.
+        rust_sources = [ "//build/rust/__SKIP_ENFORCEMENT__.rs" ]
+      },
+    ]
+    remove_configs = []
+  },
+  {
+    name = "target"
+
+    # This is the final stage where all the normal kernel code is built.
+    # Nothing that goes into the sysroot is _built_ in this final stage.
+    crates = []
+    remove_configs = []
+  },
+]
+
+# These are implicitly in deps of normal targets because :target is listed in
+# the toolchain definition.  The special crate targets defined below avoid the
+# normal target-defining templates and so don't get these injected.
+group("target_deps") {
+}
+group("target_executable_deps") {
+}
+group("target_link_deps") {
+}
+group("target_source_deps") {
+  # This needs to be in public_deps so that it counts among "direct" deps for
+  # all the Rust compilation targets that have its outputs (the `target.json`
+  # file) in their inputs via the config().
+  public_deps = [ ":rust-custom-target" ]
+
+  # This provides an ordering dep to get the custom target sysroot populated
+  # with the crates (`.rlib` files) it needs.  These rlib files aren't
+  # directly known to GN / Ninja as inputs, but will be picked up from
+  # rustc's depfile to take care of incremental rebuilds.
+  deps = [ ":target.sysroot" ]
+}
+
+# Collect the edit steps defined by each compiler_config().
+generated_file("rust-target-edits") {
+  visibility = [ ":rust-custom-target" ]
+  outputs = [ "$root_gen_dir/rust-target-edits.json" ]
+  output_conversion = "json"
+  data_keys = [ "kernel_rust_target_edits" ]
+  deps = [ ":rust-target-edits.prologue" ]
+
+  # That must be first in the list!  Append the real deps separately.
+  deps += [ "//zircon/kernel/switch:abi.rust-target-edits" ]
+}
+
+group("rust-target-edits.prologue") {
+  visibility = [ ":rust-target-edits" ]
+  metadata = {
+    # This winds up first in the collected list.  It's just the plain
+    # --target string.  Later elements are scopes to drive edits to that
+    # target's default JSON spec.
+    kernel_rust_target_edits = [ rust_target ]
+  }
+}
+
+# Generate the full target spec from the base target and the edits.
+action("rust-custom-target") {
+  visibility = [ "//zircon/kernel/*" ]
+
+  script = "rust-custom-target.py"
+
+  inputs = [ "$rustc_prefix/bin/rustc" ]
+  args = [ "--rustc=" + rebase_path(inputs[0], root_build_dir) ]
+
+  deps = [ ":rust-target-edits" ]
+  sources = get_target_outputs(deps[0])
+  args += [ "--edits=" + rebase_path(sources[0], root_build_dir) ]
+
+  # There's just one JSON file, but each stage has to find it in a different
+  # subdirectory, so it has extra links.
+  outputs = []
+  foreach(stage, stages) {
+    outputs +=
+        [ "$root_gen_dir/${stage.name}/$custom_target_relpath/target.json" ]
+  }
+  foreach(output, outputs) {
+    args += [ "--output=" + rebase_path(output, root_build_dir) ]
+  }
+}
+
+# Each stage defines: the config() to use its custom target; the copying action
+# to populate its `lib` directory; and the crate targets to build (using the
+# previous stage's custom target).
+previous_crates = []  # Accumulates all the crate names from every stage.
+foreach(stage, stages) {
+  stage.sysroot = "$root_gen_dir/${stage.name}"
+  stage.rustlib = "${stage.sysroot}/$custom_target_relpath"
+  stage.json = "${stage.rustlib}/target.json"
+
+  # Apply the custom target.  This confers the Ninja file dependency on the
+  # JSON file.  Compile targets using this config() must have direct-equivalent
+  # deps on :rust-custom-target to match its outputs being in `inputs` here.
+  config(stage.name) {
+    inputs = [ stage.json ]
+    rustflags = [
+      "--sysroot=" + rebase_path(stage.sysroot, root_build_dir),
+      "-Zunstable-options",  # Required for using custom (JSON file) targets.
+      "--target=$custom_target",
+    ]
+    if (rust_rbe_enable) {
+      rustflags += [
+        "--remote-flag=--clang-target=$current_target_tuple",
+        "--remote-inputs=" +
+            string_join(",", rebase_path(inputs, root_build_dir)),
+      ]
+    }
+  }
+
+  # This avoids the //build/rust template layers for these very special cases.
+  # As this is only upstream code, none of the analysis targets or other extra
+  # support those templates provide is useful here.  The implicit deps injected
+  # by just the rust_library() wrapper template layer from BUILDCONFIG.gn, into
+  # every other Rust target lead back here; using basic_rust_library() avoids
+  # the circularity.  Note basic_rust_library() has no set_defaults() configs!
+  foreach(crate, stage.crates) {
+    basic_rust_library(crate.name) {
+      deps = []
+      forward_variables_from(crate,
+                             "*",
+                             [
+                               "name",
+                               "rust_sources",
+                             ])
+
+      visibility = [ ":*" ]
+
+      # This is the default in GN's actual logic, but it only gets into the
+      # GN-produced 'project.json' file if it's explicit in the target scope,
+      # and generate_cargo.py needs to find it there (see
+      # //build/rust/BUILD.gn).
+      output_name = target_name
+
+      rustenv = [ "RUSTC_BOOTSTRAP=$target_name" ]
+      rustflags = [ "--edition=2024" ]
+
+      # The custom target defined by the previous stage goes early in the list.
+      # The default (final) custom target and a few other things come out.
+      configs = [ ":$previous_stage" ] + default_common_binary_configs -
+                [ "//zircon/kernel/lib/rust:target" ] + stage.remove_configs -
+                stage.remove_configs
+
+      # The config() confers an inputs list for the file dependency on the
+      # `target.json` file.  Normal Rust targets all get implicit deps that
+      # propagate to the generating action via public_deps.  Without that, it
+      # must appear in the direct deps list here to match implied inputs.
+      deps += [ ":rust-custom-target" ]
+
+      # The RBE wrapper will look for these generated files, so generate them.
+      deps += [
+        ":$target_name.rust_compilation_deps",
+        ":$target_name.rust_sources",
+      ]
+
+      metadata = {
+        distribution_entries = [
+          {
+            label = get_label_info(":$target_name", "label_with_toolchain")
+            destination = "lib${crate.name}.rlib"
+            source = rebase_path("$target_out_dir/$destination", root_build_dir)
+          },
+        ]
+      }
+    }
+
+    generated_file("${crate.name}.rust_compilation_deps") {
+      visibility = [ ":*" ]
+      outputs = [ "$target_gen_dir/$target_name" ]
+      data_keys = [ "rust_compilation_deps" ]
+      walk_keys = [ "rust_compilation_deps_barrier" ]
+      deps = [ ":${previous_stage}.sysroot" ]
+    }
+
+    generated_file("${crate.name}.rust_sources") {
+      visibility = [ ":*" ]
+      outputs = [ "$target_gen_dir/$target_name" ]
+      contents = rebase_path(crate.rust_sources, root_build_dir)
+    }
+
+    # Add to the collection the next iteration of the outer loop will use.
+    previous_crates += [ crate ]
+  }
+
+  # Collect the details for populating ${stage.rustlib}/lib.  Everything in
+  # ${stage.rustlib} (so, lib/... + target.json) is in rust_compilation_deps
+  # metadata so RBE knows to present it.
+  stage.compilation_deps = [ stage.json ]
+  stage.manifest_deps = []
+  foreach(crate, previous_crates) {
+    stage.compilation_deps += [ "${stage.rustlib}/lib/lib${crate.name}.rlib" ]
+    stage.manifest_deps += [ ":${crate.name}" ]
+  }
+
+  # Collect the manifest for all the crates built up through this stage.
+  distribution_manifest("${stage.name}.manifest") {
+    visibility = [ ":*" ]
+    deps = stage.manifest_deps
+  }
+
+  # Use that to populate ${stage.rustlib}/lib.
+  distribution_manifest_copy("${stage.name}.sysroot") {
+    visibility = [ ":*" ]
+    outputs = [ "${stage.rustlib}/lib" ]
+    deps = [ ":${stage.name}.manifest" ]
+    metadata = {
+      # This will roll up into the generated_file()s fed to the RBE wrapper so
+      # it knows what GN and Ninja know via the inputs list in the config()
+      # (target.json) plus what's only known later via depfile (lib/*.rlib).
+      rust_compilation_deps_barrier = []
+      rust_compilation_deps =
+          rebase_path(stage.compilation_deps, root_build_dir)
+    }
+  }
+
+  # Reset for the next iteration to pick up.
+  previous_stage = stage.name
+}

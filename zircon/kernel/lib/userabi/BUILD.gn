@@ -1,0 +1,231 @@
+# Copyright 2019 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/cpp/library_headers.gni")
+import("//build/zircon/c_utils.gni")
+import("//build/zircon/zircon_cpu.gni")
+import("//zircon/kernel/kernel_rust_mod.gni")
+import("//zircon/kernel/params.gni")
+
+static_library("userabi") {
+  public_deps = [ ":headers" ]
+  if (is_kernel && !kernel_no_userabi) {
+    deps = [
+      ":userabi-rs",
+      ":userboot",
+      ":vdso",
+      "//zircon/kernel/lib/instrumentation",
+    ]
+  }
+}
+
+kernel_rust_mod("userabi-rs") {
+  output_name = "userabi"
+  source_root = "vdso.rs"
+  sources = [ "vdso.rs" ]
+}
+
+library_headers("headers") {
+  visibility = [ "//zircon/kernel/*" ]
+
+  headers = [
+    "lib/userabi/userboot.h",
+    "lib/userabi/vdso-constants.h",
+    "lib/userabi/vdso.h",
+  ]
+  public_deps = [
+    # <lib/userabi/vdso.h> has #include <lib/fasttime/internal/abi.h>.
+    "//zircon/kernel/lib/fasttime:headers",
+
+    # <lib/userabi.vdso.h> has #include
+    # <lib/instrumentation/kernel-mapped-vmo.h>, and <lib/userabi/userboot.h>
+    # has #include <lib/instrumentation/vmo.h>.
+    "//zircon/kernel/lib/instrumentation:headers",
+
+    # <lib/userabi/userboot.h> has #include <phys/handoff.h>
+    "//zircon/kernel/phys:handoff",
+  ]
+  if (is_kernel) {
+    public_deps += [
+      # <lib/userabi/vdso.h> has #include <object/vm_object_dispatcher.h>.
+      "//zircon/kernel/object",
+    ]
+    if (!kernel_no_userabi) {
+      public_configs = [ ":target_gen_dir.config" ]
+
+      # Dependents can use the generated header via $public_configs
+      # (above), and so need to depend on the generation action.
+      public_deps += [
+        ":gen-sysret-offsets($default_toolchain)",
+        ":gen-vdso-valid-sysret($default_toolchain)",
+      ]
+    }
+  } else {
+    # Our own embedded "user" code needs some shared headers.
+    public_configs = [ ":userabi.user.config" ]
+  }
+}
+
+config("userabi.user.config") {
+  visibility = [ ":*" ]
+
+  # Make <arch/defines.h> accessible.
+  include_dirs = [ "//zircon/kernel/arch/$zircon_cpu/include" ]
+}
+
+# Where code is generated.
+config("target_gen_dir.config") {
+  visibility = [ ":*" ]
+  include_dirs =
+      [ get_label_info(":anything($default_toolchain)", "target_gen_dir") ]
+}
+
+# Embed an RODSO layout object and extract address constants from it.
+#
+# The userboot loadable_module() and the vdso (libzircon) shared_library()
+# both use the special RODSO layout (by default in lld or via rodso.ld in
+# gold).  The kernel needs to use address constants extracted from these
+# ELF files' headers and symbols.
+
+if (current_toolchain == default_toolchain) {
+  vdso_rspfile = "$target_gen_dir/vdso.rsp"
+  link_output_rspfile("vdso.rsp") {
+    visibility = [ ":*" ]
+    outputs = [ vdso_rspfile ]
+    deps = [ "vdso" ]
+
+    metadata = {
+      distribution_entries_barrier = []
+    }
+  }
+
+  # This generated header file tells the kernel code where the segment
+  # boundaries and entry points are.
+  vdso_header = "$target_gen_dir/vdso-code.h"
+
+  toolchain_utils_action("gen-vdso-code.h") {
+    visibility = [ ":*" ]
+    deps = [ ":vdso.rsp" ]
+    outputs = [ vdso_header ]
+    depfile = "$vdso_header.d"
+
+    script = "gen-rodso-code.sh"
+    utils = [
+      "nm",
+      "readelf",
+    ]
+    sources = [ vdso_rspfile ]
+    args = [
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+      rebase_path(vdso_header, root_build_dir),
+    ]
+    args += [
+      "VDSO",
+      "@" + rebase_path(vdso_rspfile, root_build_dir),
+    ]
+
+    public_configs = [ ":target_gen_dir.config" ]
+
+    metadata = {
+      generated_sources = rebase_path(outputs, root_build_dir)
+
+      # Prevent deps from propagating up to code that uses this action.
+      distribution_entries_barrier = []
+    }
+  }
+
+  action("gen-vdso-valid-sysret") {
+    visibility = [ ":*" ]
+    script = "gen-vdso-valid-sysret.sh"
+    deps = [ ":gen-vdso-code.h" ]
+    sources = get_target_outputs(":gen-vdso-code.h")
+    outputs = [ "$target_gen_dir/vdso-valid-sysret.h" ]
+    args = rebase_path(sources + outputs, root_build_dir)
+  }
+
+  action("gen-sysret-offsets") {
+    visibility = [ ":*" ]
+    script = "gen-sysret-offsets.sh"
+    deps = [ ":gen-vdso-code.h" ]
+    sources = get_target_outputs(":gen-vdso-code.h")
+    outputs = [ "$target_gen_dir/sysret-offsets.h" ]
+    args = rebase_path(sources + outputs, root_build_dir)
+  }
+}
+
+group("vdso-code.h") {
+  public_deps = [ ":gen-vdso-code.h($default_toolchain)" ]
+  public_configs = [ ":target_gen_dir.config" ]
+}
+
+if (is_kernel) {
+  # Initializing, supporting, and validating the vDSO itself.
+  source_set("vdso") {
+    visibility = [ ":*" ]
+    sources = [ "vdso.cc" ]
+    configs += [ "vdso:max-page-size.defines" ]
+    deps = [
+      ":headers",
+      ":vdso-code.h",
+      "//zircon/kernel/dev/timer/arm_generic:headers",
+      "//zircon/kernel/lib/boot-options",
+      "//zircon/kernel/lib/fasttime:headers",
+      "//zircon/kernel/lib/page",
+      "//zircon/kernel/lib/syscalls",
+      "//zircon/kernel/phys:boot-constants",
+      "//zircon/kernel/vm:headers",
+      "//zircon/system/ulib/affine",
+      "//zircon/system/ulib/fbl",
+    ]
+  }
+
+  # Loading and launching userboot, which loads and launches "real" userland.
+  source_set("userboot") {
+    visibility = [ ":*" ]
+    sources = [
+      "elf.cc",
+      "elf.h",
+      "resource.cc",
+      "userboot.cc",
+    ]
+
+    deps = [
+      ":headers",
+      "//src/lib/elfldltl",
+      "//zircon/kernel/lib/boot-options",
+      "//zircon/kernel/lib/console",
+      "//zircon/kernel/lib/counters",
+      "//zircon/kernel/lib/crashlog",
+      "//zircon/kernel/lib/fasttime:headers",
+      "//zircon/kernel/lib/init",
+      "//zircon/kernel/lib/page",
+      "//zircon/kernel/phys:handoff",
+      "//zircon/system/ulib/zircon-internal",
+    ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [ "userboot:tests" ]
+}
+
+group("kernel-tests") {
+  testonly = true
+}
+
+group("phys-tests") {
+  testonly = true
+}
+
+group("boot_tests") {
+  testonly = true
+  deps = [
+    "trivial-test-userboot:boot_tests",
+    "userboot/tests:boot_tests",
+  ]
+}

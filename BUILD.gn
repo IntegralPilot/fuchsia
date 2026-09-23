@@ -1,0 +1,2546 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/size_report_aggregator.gni")
+import("//build/bazel/bazel_build_action_labels.gni")
+import("//build/bazel/bazel_test_suite.gni")
+import("//build/board.gni")
+import("//build/compiled_action.gni")
+import("//build/config/build_api_module.gni")
+import("//build/config/compiler.gni")
+import("//build/drivers/check_included_drivers.gni")
+import("//build/drivers/create_all_drivers_doc.gni")
+import("//build/images/args.gni")
+import("//build/info/info.gni")
+import("//build/product.gni")
+import("//build/product_bundles_json.gni")
+import("//build/rust/config.gni")
+import("//build/testing/platforms.gni")
+import("//build/tests_json.gni")
+import("//build/toolchain/rbe.gni")
+import("//build/toolchain/zircon/clang.gni")
+import("//build/zbi/zbi.gni")
+import("//sdk/config.gni")
+
+# Standard GN args.
+declare_args() {
+  # If you add package labels to this variable, the packages will be included
+  # in the 'universe' package set, which represents all software that is
+  # produced that is to be published to a package repository or to the SDK by
+  # the build.
+  universe_package_labels = []
+
+  # Targets to add to the build graph in the default (Fuchsia) toolchain.
+  target_labels = []
+
+  # If you add package labels to this variable, the packages will be included in
+  # the 'discoverable' package set, as defined by RFC-0212 "Package Sets":
+  # https://fuchsia.dev/fuchsia-src/contribute/governance/rfcs/0212_package_sets
+  #
+  # They will be compiled, and published, but not added as dependencies of the
+  # assembled images, and so will not be able to cause the inclusion of
+  # entries to the legacy bundle.
+  #
+  # As these cannot be part of the legacy AIB for a product, there is no
+  # "legacy" version of this argument.
+  discoverable_package_labels = []
+
+  # If you add labels to this variable the `exported_fuchsia_package_archive()`
+  # targets captured by these labels will be collected and exposed in the
+  # 'package_archives' build api module. Ordinary `fuchsia_package_archive()`
+  # targets are not captured.
+  #
+  # Note: This variable is only used for metadata collection -- any package
+  # labels added here will still need to be included in the build graph
+  # elsewhere.
+  #
+  # It's usually advisable to use labels of well-defined, curated `group()`s of
+  # packages instead of explicitly adding the labels of the
+  # `exported_fuchsia_package_archive()` targets directly.
+  exported_package_labels = []
+
+  # These are arguments used by Infra (and 'fx set') to add tests to a build
+  # configuration without necessarily adding them to the assembled product, and
+  # validating that they only contain tests of the type in their name.
+
+  # Fully hermetic tests (both by packaging and at runtime)
+  hermetic_test_package_labels = []
+
+  # Host-driven, "end-to-end" tests that run on a Fuchsia image (either real
+  # hardware or emulated).
+  e2e_test_labels = []
+
+  # Host-only tests.  These cannot have any dependency on an assembled platform
+  # image, or the compiled OS itself, not even for their host_test_data().
+  #
+  # These will be added to the build using the host toolchain.
+  host_test_labels = []
+
+  # A developer-only argument that is used to add tests to the build without
+  # going through the test-type validate that the above sets of tests are.
+  # These are always a dependency of the main product assembly.
+  developer_test_labels = []
+
+  # If you add labels to this variable, these will be included in the 'host'
+  # artifact set, which represents an additional set of host-only software that
+  # is produced by the build.
+  #
+  # These will be added to the build using the host toolchain.
+  host_labels = []
+
+  # A file containing historical test duration data for this build
+  # configuration, used used by testsharder to evenly split tests across
+  # shards. It should be set for any builds where testsharder will be run
+  # afterwards.
+  test_durations_file = ""
+
+  # Extra idk_archive() labels to be uploaded to the artifacts store. This is an
+  # extension mechanism for IDK bits outside of the main repository.
+  sdk_archive_labels = []
+
+  # Extra generate_fuchsia_bazel_sdk targets to be included in the
+  #`bazel_sdk_info` API module. This allows defining bazel SDKs outside of the
+  # main repository.
+  additional_bazel_sdk_labels = []
+
+  # Platform builders should populate this list in their product.gni file.
+  # The result will be built and uploaded to CIPD by infra.
+  assembly_board_configs = []
+
+  # Platform builders should populate this list in their product.gni file.
+  # The result will be built and uploaded to CIPD by infra.
+  assembly_product_configs = []
+
+  # Platform builders should populate this list in their product.gni file.
+  # The result will be built and uploaded to CIPD by infra.
+  assembly_partitions_configs = []
+
+  # Platform builders can add targets to this list so that they get built with
+  # the //:default target
+  additional_default_targets = []
+
+  # List of additional tefmocheck target labels to include in the manifest.
+  # Defaults to empty.
+  additional_tefmocheck_labels = []
+
+  # These labels are added as dependencies of '//:default' transitively via
+  # '//:build_only'.  These are used to add targets that need to be built
+  # but aren't part of any product, board, etc.
+  #
+  # These also serve as an alternative to '//:default' for sub-builds that
+  # only want to build and define a small subset of the tree.
+  build_only_labels = []
+
+  # Labels for product bundles to assemble in addition to the main product
+  # bundle.
+  product_bundle_labels = []
+}
+
+###
+### DEPRECATED GN build args and warnings/errors
+###
+
+declare_args() {
+  test_package_labels = []
+  enable_delayed_bazel_actions = ""
+}
+
+assert(
+    test_package_labels == [],
+    "'test_package_labels' is not supported, use 'developer_test_labels' instead.")
+
+if (enable_delayed_bazel_actions != "") {
+  print(
+      "WARNING: The 'enable_delayed_bazel_actions' GN arg is now deprecated, please remove from your 'args.gn' file.")
+}
+
+### END DEPRECATED GN build args and warnings/errors
+
+# Validate that this file is only ever processed in the default toolchain, and
+# then we can start the actual work of the file.
+assert(
+    current_toolchain == default_toolchain,
+    "The root build file (//BUILD.gn) can only be processed in the `default_toolchain`.")
+
+###
+### fx integration.
+###
+
+# Write a file that can be sourced by `fx`.  This file is produced
+# by `gn gen` and is not known to Ninja at all, so it has nothing to
+# do with the build itself.  Its sole purpose is to leave bread
+# crumbs about the settings `gn gen` used for `fx` to use later.
+_host_out_dir = rebase_path(host_out_dir, root_build_dir)
+_fx_config_lines = [
+  "# Generated by `gn gen`.",
+  "FUCHSIA_ARCH='${target_cpu}'",
+  "FUCHSIA_PRODUCT_NAME=${build_info_product}",
+  "FUCHSIA_BOARD_NAME=${board_name}",
+  "FUCHSIA_ZBI_COMPRESSION=zstd",
+  "HOST_OUT_DIR='${_host_out_dir}'",
+  "MAX_BUILD_CONCURRENCY=${max_build_concurrency}",
+]
+write_file("$root_build_dir/fx.config", _fx_config_lines)
+generated_file("default_toolchain_name.txt") {
+  outputs = [ "$root_build_dir/default_toolchain_name.txt" ]
+  contents = default_toolchain
+}
+
+###
+### Build API modules.
+###
+
+# This is the top-level build API module that just lists all the others.
+# Each element of the list is the simple name of the API module; the
+# module's contents are found at "$root_build_dir/$target_name.json".
+#
+# Type: list(string)
+#
+build_api_module("api") {
+  testonly = true
+  data_keys = [ "build_api_modules" ]
+  deps = [
+    ":all_package_manifest_paths",
+    ":args",
+    ":assembly_input_archives",
+    ":assembly_manifests",
+    ":bazel_build_events_logs",
+    ":bazel_sdk_info",
+    ":binaries",
+    ":boards",
+    ":build_info",
+    ":checkout_artifacts",
+    ":cipd_assembly_artifacts",
+    ":ctf_fidl_method_summary",
+    ":debug_symbols",
+    ":delivery_blob_config",
+    ":detailed_size_checker_data",
+    ":exported_files",
+    ":extra_python_dirs",
+    ":fuzzers",
+    ":generated_sources",
+    ":gerrit_size_report",
+    ":golden_files",
+    ":images",
+    ":licenses",
+    ":ninja_subbuilds",
+    ":nuc11_fastboot_images_location",
+    ":package-repositories",
+    ":package_archives",
+    ":platform_artifacts",
+    ":platforms",
+    ":prebuilt_binaries",
+    ":prebuilt_package_flavors",
+    ":prebuilt_versions_location",
+    ":product_bundles",
+    ":product_size_checker_output",
+    ":rbe_config",
+    ":rules_fuchsia_info",
+    ":rust_target_mapping",
+    ":sdk_archives",
+    ":tefmocheck_rules_manifest",
+    ":test_components",
+    ":test_durations",
+    ":test_list_location",
+    ":tests",
+    ":tool_paths",
+    ":triage_sources",
+    ":vnames_config",
+    "//build/rbe:rbe_settings.json",
+    "//sdk/ctf:ctf_artifacts_path",
+  ]
+}
+
+# This target generates a file that contains a list of paths to
+# tefmocheck config files. These paths are relative to the $root_build_dir.
+#
+# in file: "$root_build_dir/tefmocheck_rules_manifest.json".
+#
+# Type: list(string)
+#
+build_api_module("tefmocheck_rules_manifest") {
+  data_keys = [ "tefmocheck_rules" ]
+  deps = [ "//tools/testing/tefmocheck:public_checks" ] +
+         additional_tefmocheck_labels
+}
+
+# This target is used to generate, at `gn gen` time a file
+# that is exclusively used by //build/api/client.py.
+# NOTE: nothing should depend on this target.
+generated_file("build_api_client_info") {
+  deps = [ "//:api" ]
+  outputs = [ "$root_build_dir/build_api_client_info" ]
+  data_keys = [ "build_api_client_info" ]
+  walk_keys = [ "build_api_client_info_barrier" ]
+  testonly = true
+  visibility = []  # Empty on purpose
+}
+
+# This target generates a file that contains the path to the build API client
+# script, relative to the build directory (e.g. '../../build/api/client').
+#
+# Many tools that process the build API files only have a path to the build
+# directory, and do not know where the Fuchsia source directory itself is
+# located. By reading this file, they can retrieve this information easily,
+# without relying on fragile heuristics. This file should always be
+# generated at `gn gen` time, and nothing should depend on it.
+generated_file("build_api_client_path") {
+  # IMPORTANT: Do not include a newline at the end of "contents"
+  contents = rebase_path("//build/api/client", root_build_dir)
+  outputs = [ "$root_build_dir/build_api_client_path" ]
+  visibility = []  # Empty on purpose.
+}
+
+# This describes the location of the package repository, in:
+#  "$root_build_dir/package-repositories.json"
+#
+# Type: list(scope)
+#
+#   path
+#     Required: Path to the package repository, relative to $root_build_dir.
+#     Type: path relative to $root_build_dir
+#
+#   targets
+#     Required: Path to the targets.json file with the contents in this
+#       package repository, relative to $root_build_dir.
+#     Type: path relative to $root_build_dir
+#
+#   blobs
+#     Required: Path to the blobs directory in this package repository,
+#       relative to $root_build_dir.
+#     Type: path relative to $root_build_dir
+#
+build_api_module("package-repositories") {
+  testonly = true
+  data_keys = [ "package_repository" ]
+  deps = [ "//build/images/updates" ]
+}
+
+# TODO(crbug.com/gn/132): Remove when GN emits the equivalent information
+# itself.
+#
+# in file: "$root_build_dir/args.json"
+#
+# This just regurgitates the build arguments specified to `gn gen`.  This is
+# the exact JSON representation of the settings in "$root_build_dir/args.gn".
+# It does not include build arguments left to their default values.  So to
+# reproduce the settings of this build, one could put in `args.gn`:
+# ```
+#   forward_variables_from(read_file("args.json", "json"), "*")
+# ```
+# Type: scope
+#
+build_api_module("args") {
+  contents = read_file("$root_build_dir/args.gn", "scope")
+}
+
+# Describes the location where the Bazel SDK is generated.
+#
+# Type: list(scope)
+#
+#  name
+#    Required: The name of the SDK.
+#    Type: string
+#
+#  location
+#    Required: Directory where the Bazel SDK is generated
+#    Type: string
+#
+#
+build_api_module("bazel_sdk_info") {
+  testonly = true
+  data_keys = [ "bazel_sdk_info" ]
+  deps = [
+           "//sdk:final_fuchsia_sdk",
+           "//sdk/pdk:sdk",
+         ] + additional_bazel_sdk_labels
+}
+
+# Describes the location where the Bazel rules are.
+#
+# Type: list(scope)
+#
+#  location
+#    Required: Directory where the rules are located
+#    Type: string
+#
+#
+build_api_module("rules_fuchsia_info") {
+  testonly = true
+  data_keys = [ "rules_fuchsia_info" ]
+  deps = [ ":rules_fuchsia.export" ]
+}
+
+# An action to generate the final version of rules_fuchsia to be used OOT
+# This ensures that the content of @fuchsia_rules_common is stored under
+# @rules_fuchsia/fuchsia_rules_common, and changes all instances of
+# '@rules_fuchsia_common//' to '//fuchsia_rules_common/' in the final
+# Bazel files, making the result self-contained.
+action("rules_fuchsia.export") {
+  script = "//build/bazel/scripts/export_rules_fuchsia.py"
+  _output_dir = "$target_out_dir/$target_name"
+  _stamp = "$target_out_dir/$target_name.stamp"
+  _depfile = "$target_out_dir/$target_name.d"
+  outputs = [ _stamp ]
+  depfile = _depfile
+  args = [
+    "--fuchsia-dir",
+    rebase_path("//", root_build_dir),
+    "--output-dir",
+    rebase_path(_output_dir, root_build_dir),
+    "--depfile",
+    rebase_path(_depfile, root_build_dir),
+    "--stamp",
+    rebase_path(_stamp, root_build_dir),
+  ]
+  metadata = {
+    rules_fuchsia_info = [
+      {
+        location = rebase_path(_output_dir, root_build_dir)
+      },
+    ]
+  }
+
+  # This creates a directory whose content cannot be determined before the
+  # build.
+  hermetic_deps = false
+}
+
+# Describes the location of Bazel build events log files
+# for all Bazel invocations from Ninja. For context, see
+# https://bazel.build/remote/bep
+#
+# Type: list(scope)
+#
+#  gn_label
+#    Required: GN label of action invoking a Bazel build command.
+#    Type: string
+#
+#  build_events_log
+#    Required: Path to build event log file.
+#    Type: Path relative to build directory.
+#
+#  format
+#    Required: Format of log file, can be "binary", "text" or "json"
+#    Type: string
+#
+#
+build_api_module("bazel_build_events_logs") {
+  testonly = true
+  data_keys = [ "bazel_build_events_log" ]
+  deps = [
+    ":default",
+    "//:root_targets",
+  ]
+}
+
+# This describes all the binaries linked by the build.
+#
+# This enumerates each linked binary (executable, shared library, or
+# loadable/"plug-in" module) used by the build, or produced by the build.
+#
+# This includes host tools, kernels, boot loaders, drivers, as well as
+# normal executables. This also includes prebuilt toolchain runtime
+# libraries that end up in image files. It does not yet include any
+# non-native binary formats.
+#
+# For non-prebuilts, this is meant to reach the entire dependency graph
+# of all binaries that the build would ever produce.  Not every binary
+# described is necessarily actually produced by any given Ninja run.  Either
+# the $debug or the $dist file for any individual binary can be passed to
+# Ninja as a specific target argument to ensure it's built and
+# up to date before making use of that binary.  Like all build_api_module()
+# targets, the top-level "binaries" target serves as a Ninja target to
+# request that every binary described be built.
+#
+# Note that in certain cases, the paths in `debug` and `dist` will
+# point out of the build tree, and thus cannot be used as Ninja targets.
+# This happens for prebuilts or binaries produced by the Zircon build.
+#
+# Type: list(scope)
+#
+#   cpu
+#     Required: CPU architecture the binary is for, e.g. "arm64" or "x64".
+#     Type: string
+#
+#   os
+#     Required: OS the binary is for, e.g. "fuchsia", "linux", or "mac".
+#     Type: string
+#
+#   environment
+#     Required: The ${toolchain_environment} name of what specific
+#     execution this was built for, e.g. "user", "host", "guest".  The
+#     tuple of ($cpu, $os, $environment) should indicate what hardware and
+#     software environment this binary is compatible with.
+#     Type: string
+#
+#   label
+#     Required: The GN label of the binary target.
+#     Type: label_with_toolchain
+#
+#   type
+#     Required: The type of binary.
+#     Type: "executable" or "shared_library" or "loadable_module"
+#
+#   debug
+#     Required: Path to where the unstripped or separate debug file is
+#     found, relative to $root_build_dir.  If $dist is omitted, this
+#     is also the file that is used at runtime.
+#     Type: path relative to $root_build_dir
+#
+#   dist
+#     Optional: Path to where the stripped binary for deployment/execution is
+#     found, relative to $root_build_dir.  This binary may be required for
+#     some debugging tasks if $debug is a separate debug file rather than
+#     an unstripped file.  It should exactly match the binary that will be
+#     seen on devices or run directly on hosts.
+#     Type: path relative to $root_build_dir
+#
+#   elf_build_id
+#     Optional: Path to a file containing the lowercase ASCII hexadecimal
+#     representation of the ELF build ID in this binary.  This is omitted
+#     for OS environments that don't use ELF.  For an ELF binary that
+#     doesn't have a build ID note, this key will be present but point to
+#     an empty file.
+#     Type: path relative to $root_build_dir
+#
+#   breakpad
+#     Optional: Path to the breakpad symbol file for the debug binary.  This
+#     will only be present if $output_breakpad_syms was set.
+#     Type: path relative to $root_build_dir
+build_api_module("binaries") {
+  testonly = true
+  data_keys = [ "binaries" ]
+  deps = [ ":default" ]
+}
+
+# A build API module to describe the debug symbols for all ELF files that are
+# either generated or used (as prebuilts) by the current build configuration.
+# This is useful for infra tools to upload said symbol files to cloud storage.
+#
+# Debug symbols files can come from different sources:
+#
+# - They can be generated directly by GN C++ or Rust link commands, for example see
+#   the tool() definitions in clang_toolchain().
+#
+# - They can be provided directly by certain prebuilts. For example, the Clang and
+#   Rust toolchains provide a lib/debug/.build-id/ directory, whose content is
+#   referenced from lib/runtime.json describing each runtime shared library
+#   and the corresponding debug symbol files. See
+#   //build/toolchain/runtime/toolchain_runtime_deps.gni
+#
+# - Many prebuilt binaries are distributed from CIPD packages that do not include
+#   debug symbols at all. Instead, these debug symbol files are provided by a separate
+#   and *optional* CIPD package that Jiri does not download by default.
+#
+#   For example, the JIRI manifest fragment at //integration/fuchsia/prebuilts
+#   contains entries like:
+#
+#       <package name="fuchsia/prebuilt/bt-host/arm64"
+#                path="prebuilt/connectivity/bluetooth/bt-host/arm64"
+#                version="git_revision:29508f79429cd7610e1a87957d33d8ba8501475c"/>
+#
+#       <package name="fuchsia/prebuilt/bt-host/debug-symbols-arm64"
+#                path="prebuilt/.build-id"
+#                version="git_revision:29508f79429cd7610e1a87957d33d8ba8501475c"
+#                attributes="debug-symbols,debug-symbols-arm64"/>
+#
+#   Note that debug symbols CIPD packages:
+#
+#       - Include "debug-symbols" in their name (either as a prefix or suffix)
+#       - Set the "debug-symbols" JIRI "attributes" value.
+#       - Typically extract to //prebuilt/.build-id/
+#
+#   A Jiri checkout can be configured to download and unpack debug symbols
+#   with the following command:
+#
+#       jiri init -fetch-optional=debug-symbols
+#       jiri update
+#
+#   Note that this adds about 66 GiB of prebuilts to the checkout as of March 2025!
+#
+# - Bazel targets can also generate unstripped ELF binaries, or can
+#   depend on prebuilt ones provided by the @fuchsia_sdk repository.
+#
+# There are two types of entries in this manifest.
+#
+# The first one uses the "debug_symbol_files" metadata key, and describes one
+# individual ELF debug symbol per entry, and is used for GN targets that
+# generate them directly (e.g. C++ or Rust link actions), or from the
+# runtime.json definitions provided with the prebuilt Clang and Rust toolchains.
+# Its schema is:
+#
+# LINT.IfChange(debug_symbols)
+#
+# Type: list(scope)
+#
+#   label
+#     Optional: The GN label of the binary target. Only used for debugging or
+#     printing error messages.
+#     Type: label_with_toolchain
+#
+#   dest_path
+#     Optional: The Fuchsia package path for the corresponding stripped
+#     binary, if available. Only used as debugging information, as several entries
+#     can have the same dest_path value.
+#     Type: path relative to Fuchsia package root.
+#
+#   cpu
+#     Required: CPU architecture the binary is for, e.g. "arm64" or "x64".
+#     Type: string
+#
+#   os
+#     Required: OS the binary is for, e.g. "fuchsia", "linux", or "mac".
+#     Type: string
+#
+#   debug
+#     Required: Path to where the unstripped or separate debug file is.
+#     Type: path relative to $root_build_dir
+#
+#   elf_build_id
+#     Optional: Lowercase hexadecimal ASCII representation of the ELF build ID
+#     for this binary, if available at `gn gen` time.
+#     Type: string
+#
+#   elf_build_id_file
+#     Optional: Path to a file containing the lowercase ASCII hexadecimal
+#     representation of the ELF build ID in this binary. This is useful when
+#     the value can be computed at build time, instead of `gn gen` time.
+#     Type: path relative to $root_build_dir
+#
+#   breakpad
+#     Optional: Path to the breakpad symbol file for the debug binary,
+#     if available.
+#
+# LINT.ThenChange(
+#    //build/bazel/debug_symbols/aspects.bzl:debug_symbols,
+#    //build/bazel/scripts/bazel_tests_utils.py:debug_symbols,
+#    //tools/artifactory/debug_symbols.go:ExportedDebugSymbol)
+#
+# Note that it is possible for none of "elf_build_id" or "elf_build_id_file" to
+# be defined. This happens for Go executables for example. In that case, the
+# value must be extracted by post-build tools manually, either by looking at the
+# "debug" path, if it looks like "...../.build-id/xx/yyyyyyyyy.debug", or by
+# parsing the content of the ELF file.
+#
+# If there is no breakpad value for an entry, the corresponding Breakpad symbol
+# must be generated post-build, for example with the generate_breakpad tool.
+#
+# The second format, using "debug_symbol_manifests" metadata entries, describes
+# one manifest per entry. This is to be used for prebuilt packages, or Bazel
+# build targets.
+#
+#   label
+#     Optional: The GN label of the target generating the manifest.
+#     Type: label_with_toolchain
+#
+#   manifest
+#     Required: Path to a manifest file listing all debug symbols corresponding
+#     to a given target. The file must follow the same schema, and thus can include
+#     entries pointing to other manifests (cycles are forbidden).
+#
+# Due to the way GN metadata collection works, the content of this manifest will
+# reflect all possible debug symbols used/generated by the current build
+# configuration, which is a superset of the symbols used/generated by the last
+# build command.
+#
+# To filter its content properly, one should use the `//build/api/client
+# print_debug_symbols --last-build-only` command instead, which will also
+# flatten all nested manifest definitions into a single list of file entries.
+#
+build_api_module("debug_symbols") {
+  testonly = true
+  data_keys = [
+    "debug_symbol_files",
+    "debug_symbol_manifests",
+  ]
+  deps = [
+    ":default",
+    "//:bazel_test_suites",
+    "//:prebuilt_binaries",
+  ]
+}
+
+# Lists the board configurations that are defined in this build.
+#
+# Type: list (scope)
+#
+#  label
+#    Required: The GN label for the board_configuration target
+#
+#  outdir
+#    Required: The path (relative to the root out dir) of the directory that
+#    contains the board configuration.
+#
+build_api_module("boards") {
+  testonly = true
+  data_keys = [ "board_configs" ]
+  deps = assembly_board_configs
+}
+
+# Lists the product configurations that are defined in this build.
+#
+# Type: list (scope)
+#
+#  label
+#    Required: The GN label for the product_configuration target
+#
+#  outdir
+#    Required: The path (relative to the root out dir) of the directory that
+#    contains the product configuration.
+#
+build_api_module("products") {
+  testonly = true
+  data_keys = [ "product_configs" ]
+  walk_keys = [ "product_configs_barrier" ]
+  deps = assembly_product_configs
+}
+
+# Lists the product input bundles that are defined in this build.
+#
+# Type: list (scope)
+#
+#  label
+#    Required: The GN label for the product_input_bundle target
+#
+#  outdir
+#    Required: The path (relative to the root out dir) of the directory that
+#    contains the product input bundle.
+#
+build_api_module("product_input_bundles") {
+  testonly = true
+  data_keys = [ "product_input_bundles" ]
+  walk_keys = [ "product_input_bundle_barrier" ]
+  deps = assembly_product_configs
+}
+
+# Lists the board input bundle sets that are defined in this build.
+#
+# Type: list (scope)
+#
+#  label
+#    Required: The GN label for the board_input_bundle_set target
+#
+#  outdir
+#    Required: The path (relative to the root out dir) of the directory that
+#    contains the board input bundle set.
+#
+build_api_module("board_input_bundle_sets") {
+  testonly = true
+  data_keys = [ "board_input_bundle_sets" ]
+  walk_keys = [ "board_input_bundle_sets_barrier" ]
+  deps = assembly_board_configs
+}
+
+# Describes the configuration of the build in the file:
+#  "$root_build_dir/build_info.json"
+#
+# Type: list(scope)
+#
+#   version
+#     Optional: The version of the build. Present during official builds.
+#     Type: string
+#
+#   configurations
+#     Required: The list of product/board configurations within the build.
+#     Each `configurations` entry is a scope that contains both a product
+#     and board specification.
+#     Type: list(scope)
+#
+build_api_module("build_info") {
+  testonly = true
+  contents = {
+    version = build_info_version
+
+    # A list to accommodate the future of a build that support building multiple
+    # (board, product) pairs.
+    configurations = [
+      {
+        board = build_info_board
+        product = build_info_product
+      },
+    ]
+  }
+}
+
+# Artifacts from the checkout. Though a priori unrelated to the build, they are
+# useful to track here.
+#
+# in file: "$root_build_dir/checkout_artifacts.json"
+#
+# Type: list(scope)
+#
+#   name
+#     Required: The primary way that this file is known to consumers.
+#     The name should be unique among other entries.
+#     Type: string
+#
+#   path
+#     Required: Path to where the file is found, relative to $root_build_dir.
+#     Type: path relative to $root_build_dir
+#
+#   type
+#     Required: The file format (e.g., "txt" or "xml").
+#     Type: string
+#
+build_api_module("checkout_artifacts") {
+  testonly = true
+  data_keys = [ "checkout_artifacts" ]
+  deps = [ ":checkout_artifacts.metadata" ]
+}
+
+group("checkout_artifacts.metadata") {
+  testonly = true
+  visibility = [ ":checkout_artifacts" ]
+  metadata = {
+    checkout_artifacts = [
+      {
+        # TODO(https://fxbug.dev/42119886): Remove `archive` field. This is a signal to
+        # include the this file in the archive.
+        archive = true
+        name = "jiri_snapshot"
+        path = rebase_path("//.jiri_root/update_history/latest", root_build_dir)
+        type = "xml"
+      },
+    ]
+  }
+}
+
+# This describes all the generated source files in the build.
+#
+# The intent is that telling Ninja to build all these individual files
+# will be the minimal work sufficient for source code analysis of all
+# the files described in the compilation database to be viable.
+#
+# Type: list(path relative to $root_build_dir)
+#
+build_api_module("generated_sources") {
+  testonly = true
+  data_keys = [ "generated_sources" ]
+  deps = [
+    "//build/images/updates:packages",
+    "//sdk",
+  ]
+}
+
+# This describes the path to all FIDL Python bindings in the build.
+#
+# This data is post-processed to instruct Python IDE integrations to search
+# these locations for type definitions to support code completion.
+#
+# Type: list(path relative to $root_build_dir)
+build_api_module("extra_python_dirs") {
+  testonly = true
+  data_keys = [
+    "fidl_python_output",
+    "extra_python_dirs",
+  ]
+  deps = [
+    ":host",
+    ":tests",
+    "//build/images/updates:packages",
+    "//sdk",
+  ]
+}
+
+# This describes all golden files in the build, as defined by `golden_files()`.
+#
+# Type: list(scope)
+#
+#  * name
+#    - Required: The name of the target defining the golden files.
+#    - Type: string
+#
+#  * label
+#    - Required: The label toolchain of the associated target.
+#    - Type: label_with_toolchain
+#
+#  * stamp
+#    - Required: The stamp file of the associated diff check.
+#    - Type: build directory -relative path
+#
+#  * files
+#    - Required: The associated golden file comparisons.
+#    - Type: list(scope)
+#
+#    Each scope contains:
+#
+#    * golden
+#      - Required: A golden file.
+#      - Type: source-relative path
+#
+#    * candidate
+#      - Required: The candidate version of the file, to be compared against the
+#        golden.
+#      - Type: build directory -relative path
+#
+build_api_module("golden_files") {
+  testonly = true
+  data_keys = [ "golden_files" ]
+  deps = [ ":default" ]
+}
+
+# This describes all exported files in the build, as defined by
+# `exported_files()`. This build api module is used to collect files that needs
+# to be individually released to CIPD, and later used by OOT repository.
+# Examples are devicetree binaries and bootshims.
+#
+# Type: list(scope)
+#
+#  * name
+#    - Required: The name of the target defining the exported files.
+#    - Type: string
+#
+#  * path
+#    - Required: Path to the file.
+#    - Type: string
+#
+build_api_module("exported_files") {
+  testonly = true
+  data_keys = [ "exported_files" ]
+  deps = [ ":default" ]
+}
+
+# This exposes the value of delivery_blob_type to artifactory after the build.
+#
+# Type: scope
+#
+# * type
+#   - Required: Value of delivery_blob_type for this build configuration.
+#   - Type: integer
+#
+build_api_module("delivery_blob_config") {
+  contents = {
+    type = delivery_blob_type
+  }
+}
+
+# Describes the "fuzzers" in the build, in the file:
+#  "$root_build_dir/fuzzers.json"
+#
+# See //build/fuzzing/fuzzer.gni for more details.
+#
+#
+# Type: list(scope)
+#
+#  fuzzer_package
+#    Required: Name of a package containing fuzzers.
+#    Type: string
+#
+#  fuzzers
+#    Required: The fuzzer binaries included in the associated package.
+#    Type: list of labels
+#
+#  fuzz_host
+#    Required: Indicates whether the associated fuzzer binaries were built for
+#    the host.
+#    Type: boolean
+#
+build_api_module("fuzzers") {
+  testonly = true
+  data_keys = [ "fuzz_spec" ]
+  deps = [ "//build/images/updates:packages" ]
+}
+
+# This describes all the "image" files the build can produce, in the file:
+#  "$root_build_dir/images.json"
+#
+# An "image file" is a binary file that typically ends up on a device
+# partition (e.g. kernel, boot loader, partition image, etc).
+#
+# Consumers of the build should look here for the images to be built.
+# The $cpu, $name, and $type fields identify the purpose of each image.
+# Consumers are expected to ignore extra images they have no use for or
+# whose fields they don't understand.
+#
+# The $path field indicates where the file is found in the build
+# directory.  The presence of an image in the list means that the build
+# *can* produce it, not that the build *will* produce it.  Hence,
+# consumers should use $path as an explicit argument to Ninja to ensure
+# that each needed image gets built.
+#
+# Type: list(scope)
+#
+#   cpu
+#     Required: CPU architecture the image is for, e.g. "arm64" or "x64".
+#     Type: string
+#
+#   name
+#     Required: The primary way that this image is known to consumers.
+#     Note that the name need not be unique within the images list.
+#     The tuple of ($name, $type, $cpu) should be unique.
+#     Type: string
+#
+#   fastboot_flash
+#     Optional: the partition(s) to fastboot flash this image to. As a special
+#     case, this can be an empty list to indicate a file that may be needed for
+#     flashing but doesn't necessarily get flashed to a partition, for example
+#     bootloader unlock credentials.
+#     Type: list(string)
+#
+#   label
+#     Required: The GN label of the image target.
+#     Type: label_with_toolchain
+#
+#   path
+#     Required: Path to where the file is found, relative to $root_build_dir.
+#     This is also the argument to Ninja that ensures this image will be built.
+#     Type: path relative to $root_build_dir
+#
+#   testonly
+#     Optional: This image includes test code/data not meant for production.
+#     Type: bool
+#     Default: false
+#
+#   tags
+#     Optional: Tags associated with the image.  Certain tags may indicate
+#     to the build API consumer what should be done with the image.
+#     Type: list(string)
+#
+#   type
+#     Required: Type of file, e.g. "zbi".  This often corresponds to the
+#     extension used on the image file name, but not always.  For many
+#     miscellaneous formats, this is just "bin" and the consumer is
+#     expected to understand what the particular format is for particular
+#     $name, $cpu combinations.  Other types include:
+#      * "zbi": the ZBI (<lib/zbi-format/zbi.h>) format
+#      * "efi": an EFI executable that an EFI boot loader can load
+#      * "kernel": some other format loaded by a boot loader or emulator
+#      * "blk": contents to be written to a storage device or partition
+#     Type: string
+#
+#   bootserver_netboot
+#     Optional: flag names under which the associated image should be passed to
+#     the bootserver when netbooting.
+#     Type: list(string)
+#
+#   archive
+#     Optional: Set to true to indicate this image should be part of
+#     the build archives generated by //build/images/archive.
+#     Type: bool
+#     Default: false
+#
+build_api_module("images") {
+  testonly = true
+  walk_keys = [ "images_barrier" ]
+  data_keys = [ "images" ]
+  deps = [
+    # XXX(46415): as the build is specialized by board (bootfs_only)
+    # for bringup, it is not possible for this to be complete. As this
+    # is used in the formation of the build API with infrastructure,
+    # and infrastructure assumes that the board configuration modulates
+    # the definition of `zircon-a` between bringup/non-bringup, we can
+    # not in fact have a complete description. See the associated
+    # conditional at this group also.
+    "build/images",
+
+    # Images who are pulled as part of host interaction tests.
+    ":host",
+
+    # There are standalone images outside of the main assembly dependency graph
+    # which may be specified as data dependencies of select tests.
+    ":tests",
+  ]
+}
+
+# This describes where to any nested ninja "subbuild" directories, in the file:
+#  "$root_build_dir/ninja_subbuilds.json"
+#
+# See `//build/sdk/idk.gni` for more background on subbuilds.
+#
+# Type: list(scope)
+#
+#   build_dir
+#     Required: The path to the subbuild's build directory, relative to
+#     root_build_dir.
+#     Type: string
+#
+build_api_module("ninja_subbuilds") {
+  testonly = true
+  data_keys = [ "ninja_subbuilds" ]
+  deps = [
+           "//sdk:final_fuchsia_idk",
+           "//sdk/ctf:ctf_subbuild",
+         ] + sdk_archive_labels
+}
+
+# Describes the SDK archives that can be built, in the file:
+# "$root_build_dir/sdk_archives.json"
+#
+#   * name
+#     - Required: Name of the SDK.
+#     - Type: string
+#
+#   * label
+#     - Required: GN label of the associated `sdk` target.
+#     - Type: label_with_toolchain
+#
+#   * path
+#     - Required: Path to the built archive.
+#     - Type: path relative to $root_build_dir
+#
+#   * os
+#     - Required: OS is the operating system which the SDK is built for. A value
+#       of "fuchsia" indicates the SDK is host OS agnostic.
+#     - Type: string
+#
+#   * cpu
+#     - Required: CPU architecture which the SDK is built for.
+#     - Type: string
+#
+build_api_module("sdk_archives") {
+  testonly = true
+  data_keys = [ "sdk_archives" ]
+  deps = [
+           "//sdk:final_fuchsia_idk",
+           "//sdk/pdk:idk_archive",
+         ] + sdk_archive_labels
+}
+
+# Describes the `exported_package_archive`s labels specified by the gn arg
+# `exported_package_labels` in `$root_build_dir/package_archives.json`.
+#
+# Since some information (like the package's name) cannot be known during the
+# GN gen phase, we instead collect that information during the action/ninja
+# phase, meaning that the full metadata cannot be embed the directly inside
+# `package_archives.json`.
+#
+# Thus, the metadata exposed by this build API module is simply a list of paths
+# to other JSON files; each following this exact schema:
+#
+#   * name
+#     - Required: The name of the archived package.
+#     - Type: string
+#
+#   * label
+#     - Required: GN label of the archived package.
+#     - Type: label_with_toolchain
+#
+#   * path
+#     - Required: Path to the built archive.
+#     - Type: path relative to $root_build_dir
+#
+#   * cpu
+#     - Required: The package's target CPU architecture.
+#     - Type: string
+#
+#   * api_level
+#     - Required: The package's minimum supported API level.
+#     - Type: int
+#
+build_api_module("package_archives") {
+  testonly = true
+  data_keys = [ "exported_package_archives" ]
+  deps = exported_package_labels
+}
+
+# Lists the partitions configurations that are defined in this build.
+#
+# Type: list (scope)
+#
+#  label
+#    Required: The GN label for the generated_partitions_config target
+#
+#  outdir
+#    Required: The path (relative to the root out dir) of the directory that
+#    contains the partitions configuration.
+#
+build_api_module("partitions") {
+  testonly = true
+  data_keys = [ "partitions_configs" ]
+  deps = assembly_partitions_configs
+}
+
+# Describes the platforms available for testing, in the file:
+#  "$root_build_dir/platforms.json"
+#
+# TODO(https://fxbug.dev/42055429): the fuchsia platform should not know about such things.
+#
+# Type: list(scope)
+#
+build_api_module("platforms") {
+  testonly = true
+  contents = []
+  foreach(platform, test_platforms) {
+    if (!defined(platform.cpu) || platform.cpu == current_cpu) {
+      contents += [ platform ]
+    }
+  }
+}
+
+# This describes where to find all prebuilt binaries, in the file:
+#  "$root_build_dir/prebuilt_binaries.json"
+#
+# The `manifest` field will point to another JSON file that is almost a subset
+# of the :binaries build API module: the only fields present are `cpu`,
+# `debug`, `os`, and `elf_build_id`, which in this case is not a file pointer
+# but instead the actual build ID.
+#
+#
+# Type: list(scope)
+#
+#   name
+#     Required: The name of the collection of prebuilt binaries.
+#     Type: string
+#
+#   manifest
+#     Required: The path to the manifest of prebuilt binaires. See note above
+#     for its schema.
+#     Type: string
+#
+build_api_module("prebuilt_binaries") {
+  testonly = true
+  data_keys = [ "prebuilt_binaries" ]
+  deps = [
+    "//build/images/updates:packages",
+    "//build/prebuilt",
+    "//sdk",
+  ]
+}
+
+# This describes which flavor was used for each of the prebuilt packages
+# which provide multiple flavors to choose from.
+#
+# in file:
+#  "$root_build_dir/images.json"
+#
+# For more information, see:  //build/packages/prebuilt_package_with_flavors.gni
+#
+# Type: list(scope)
+#
+#   package
+#     Required: The name of the package.
+#
+#   name
+#     Required: The name of the flavor that is being used.
+#
+#   archive
+#     Required: The path to the archive that was used.
+#
+#   production_safe
+#     Required:  if 'true' then this flavor is valid for use in production
+#     contexts.
+#
+build_api_module("prebuilt_package_flavors") {
+  testonly = true
+  data_keys = [ "prebuilt_package_with_flavors" ]
+  deps = [ "//build/images/updates:packages" ]
+}
+
+# Location of the json manifest describing the versions of the jiri
+# packages included in the checkout. This manifest will be generated by
+# the //scripts/generate_prebuilt_versions.sh script run as a jiri hook.
+#
+# in file: "$root_build_dir/prebuilt_versions_location.json"
+#
+# Type: scope
+#
+#   location
+#     Required: The location of the prebuilt_versions.json relative
+#     to the $root_build_dir.
+#
+build_api_module("prebuilt_versions_location") {
+  testonly = true
+
+  contents = {
+    location =
+        rebase_path("//.jiri_root/prebuilt_versions.json", root_build_dir)
+  }
+}
+
+# Tests in the build.
+#
+#  Below, the "testing root" refers to $root_build_dir on host, and the full
+#  filesystem path from the root on device.
+#
+#  This rule outputs the tests.json file in the build directory,
+#  which is aggregated at test time.
+#
+#  The format is documented at
+#  https://fuchsia.dev/fuchsia-src/reference/testing/tests-json-format
+#
+# Type: list(scope)
+#
+#   * name
+#     - Required: Name of test.
+#     - Type: string
+#
+#   * label
+#     - Required: GN label associated with the test
+#     - Type: label_with_toolchain
+#
+#   * source_label
+#     - Required: GN or Bazel label associated with the test's source code.
+#     - Type: label_no_toolchain
+#
+#   * path
+#     - Required: Path to the test's executable.
+#     - Type: path relative to the testing root.
+#
+#   * cpu, os
+#     - Required: cpu and os values, respectively, for which this test is
+#       intended. Defaults to $current_cpu and $current_os if not manually
+#       specified.
+#     - Type: string
+#
+#   * disabled
+#     - Optional: a free-form string indicating a reason for the test being
+#       disabled.
+#     - Type: string
+#
+#   * runtime_deps
+#     - Optional: a JSON file containing a list of root_build_dir-relative
+#       paths defining ascribed runtime dependencies of the test. These
+#       dependencies are aggregated via the metadata graph of the associated
+#       test target under a data key of "test_runtime_deps.
+#     - Type: path relative to root_build_dir
+#
+#   * isolated
+#     - Optional: whether the test needs to be run in isolation to other tests.
+#     - Type: bool
+#
+#   * timeout_secs
+#     - Optional: the timeout in seconds for the test.
+#     - Type: int
+#
+generated_file("tests_from_metadata") {
+  testonly = true
+  data_keys = [ "tests" ]
+  walk_keys = [ "tests_barrier" ]
+  outputs = [ "${root_build_dir}/tests_from_metadata.json" ]
+  output_conversion = "json"
+  deps = [
+    # Pull in tests from host_labels.  This is deprecated, and tests should be
+    # in //:host_tests instead.
+    "//:host",
+
+    # Pull in tests present in the assembled product image. This is deprecated,
+    # only the `bringup_with_tests` product configurations provide tests via
+    # this path, and they need to be migrated to another way of specifying the
+    # tests.
+    "//build/images:main_assembly",
+
+    # Pull in tests from the non-device type-specific test groups.
+    "//:host_tests",
+
+    # Pull in tests from the developer
+    "//:developer_specified_tests",
+
+    # And from discoverable, so that --with continues to work
+    "//:discoverable_packages",
+  ]
+}
+
+# Declare the tests.json file.
+#
+# This action does not actually generate the tests.json file, because that is
+# generated by regenerator.py. This action "pretends" to generate it and makes
+# it available as an output and as a build_api_module.
+tests_json("tests") {
+  pb_test_groups = [ ":tests_from_metadata" ]
+}
+
+# Test components in the build.
+#
+#  Creates list of test components and the realm to run them in if not running
+#  in the default hermetic realm.
+#
+# Type: list(scope)
+#
+#   * label
+#     - Required: GN label associated with the test component
+#     - Type: label_with_toolchain
+#
+#   * realm
+#     - Optional: Moniker of the realm to run the test in.
+#     - Type: Moniker inside the system topology.
+#
+build_api_module("test_components") {
+  testonly = true
+  data_keys = [ "test_components" ]
+  walk_keys = [ "test_components_barrier" ]
+  deps = [
+    # Pull in tests present in the assembled product image.  This is deprecated,
+    # and tests should be in the various type-specific test groups below.
+    "//build/images:main_assembly",
+
+    # Pull in tests from the developer
+    "//:developer_specified_tests",
+
+    # And from discoverable, so that --with continues to work
+    "//:discoverable_packages",
+  ]
+}
+
+# The output location of test-list.json.
+#
+#   Creates a stable build API that users can use to programmatically retrieve
+#   test-list.json without having to hardcode the location of the file.
+#
+# Type: list(string): Each entry will be the location of a test-list.json file.
+build_api_module("test_list_location") {
+  testonly = true
+  data_keys = [ "test_list" ]
+  deps = [
+    # Pull in the actual test-list target.
+    "//:test-list",
+  ]
+}
+
+# test-list.json contains the set of tests in the build along with arbitrary
+# test metadata attached to each test.
+compiled_action("test-list") {
+  testonly = true
+  tool = "//tools/test_list_tool"
+  tool_output_name = "test_list_tool"
+  test_list_file = "$root_build_dir/test-list.json"
+  test_config_file = "$root_build_dir/test-config.json"
+  disabled_tests_file = "//sdk/ctf/disabled_tests.json"
+  inputs = [
+    "$root_build_dir/tests.json",
+    "$root_build_dir/test_components.json",
+    disabled_tests_file,
+  ]
+  outputs = [
+    test_list_file,
+    test_config_file,
+  ]
+  depfile = "$root_build_dir/test-list.json.d"
+
+  metadata = {
+    test_list = [ rebase_path(outputs[0], root_build_dir) ]
+  }
+
+  deps = [
+    ":test_components",
+    ":tests",
+    "//tools/test_list_tool:install($host_toolchain)",
+  ]
+
+  args = [
+    "--build-dir",
+    ".",
+    "--input",
+    "tests.json",
+    "--test-components",
+    "test_components.json",
+    "--disabled-ctf-tests",
+    rebase_path(disabled_tests_file, root_build_dir),
+    "--output",
+    rebase_path(test_list_file, root_build_dir),
+    "--experimental-test-config",
+    rebase_path(test_config_file, root_build_dir),
+    "--depfile",
+    "test-list.json.d",
+  ]
+}
+
+# test_durations.json contains historical test durations data to be used for
+# scheduling tests.
+#
+# It contains a list of JSON objects with the following fields:
+#
+#   name
+#     Required: The name of the test. For Fuchsia tests, this will correspond to
+#     the test package URL; for host-side tests, the installation path.
+#     Type: string
+#
+#   median_duration_ms
+#     Required: The median historical duration for this test over some period of
+#     time, in milliseconds.
+#     Type: int
+#
+build_api_module("test_durations") {
+  testonly = true
+  contents = []
+  if (test_durations_file != "") {
+    contents = read_file(test_durations_file, "json")
+  }
+}
+
+# Collect labels of Bazel test_suite() and host_xxx_test() and write them to a
+# text file, one per line. This is __NOT__ a build API module and is only used
+# by //build/regenerator.
+generated_file("bazel_test_suites") {
+  testonly = true
+  data_keys = [ "bazel_test_suite" ]
+  walk_keys = [ "bazel_test_suite_barrier" ]
+  outputs = [ "${root_build_dir}/bazel_test_suites.txt" ]
+  output_conversion = "list lines"
+  deps = [
+    # Pull in tests from host_labels.
+    # This is deprecated, and tests should be in //:host_tests instead.
+    "//:host",
+
+    # Pull in tests from the non-device type-specific test groups.
+    "//:host_tests",
+
+    # Pull in tests from the developer
+    "//:developer_specified_tests",
+
+    # And from discoverable, so that --with continues to work
+    "//:discoverable_packages",
+  ]
+  metadata = {
+    debug_symbol_manifests = [
+      {
+        label = get_label_info(":$target_name", "label_no_toolchain")
+        manifest =
+            rebase_path("${root_build_dir}/bazel_host_tests.debug_symbols.json",
+                        root_build_dir)
+      },
+    ]
+  }
+}
+
+# Tools provided by the build or as prebuilts, to be used outside the build.
+#
+# Type: list(scope)
+#
+#   * name
+#     - Required: Name of a host tool.
+#     - Type: string
+#
+#   * label
+#     - Required: GN label associated with the tool.
+#     - Type: label_with_toolchain
+#
+#   * path
+#     - Required: Path to the tool's executable for the build host.
+#     - Type: path relative to $root_build_dir
+#
+#   * cpu, os
+#     - Required: $current_cpu and $current_os values, respectively, for
+#       which this tool is intended.
+#     - Type: string
+#
+#   * runtime_files
+#     - Optional: Path to files that are also required for the tool to function
+#       (must also be built by `label`).
+#     - Type: path relative to $root_build_dir
+build_api_module("tool_paths") {
+  testonly = true
+  data_keys = [ "tool_paths" ]
+  walk_keys = [ "tool_barrier" ]
+
+  # Disable automatic sorting and grouping to ensure comments are associated
+  # with only the intended lines.
+  #
+  # NOSORT
+  deps = [
+    # Pull in tools from host_labels.
+    ":host",
+
+    # ffx is used as part of the top-level build for every product configuration
+    # so should always be included in the tools manifest.
+    "//src/developer/ffx($host_toolchain)",
+    "//build/rust:tool_paths($host_toolchain)",
+    ":tool_paths.llvm-tools",
+    ":tool_paths.metadata",
+    "//build/images/updates:packages",
+    "//src/sys/pkg/tests/system-tests:system_tests_tools($host_toolchain)",
+    "//src/storage/bin/fvm($host_toolchain)",
+    "//third_party/cobalt/src/bin/config_change_validator/src:bin($host_toolchain)",
+    "//third_party/cobalt/src/bin/config_parser/src:bin($host_toolchain)",
+    "//tools/doc_checker($host_toolchain)",
+    "//tools/fidl:fidl-lint($host_toolchain)",
+    "//tools/fidl:fidlfmt($host_toolchain)",
+    "//tools/fidl/fidlc:host($host_toolchain)",
+    "//zircon/third_party/uapp/mkfs-msdosfs($host_toolchain)",
+    "//src/storage/blobfs/tools:blobfs($host_toolchain)",
+    "//zircon/tools/lz4($host_toolchain)",
+    "//src/storage/minfs/tools:minfs($host_toolchain)",
+    "//zircon/tools/zbi($host_toolchain)",
+    "//zircon/tools/zither($host_toolchain)",
+  ]
+}
+
+group("tool_paths.metadata") {
+  visibility = [ ":tool_paths" ]
+  prebuilt_tools = [
+    "$rustc_prefix/bin/cargo",
+    "$rustc_prefix/bin/rustc",
+    "$rustc_prefix/bin/rustdoc",
+    "$rustc_prefix/bin/rustfmt",
+    "//src/testing/fidl_coverage",
+    "//src/testing/perfcompare",
+
+    rbe_metrics_summary_script,
+
+    # Unified python build orchestrator
+    "//build/scripts/main_build.py",
+
+    # drop-in replacement for ninja that is wrapped with rsproxy for ResultStore
+    "//build/resultstore/rs-sub-ninja.sh",
+
+    # reclient is using fairly generic names (bootstrap, dumpstats). We may
+    # need to move these into their own group() at some point to namespace
+    # them.
+    "//prebuilt/third_party/reclient/$host_platform/bootstrap",
+    "//prebuilt/third_party/reclient/$host_platform/dumpstats",
+    "//prebuilt/third_party/reclient/$host_platform/reproxy",
+    "//prebuilt/third_party/reclient/$host_platform/rewrapper",
+
+    "//prebuilt/sdk/bazel/bazel",
+    "//prebuilt/third_party/buildifier/$host_platform/buildifier",
+    "//prebuilt/third_party/clang/$host_platform/share/clang/clang-format-diff.py",
+    "//prebuilt/third_party/clang/$host_platform/share/clang/clang-tidy-diff.py",
+    "//prebuilt/third_party/dart/$host_platform/bin/dart",
+    "//prebuilt/third_party/gn/$host_platform/gn",
+    "//prebuilt/third_party/go/$host_platform/bin/go",
+    "//prebuilt/third_party/go/$host_platform/bin/gofmt",
+    "//prebuilt/third_party/ninja/$host_platform/ninja",
+    "//prebuilt/third_party/python3/$host_platform/bin/python3",
+    "//prebuilt/tools/shac/shac",
+    "//third_party/catapult/tracing/bin/trace2html",
+  ]
+
+  renamed_prebuilt_tools = [
+    # Rename prebuilt buildstats to avoid conflict with the buildstats go_binary
+    # when they are both included in the build graph.
+    {
+      name = "buildstats_prebuilt"
+      path = "//prebuilt/tools/buildstats/$host_platform/buildstats"
+    },
+
+    # Rename prebuilt ninjatrace to avoid conflict with the ninjatrace go_binary
+    # when they are both included in the build graph.
+    {
+      name = "ninjatrace_prebuilt"
+      path = "//prebuilt/tools/ninjatrace/$host_platform/ninjatrace"
+    },
+  ]
+
+  metadata = {
+    tool_paths = []
+    foreach(tool, prebuilt_tools) {
+      tool_paths += [
+        {
+          cpu = host_cpu
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          name = get_path_info(tool, "name")
+          os = host_os
+          path = rebase_path(tool, root_build_dir)
+        },
+      ]
+    }
+    foreach(renamed_tool, renamed_prebuilt_tools) {
+      tool_paths += [
+        {
+          cpu = host_cpu
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          name = renamed_tool.name
+          os = host_os
+          path = rebase_path(renamed_tool.path, root_build_dir)
+        },
+      ]
+    }
+
+    # Add SSH prebuilts to the tool paths. We need both architectures regardless
+    # of the host architectures since it's used on test bots that may be running
+    # ARM64 (even if we built on x64).
+    foreach(arch,
+            [
+              "arm64",
+              "x64",
+            ]) {
+      tool_paths += [
+        {
+          cpu = arch
+          label = get_label_info(
+                  "//prebuilt/third_party/openssh-portable/linux-${arch}/bin/ssh",
+                  "label_with_toolchain")
+          name = get_path_info(
+                  "//prebuilt/third_party/openssh-portable/linux-${arch}/bin/ssh",
+                  "name")
+          os = "linux"
+          path = rebase_path(
+                  "//prebuilt/third_party/openssh-portable/linux-${arch}/bin/ssh",
+                  root_build_dir)
+        },
+      ]
+    }
+  }
+}
+
+group("tool_paths.llvm-tools") {
+  visibility = [ ":tool_paths" ]
+  _llvm_tools = [
+    "clang",
+    "clang++",
+    "clang-doc",
+    "clang-format",
+    "clang-include-fixer",
+    "clang-refactor",
+    "clang-tidy",
+    "clangd",
+    "llvm-cov",
+    "llvm-cxxfilt",
+    "llvm-dwp",
+    "llvm-objcopy",
+    "llvm-profdata",
+    "llvm-readelf",
+    "llvm-size",
+    "llvm-strip",
+    "llvm-symbolizer",
+    "llvm-xray",
+    "sancov",
+  ]
+  metadata = {
+    tool_paths = []
+    foreach(tool, _llvm_tools) {
+      tool_paths += [
+        {
+          cpu = host_cpu
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          name = tool
+          os = host_os
+          path = rebase_path("$clang_tool_dir/$tool", root_build_dir)
+        },
+      ]
+    }
+
+    # Add the arm64 version of llvm-profdata to tool_paths for use by the arm64
+    # coverage builder.
+    if (target_cpu == "arm64" && host_platform == "linux-x64" && is_coverage) {
+      tool_paths += [
+        {
+          cpu = target_cpu
+          label = get_label_info(":$target_name", "label_no_toolchain") +
+                  "($host_arm64_toolchain)"
+          name = "llvm-profdata"
+          os = host_os
+          path = rebase_path(
+                  "//prebuilt/third_party/clang/linux-arm64/bin/llvm-profdata",
+                  root_build_dir)
+        },
+      ]
+    }
+  }
+}
+
+# The "triage_sources.json" build API file contains a list of paths to
+# `<foo>.triage` configuration files that are used by the
+# `fx triage` command. These paths are relative to the $root_build_dir.
+# in file: "$root_build_dir/triage_sources.json".
+#
+# Type: list(string)
+#
+build_api_module("triage_sources") {
+  testonly = true
+  data_keys = [ "triage_sources" ]
+  deps = [
+    "//build/images/updates:packages",
+    "//src/diagnostics/config/triage",
+  ]
+}
+
+# The "ctf_fidl_method_summary.json" build API file contains a path to
+# the `ctf_sdk_fidl_methods.json` API summary file that is used by the
+# CTF FIDL coverage recipe. This path is relative to the $root_build_dir.
+# in file: "$root_build_dir/ctf_fidl_method_summary.json".
+#
+# Type: list(string)
+#
+build_api_module("ctf_fidl_method_summary") {
+  testonly = true
+  data_keys = [ "ctf_fidl_method_summary" ]
+  deps = [ "//sdk/ctf:summarize_ctf_fidl_methods" ]
+}
+
+# Describes the path to a list of all the package manifests, the same
+# list that is used for the pm_publish step.
+#
+# The path is relative to the root build dir.
+#
+# Type: List of strings
+#
+build_api_module("all_package_manifest_paths") {
+  testonly = true
+
+  deps = [ "//build/images/updates:all_package_manifests.list" ]
+
+  contents = [ "all_package_manifests.list" ]
+}
+
+# Describes the path to the Fuchsia RBE config file.
+# in file: "$root_build_dir/rbe_config.json"
+#
+# Paths are relative to $root_build_dir.
+#
+# This file is read by infra recipes.
+#
+# Type: list(scope)
+#
+#   * path
+#     - Required: Path to where the file is found, relative to $root_build_dir.
+#     - Type: path relative to $root_build_dir
+#
+build_api_module("rbe_config") {
+  testonly = true
+  data_keys = [ "rbe_config" ]
+  rebase = root_build_dir
+  deps = [ ":rbe_config.metadata" ]
+}
+
+group("rbe_config.metadata") {
+  testonly = true
+  visibility = [ ":rbe_config" ]
+  metadata = {
+    rbe_config = [
+      {
+        path = reproxy_config_file
+      },
+    ]
+    foreach(p, rbe_extra_reproxy_configs) {
+      rbe_config += [
+        {
+          path = p
+        },
+      ]
+    }
+  }
+}
+
+# Provides information about all available rust, clippy, and rustdoc targets.
+# Consumed by `//tools/devshell/contrib/lib/rust/clippy.py` and
+# `//tools/devshell/contrib/lib/rust/rustdoc-link.py`.
+#
+# Type: list(scope)
+#
+#   actual_label
+#       - Description: label for target that invokes rustc
+#       - Type: label_with_toolchain
+#       - Example: //src/lib/fuchsia-async:fuchsia-async.actual(//build/toolchain:host_x64)
+#   disable_clippy
+#       - Description: whether the clippy target is put into the build graph
+#       - Type: boolean
+#   disable_rustdoc
+#       - Whether the rustdoc target is put into the build graph
+#       - Type: boolean
+#   clippy_label(optional)
+#       - Description: Label for target that invokes clippy
+#       - Present: this field is only guaranteed for !disable_clippy
+#       - Type: label_with_toolchain
+#       - Example: //src/lib/fuchsia-async:fuchsia-async.actual.clippy(//build/toolchain:host_x64)
+#   clippy_output(optional)
+#       - Description: file that contains the clippy output
+#       - Present: this field is only guaranteed for !disable_clippy
+#       - Type: path relative to $root_build_dir
+#       - Example: host_x64/gen/src/lib/fuchsia-async/fuchsia-async.actual.clippy
+#   original_label
+#       - Description: The original target name before a possible .actual suffix is added.
+#         May refer to a group.
+#       - Type: label_with_toolchain
+#       - Example: //src/lib/fuchsia-async:fuchsia-async(//build/toolchain:host_x64)
+#   rustdoc_label(optional)
+#       - Description: The label of the rustdoc target
+#       - Present: this field is only guaranteed for !disable_rustdoc
+#       - Type: label_with_toolchain
+#       - Example: //src/lib/fuchsia-async:fuchsia-async.actual.rustdoc(//build/toolchain:host_x64)
+#   rustdoc_out_dir(optional)
+#       - Description: directory in which rustdoc output is written
+#       - Present: this field is only guaranteed for !disable_rustdoc
+#       - Type: path relative to $root_build_dir
+#       - Example: host_x64/gen/src/lib/fuchsia-async/fuchsia-async.aux.doc
+#   rustdoc_parts_dir(optional)
+#       - Description: directory in which rustdoc cross-crate linking information is written
+#       - Present: this field is only guaranteed for !disable_rustdoc
+#       - Type: path relative to $root_build_dir
+#       - Example: host_x64/gen/src/lib/fuchsia-async/fuchsia-async.aux.doc.parts
+#   target_is_fuchsia(optional)
+#       - Description: whether this is a Fuchsia target (as opposed to a host target)
+#       - Present: always
+#       - Type: boolean
+#       - Example: true
+#   rustdoc_stamp_output(optional)
+#       - Description: this file's mtime is updated when rustdoc is successfully built for a target
+#       - Present: this field is only guaranteed for !disable_rustdoc
+#       - Type: path relative to $root_build_dir
+#       - Example: host_x64/gen/src/lib/fuchsia-async/fuchsia-async.aux.touch
+#   extern(optional)
+#       - Description: command line argument needed to pass to rustc to depend on this target.
+#       - Present: this field is not present on bin targets
+#       - Type: command line argument
+#       - Example: --extern=fuchsia_async=host_x64/obj/src/lib/fuchsia-async/fuchsia-async.actual/libfuchsia_async.rlib
+#   searchdir(optional)
+#       - Description: command line argument needed to pass to rustc to transitively depend on this target.
+#       - Present: this field is not present on bin targets
+#       - Type: command line argument
+#       - Example: -Ldependency=host_x64/obj/src/lib/fuchsia-async/fuchsia-async.actual
+#   src(optional)
+#       - Description: list of rust source code files, relative to $root_build_dir
+#       - Present: this field is only guaranteed for !disable_clippy
+#       - Type: list(str)
+#       - Example: [ "../../src/lib/fuchsia-async/src/lib.rs", ... ]
+#   target
+#       - Required: rust target tuple under which the actual, rustdoc, and clippy targets are built
+#       - Example: "x86_64-unknown-linux-gnu"
+build_api_module("rust_target_mapping") {
+  testonly = true
+  data_keys = [ "rust_target_mapping" ]
+  walk_keys = [ "rust_test_barrier" ]
+  deps = [ "//:default" ]
+}
+
+# Check that all of the drivers included in the image and packages.
+# are components and in the all-drivers-list
+check_included_drivers("drivers-check") {
+  testonly = true
+  deps = [
+    "//build/images",
+    "//build/images/updates:packages",
+  ]
+}
+
+# Provides a flat list of the artifacts needed for assembly, which should be
+# uploaded to CIPD.
+#
+# Type: list(scope)
+#
+#   * path
+#     - Required: Path to the artifacts file
+#     - Type: path relative to $root_build_dir
+#
+# An artifacts file has the JSON format:
+#
+# [
+#   {
+#     "source": "/path/on/host/file.txt",
+#     "destination": "path/in/cipd/package/file.txt"
+#   },
+# ]
+#
+build_api_module("cipd_assembly_artifacts") {
+  testonly = true
+  data_keys = [ "assembly_inputs" ]
+  walk_keys = [ "assembly_inputs_barrier" ]
+
+  deps = cipd_assembly_artifact_targets
+}
+
+# This describes the locations of archives for the out-of-tree assembly inputs
+#
+# Type: list(scope)
+#
+#   path
+#     Required: Path to the archive file
+#     Type: path relative to $root_build_dir
+#
+#   label
+#     Required: label that created the archive
+#     Type: GN Label
+#
+build_api_module("assembly_input_archives") {
+  testonly = true
+  data_keys = [ "assembly_input_archives" ]
+  walk_keys = [ "assembly_input_archives_barrier" ]
+  deps = [
+    # The platform bundles
+    "//bundles/assembly",
+
+    # The legacy bundle for the main product assembly.
+    "//build/images:main_assembly",
+  ]
+}
+
+# Describes the location of the directory of platform artifacts that can be
+# shipped and consumed by out-of-tree customers.
+#
+# Type: list(scope)
+#
+#   path
+#     Required: Path to the directory that contains all the AIBs.
+#     Type: path relative to $root_build_dir
+#
+#   label
+#     Required: label that created the archive
+#     Type: GN Label
+#
+build_api_module("platform_artifacts") {
+  testonly = true
+  data_keys = [ "platform_artifacts" ]
+  walk_keys = [ "platform_artifacts_barrier" ]
+  deps = [ "//bundles/assembly" ]
+}
+
+# gerrit_size_report.json contains a list (size 0 or 1) of gerrit size reports
+# produced by the build. The gerrit size reports have the format described in:
+#   https://chromium.googlesource.com/infra/gerrit-plugins/binary-size/+/HEAD/README.md
+#
+# Type: list(scope)
+#
+#   path
+#     Required: Path to the gerrit size report
+#     Type: path relative to $root_build_dir
+#
+# Aggregates size reports from all product bundles into a single merged report.
+#
+# Note: //:build_only catches product bundles from multi-product builders (via
+# build_only_labels), additional_default_targets catches builder-added targets,
+# and target_labels catches what developers add manually.
+size_report_aggregator("size_reports") {
+  testonly = true
+  deps = [
+           # Catch product bundles from multi-product builders (via
+           # build_only_labels).
+           "//:build_only",
+
+           # Catch the main product assembly.
+           "//build/images",
+         ] + additional_default_targets + target_labels
+}
+
+build_api_module("gerrit_size_report") {
+  testonly = true
+  data_keys = [ "gerrit_size_reports" ]
+  walk_keys = [ "gerrit_size_reports_barrier" ]
+  deps = [ ":size_reports" ]
+}
+
+# Contains the paths to all assembly manifests.
+# Used by Artifactory to find and upload all assembly manifests.
+#
+# Type: list(scope)
+#   assembly_manifest_path
+#     Required: Path to the assembly manifest.
+#   image_name
+#     Required: Name of the image for which the assembly manifest was generated.
+#   label
+#     Required: Label (with toolchain) that generated this assembly manifest.
+build_api_module("assembly_manifests") {
+  testonly = true
+  data_keys = [ "assembly_manifests" ]
+  deps = [ "//build/images" ]
+}
+
+# Contains information about 0 or 1 product size checker outputs produced by the
+# build.
+#
+# Type: list(scope)
+#   size_breakdown
+#     Required: Path to the size breakdown text file.
+#   visualization
+#     Required: Path to the directory containing the size visualization.
+build_api_module("product_size_checker_output") {
+  testonly = true
+  data_keys = [ "product_size_checker_output" ]
+  deps = [ "//build/images" ]
+}
+
+# Contains details about the size checker output
+#
+# This is informational only, as a debugging aid.
+#
+# Type: list(scope) (0 or more)
+#  size_budgets
+#    Optional:  Path to the breakdown of packages to size budgets.
+#
+build_api_module("detailed_size_checker_data") {
+  testonly = true
+  data_keys = [ "detailed_size_checker_data" ]
+  deps = [ "//build/images" ]
+}
+
+# File of estimated ninja build-graph edge weights (values are in milliseoncds)
+#
+# This file is passed to ninja on the command-line, and gives it estimates
+# for potentially long-running actions in the builds, so that those can be
+# scheduled earlier in the build process.
+#
+generated_file("ninja_edge_weights") {
+  testonly = true
+  data_keys = [ "ninja_edge_weights" ]
+  deps = [ ":default" ]
+  outputs = [ "${root_build_dir}/ninja_edge_weights_from_metadata.csv" ]
+}
+
+# Builds a list of all the product bundles in the build.
+#
+# This target will NOT build the product bundles, but will pretend to
+# in order to list product_bundles.json as an output.
+product_bundles_json("product_bundles") {
+  deps = [
+           ":tests",
+           "//build/images",
+         ] + product_bundle_labels
+}
+
+# Checks that product bundle names are unique.
+action("product_bundles.check") {
+  testonly = true
+
+  inputs = get_target_outputs(":product_bundles")
+  outputs = [ "${root_build_dir}/$target_name.stamp" ]
+
+  script = "//build/check_product_bundles_manifest.py"
+  args = [
+    "--product-bundle-json",
+    rebase_path(inputs[0], root_build_dir),
+    "--stamp",
+    rebase_path(outputs[0], root_build_dir),
+  ]
+
+  if (!is_multi_product_build) {
+    args += [
+      # Fuchsia infrastructure expects this product bundle to exist.
+      # TODO(https://fxbug.dev/402187053): Remove this check.
+      "--expect-product-bundle-name",
+      "${build_info_product}.${build_info_board}",
+    ]
+  }
+
+  deps = [ ":product_bundles" ]
+}
+
+# licenses.json enumerates the output artifacts of //tools/check-licenses
+# which need to be saved after completion of a check-licenses run.
+#
+#
+# Type: list(scope)
+#
+#   compliance_file
+#     - Required: Path to the generated compliance file.
+#     - Type: string
+#
+#   license_files
+#     - Optional: Path to a root folder containing license text files.
+#     - Type: string
+#
+#   run_files_archive
+#     - Optional: Path to a root folder containing check-licenses output files.
+#     - Type: string
+#
+build_api_module("licenses") {
+  testonly = true
+  data_keys = [ "licenses" ]
+
+  # No need to save license artifacts for SDK-only builds.
+  if (has_board) {
+    deps = [ "//build/images" ]
+  }
+}
+
+# Describes the path to the Fuchsia `vnames.json` file.
+# in file: "$root_build_dir/vnames_config.json"
+#
+# Paths are relative to $root_build_dir.
+#
+# Type: list(scope)
+#
+#   * path
+#     - Required: Path to where the file is found, relative to $root_build_dir.
+#     - Type: path relative to $root_build_dir
+#
+build_api_module("vnames_config") {
+  testonly = true
+  data_keys = [ "vnames_config" ]
+  rebase = root_build_dir
+  deps = [ ":vnames_config.metadata" ]
+}
+
+group("vnames_config.metadata") {
+  testonly = true
+  visibility = [ ":vnames_config" ]
+  metadata = {
+    vnames_config = [
+      {
+        path = "//build/kythe/vnames.json"
+      },
+    ]
+  }
+}
+
+# nuc11_fastboot_images_location.json provides the paths to images needed to
+# bootstrap NUC11s idling in fastboot over TCP.
+#
+# Type: scope
+#
+#   gpt_bin_path
+#     Required: The location of the gpt.bin for NUC firmware relative
+#     to the $root_build_dir.
+#   fastboot_tcp_gbl_path
+#     Required: The path to the fastboot TCP GBL generated after running the commands
+#     in step 2 and 3 of https://fuchsia.googlesource.com
+#     /fuchsia/+/main/src/firmware/gigaboot/boards/nuc/README.md#bootstrap-fuchsia-with-gbl .
+build_api_module("nuc11_fastboot_images_location") {
+  contents = {
+    gpt_bin_path = rebase_path("//src/firmware/gigaboot/boards/nuc/gpt.bin",
+                               root_build_dir)
+    fastboot_tcp_gbl_path = "kernel.efi_x64/gbl-installer-efi.efi"
+  }
+}
+
+# LINT.IfChange(bazel_target_infos)
+#
+# The bazel_target_infos.json file maps provides the information necessary for
+# Ninja to run a bazel action, by telling the bazeL_ninja_delayed_actions.py
+# script how to find all the inputs from Ninja for each Bazel target, and all
+# the outputs to copy out.
+#
+# This data is structured for ease of generation, and is flattened into a more
+# manageable format by the parsing code used by bazeL_ninja_delayed_actions.py.
+#
+# Type: list(scope)
+#
+#   type:
+#     - Required: The output type, one of:
+#         file
+#         directory
+#         package
+#         final_symlink
+#     - Type: string
+#
+#   bazel_target:
+#     - Required: bazel target that builds the directory
+#     - Type: string
+#
+#   bazel_platform_label:
+#     - Required: bazel platform label to use with the --platforms arg when calling bazel
+#     - Type: string
+#
+#   bazel_platform_config:
+#     - Required: bazel config to add to the bazel command line with the --config arg
+#     - Type: string
+#
+#   ninja_depfile:
+#     - Required: the ninja depfile path (rebased) for the action
+#     - Type: string
+#
+#   gn_targets_manifest
+#     - Required: Path to a manifest of file to add the to the @gn_targets directory when building
+#                 this target
+#     - Type: string
+#
+#   stamp_path
+#     - Required: Path to a "stamp file" that is to be touched when 'bazel_target' has been built.
+#     - Type: string
+#
+#   update_rust_project:
+#     - Optional: Whether this target should trigger updating rust-project.json
+#     - Type: bool
+#
+#  The other fields depend on the 'type':
+#
+#     "file":
+#        bazel_file:
+#          - Required: Path in the bazel outdir to copy a file from
+#          - Type: string
+#
+#        ninja_file:
+#          - Required: path in the ninja outdir to copy to the file to
+#          - Type: string
+#
+#     "directory":
+#        bazel_dir:
+#          - Required: path in the bazel outputs to the directory to copy
+#          - Type: string
+#
+#        ninja_dir:
+#          - Required: path in the ninja outdir to copy to the directory to
+#          - Type: string
+#
+#        tracked_files:
+#          - Required: list of file paths that are expected outputs by ninja, and used to track if
+#            the directory contents have changed.
+#          - Type: string
+#
+#        copy_debug_symbols:
+#          - Optional: whether or not to copy debug symbols from the outputs back to ninja.
+#          - Default: false
+#          - Type: boolean
+#
+#     "package":
+#
+#        ninja_archive:
+#          - Required: path the package archive (far) file
+#          - Type: string
+#
+#        copy_debug_symbols:
+#          - Optional: whether or not to copy debug symbols from the package back to ninja.
+#          - Default: false
+#          - Type: boolean
+#
+#     "final_symlink":
+#        bazel_file:
+#          - Required: path in the bazel outputs that's the symlink target
+#          - Type: string
+#
+#        ninja_file:
+#          - Required: path in the ninja outdir that's the symlink source
+#          - Type: string
+#
+generated_file("bazel_target_infos") {
+  testonly = true
+  deps = [
+           ":default",
+
+           # //:root_targets has bazel_action() dependencies that are always
+           # defined in the GN graph, so depend on it.
+           "//:root_targets",
+
+           # If it's in a build_api(), we need the ability to build it with
+           # Bazel.
+           ":api",
+         ] + extra_bazel_build_action_labels
+
+  data_keys = [ "bazel_target_infos" ]
+  outputs = [ "$root_build_dir/$target_name.json" ]
+  output_conversion = "json"
+}
+
+# LINT.ThenChange(
+#   //build/bazel/scripts/bazel_action_utils.py:bazel_target_infos,
+#   //build/bazel/bazel_action.gni:bazel_target_infos)
+
+###
+### Top-level targets.
+###
+group("default") {
+  testonly = true
+  deps = [
+    ":size_reports",
+    "//:build_only",
+    "//:host",
+    "//:product_bundles.check",
+    "//:test-list",
+    "//build:bazel2gn_dir_list",
+    "//build/assembly:validate_product_defs",
+    "//build/bazel:gn_build_variables_for_bazel",
+    "//bundles/assembly",
+
+    # TODO(https://fxbug.dev/42067746) has_board check not working
+    "//build/images",
+    "//build/images/updates:packages",
+    "//sdk",
+
+    # LINT.IfChange(fidl_compatibility_checks)
+    # Ensure compatibility tests and SDK category checks run for all FIDL
+    # libraries that require them.
+    "//sdk/fidl:compatibility_tests",
+
+    # LINT.ThenChange(//sdk/fidl/BUILD.gn:ensure_compatibility_checks)
+  ]
+
+  # SDK-only builds must not attempt to build images.
+  if (has_board) {
+    deps += [
+      "//:drivers-check",
+      "//build/images",
+    ]
+  }
+
+  # Add any additional targets from the product.
+  deps += additional_default_targets
+}
+
+###
+# The build-only group.  These are additional targets to add to the build but
+# are not part of a product, board, or host tools.  This group also serves as
+# an alternative to '//:default' when performing sub-builds.
+group("build_only") {
+  testonly = true
+  deps = build_only_labels
+}
+
+###
+# GN-Argument configured groups for adding tests to a build.
+#
+
+# Host-only tests.  These cannot have any dependency on an assembled platform
+# image, or the compiled OS itself, not even for their host_test_data().
+group("host_tests") {
+  testonly = true
+  visibility = [ ":*" ]
+
+  deps = []
+  foreach(label, host_test_labels) {
+    # Strip any toolchain that is provided, and replace with the host toolchain.
+    full_label = get_label_info(label, "label_no_toolchain")
+    deps += [ "$full_label($host_toolchain)" ]
+  }
+}
+
+# Can be any test-type. This is for local-developer use only.  It is not for use
+# by infra or products.
+group("developer_specified_tests") {
+  testonly = true
+  visibility = [
+    ":*",
+    "//build/images/updates:*",
+  ]
+  public_deps = target_labels + developer_test_labels + e2e_test_labels +
+                hermetic_test_package_labels
+}
+
+###
+# GN-Argument configured groups other package sets
+#
+
+# Packages that are compiled and published, but unable to contribute to the
+# product in any way.
+group("discoverable_packages") {
+  testonly = true
+  visibility = [
+    "//:bazel_test_suites",
+    "//:test_components",
+    "//:tests_from_metadata",
+    "//build/images/updates:*",
+  ]
+  public_deps = discoverable_package_labels + universe_package_labels
+
+  # Add //bundles/tools to the discoverable package set, as generally-available
+  # platform tools, as all products were including them in
+  # discoverable_package_labels anyway.
+  public_deps += [ "//bundles/tools" ]
+  assert_no_deps = [
+    "//build/validate:config_data_tag",
+    "//build/validate:shell_command_tag",
+  ]
+}
+
+###
+# GN-Argument configured groups for host binaries and tools
+#
+
+group("host") {
+  # TODO(https://fxbug.dev/42160904) investigate removing testonly here
+  testonly = true
+  public_deps = [
+    # Static analysis tools used by shac should always be built so that
+    # `fx format-code` and other static analysis entrypoints can be run on any
+    # build configuration.
+    "//bundles/buildbot/static_checks($host_toolchain)",
+
+    # Host tests for //build/api/client
+    "//build/api:tests",
+
+    # Tools & tests added by the developer
+    ":developer_host_tools",
+  ]
+
+  public_deps += [ "//bundles/tools:host_tools" ]
+
+  if (has_board) {
+    # This indicates that we're building a product, rather than the SDK. In
+    # this case it is likely useful to have fx tools pre-compiled for testing as
+    # an optimization. That way fx commands can assume the executables exist
+    # instead of running ninja, which is costly even if it's a no-op.
+    public_deps += [ "//tools/devshell:fx($host_toolchain)" ]
+  }
+}
+
+# WARNING: Known to infrastructure
+#
+# This group creates a single ninja build target that can create all targets
+# specified by `host_labels` with `fx build :developer_host_tools`
+group("developer_host_tools") {
+  testonly = true
+  public_deps = []
+
+  foreach(label, host_labels) {
+    # Strip any toolchain that is provided, and replace with the host toolchain.
+    full_label = get_label_info(label, "label_no_toolchain")
+    public_deps += [ "$full_label($host_toolchain)" ]
+  }
+}
+
+# IMPORTANT: Nothing should depend on this target, except other generated_file()
+# targets in this file. It is here to ensure that its dependencies are always in
+# the GN build graph even if they are not reachable from //:default.
+group("root_targets") {
+  testonly = true
+  visibility = [ ":*" ]
+  deps = [
+    # These are only required by the
+    # core.x64-sdk_source_sets_and_shlibs-apiXX-build_only
+    # builders. TODO(https://fxbug.dev/42082833): Remove these lines once these builders are
+    # removed since they seem no longer necessary.
+    "//build/sdk:sdk_versioned_shared_libraries",
+    "//build/sdk:sdk_versioned_source_sets",
+
+    # The Fuchsia Bazel SDK generated from the Fuchsia IDK, and the associated
+    # tests.
+    "//sdk:final_fuchsia_sdk_tests",
+
+    # The IDK generated for the in-tree @fuchsia_sdk Bazel workspace, and
+    # associated tests.
+    "//sdk:bazel_in_tree_idk_tests",
+
+    # The Bazel SDK test suite running against the in-tree @fuchsia_sdk
+    # repository.
+    "//build/bazel/bazel_sdk:bazel_sdk_tests",
+
+    # Tests of platform Bazel rules, macros, and migrated targets.
+    "//build/bazel/rules/tests:all",
+
+    # Required by `fx fidldoc` as well as the Fuchsia controller ffx plugin
+    # at runtime!
+    "//build/fidl:all_fidl_json",
+
+    # Required for local developer overrides to be found by the bazel workspace.
+    "//build/bazel:assembly_developer_overrides",
+
+    # The list of content hash files required by the Bazel workspace.
+    # This is parsed by //build/regenerator just after `gn gen` to create
+    # the final files in the Bazel workspace.
+    "//build/bazel:bazel_content_hashes_json",
+
+    # The sysroot files for the Bazel fuchsia_platform toolchain.
+    "//zircon/public/sysroot_sdk:sysroot_for_fuchsia_platform",
+
+    # The bazel_build_args.json collects the Bazel build arguments
+    # needed to replicate the GN build configuration. Necessary to implement
+    # `fx build @<bazel_label>` properly.
+    "//build/bazel:bazel_args_json",
+
+    # It must be possible to run the versioning scripts without them being part
+    # of the default build.
+    "//scripts/versioning($host_toolchain)",
+
+    # To allow multi-products builds to define products that can be build with
+    # fx build
+    #
+    # (the ":product_bundles" target itself is only a stub, so we need to
+    # include its metadata target that actually follows the dependencies pass to
+    # it)
+    ":product_bundles_metadata",
+
+    # A manifest file that points to implicit inputs for all targets listed
+    # by ninja_implicit_inputs_root_labels.
+    "//build/ninja_implicit_inputs:manifest",
+  ]
+
+  # Required by `fx publish` at runtime. Only included when package serving
+  # processes are needed.
+  if (has_board) {
+    deps += [ "//build/images/updates:prepare_publish" ]
+  }
+
+  deps += [ "//sdk:subbuild_config" ]
+}
+
+# A GN pool matching the special Ninja 'console' pool. Any action() that
+# uses this pool will be able to send its stdout/stderr directly to the
+# output terminal, instead of being buffered by Ninja until the command
+# completes.
+#
+# This is very useful for long-running commands, e.g. bazel build invocations
+# that can take several dozen seconds to complete, or any other command that
+# prints a _lot_ of output, because our infra bots will timeout if Ninja tries
+# to print too much data at once after command completion for some undetermined
+# reason.
+#
+pool("console") {
+  depth = 1
+}
+
+# An action that pretends to create ninja_outputs.json. Dependents will be
+# re-run when this file is regenerated, which will happen when the regenerator
+# is invoked.
+action("ninja_outputs_json") {
+  script = "//build/scripts/no_op.sh"
+  outputs = [ "${root_build_dir}/ninja_outputs.json" ]
+  args = rebase_path(outputs, root_build_dir)
+}

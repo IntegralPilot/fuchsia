@@ -1,0 +1,106 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.virtualization.guest.interaction;
+
+using fuchsia.virtualization;
+using fuchsia.io;
+using zx;
+
+const GUEST_INTERACTION_MAX_LENGTH uint32 = 1024;
+const GUEST_EXECUTION_COMMAND_MAX_LENGTH uint32 = 8192;
+const DEFAULT_REALM string = "gis_default";
+const GUEST_NAME_MAX_LENGTH uint32 = 1024;
+
+/// The available guest types.
+type GuestType = strict enum {
+    /// A minimal Fuchsia system that boots to a Zircon virtcon.
+    ZIRCON = 0;
+    /// A Debian guest, exact version dependent on prebuilts.
+    DEBIAN = 1;
+    /// A Linux guest that contains additional features for Vulkan and window manager
+    /// integration, based on the Termina VM from ChromeOS.
+    TERMINA = 2;
+};
+
+/// Enables discovery of guest VM's for control in tests.
+@discoverable
+closed protocol Discovery {
+    /// Finds the guest VM specified by realm name/guest name pair and connects to it to enable
+    /// file transfers and execution of commands.  If `realm_name` is null, `DEFAULT_REALM` is
+    /// used instead.
+    strict GetGuest(resource struct {
+        realm_name string:<GUEST_INTERACTION_MAX_LENGTH, optional>;
+        guest_name string:GUEST_INTERACTION_MAX_LENGTH;
+        guest server_end:Interaction;
+    });
+};
+
+/// Represents a key/value pair to be injected into an environment where a command is executed.
+type EnvironmentVariable = struct {
+    key string:GUEST_INTERACTION_MAX_LENGTH;
+    value string:GUEST_INTERACTION_MAX_LENGTH;
+};
+
+closed protocol CommandListener {
+    /// Signal to a client that is attempting to exec inside of a guest whether
+    /// or not the subprocess was successfully started.
+    strict -> OnStarted(struct {
+        status zx.Status;
+    });
+
+    /// Signal to a client that the Exec request has completed.
+    strict -> OnTerminated(struct {
+        status zx.Status;
+        return_code int32;
+    });
+};
+
+closed protocol Interaction {
+    /// Take a local file from the Fuchsia host and transfer it to a destination
+    /// location on the guest under test.
+    strict PutFile(resource struct {
+        local_file client_end:fuchsia.io.File;
+        remote_path string:GUEST_INTERACTION_MAX_LENGTH;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Pull a file from the guest under test and copy it to the specified
+    /// location on the Fuchsia host.
+    strict GetFile(resource struct {
+        remote_path string:GUEST_INTERACTION_MAX_LENGTH;
+        local_file client_end:fuchsia.io.File;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Execute command on the guest under test and return the resulting output,
+    /// error, and return code.
+    strict ExecuteCommand(resource struct {
+        command string:GUEST_EXECUTION_COMMAND_MAX_LENGTH;
+        env vector<EnvironmentVariable>:GUEST_INTERACTION_MAX_LENGTH;
+        stdin zx.Handle:<SOCKET, optional>;
+        stdout zx.Handle:<SOCKET, optional>;
+        stderr zx.Handle:<SOCKET, optional>;
+        command_listener server_end:CommandListener;
+    });
+};
+
+/// Encapsulates the starting and interaction of a guest. This is primarily a convenience,
+/// but also provides an abstraction layer over the interaction client_impl.h and
+/// client_operation_state.h files. This abstraction allows reuse of the interaction implementations
+/// across Fuchsia processes via FIDL, regardless of the caller language (e.g. Rust).
+@discoverable
+closed protocol InteractiveGuest {
+    compose Interaction;
+
+    strict Start(resource struct {
+        guest_type GuestType;
+        name string:GUEST_NAME_MAX_LENGTH;
+        guest_config fuchsia.virtualization.GuestConfig;
+    }) -> ();
+
+    strict Shutdown() -> ();
+};

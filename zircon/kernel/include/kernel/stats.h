@@ -1,0 +1,81 @@
+// Copyright 2017 The Fuchsia Authors
+//
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT
+#ifndef ZIRCON_KERNEL_INCLUDE_KERNEL_STATS_H_
+#define ZIRCON_KERNEL_INCLUDE_KERNEL_STATS_H_
+
+#include <sys/types.h>
+#include <zircon/compiler.h>
+#include <zircon/types.h>
+
+// per cpu guest statistics
+struct guest_stats {
+  ulong vm_entries;
+  ulong vm_exits;
+#if defined(__aarch64__)
+  ulong wfi_wfe_instructions;
+  ulong instruction_aborts;
+  ulong data_aborts;
+  ulong system_instructions;
+  ulong smc_instructions;
+  ulong interrupts;
+#elif defined(__x86_64__)
+  ulong interrupts;
+  ulong interrupt_windows;
+  ulong cpuid_instructions;
+  ulong hlt_instructions;
+  ulong control_register_accesses;
+  ulong io_instructions;
+  ulong rdmsr_instructions;
+  ulong wrmsr_instructions;
+  ulong ept_violations;
+  ulong xsetbv_instructions;
+  ulong pause_instructions;
+  ulong vmcall_instructions;
+#endif
+};
+
+// per cpu kernel level statistics
+struct cpu_stats {
+  zx_instant_mono_t last_updated_instant;
+  zx_duration_mono_t normalized_busy_time;
+
+  zx_duration_mono_t idle_time;
+  ulong reschedules;
+  ulong context_switches;
+  ulong preempts;
+  ulong yields;
+
+  // cpu level interrupts and exceptions
+  ulong interrupts;  // hardware interrupts, minus timer interrupts or inter-processor interrupts
+  ulong timer_ints;  // timer interrupts
+  ulong timers;      // timer callbacks
+  ulong perf_ints;   // performance monitor interrupts
+  ulong syscalls;
+  ulong page_faults;
+
+  // inter-processor interrupts
+  ulong reschedule_ipis;
+  ulong generic_ipis;
+
+  // energy consumption
+  ulong active_energy_consumption_nj;
+  ulong idle_energy_consumption_nj;
+};
+
+// include after the cpu_stats definition above, since it is part of the percpu structure
+#include <kernel/percpu.h>
+
+#define GUEST_STATS_INC(name)                                                    \
+  do {                                                                           \
+    __atomic_fetch_add(&percpu::GetCurrent().gstats.name, 1u, __ATOMIC_RELAXED); \
+  } while (0)
+
+#define CPU_STATS_INC(name)                                                     \
+  do {                                                                          \
+    __atomic_fetch_add(&percpu::GetCurrent().stats.name, 1u, __ATOMIC_RELAXED); \
+  } while (0)
+
+#endif  // ZIRCON_KERNEL_INCLUDE_KERNEL_STATS_H_

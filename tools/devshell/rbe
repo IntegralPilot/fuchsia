@@ -1,0 +1,507 @@
+#!/bin/bash
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Build
+### check remote build configuration
+
+## usage:
+##  fx rbe auth [options...]
+##      Verify authentication to RBE services through reclient and bazel.
+##      Options:
+##        -f,--force: Always request a fresh authentication token.
+##        All other unknown options are forwarded to 'gcloud auth application-default login'.
+##      Testing tips:
+##        To revoke gcloud credentials: gcloud auth revoke
+##        To revoke ADC credentials: rm ~/.config/gcloud/application_default_credentials.json
+##        To revoke LOAS credentials: loas_destroy
+##
+##  fx rbe check_loas [options...]
+##      For Google FTEs only.
+##      Reports the type of LOAS certificate as "restricted" or "unrestricted".
+##      Options:
+##        -f,--force: re-evaluate LOAS certificate type and update the
+##          cache file, instead of just taking the cached result.
+##      Use `fx-command-run rbe _check_loas_type` inside other fx scripts.
+##
+##  fx rbe cleanlogs
+##      Clean up reproxy log dirs (from using fuchsia-reproxy-wrap.sh).
+##
+##  fx rbe ensure_loas
+##      Checks for valid LOAS credentials, and runs gcert if needed.
+##
+##  fx rbe ensure_oauth
+##      Checks for valid OAuth token, and runs gcloud auth if needed.
+##
+##  fx rbe last_logdir
+##      Prints the path to the most recent RBE log dir corresponding to the
+##      current build output dir.  If none exists, print nothing.
+##
+##  fx rbe preflight
+##      Ensure credentials for using remote build services is valid,
+##      and prompt the user to re-auth if deemed necessary.
+##
+##  fx rbe version
+##      Reports re-client version.
+
+set -e
+set -o pipefail
+
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+# shellcheck source=/dev/null
+source "${FUCHSIA_DIR}/tools/devshell/lib/style.sh" || exit $?
+
+# This sets up and shuts down reproxy automatically.
+readonly reproxy_wrap="$FUCHSIA_DIR/build/rbe/fuchsia-reproxy-wrap.sh"
+
+readonly python="$PREBUILT_PYTHON3"
+
+# remote_action.py exercises rewrapper
+readonly remote_action="$FUCHSIA_DIR/build/rbe/remote_action.py"
+
+declare -a subshell_trace=()
+# Propagate tracing option from `fx -x rbe ...` to the wrapper script.
+# This is less invasive than re-exporting SHELLOPTS.
+if [[ -o xtrace ]]; then
+  subshell_trace=( /bin/bash -x )
+fi
+
+readonly -a reproxy_wrap_cmd=( "${subshell_trace[@]}" "$reproxy_wrap" )
+
+# A single command that tests RBE end-to-end through reclient.
+reclient_auth_test_cmd=(
+  env
+  --unset=FX_BUILD_RBE_STATS
+  FX_REMOTE_BUILD_METRICS=0
+  # Let the wrapper use a default --logdir and --tmpdir.
+  "${reproxy_wrap_cmd[@]}" --
+  "$python" -S "$remote_action" --
+  echo "greetings from a remote RBE worker"
+)
+
+function usage() {
+  fx-command-help
+}
+
+fx-standard-switches "$@"
+set -- "${FX_ARGV[@]}"
+
+if [[ $# -lt 1 ]]; then
+  fx-error Invalid syntax
+  fx-command-help
+  exit 1
+fi
+
+action="$1"
+shift
+action_args=("$@")
+
+function is_googler() {
+  which gcert > /dev/null 2>&1
+}
+
+gcloud=
+readonly gcloud_help_msg="Follow the instructions at go/gcloud-cli#getting-started"
+
+function ensure_gcloud() {
+  # go/gcloud-cli#getting-started
+  [[ -z "$gcloud" ]] || return 0
+  gcloud="$(which gcloud)" || {
+    echo "gcloud not found."
+    if is_googler
+    then
+      _cmd=(sudo apt install -y google-cloud-cli)
+      if ! [[ -t 0 ]] || is_invoked_by_agent; then
+        echo "To install gcloud, run: ${_cmd[*]}"
+        echo "$gcloud_help_msg"
+        return 1
+      fi
+      echo "Install gcloud with the following command?: ${_cmd[*]} [y/N]"
+      read -r yn
+      case "$yn" in
+        [yY] ) "${_cmd[@]}" && gcloud="$(which gcloud)" ; return "$?" ;;
+        * ) echo "$gcloud_help_msg" ;;
+      esac
+    else
+      echo "Follow the instructions at https://cloud.google.com/sdk/docs/install"
+    fi
+    return 1
+  }
+}
+
+readonly global_gcloud_auth_args=(auth application-default login)
+function gcloud_auth() {
+  # "$@" args are forwarded to 'gcloud auth application-default login'
+  ensure_gcloud &&
+    echo "running: gcloud ${global_gcloud_auth_args[*]}" "$@" &&
+    echo "If you see a warning about running on a \"Google Compute Engine virtual machine\", hit 'Y' to continue to use a personal account." &&
+    "$gcloud" "${global_gcloud_auth_args[@]}" "$@"
+}
+
+function reclient_auth_test() {
+  cat <<EOF
+Testing a small remote-enabled reclient remote action end-to-end.
+If the first attempt fails, follow the authentication prompts.
+It will retry until success.
+EOF
+  # Coerce the working directory to match the exec-root ($FUCHSIA_DIR), so the
+  # remote environment does not try to run in a nonexistent subdir.
+  # Normally subdirs are created automatically based on remote inputs and
+  # outputs, but this test command (echo) has neither inputs nor outputs.
+  # b/376105913 is an example of failing to execute remotely for this reason.
+  cd "$FUCHSIA_DIR"
+  until "${reclient_auth_test_cmd[@]}"
+  do
+    # gcert only works in environments that get unrestricted LOAS credentials
+    # whereas gcloud auth will always work.
+    # https://fuchsia.dev/internal/intree/concepts/remote-builds#authentication
+    ensure_auth_for_reclient "$@" || {
+      echo "Failed to authenticate for reclient."
+      return 1
+    }
+  done
+  style::echo --green "re-client+RBE authentication successful"
+}
+
+readonly BAZEL_TEST_DIR="$FUCHSIA_DIR/out/_bazel_rbe_test"
+readonly BAZEL_CRED_HELPER="/google/src/head/depot/google3/devtools/blaze/bazel/credhelper/credhelper"
+
+function setup_bazel_workspace() {
+  rm -rf "$BAZEL_TEST_DIR"
+  "$python" -S "$FUCHSIA_DIR/build/bazel/scripts/minimal_workspace.py" \
+    --fuchsia-dir="$FUCHSIA_DIR" \
+    --bazel-bin="$PREBUILT_BAZEL" \
+    --topdir="$BAZEL_TEST_DIR"
+}
+
+function get_loas_cert_type_for_bazel() {
+  local -r loas_cert_type="$(get_loas_cert_type)"
+  if [[ "$loas_cert_type" == "unrestricted" ]]; then
+    # In corporate environments, an unrestricted LOAS type implies we can use
+    # Bazel's gcert credential helper. However, if that helper is not executable or
+    # accessible (e.g. on new systems, cloudtops with unmounted SrcFS, or due to
+    # specific subdirectory permission/ACL restrictions), any attempt to run Bazel
+    # with --config=gcertauth will fail immediately with permission denied.
+    # In these circumstances, we gracefully downgrade to "restricted" mode to fall
+    # back to local gcloud Application Default Credentials (ADC).
+    if [[ ! -x "$BAZEL_CRED_HELPER" ]]; then
+      style::echo --warning "Bazel credential helper on SrcFS is not accessible: $BAZEL_CRED_HELPER"
+      style::echo --warning "Gracefully falling back to restricted (local gcloud/ADC) mode."
+      echo "restricted"
+      return 0
+    fi
+  fi
+  echo "$loas_cert_type"
+}
+
+function ensure_adc_file_exists() {
+  # If this file doesn't already exist, generate it one time using gcloud auth.
+  local -r adc_file="$HOME/.config/gcloud/application_default_credentials.json"
+  [[ -f "$adc_file" ]] || gcloud_auth
+}
+
+function test_bazel_rbe() {
+  ensure_adc_file_exists
+  setup_bazel_workspace
+  # Test authentication to RBE and BES (both share the same gcloud auth).
+  # Shutdown any bazel server each time to prevent it from caching
+  # stale credentials, and force it to refresh.
+  # Limit the number of upload retries to make this operation fail-fast.
+  local -r loas_cert_type="$(get_loas_cert_type_for_bazel)"
+  local -a auth_config_args=()
+  if [[ "$loas_cert_type" == "unrestricted" ]]
+  then auth_config_args+=( --config=gcertauth )
+  fi
+  (
+    cd "$BAZEL_TEST_DIR/workspace" &&
+      ../bazel shutdown && \
+      ../bazel --nohome_rc \
+          test \
+          --nouse_action_cache \
+          --nocache_test_results \
+          --config=remote \
+          --config=resultstore \
+          "${auth_config_args[@]}" \
+          --build_event_upload_max_retries=1 \
+          --bes_timeout=10s \
+          --bes_upload_mode=wait_for_upload_complete \
+          :all
+  )
+}
+
+function check_credential_helper_latency() {
+  # Defensive check that access to the bazel credential helper
+  # on SrcFS is not unreasonably slow.
+  if [[ "$(get_loas_cert_type_for_bazel)" != "unrestricted" ]]; then
+    # SrcFS is only accessible with unrestricted LOAS creds.
+    # The credshelper is not used with restricted LOAS.
+    return 0
+  fi
+  if [[ -x "$BAZEL_CRED_HELPER" ]]; then
+    local -r start_time=$SECONDS
+    # Run the helper (which prints 'invalid arguments' and exits with 1)
+    "$BAZEL_CRED_HELPER" >/dev/null 2>&1 || :
+    local -r duration=$((SECONDS - start_time))
+
+    if [[ $duration -ge 2 ]]; then
+      style::echo --warning "Access to the Bazel credential helper on SrcFS is extremely slow ($duration seconds startup latency)."
+      style::echo --warning "This is likely causing Bazel's Capabilities check or credential retrieval to timeout."
+      style::echo --warning "We recommend checking SrcFS/Citc mount health or warming the cache by running:"
+      style::echo --warning "  ls -l $BAZEL_CRED_HELPER"
+    fi
+  fi
+}
+
+function bazel_auth_test() {
+  cat <<EOF
+Testing a small remote-enabled bazel build end-to-end.
+If the first build attempt fails, follow the authentication prompts.
+It will retry twice before reporting failure.
+EOF
+  check_credential_helper_latency
+  for tries in 1 2 3; do
+      printf "\n=== Attempt $tries/3 =====================\n"
+      if test_bazel_rbe; then
+          style::echo --green "bazel+RBE authentication successful"
+          return 0
+      fi
+  done
+  printf "\n======================================\n"
+  echo "If the previous build attempt failed due to authentication, follow the prompts to authenticate."
+  ensure_auth_for_bazel "$@" || {
+    echo "Failed to authenticate for bazel."
+    return 1
+  }
+  fx-error "Failed to use Bazel RBE for unknown reason! Please contact fuchsia-build-team@ !"
+  return 1
+}
+
+function auth_subcommand() {
+  local force=0
+  local gcloud_auth_args=()
+  for opt in "$@"
+  do
+    case "$opt" in
+      -f|--force) force=1 ;;
+      *) gcloud_auth_args+=("$opt") ;;
+    esac
+  done
+
+  if [[ "$force" == 1 ]]
+  then
+    # Start with a re-auth to get a fresh token.
+    # This is a good idea if you don't know when your current token expires.
+    gcloud_auth "${gcloud_auth_args[@]}" || {
+      echo "Failed to authenticate with gcloud."
+      return 1
+    }
+  fi
+
+  # Run check-runt-network command if available. http://b/399096925
+  check_runt_script="${FUCHSIA_DIR}/vendor/google/scripts/devshell/check-runt-network"
+  if [[ -x "${check_runt_script}" ]]; then
+    "${check_runt_script}" || exit 1
+  fi
+
+  bazel_auth_test "${gcloud_auth_args[@]}" && \
+    echo && \
+    reclient_auth_test "${gcloud_auth_args[@]}" && \
+    echo && \
+    style::echo --bold --green "You can now 'fx build' with RBE."
+}
+
+# Determine whether or not host environment can get unrestricted LOAS
+# credentials.
+# Applicable to Google corp. networks only.
+# Returns 0 (success) if LOAS credentials are unrestricted.
+# Returns non-zero if credentials are restricted or some other error occurred.
+function check_loas_restrictions() {
+  local -r check_loas_script="${FUCHSIA_DIR}/build/auth/check_loas_restrictions.sh"
+  [[ -r "$check_loas_script" ]] || {
+    fx-error "Script not found: $check_loas_script"
+    return 1
+  }
+
+  # Print only the last line, in case there was any interactive gcert.
+  "${subshell_trace[@]}" "$check_loas_script" | tail -n 1
+}
+
+function get_loas_cert_type() {
+  # Prints "restricted" or "unrestricted" based on LOAS certificate type.
+  # Also uses cache file.
+  # This only needs to be computed once per development environment,
+  # or whenever the network changes.
+  # Options:
+  #   -f,--force : don't read the cache file, re-evaluate and re-write it.
+
+  local recache=0
+  for opt in "$@"
+  do
+    case "$opt" in
+      -f|--force) recache=1 ;;
+      *) fx-error "get_loas_cert_type: Unknown option $opt"; return 1 ;;
+    esac
+  done
+
+  # Use the cached result unless -f forces an update to the cache.
+  local -r auth_config="${FUCHSIA_DIR}/.fx/config/build-auth"
+  local -r auth_config_old="${FUCHSIA_DIR}/.fx/auth-config"
+  if [[ -f "$auth_config_old" ]]
+  then
+    fx-info "Moving $auth_config_old to new location $auth_config.  No further action is necessary."
+    mv "$auth_config_old" "$auth_config"
+  fi
+  if [[ -r "$auth_config" && "$recache" == 0 ]]
+  then
+    # Print the cached value
+    grep "loas_cert_type" "$auth_config" | cut -d"=" -f2
+    return
+  fi
+
+  # Re-run LOAS check.
+  local loas_cert_type=restricted  # safe default
+  [[ "$recache" == 0 ]] || loas_destroy || :
+  # if `loas_destroy` appears to be missing, it is because having a valid
+  # gcert is required to access on gLinux laptops in the first place.
+  # Since we want to be in an unauthenticated state in this case,
+  # it is safe and correct to ignore.
+  loas_cert_type="$(check_loas_restrictions)" || {
+    fx-error "Error trying to check LOAS certificate type."
+    return 1
+  }
+
+  # Cache result to file.
+  echo "loas_cert_type=$loas_cert_type" > "$auth_config"
+  echo "$loas_cert_type"
+}
+
+
+function check_loas_subcommand() {
+  echo "Checking LOAS certificate type:"
+  local -r loas_cert_type="$(get_loas_cert_type "$@")" || {
+    return 1
+  }
+  style::echo --green "$loas_cert_type"
+}
+
+function gcert_auth() {
+  gcert
+}
+
+function ensure_loas() {
+  gcertstatus -check_ssh=false --check_remaining=2h > /dev/null || gcert_auth
+}
+
+# With the gcloud auth workflow, there is a risk that the current
+# credentials expire before the end of the build because OAuth tokens
+# only last one hour.
+function ensure_oauth() {
+  ensure_gcloud && {
+    # Check if Application Default Credentials are valid.
+    # We used to check `gcloud auth list`, but that doesn't guarantee
+    # that ADC is set up, especially for restricted users (TVCs) who
+    # need to use `gcloud auth application-default login` specifically.
+    "$gcloud" auth application-default print-access-token &>/dev/null || gcloud_auth
+  }
+}
+
+function ensure_auth_for_reclient() {
+  local -r loas_cert_type="$(get_loas_cert_type)" || {
+    exit 1
+  }
+  case "$loas_cert_type" in
+    unrestricted) ensure_loas ;;
+    restricted) ensure_oauth ;;
+  esac
+}
+
+function ensure_auth_for_bazel() {
+  local -r loas_cert_type="$(get_loas_cert_type_for_bazel)" || {
+    exit 1
+  }
+  case "$loas_cert_type" in
+    unrestricted) ensure_loas ;;
+    restricted) ensure_oauth ;;
+  esac
+}
+
+# For builds that use remote services like RBE, ResultStore,
+# ensure that there are valid credentials at the time a build
+# is launched.
+function preflight_subcommand() {
+  # If no authenticated services are used, this is a no-op.
+  if ! fx-build-needs-auth
+  then return 0
+  fi
+  ensure_adc_file_exists && ensure_auth_for_reclient && ensure_auth_for_bazel
+}
+
+# LINT.IfChange(reproxy_log_dirs)
+# vars.sh:fx-run-ninja writes RBE logs here:
+readonly rbe_logs_dir_root="${FUCHSIA_DIR}/out/.reproxy_logs"
+# LINT.ThenChange(/tools/devshell/lib/vars.sh:reproxy_log_dirs)
+function cleanlogs_subcommand() {
+  echo "Removing $rbe_logs_dir_root"
+  rm -rf "$rbe_logs_dir_root"
+}
+
+# Print the path to the most recent reproxy log dir for the current
+# build output directory.  If none exists, print nothing.
+function last_logdir_subcommand() {
+  fx-build-dir-if-present || return
+  local -r build_subdir="$(basename "${FUCHSIA_BUILD_DIR}")"
+  local -r out_dir="$(basename "$(dirname "${FUCHSIA_BUILD_DIR}")")"
+  local -r new_logs_dir="${FUCHSIA_DIR}/${out_dir}/.build_logs/${build_subdir}"
+  if [[ -d "$new_logs_dir" ]]; then
+    # shellcheck disable=SC2012
+    local -r recent_log_dir="$(ls -1 -d "${new_logs_dir}"/build.* | tail -n 1)"
+    if [[ -d "$recent_log_dir" ]]; then
+      echo "$recent_log_dir"
+      return
+    fi
+  fi
+
+  # Fallback to the old location.
+  local -r old_logs_dir="${FUCHSIA_DIR}/${out_dir}/.reproxy_logs/${build_subdir}"
+  if [[ -d "$old_logs_dir" ]]
+  then
+    # shellcheck disable=SC2012
+    local -r recent_rbe_log_dir="$(ls -1 -d "${old_logs_dir}"/reproxy.* | tail -n 1)"
+    if [[ -d "$recent_rbe_log_dir" ]]
+    then
+      echo "$recent_rbe_log_dir"
+    fi
+  fi
+}
+
+function version_subcommand() {
+  readonly reproxy="${PREBUILT_RECLIENT_DIR}"/reproxy
+  echo "reclient version:"
+  "$reproxy" --version
+}
+
+# main
+case "$action" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+
+  auth) auth_subcommand "${action_args[@]}" ;;
+  check_loas) check_loas_subcommand "${action_args[@]}" ;;
+  _check_loas_type) get_loas_cert_type "${action_args[@]}" ;;
+  cleanlogs) cleanlogs_subcommand "${action_args[@]}" ;;
+  ensure_loas) ensure_loas "${action_args[@]}" ;;
+  ensure_oauth) ensure_oauth "${action_args[@]}" ;;
+  last_logdir) last_logdir_subcommand "${action_args[@]}" ;;
+  preflight) preflight_subcommand "${action_args[@]}" ;;
+  version) version_subcommand "${action_args[@]}" ;;
+
+  *)
+    fx-error Invalid syntax
+    fx-command-help
+    exit 1
+    ;;
+esac

@@ -1,0 +1,266 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/dart/dart_library.gni")
+import("//build/dart/toolchain.gni")
+import("//build/testing/host_test_data.gni")
+import("//build/testing/test_spec.gni")
+
+# Defines a Dart test suite.
+#
+# Parameters
+#
+#   sources
+#     Required: The list of public dart sources files defining the test.
+#       NOTE: this template assumes that all test entrypoints are defined by
+#       files with a suffix of "_test.dart".
+#
+#   source_dir
+#     Optional: The directory of test sources files. Defaults to "test".
+#
+#   deps
+#     Optional: Dart dependencies of the test.
+#
+#   non_dart_deps
+#     Optional: List of labels this package depends on that are not Dart
+#       packages.
+#
+#   package_deps
+#     Optional: List of `fuchsia_package` labels needed by the test at runtime.
+#       See //build/testing/test_spec.gni for more details.
+#
+#   environments
+#     Optional: What environments this test should target. Only used here for
+#       linux and mac tests, with a default value of a general linux/mac
+#       environment (as a function of $current_os).
+#       See //build/testing/test_spec.gni for more details.
+#
+#   args
+#     Optional: Command-line arguments to pass to the Dart application. These
+#       arguments are inserted ahead of any arguments given to the invocation,
+#       like the program/args entry in a component manifest.
+#
+#   null_safe
+#     Optional: A flag that enables null safety check in dart libraries.
+#
+template("dart_test") {
+  assert(defined(invoker.sources), "dart_test() must specify sources")
+
+  _main_target_name = target_name
+  _dart_library_target_name = "${target_name}_dart_library"
+  _test_grouping_target_name = "${target_name}_test_grouping"
+  _snapshot_target_name = "${target_name}_snapshot"
+  _spec_target_name = "${target_name}_spec"
+
+  if (is_host) {
+    _test_data_target_name = "${target_name}_test_data"
+  }
+
+  if (defined(invoker.source_dir)) {
+    _source_dir = invoker.source_dir
+  } else {
+    _source_dir = "test"
+  }
+
+  dart_library(_dart_library_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "sources",
+                             "hermetic_deps",
+                             "null_safe",
+                             "options_file",
+                           ])
+
+    # We want to mimic the package_root being in place of the source_dir. Dart
+    # does not allow multiple packages to share the same package_root so we
+    # do this so our /test directories can live along side out /lib directories
+    # which is how most dart packages are structured in out tree.
+    package_root = rebase_path(_source_dir, ".")
+    source_dir = "."
+
+    infer_package_name = true
+    testonly = true
+
+    # TODO(https://fxbug.dev/42151305): replace the enclosing dart_library with an analysis
+    # target when they are decoupled.
+    #
+    # Skip source verification because the purpose of this target is to run
+    # analysis only. `dart_library` expects all sources under `source_dir` to be
+    # included in `sources`, and this doesn't apply to `dart_test` because it is
+    # valid to have multiple test files for different tests in the same dir.
+    disable_source_verification = true
+  }
+
+  # Create a single, grouped test file, as snapshot files correspond to a single
+  # entrypoint.
+  _grouped_main_file = "$target_gen_dir/${_main_target_name}_grouped.dart"
+
+  action(_test_grouping_target_name) {
+    script = "//build/dart/group_tests.py"
+    outputs = [ _grouped_main_file ]
+    args = [
+      "--out",
+      rebase_path(_grouped_main_file, root_build_dir),
+    ]
+    foreach(src, invoker.sources) {
+      args += [
+        "--source",
+
+        # Sources are imported to the grouped test, so their paths should be
+        # relative to the output grouped test file.
+        rebase_path("$_source_dir/$src",
+                    get_path_info(_grouped_main_file, "dir")),
+      ]
+    }
+    testonly = true
+  }
+
+  # When using the prebuilt, we copy the dart binary into the build directory
+  # so that it can be used without the prebuilt directory in the source tree.
+
+  _dart_binary = "$target_gen_dir/$_main_target_name/dart"
+
+  _copy_target_name = "${target_name}_copy"
+  copy(_copy_target_name) {
+    sources = [ prebuilt_dart ]
+    outputs = [ _dart_binary ]
+    deps = dart_sdk_deps
+  }
+
+  # Creates a snapshot file, which allows the test to be invoked hermetically.
+  _snapshot = "$target_gen_dir/${target_name}.snapshot"
+  _dart_target_gen_dir =
+      get_label_info(":anything($dart_toolchain)", "target_gen_dir")
+  _packages_path =
+      "$_dart_target_gen_dir/${_dart_library_target_name}_package_config.json"
+
+  action(_snapshot_target_name) {
+    depfile = "${_snapshot}.d"
+
+    outputs = [ _snapshot ]
+
+    # Dart writes absolute paths to depfiles, convert them to relative.
+    # See more information in https://fxbug.dev/42155246.
+    script = "//build/depfile_path_to_relative.py"
+    inputs = [ prebuilt_dart ]
+
+    args = [
+      "--depfile=" + rebase_path(depfile, root_build_dir),
+      "--",
+      rebase_path(prebuilt_dart, root_build_dir),
+      "--verbosity=warning",
+      "--snapshot=" + rebase_path(_snapshot, root_build_dir),
+      "--snapshot-depfile=" + rebase_path(depfile, root_build_dir),
+      "--packages=" + rebase_path(_packages_path, root_build_dir),
+      "--no-sound-null-safety",
+      rebase_path(_grouped_main_file, root_build_dir),
+    ]
+
+    deps = [
+      ":$_dart_library_target_name",
+      ":$_test_grouping_target_name",
+    ]
+    testonly = true
+
+    # snapshot file contains output dir name
+    check_for_output_dir_leaks = false
+  }
+
+  if (is_host) {
+    host_test_data(_test_data_target_name) {
+      sources = [
+        _dart_binary,
+        _snapshot,
+        get_label_info("//tools/dart_test_parser", "root_out_dir") +
+            "/dart_test_parser",
+      ]
+      deps = [
+        ":$_copy_target_name",
+        ":$_snapshot_target_name",
+        "//tools/dart_test_parser",
+      ]
+    }
+  }
+
+  _invocation = "$root_out_dir/$_main_target_name"
+  test_spec(_spec_target_name) {
+    target = get_label_info(":${_main_target_name}", "label_with_toolchain")
+    path = _invocation
+
+    forward_variables_from(invoker,
+                           [
+                             "build_only",
+                             "environments",
+                             "isolated",
+                             "package_deps",
+                             "timeout_secs",
+                           ])
+
+    deps = [ ":$_snapshot_target_name" ]
+    if (is_host) {
+      deps += [ ":$_test_data_target_name" ]
+    }
+
+    if (defined(invoker.deps)) {
+      foreach(dep, invoker.deps) {
+        deps +=
+            [ get_label_info(dep, "label_no_toolchain") + "($dart_toolchain)" ]
+      }
+    }
+    if (defined(invoker.non_dart_deps)) {
+      deps += invoker.non_dart_deps
+    }
+  }
+
+  # Creates a convenience script to invoke the test.
+  action(_main_target_name) {
+    script = "//build/dart/gen_dart_test_invocation.py"
+
+    inputs = [ _snapshot ]
+    outputs = [ _invocation ]
+
+    args = [
+      "--wd",
+
+      # TODO(crbug.com/gn/56): Rebasing root_build_dir alone yields a path
+      # component that leaves root_build_dir, preventing portability.
+      rebase_path("$root_build_dir/dummy/..",
+                  get_path_info(_invocation, "dir")),
+      "--out",
+      rebase_path(_invocation, root_build_dir),
+      "--dart",
+      rebase_path(_dart_binary, root_build_dir),
+      "--snapshot",
+      rebase_path(_snapshot, root_build_dir),
+      "--results-parser",
+      rebase_path(get_label_info("//tools/dart_test_parser", "root_out_dir") +
+                      "/dart_test_parser",
+                  root_build_dir),
+    ]
+
+    # TODO(joshuaseaton): use test_spec's `command` field when fx supports
+    # running tests out of $root_build_dir/tests.json.
+    # CL to back out: https://fuchsia-review.googlesource.com/269458
+    if (defined(invoker.args) && invoker.args != []) {
+      argstr = ""
+      foreach(arg, invoker.args) {
+        argstr += "\"" + arg + "\" "
+      }
+
+      args += [
+        "--args",
+        argstr,
+      ]
+    }
+
+    deps = [
+      ":$_copy_target_name",
+      ":$_snapshot_target_name",
+      ":$_spec_target_name",
+      "//tools/dart_test_parser",
+    ]
+    testonly = true
+  }
+}

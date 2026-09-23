@@ -1,0 +1,138 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.input.report;
+
+using zx;
+
+const MAX_DEVICE_REPORT_COUNT uint32 = 50;
+
+/// The InputReport field to be populated by InputDevice.GetInputReport.
+@available(removed=HEAD)
+type DeviceType = flexible enum {
+    MOUSE = 0;
+    SENSOR = 1;
+    TOUCH = 2;
+    KEYBOARD = 3;
+    CONSUMER_CONTROL = 4;
+};
+
+/// Each `InputReportsReader` has its own FIFO of InputReports that it maintains.
+/// When ReadInputReports is called it drains the InputReports FIFO.
+/// If too many InputReports are created before the FIFO is drained, then
+/// the oldest InputReport will be silently discarded.
+@available(deprecated=32, note="use InputReportsReaderV2")
+closed protocol InputReportsReader {
+    /// This is a Hanging-Get function to read the reports in the
+    /// InputReport FIFO. This will not reply until there is at least one
+    /// report available.
+    /// If there is already one outstanding Hanging-Get, calling this
+    /// again will return ZX_ERR_ALREADY_BOUND.
+    strict ReadInputReports() -> (resource(added=32) struct {
+        reports vector<InputReport>:MAX_DEVICE_REPORT_COUNT;
+    }) error zx.Status;
+};
+
+/// A reader protocol that reports input events.
+@available(added=32)
+open protocol InputReportsReaderV2 {
+    /// The device pushes events to the client.
+    /// The client does not need to acknowledge every report; it can allow multiple
+    /// reports to be in flight up to `max_unacknowledged_reports`.
+    ///
+    /// Streaming begins automatically on connection.
+    flexible -> OnInputReports(resource struct {
+        reports vector<InputReport>:MAX_DEVICE_REPORT_COUNT;
+        /// Each report is associated with a strictly monotonic numerical report
+        /// stamp. This field contains the report stamp for the last element in
+        /// `reports`.
+        last_report_stamp uint64;
+    });
+
+    /// The client has processed events up to `last_acknowledged_report_stamp`.
+    /// All reports sent with a `last_report_stamp` less than or equal to
+    /// `last_acknowledged_report_stamp` will be considered acknowledged, and therefore
+    /// will not count towards the `max_unacknowledged_reports` limit.
+    flexible AcknowledgeReports(struct {
+        last_acknowledged_report_stamp uint64;
+    });
+};
+
+/// An `InputDevice` driver represents a single physical input device.
+/// The InputDevice maintains an internal FIFO of `MAX_DEVICE_REPORT_COUNT`
+/// reports for each client that connects. Reports are removed from the FIFO
+/// once they are read by the client. If the FIFO is full, it will drop the
+/// oldest report to make room for an incoming report.
+@discoverable(client="platform", server="platform")
+open protocol InputDevice {
+    /// Open a new InputReportsReader on this device. Each reader receives
+    /// their own reports.
+    @available(deprecated=32, note="use GetInputReportsReaderV2")
+    strict GetInputReportsReader(resource struct {
+        reader server_end:InputReportsReader;
+    });
+
+    /// Open a new InputReportsReaderV2 on this device. Each reader receives
+    /// the full stream of event reports.
+    @available(added=32)
+    strict GetInputReportsReaderV2(resource struct {
+        reader server_end:InputReportsReaderV2;
+        /// The maximum number of unacknowledged `OnInputReports` events that the client
+        /// requests the device to allow in flight simultaneously.
+        ///
+        /// The client should determine this value based on product configuration and
+        /// processing capabilities. The device uses this limit as an upper bound when
+        /// deciding the effective `max_unacknowledged_reports` returned in the response.
+        max_unacknowledged_reports_limit uint16;
+    }) -> (struct {
+        /// The device must not send any `OnInputReports()` events when there are
+        /// `max_unacknowledged_reports` unacknowledged reports.
+        ///
+        /// The server may queue or drop events after unacknowledged events reach
+        /// `max_unacknowledged_reports`.
+        ///
+        /// The client should send acknowledgements before unacknowledged reports
+        /// reach `max_unacknowledged_reports` to avoid being throttled.
+        max_unacknowledged_reports uint16;
+    });
+
+    /// Gets the device descriptor for this device.
+    strict GetDescriptor() -> (struct {
+        descriptor DeviceDescriptor;
+    });
+
+    /// Send a single output report to the device. This will throw an error
+    /// if the output report does not follow the OutputDescriptor.
+    strict SendOutputReport(struct {
+        report OutputReport;
+    }) -> () error zx.Status;
+
+    /// Get the feature report for a given device. This requests the state of
+    /// the device's features.
+    strict GetFeatureReport() -> (struct {
+        report FeatureReport;
+    }) error zx.Status;
+
+    /// Set the feature report for a given device. This sets the state of
+    /// the device's features.
+    strict SetFeatureReport(struct {
+        report FeatureReport;
+    }) -> () error zx.Status;
+
+    /// For general cases, InputReportReader is the preferred way of getting
+    /// InputReports. For devices that don't send InputReports naturally, this
+    /// method can be used to request a report from the device type indicated.
+    /// Does not block, and returns ZX_ERR_NOT_SUPPORTED if `GetInputReport` or
+    /// `device_type` are not supported.
+    @available(removed=HEAD)
+    strict GetInputReport(struct {
+        device_type DeviceType;
+    }) -> (resource(added=32) struct {
+        report InputReport;
+    }) error zx.Status;
+};
+
+// Added to allow service connection to replace devfs
+service Service {
+    input_device client_end:InputDevice;
+};

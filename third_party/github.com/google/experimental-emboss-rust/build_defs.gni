@@ -1,0 +1,570 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/python/python_action.gni")
+import("//build/rust/rustc_library.gni")
+import(
+    "//third_party/github.com/google/experimental-emboss-rust/src/gen/sources.gni")
+
+_emboss_src = get_path_info("./src/", "abspath")
+_emboss_dir = get_path_info(".", "abspath")
+
+_embossc_inputs = []
+foreach(src, embossc_sources) {
+  _embossc_inputs += [ "$_emboss_src/$src" ]
+}
+_embossc_inputs += [
+  "$_emboss_src/compiler/back_end/experimental/__init__.py",
+  "$_emboss_src/compiler/back_end/experimental/rust/__init__.py",
+  "$_emboss_src/compiler/back_end/experimental/rust/emboss_codegen_rust.py",
+  "$_emboss_src/compiler/back_end/experimental/rust/generated_code_templates",
+]
+
+declare_args() {
+  # An optional relative path from `root_build_dir` to `//`, which can be used
+  # by `emboss_cc_library` and `emboss_rust_library` to rebase `embossc` source
+  # files.
+  emboss_build_dir_to_root = ""
+}
+
+# Compiles a .emb file into C++ header files.
+#
+# Parameters
+#   source (required, or srcs)
+#     [path] The path to the .emb file that is to be compiled.
+#
+#   import_dirs (optional)
+#     [list of paths] Directories to search for imported .emb files.
+#
+#   imports (optional)
+#     [list of paths] Paths to imported .emb files for GN dependency tracking.
+#
+#   enable_enum_traits (optional)
+#     [boolean] Whether to generate enum traits (default: true).
+#
+#   deps (optional)
+#     [list of targets] Other emboss_cc_library targets imported by this target.
+template("emboss_cc_library") {
+  assert(defined(invoker.source) || defined(invoker.srcs),
+         "Need source or srcs arg for emboss_cc_library")
+
+  if (defined(invoker.source)) {
+    _source = invoker.source
+  } else {
+    _srcs = invoker.srcs
+    assert(_srcs == [ _srcs[0] ], "srcs must contain exactly one file")
+    _source = _srcs[0]
+  }
+
+  if (defined(pw_emboss_build_dir_to_root) &&
+      pw_emboss_build_dir_to_root != "") {
+    _build_dir_to_root = pw_emboss_build_dir_to_root
+  } else if (defined(emboss_build_dir_to_root)) {
+    _build_dir_to_root = emboss_build_dir_to_root
+  } else {
+    _build_dir_to_root = ""
+  }
+
+  if (_build_dir_to_root == "") {
+    relative_source = rebase_path(_source, root_build_dir)
+  } else {
+    symlink_safe_build_dir =
+        "/" + rebase_path("//", "/") +
+        rebase_path(root_build_dir, "${root_build_dir}/${_build_dir_to_root}")
+    relative_source = rebase_path(_source, symlink_safe_build_dir)
+  }
+
+  compiled_header_path = "$target_gen_dir/" + _source + ".h"
+  path_sep = "/"
+  elements = string_split(relative_source, path_sep)
+  updirs = filter_include(elements, [ ".." ])
+
+  fakedirs = []
+  foreach(element, updirs) {
+    fakedirs += [ "fake" ]
+  }
+  output_path = root_gen_dir + path_sep + string_join(path_sep, fakedirs)
+
+  python_action("${target_name}_header") {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    binary_label =
+        "//third_party/github.com/google/experimental-emboss-rust:embossc"
+
+    args = [
+      "--generate",
+      "cc",
+      "--no-experimental-warning",
+      "--output-path",
+      rebase_path(output_path, root_build_dir),
+      relative_source,
+    ]
+
+    if (defined(invoker.enable_enum_traits) && !invoker.enable_enum_traits) {
+      args += [ "--no-cc-enum-traits" ]
+    }
+
+    default_import_dirs = [ rebase_path("//", root_build_dir) ]
+    if (defined(dir_pigweed) && dir_pigweed != "") {
+      default_import_dirs += [ rebase_path(dir_pigweed, root_build_dir) ]
+    }
+    foreach(dir, default_import_dirs) {
+      args += [
+        "--import-dir",
+        dir,
+      ]
+    }
+
+    if (defined(invoker.import_dirs)) {
+      foreach(dir, invoker.import_dirs) {
+        args += [
+          "--import-dir",
+          rebase_path(dir, root_build_dir),
+        ]
+      }
+    }
+
+    sources = [ _source ]
+
+    inputs = _embossc_inputs
+    if (defined(invoker.imports)) {
+      inputs += invoker.imports
+    }
+
+    outputs = [ compiled_header_path ]
+  }
+
+  config("${target_name}_emboss_config") {
+    include_dirs = [
+      _emboss_src,
+      root_gen_dir,
+    ]
+  }
+
+  source_set(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "source",
+                             "srcs",
+                             "import_dirs",
+                             "imports",
+                             "enable_enum_traits",
+                           ])
+
+    sources = [ compiled_header_path ]
+
+    if (!defined(public_deps)) {
+      public_deps = []
+    }
+    public_deps += [
+      ":${target_name}_header",
+      "$_emboss_dir:cpp_utils",
+    ]
+
+    if (!defined(public_configs)) {
+      public_configs = []
+    }
+    public_configs += [ ":${target_name}_emboss_config" ]
+  }
+}
+
+# Compiles a .emb file into a Rust library.
+#
+# Parameters
+#   source (required, or srcs)
+#     [path] The path to the .emb file that is to be compiled.
+#
+#   crate_name (optional)
+#     [string] Name of the Rust crate. Defaults to workspace-relative path based name.
+#
+#   edition (optional)
+#     [string] Rust edition (default: "2024").
+#
+#   import_dirs (optional)
+#     [list of paths] Directories to search for imported .emb files.
+#
+#   imports (optional)
+#     [list of paths] Paths to imported .emb files for GN dependency tracking.
+#
+#   deps (optional)
+#     [list of targets] Dependencies forwarded to the rustc_library.
+#
+#   rust_deps (optional)
+#     [list of targets] Additional Rust library dependencies.
+template("emboss_rust_library") {
+  assert(defined(invoker.sources) || defined(invoker.source) ||
+             defined(invoker.srcs),
+         "Need sources, source or srcs arg for emboss_rust_library")
+
+  if (defined(invoker.sources)) {
+    _sources = invoker.sources
+  } else if (defined(invoker.source)) {
+    _sources = [ invoker.source ]
+  } else {
+    _sources = invoker.srcs
+  }
+
+  _action_targets = []
+  _compiled_rust_paths = []
+  _module_lines = [
+    "// Generated by emboss_rust_library. Do not edit.",
+    "#![no_std]",
+    "#![allow(unused_imports, non_snake_case)]",
+    "",
+  ]
+
+  foreach(_source, _sources) {
+    _source_target_name =
+        "${target_name}_" + string_replace(
+            string_replace(string_replace(_source, "/", "_"), ".", "_"),
+            "-",
+            "_")
+    _action_targets += [ ":$_source_target_name" ]
+
+    if (defined(pw_emboss_build_dir_to_root) &&
+        pw_emboss_build_dir_to_root != "") {
+      _build_dir_to_root = pw_emboss_build_dir_to_root
+    } else if (defined(emboss_build_dir_to_root)) {
+      _build_dir_to_root = emboss_build_dir_to_root
+    } else {
+      _build_dir_to_root = ""
+    }
+
+    if (_build_dir_to_root == "") {
+      relative_source = rebase_path(_source, root_build_dir)
+    } else {
+      symlink_safe_build_dir =
+          "/" + rebase_path("//", "/") +
+          rebase_path(root_build_dir, "${root_build_dir}/${_build_dir_to_root}")
+      relative_source = rebase_path(_source, symlink_safe_build_dir)
+    }
+
+    _source_rs = string_replace(_source, ".emb", ".rs")
+    relative_source_rs = string_replace(relative_source, ".emb", ".rs")
+    compiled_rust_path = "$target_gen_dir/" + _source_rs
+    _compiled_rust_paths += [ compiled_rust_path ]
+
+    _mod_name = string_replace(get_path_info(_source, "name"), "-", "_")
+    _module_lines += [
+      "#[path = \"${_source_rs}\"]",
+      "pub mod ${_mod_name};",
+    ]
+
+    path_sep = "/"
+    elements = []
+    elements = string_split(relative_source, path_sep)
+    updirs = []
+    updirs = filter_include(elements, [ ".." ])
+    fakedirs = []
+    foreach(element, updirs) {
+      fakedirs += [ "fake" ]
+    }
+    output_path = root_gen_dir + path_sep + string_join(path_sep, fakedirs)
+
+    python_action(_source_target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      binary_label =
+          "//third_party/github.com/google/experimental-emboss-rust:embossc"
+
+      args = [
+        "--generate",
+        "rust",
+        "--no-experimental-warning",
+        "--output-path",
+        rebase_path(output_path, root_build_dir),
+        "--output-file",
+        relative_source_rs,
+        relative_source,
+      ]
+
+      default_import_dirs = [
+        rebase_path(get_path_info(_source, "dir"), root_build_dir),
+        rebase_path("//", root_build_dir),
+      ]
+      if (defined(dir_pigweed) && dir_pigweed != "") {
+        default_import_dirs += [ rebase_path(dir_pigweed, root_build_dir) ]
+      }
+      foreach(dir, default_import_dirs) {
+        args += [
+          "--import-dir",
+          dir,
+        ]
+      }
+
+      if (defined(invoker.import_dirs)) {
+        foreach(dir, invoker.import_dirs) {
+          args += [
+            "--import-dir",
+            rebase_path(dir, root_build_dir),
+          ]
+        }
+      }
+
+      sources = [ _source ]
+
+      inputs = _embossc_inputs
+      if (defined(invoker.imports)) {
+        inputs += invoker.imports
+      }
+      if (defined(invoker.inputs)) {
+        inputs += invoker.inputs
+      }
+
+      outputs = [ compiled_rust_path ]
+    }
+  }
+
+  if (defined(invoker.crate_name)) {
+    _derived_crate_name = invoker.crate_name
+  } else if (defined(invoker.name)) {
+    _derived_crate_name = invoker.name
+  } else {
+    _derived_crate_name = target_name
+  }
+  _derived_crate_name =
+      string_replace(
+          string_replace(string_replace(_derived_crate_name, ".", "_"),
+                         "/",
+                         "_"),
+          "-",
+          "_")
+
+  if (_sources == [ _sources[0] ]) {
+    _crate_source_root = _compiled_rust_paths[0]
+    _crate_sources = _compiled_rust_paths
+  } else {
+    _crate_source_root = "$target_gen_dir/${target_name}_lib.rs"
+    _crate_sources = [ _crate_source_root ] + _compiled_rust_paths
+    generated_file("${target_name}_module_index") {
+      outputs = [ _crate_source_root ]
+      contents = _module_lines
+    }
+    _action_targets += [ ":${target_name}_module_index" ]
+  }
+
+  rustc_library(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "source",
+                             "sources",
+                             "srcs",
+                             "import_dirs",
+                             "imports",
+                             "deps",
+                             "rust_deps",
+                             "name",
+                             "crate_name",
+                             "inputs",
+                           ])
+
+    crate_name = _derived_crate_name
+
+    if (!defined(edition)) {
+      edition = "2024"
+    }
+
+    source_root = _crate_source_root
+    sources = _crate_sources
+
+    inputs = []
+    if (defined(invoker.inputs)) {
+      inputs += invoker.inputs
+    }
+    if (defined(invoker.imports)) {
+      inputs += invoker.imports
+    }
+    inputs += _sources
+
+    deps = _action_targets + [ "$_emboss_dir:emboss_runtime" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    if (defined(invoker.rust_deps)) {
+      deps += invoker.rust_deps
+    }
+  }
+}
+
+# Compiles .emb file(s) into Rust source files without creating a rustc_library.
+#
+# Parameters
+#   sources (required, or source / srcs)
+#     [list of paths] The paths to the .emb files to compile.
+#
+#   import_dirs (optional)
+#     [list of paths] Directories to search for imported .emb files.
+#
+#   imports (optional)
+#     [list of paths] Paths to imported .emb files for GN dependency tracking.
+template("emboss_rust_sources") {
+  assert(defined(invoker.sources) || defined(invoker.source) ||
+             defined(invoker.srcs),
+         "Need sources, source or srcs arg for emboss_rust_sources")
+
+  if (defined(invoker.sources)) {
+    _sources = invoker.sources
+  } else if (defined(invoker.source)) {
+    _sources = [ invoker.source ]
+  } else {
+    _sources = invoker.srcs
+  }
+
+  _action_targets = []
+  _module_lines = [
+    "// Generated by emboss_rust_sources. Do not edit.",
+    "#![no_std]",
+    "#![allow(unused_imports)]",
+    "",
+  ]
+
+  foreach(_source, _sources) {
+    _source_target_name =
+        "${target_name}_" + string_replace(
+            string_replace(string_replace(_source, "/", "_"), ".", "_"),
+            "-",
+            "_")
+    _action_targets += [ ":$_source_target_name" ]
+
+    if (defined(pw_emboss_build_dir_to_root) &&
+        pw_emboss_build_dir_to_root != "") {
+      _build_dir_to_root = pw_emboss_build_dir_to_root
+    } else if (defined(emboss_build_dir_to_root)) {
+      _build_dir_to_root = emboss_build_dir_to_root
+    } else {
+      _build_dir_to_root = ""
+    }
+
+    if (_build_dir_to_root == "") {
+      relative_source = rebase_path(_source, root_build_dir)
+    } else {
+      symlink_safe_build_dir =
+          "/" + rebase_path("//", "/") +
+          rebase_path(root_build_dir, "${root_build_dir}/${_build_dir_to_root}")
+      relative_source = rebase_path(_source, symlink_safe_build_dir)
+    }
+
+    _source_rs = string_replace(_source, ".emb", ".rs")
+    relative_source_rs = string_replace(relative_source, ".emb", ".rs")
+    compiled_rust_path = "$target_gen_dir/" + _source_rs
+
+    _mod_name = string_replace(get_path_info(_source, "name"), "-", "_")
+    _module_lines += [
+      "#[path = \"${_source_rs}\"]",
+      "pub mod ${_mod_name};",
+    ]
+
+    path_sep = "/"
+    elements = []
+    elements = string_split(relative_source, path_sep)
+    updirs = []
+    updirs = filter_include(elements, [ ".." ])
+    fakedirs = []
+    foreach(element, updirs) {
+      fakedirs += [ "fake" ]
+    }
+    output_path = root_gen_dir + path_sep + string_join(path_sep, fakedirs)
+
+    python_action(_source_target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      binary_label =
+          "//third_party/github.com/google/experimental-emboss-rust:embossc"
+
+      args = [
+        "--generate",
+        "rust",
+        "--no-experimental-warning",
+        "--output-path",
+        rebase_path(output_path, root_build_dir),
+        "--output-file",
+        relative_source_rs,
+        relative_source,
+      ]
+
+      default_import_dirs = [
+        rebase_path(get_path_info(_source, "dir"), root_build_dir),
+        rebase_path("//", root_build_dir),
+      ]
+      if (defined(dir_pigweed) && dir_pigweed != "") {
+        default_import_dirs += [ rebase_path(dir_pigweed, root_build_dir) ]
+      }
+      foreach(dir, default_import_dirs) {
+        args += [
+          "--import-dir",
+          dir,
+        ]
+      }
+
+      if (defined(invoker.import_dirs)) {
+        foreach(dir, invoker.import_dirs) {
+          args += [
+            "--import-dir",
+            rebase_path(dir, root_build_dir),
+          ]
+        }
+      }
+
+      sources = [ _source ]
+
+      inputs = _embossc_inputs
+      if (defined(invoker.imports)) {
+        inputs += invoker.imports
+      }
+      if (defined(invoker.inputs)) {
+        inputs += invoker.inputs
+      }
+
+      outputs = [ compiled_rust_path ]
+    }
+  }
+
+  if (defined(invoker.extra_sources)) {
+    foreach(_extra, invoker.extra_sources) {
+      _extra_rebased = rebase_path(_extra, target_gen_dir)
+      _extra_mod = string_replace(get_path_info(_extra, "name"), "-", "_")
+      _module_lines += [
+        "#[path = \"${_extra_rebased}\"]",
+        "mod ${_extra_mod};",
+        "pub use ${_extra_mod}::*;",
+      ]
+    }
+  }
+
+  generated_file("${target_name}_module_index") {
+    outputs = [ "$target_gen_dir/${target_name}_lib.rs" ]
+    contents = _module_lines
+  }
+  _action_targets += [ ":${target_name}_module_index" ]
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    public_deps = _action_targets
+  }
+}

@@ -1,0 +1,120 @@
+#!/bin/bash
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Device discovery
+### set the default device to interact with
+
+## usage: fx set-device [DEVICE[:SSH_PORT]]
+##
+## fx set-device is used to specify the default device to target for
+## the current Fuchsia build directory, i.e. $FUCHSIA_BUILD_DIR.
+## This means a device is set within the scope of a build directory (i.e. out/arm64 may
+## have a different default device than out/x64).
+##
+## If no device name is given, set-device will attempt to discover devices. If
+## one device is found, that device is set as the default for the current build
+## directory. If more than one device is found, the user must select one.
+##
+## If specified, DEVICE may be a Fuchsia device name, target specifier (e.g. serial:<serial>,
+## id:<id>), or network address that will be resolved using ffx.
+##
+## The default device resolution is performed by ffx using
+## a prioritized list of configuration to resolve the default target.
+## Once there is a value, the remainder of the list is ignored.
+##
+## * Specify the target on the ffx command line with --target.
+## * If configured, use the user level configuration set by ffx target default set.
+##   This user level configuration is stored relative to $HOME. This is controlled by
+##   running `ffx target default set`.
+## * The default configuration compiled into ffx checks two environment variables:
+##     "$FUCHSIA_DEVICE_ADDR"
+##     "$FUCHSIA_NODENAME"
+##    These are used by Fuchsia infra jobs to specify which target should be used
+##     when running a specific test FUCHSIA_NODENAME is also set to any
+##     build-directory default target set by `fx set-device`.
+## * If only one device is discovered
+##
+## If there is still no target device identified, or if there are multiple devices discovered,
+## an error is returned indicating a specific device needs to be identified as the default device
+## for that command.
+##
+## Examples:
+##   fx set-device strut-wind-ahead-turf
+##   fx set-device strut-wind-ahead-turf:222
+##   fx set-device 192.168.1.2
+##   fx set-device 192.168.3.1:8022
+##   fx set-device [fe80::7:8%eth0]
+##   fx set-device [fe80::7:8%eth0]:5222
+##   fx set-device serial:EM-C0B2F2D96
+##   fx set-device id:EM-C0B2F2D96
+##   fx set-device
+##
+## To unset, use `fx unset-device`.
+
+# -e exit immediately on commmand failure
+# -o pipefail the return value is the value of rightmost command in a pipeline.
+set -e -o pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+fx-standard-switches "$@"
+fx-config-read
+fx-fail-if-device-specified
+
+function select_device() {
+  IFS=$'\n' read -rd '' -a devices <<<"$1"
+  select choice in "${devices[@]}"; do
+    echo "${devices[$((REPLY-1))]}"
+    break
+  done
+}
+
+# FX_REMOTE_INVOCATION is set by serve-remote to supress the warning
+# for that use case.
+if is-remote-workflow-device && [[ -z "${FX_REMOTE_INVOCATION}" ]]; then
+  fx-warn "Local configuration indicates a remote-workflow setup"
+  fx-warn "  'fx set-device' does not work correctly at this end of a remote setup"
+  fx-warn "Execute set-device on the local machine in order to change targets in the remote flow"
+fi
+
+device="$1"
+if [[ -z "$device" ]]; then
+  devices="$(fx-target-finder-info | cut -d ' ' -f 2)"
+  if [[ -z "${devices}" ]]; then
+    fx-error "No devices discovered, please supply a device name"
+    exit 1
+  fi
+  if [[ "$(echo "$devices" | wc -l)" -ge 2 ]]; then
+    fx-error "Multiple devices found, please pick one from the list:"
+    device=$(select_device "$devices")
+  else
+    device="${devices}"
+  fi
+elif ! is-valid-device "${device}"; then
+  fx-error "Invalid device: ${device}"
+  fx-command-help
+  exit 1
+fi
+
+if [[ ! -d "${FUCHSIA_BUILD_DIR}" ]]; then
+  fx-error "Build directory ${FUCHSIA_BUILD_DIR} does not exist, run \"fx set\" first."
+  exit 1
+fi
+
+echo "Default device for '${FUCHSIA_BUILD_DIR}' is now ${device}"
+echo "$device" > "${FUCHSIA_BUILD_DIR}.device"
+
+# Ensure the below checks will report the correct error message.
+export FUCHSIA_NODENAME="${device}"
+
+# Check if the user has set a default target via environment variable(s) which
+# can override the effectiveness of this command.
+function overridden-env-var-error {
+  # This line is executed after echoing `Default device for ... is now $device`.
+  fx-error "However, you've overriden this value by setting ${ENV_VARS}."
+  fx-error "If you want to use \"$device\", please unset the ${ENV_VAR_NAMES} environment variable."
+
+  exit 1
+}
+fx-if-target-set-by-env overridden-env-var-error

@@ -1,0 +1,140 @@
+{{/*
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+
+{{- define "Method:CompleterBase:driver/WireMessagingHeader" }}
+{{ EnsureNamespace "" }}
+template<>
+class {{ .WireCompleterImpl }} : public ::fdf::internal::CompleterImplBase<{{ .Marker }}> {
+ public:
+  using CompleterImplBase::CompleterImplBase;
+
+  {{- /* Managed flavors are for now omitted from driver messaging. */}}
+};
+
+template <>
+class {{ .WireBufferCompleterImpl }} : public ::fdf::internal::BufferCompleterImplBase {
+ public:
+  using BufferCompleterImplBase::BufferCompleterImplBase;
+
+  void Reply({{ .WireReplyArgs }});
+
+  {{- if .HasDomainError }}
+  void ReplySuccess({{ RenderParams .Result.ValueParameters }});
+  void ReplyError({{ .Result.ErrorDecl }} error);
+  {{- end }}
+
+ private:
+  void MakeReply({{ RenderParams .ResponseArgs }});
+};
+
+template<>
+class {{ .WireCompleterBase }} : public ::fidl::CompleterBase, public {{ .WireCompleterImpl }} {
+ public:
+  {{ .WireCompleterBase.Self }}(::fidl::Transaction* transaction, bool owned, bool expects_reply)
+      : CompleterBase(transaction, owned, expects_reply),
+        {{ .WireCompleterImpl.Self }}(this) {}
+
+  {{- /* Update `this` pointer after moving the completer. */}}
+  {{ .WireCompleterBase.Self }}({{ .WireCompleterBase.Self }}&& other) noexcept
+      : CompleterBase(std::move(other)), {{ .WireCompleterImpl.Self }}(this) {}
+  {{ .WireCompleterBase.Self }}& operator=({{ .WireCompleterBase.Self }}&& other) noexcept {
+    CompleterBase::operator=(std::move(other));
+    {{ .WireCompleterImpl.Self }}::_set_core(this);
+    return *this;
+  }
+};
+
+{{- end }}
+
+
+
+{{- define "Method:CompleterBase:driver/WireMessagingSource" }}
+{{ EnsureNamespace "" }}
+
+void
+{{ .WireBufferCompleterImpl.NoLeading }}::Reply({{ .WireReplyArgs }}) {
+  {{- if .HasDomainError }}
+  if (result.is_ok()) {
+    return MakeReply({{ .WireReplySuccess "result.value()" }});
+  }
+  return ReplyError(std::move(result.error_value()));
+  {{- else if .HasFrameworkError }}
+  {{ .Result.BuildPayload "_response" -}}
+  return MakeReply({{ .WireReplySuccess "&_response" }});
+  {{- else }}
+  return MakeReply({{ RenderForwardParams .ResponseArgs }});
+  {{- end }}
+}
+
+void
+{{ .WireBufferCompleterImpl.NoLeading }}::MakeReply({{ RenderParams .ResponseArgs }}) {
+  {{ .WireTransactionalResponse }} _response{ {{ RenderForwardParams .ResponseArgs }} };
+  constexpr uint32_t _buffer_size = ::fidl::ServerReplyBufferSizeInChannel<{{ .Marker }}>();
+  uint8_t* _buffer = static_cast<uint8_t*>(_arena().Allocate(_buffer_size));
+  ::fidl::internal::UnownedEncodedMessage<
+      {{ .WireTransactionalResponse }}, {{ .Transport.Type }}> _response_message(
+      _buffer, _buffer_size, &_response);
+  return _core()->SendReply(
+      &_response_message.GetOutgoingMessage(),
+      ::fidl::internal::OutgoingTransportContext::Create<::fidl::internal::DriverTransport>(
+          _arena().get()));
+}
+
+{{- if .HasDomainError }}
+  void
+  {{ .WireBufferCompleterImpl.NoLeading }}::ReplySuccess(
+      {{- RenderParams .Result.ValueParameters }}) {
+    {{ .Result.BuildPayload "_response" -}}
+    return MakeReply({{ .WireReplySuccess "&_response" }});
+  }
+
+  void
+  {{ .WireBufferCompleterImpl.NoLeading }}::ReplyError({{ .Result.ErrorDecl }} error) {
+    return MakeReply({{ .WireReplyError "error" }});
+  }
+{{- end }}
+
+{{- end }}
+
+
+{{- define "Method:CompleterBase:driver/NaturalMessagingHeader" }}
+{{ EnsureNamespace "" }}
+template<>
+class {{ .NaturalCompleterBase }} : public ::fidl::CompleterBase {
+ public:
+  void Reply({{ .NaturalResponseArg "response" }});
+
+ protected:
+  using ::fidl::CompleterBase::CompleterBase;
+};
+
+{{- end }}
+
+
+
+{{- define "Method:CompleterBase:driver/NaturalMessagingSource" }}
+{{ EnsureNamespace "" }}
+void {{ .NaturalCompleterBase.NoLeading }}::Reply({{ .NaturalResponseArg "response" }}) {
+  ::fidl::internal::NaturalMessageEncoder _encoder{
+      &::fidl::internal::DriverTransport::VTable, {{ .OrdinalName }}, {{ .DynamicFlagsName }} };
+
+  fdf::Arena _arena('FIDL');
+  ::fidl::internal::OutgoingTransportContext _context =
+    ::fidl::internal::OutgoingTransportContext::Create<::fidl::internal::DriverTransport>(_arena.get());
+  {{- if .HasResponsePayload }}
+    {{- if .HasResponseArgs }}
+  _encoder.EncodeBody(
+      {{ .NaturalResponseConverter }}::IntoDomainObject({{ .Response.Forward "response" }}));
+    {{- else }}
+  _encoder.EncodeBody({{ .Result.ResultDecl }}::WithResponse({}));
+    {{- end }}
+  {{- end }}
+  ::fidl::OutgoingMessage _msg = _encoder.GetMessage();
+  ::fidl::OutgoingMessage _arena_msg = ::fdf::internal::MoveToArena(_msg, _arena);
+  SendReply(&_arena_msg, std::move(_context));
+}
+{{- end }}

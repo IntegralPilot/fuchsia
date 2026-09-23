@@ -1,0 +1,202 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.net.interfaces.admin;
+
+using zx;
+using fuchsia.net.interfaces;
+
+/// Properties of an IP address.
+type AddressProperties = table {
+    /// Information about the preferred lifetime of the address.
+    ///
+    /// If not set, interpreted as
+    /// `PreferredLifetimeInfo.preferred_lifetime_end = zx.Time.INFINITE`.
+    1: preferred_lifetime_info fuchsia.net.interfaces.PreferredLifetimeInfo;
+
+    /// The end of the valid lifetime of the address.
+    ///
+    /// The address should *not* be considered invalid if `zx.Time` is in the
+    /// past. `valid_lifetime_end` is exchanged as a means to inform the
+    /// deadline where invalidation is expected to happen.
+    ///
+    /// Refers to the valid lifetime of the address, as defined in
+    /// [RFC 4862, section 2](https://tools.ietf.org/html/rfc4862#section-2).
+    ///
+    /// Must be greater than 0. If `zx.Time.INFINITE`, the valid lifetime does
+    /// not expire.
+    ///
+    /// If not set, interpreted as `zx.Time.INFINITE`.
+    2: valid_lifetime_end zx.Time;
+};
+
+/// Reasons from IP address removal.
+type AddressRemovalReason = strict enum {
+    // TODO(https://fxbug.dev/42163322): Replace this comment with FIDL that
+    // actually reserves 0.
+    //
+    // The value of 0 is reserved and should never be added to avoid the
+    // ambiguity of 0 being the default integer value in some languages. See:
+    // https://fuchsia.dev/fuchsia-src/concepts/api/fidl#enum.
+
+    /// The address is not a valid address.
+    INVALID = 1;
+
+    /// The address is already assigned to the interface.
+    ALREADY_ASSIGNED = 2;
+
+    /// Duplicate Address Detection failed.
+    ///
+    /// A neighbor was found to hold the address.
+    DAD_FAILED = 3;
+
+    /// The address was removed as a result of the interface being removed.
+    INTERFACE_REMOVED = 4;
+
+    /// The address was removed from the interface by user action.
+    USER_REMOVED = 5;
+
+    /// Invalid address properties or parameters during addition or properties
+    /// update.
+    INVALID_PROPERTIES = 6;
+
+    /// The address was voluntarily forfeited.
+    ///
+    /// While performing ongoing address conflict detection, a neighbor was
+    /// found to be using the address. This error is similar to `DAD_FAILED`,
+    /// except that it may occur at any time after the address becomes assigned.
+    FORFEITED = 7;
+};
+
+/// Offers state information about an IP address.
+///
+/// This protocol encodes the underlying object's lifetime in both directions;
+/// the underlying object is alive iff both ends of the protocol are open
+/// (unless [`AddressStateProvider.Detach`] has been called). That is:
+///
+/// - Closing the client end causes the object to be destroyed.
+/// - Observing a closure of the server end indicates the object no longer
+///   exists.
+closed protocol AddressStateProvider {
+    /// Push an update when the address properties change.
+    ///
+    /// The client pushes updates on address properties changes, such as the
+    /// address becoming deprecated, or the preferred and valid lifetimes being
+    /// updated as a result of extending the address' lifetime. The server is
+    /// expected to cache address properties.
+    ///
+    /// If `address_properties` contains invalid property values, the address is
+    /// removed and [`AddressRemovalReason.INVALID_PROPERTIES`] is issued.
+    ///
+    /// + request `address_properties` the updated properties of the address.
+    strict UpdateAddressProperties(struct {
+        address_properties AddressProperties;
+    }) -> ();
+
+    /// Hanging get for address assignment state.
+    ///
+    /// The server does not keep a queue of assignment states, it returns the
+    /// latest state if it differs from the last one observed.
+    ///
+    /// The first call will always immediately return the current assignment
+    /// state. Subsequent calls will block until the returned value differs
+    /// from the last observed value.
+    ///
+    /// It is invalid to call this method while a previous call is pending.
+    /// Doing so will cause the server end of the protocol to be closed.
+    ///
+    /// - response `assignment_state` the assignment state of the address.
+    strict WatchAddressAssignmentState() -> (struct {
+        assignment_state fuchsia.net.interfaces.AddressAssignmentState;
+    });
+
+    /// Detaches the address' lifetime from the client end of the protocol.
+    ///
+    /// The client end of the protocol can be closed immediately after
+    /// calling this method, and the address will not be removed.
+    strict Detach();
+
+    /// Removes the address.
+    ///
+    /// The server end of the protocol is closed after address removal has
+    /// completed, and the `USER_REMOVED` `OnAddressRemoved` event is sent.
+    strict Remove();
+
+    /// Address successfully added event.
+    ///
+    /// This event is emitted at max once for the lifetime of the address when
+    /// the address is successfully added. If the address failed to be added,
+    /// this event will not be emitted and a terminal [`OnAddressRemoved`] event
+    /// is emitted instead with the reason [`AddressRemovalReason.INVALID`] or
+    /// [`AddressRemovalReason.ALREADY_ASSIGNED`].
+    strict -> OnAddressAdded();
+
+    /// Terminal event.
+    ///
+    /// Immediately precedes the closure of the server end of the protocol.
+    ///
+    /// - response `error` the removal reason.
+    strict -> OnAddressRemoved(struct {
+        error AddressRemovalReason;
+    });
+};
+
+/// Address assignment parameters.
+type AddressParameters = table {
+    /// The initial properties of the address.
+    ///
+    /// If not set, interpreted as an empty `AddressProperties`.
+    1: initial_properties AddressProperties;
+
+    /// True if the address is temporary.
+    ///
+    /// A temporary address is intended to be used for a short period of time
+    /// (hours to days), and its lifetime may not be extended, as detailed in
+    /// [RFC 4941](https://tools.ietf.org/html/rfc4941).
+    ///
+    /// Both temporary and non-temporary addresses have preferred and valid
+    /// lifetimes, but temporary addresses may not be renewed beyond their
+    /// initial lifetime.
+    ///
+    /// Information used in source address selection; temporary addresses are
+    /// preferred over non-temporary addresses if both types are available, as
+    /// detailed in
+    /// [RFC 6724, section 5](https://tools.ietf.org/html/rfc6724#section-5).
+    ///
+    /// If not set, interpreted as false.
+    2: temporary bool;
+
+    /// True if the subnet route corresponding to the address should be
+    /// installed, and removed once the address is removed.
+    ///
+    /// For example, if `Control#AddAddress` is called with 192.168.1.5/24, and
+    /// `add_subnet_route` is true, then a route with destination 192.168.1.0/24
+    /// will be installed through the interface the address is being added to.
+    /// If the address is removed for any reason, the route will also be
+    /// removed.
+    ///
+    /// The subnet route is always installed in the main table (see
+    /// https://fxbug.dev/42074223#c13 for more details). In the future, we
+    /// should allow the user of this API to specify where the route should be
+    /// installed and provide proof of access.
+    @deprecated(
+            "TODO(https://fxbug.dev/42074223): Do not use this without consulting with the Netstack team.")
+    3: add_subnet_route bool;
+
+    /// True if Duplicate Address Detection (DAD) should be performed.
+    ///
+    /// For IPv6, DAD is defined in RFC 4862, Section 5.4.
+    ///
+    /// For IPv4, Address Conflict Detection (ACD) is defined in RFC 5227. For
+    /// simplicity's sake, both specifications are refered to as DAD on this
+    /// API.
+    ///
+    /// If not set, interpreted as `true` for IPv6 addresses, and `false` for
+    /// IPv4 addresses.
+    ///
+    /// Note, the `fuchsia.net.interfaces.admin/Control` API allows setting
+    /// per-interface DAD configuration. DAD will only be performed for a given
+    /// address if its interface's configuration allows for it. Setting this
+    /// property to `true` will not override the interface's DAD configuration.
+    4: perform_dad bool;
+};

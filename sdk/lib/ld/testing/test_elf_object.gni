@@ -1,0 +1,250 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/zircon/c_utils.gni")
+
+# Generate ld::testing::TestElfObject data.
+#
+# This defines a target to examine a linked ELF file and generate source code
+# to define an ld::testing::TestElfObject C++ object for it.  This target is a
+# build action that generates a source code fragment into a file, but the only
+# "output" of this target is its metadata.  A test_elf_object() target's only
+# purpose is to be reached by the $deps of test_elf_load_set() targets, which
+# consume that metadata.
+#
+# Note that while a test_elf_object() target is not inherently testonly, the
+# targets that consume its metadata are all automatically testonly.
+#
+# Parameters
+#
+#   * deps
+#     - Required: Should reach at least one linking target.  It can reach more
+#     than one, to generate multiple ld::testing::TestElfObject objects at
+#     once.  But usually there's a separate test_elf_object() for each linking
+#     target, so it's regenerated only when that one target is relinked.
+#     - Type: list(label)
+#
+#   * visibility, testonly
+#     - Optional: Standard GN meaning.
+#     - Type: bool
+#
+template("test_elf_object") {
+  main_target = target_name
+  rspfile_target = "$target_name.rsp"
+  rspfile = "$target_gen_dir/$rspfile_target"
+  libprefix_target = "$target_name.libprefix"
+  libprefix_rspfile = "$target_gen_dir/$libprefix_target"
+
+  # `inline const ld::testing::TestElfObject kTestObject_<build-id-hex> = ...;`
+  gen_object = "$target_gen_dir/$target_name.test-elf-object.object.inc"
+  gen_object_path = rebase_path(gen_object, root_build_dir)
+
+  # `, kTestObject_<build-id-hex>`
+  gen_entry = "$target_gen_dir/$target_name.test-elf-object.entry.inc"
+  gen_entry_path = rebase_path(gen_entry, root_build_dir)
+
+  toolchain_utils_action(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "testonly",
+                           ])
+    script = "//sdk/lib/ld/testing/gen-test-elf-object.py"
+    utils = [ "llvm-readelf" ]
+    sources = [
+      libprefix_rspfile,
+      rspfile,
+    ]
+    depfile = "$target_gen_dir/$target_name.d"
+    outputs = [
+      gen_object,
+      gen_entry,
+    ]
+    deps = [
+      ":$libprefix_target",
+      ":$rspfile_target",
+    ]
+    args = [
+      "--rspfile=" + rebase_path(rspfile, root_build_dir),
+      "--libprefix-rspfile=" + rebase_path(libprefix_rspfile, root_build_dir),
+      "--depfile=" + rebase_path(depfile, root_build_dir),
+      "--object=$gen_object_path",
+      "--entry=$gen_entry_path",
+    ]
+    metadata = {
+      test_elf_object_include_object = [ "#include \"$gen_object_path\"" ]
+      test_elf_object_include_entry = [ "#include \"$gen_entry_path\"" ]
+    }
+  }
+
+  link_output_rspfile(rspfile_target) {
+    visibility = [ ":$main_target" ]
+    forward_variables_from(invoker, [ "testonly" ])
+    outputs = [ rspfile ]
+    deps = invoker.deps
+  }
+
+  generated_file(libprefix_target) {
+    visibility = [ ":$main_target" ]
+    forward_variables_from(invoker, [ "testonly" ])
+    outputs = [ libprefix_rspfile ]
+    deps = invoker.deps
+    output_conversion = "list lines"
+    data_keys = [ "libprefix" ]
+    walk_keys = [ "link_output_barrier" ]
+  }
+}
+
+# Generate ld::testing::TestElfLoadSet data.
+#
+# This collects metadata from any test_elf_object() targets in its $deps graph,
+# and assembles them into a larger source code fragment to define one named
+# ld::testing::TestElfLoadSet C++ object.  The underlying targets are just
+# generated_file(), so there is no work done after the `gn gen` stage.  These
+# files are referenced only via this target's metadata, which is collected by
+# test_elf_source_set() targets.
+#
+# test_elf_load_set() targets are inherently testonly.
+#
+# Parameters
+#
+#   * deps
+#     - Required: Should reach test_elf_object() targets.
+#     - Type: list(label)
+#
+#   * output_name
+#     - Required: Name for `ld::testing::TestLoadSet::FindLoadSet`.
+#     - Type: string
+#
+#   * visibility
+#     - Optional: Standard GN meaning.
+#     - Type: bool
+#
+template("test_elf_load_set") {
+  main_target = target_name
+  set_name = invoker.output_name
+  set_id = string_replace(string_replace(set_name, "-", "_"), ".", "_")
+
+  gen_set = "$target_gen_dir/$main_target.load-set.cc"
+  gen_set_path = rebase_path(gen_set, root_build_dir)
+  gen_object_inc_target = "$main_target.object"
+  gen_object_inc = "$target_gen_dir/$main_target.object.inc"
+  gen_object_inc_path = rebase_path(gen_object_inc, root_build_dir)
+  gen_entry_inc_target = "$main_target.entry"
+  gen_entry_inc = "$target_gen_dir/$main_target.entry.inc"
+  gen_entry_inc_path = rebase_path(gen_entry_inc, root_build_dir)
+
+  label = get_label_info(":$main_target", "label_with_toolchain")
+
+  generated_file(main_target) {
+    forward_variables_from(invoker, [ "visibility" ])
+    testonly = true
+    outputs = [ gen_set ]
+    contents = [
+      "// Generated by $label. DO NOT EDIT!",
+      "namespace ld::testing {",
+      "using namespace elfldltl::literals;",
+      "#include \"$gen_object_inc_path\"",
+      "const TestElfLoadSet kTestElfLoadSet_$set_id{\"$set_name\"_soname,",
+      "    kTestElfObjectList<void",
+      "#include \"$gen_entry_inc_path\"",
+      "    >};",
+      "}  // namespace ld::testing",
+    ]
+    deps = [
+      ":$gen_entry_inc_target",
+      ":$gen_object_inc_target",
+    ]
+    metadata = {
+      test_elf_load_set_include = [ "#include \"$gen_set_path\"" ]
+
+      # The barrier prevents another test_elf_load_set() whose deps reach this
+      # one from looking into this target's $deps to find the test_elf_object()
+      # targets that were already collected here.
+      test_elf_load_set_barrier = []
+
+      # These barriers prevent the deps propagating up things meant only for
+      # the direct users of the test ELF objects per se, not for the test
+      # harness code that uses the data about those ELF objects.
+      distribution_entries_barrier = []
+      link_output_barrier = []
+    }
+  }
+
+  generated_file(gen_object_inc_target) {
+    visibility = [ ":$main_target" ]
+    testonly = true
+    outputs = [ gen_object_inc ]
+    deps = invoker.deps
+    data_keys = [ "test_elf_object_include_object" ]
+    walk_keys = [ "test_elf_load_set_barrier" ]
+  }
+
+  generated_file(gen_entry_inc_target) {
+    visibility = [ ":$main_target" ]
+    testonly = true
+    outputs = [ gen_entry_inc ]
+    deps = invoker.deps
+    data_keys = [ "test_elf_object_include_entry" ]
+    walk_keys = [ "test_elf_load_set_barrier" ]
+  }
+}
+
+# Compile in ld::testing::TestElfLoadSet data.
+#
+# This produces a source_set() to compile the results of test_elf_load_set()
+# targets into test code.  Including this source_set() in a test executable
+# enables `ld::testing::TestElfLoadSet::Get("$output_name")` to find the data
+# for the test_elf_load_set() in $deps with that $output_name.
+#
+# test_elf_source_set() targets are inherently testonly.
+#
+# Parameters
+#
+#   * deps
+#     - Required: Should reach any number of test_elf_load_set() targets.
+#     - Type: list(label)
+#
+#   * visibility
+#     - Optional: Standard GN meaning.
+#     - Type: list(label)
+#
+template("test_elf_source_set") {
+  main_target = target_name
+  preamble_target = "$target_name.preamble"
+  gen_target = "$target_name.gen"
+  gen_file = "$target_gen_dir/$target_name.cc"
+
+  label = get_label_info(":$main_target", "label_with_toolchain")
+
+  source_set(main_target) {
+    forward_variables_from(invoker, [ "visibility" ])
+    testonly = true
+    sources = [ gen_file ]
+    include_dirs = [ root_build_dir ]
+    deps = [
+      ":$gen_target",
+      "//sdk/lib/ld/testing",
+    ]
+  }
+
+  group(preamble_target) {
+    visibility = [ ":$gen_target" ]
+    testonly = true
+    metadata = {
+      test_elf_load_set_include = [
+        "// Generated by $label. DO NOT EDIT!",
+        "#include <lib/ld/testing/test-elf-object.h>",
+      ]
+    }
+  }
+
+  generated_file(gen_target) {
+    visibility = [ ":$main_target" ]
+    testonly = true
+    outputs = [ gen_file ]
+    deps = [ ":$preamble_target" ] + invoker.deps
+    data_keys = [ "test_elf_load_set_include" ]
+  }
+}

@@ -1,0 +1,126 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.storage.partitions;
+
+using fuchsia.storage.block;
+using zx;
+
+alias PartitionInfo = fuchsia.storage.block.PartitionInfo;
+
+/// Exposes per-partition operations.
+/// Note that this protocol is only exposed for GPT partitions which are not included in an overlay
+/// (and are actual partitions; i.e. not overlays themselves).  It follows that partitions involved
+/// in an overlay cannot be modified, as the `UpdateMetadata` method is the only means for a client
+/// to modify a partition.
+@discoverable
+closed protocol Partition {
+    /// Appends an update to `transaction` (see `PartitionManager.CreateTransaction`)
+    /// to modify the partition's metadata.  The update is only applied once the transaction
+    /// is committed.
+    strict UpdateMetadata(resource table {
+        1: transaction zx.Handle:EVENTPAIR;
+        2: type_guid fuchsia.storage.block.Guid;
+        3: flags uint64;
+    }) -> () error zx.Status;
+};
+
+// This limit is arbitrary and can change as needed.
+const MAX_PARTITIONS_PER_OVERLAY uint32 = 2;
+
+/// An overlay is created from merging several contiguous GPT partitions into one logical partition.
+@discoverable
+closed protocol OverlayPartition {
+    /// Returns the set of underlying GPT partitions which the overlay contains.
+    strict GetPartitions() -> (struct {
+        partitions vector<PartitionInfo>:MAX_PARTITIONS_PER_OVERLAY;
+    }) error zx.Status;
+};
+
+@discoverable
+closed protocol PartitionsManager {
+    /// Returns the dimensions of the block device the partition manager resides in.
+    strict GetBlockInfo() -> (struct {
+        block_count uint64;
+        block_size uint32;
+    }) error zx.Status;
+
+    /// Starts a new transaction to modify the partition table.  The transaction will only be
+    /// applied when `CommitTransaction` is called.  Only one transaction may be active at any given
+    /// time.  Closing all handles to the returned event will cancel the transaction.
+    /// Changes are added to the transaction via the `Partition` interface, passing in a
+    /// duplicate of the `transaction` object.
+    ///
+    /// All changes in the transaction are applied atomically.
+    strict CreateTransaction() -> (resource struct {
+        transaction zx.Handle:EVENTPAIR;
+    }) error zx.Status;
+
+    /// Commits the changes pending in the transaction.
+    strict CommitTransaction(resource struct {
+        transaction zx.Handle:EVENTPAIR;
+    }) -> () error zx.Status;
+
+    /// Allocates a new partition in `transaction`.  Fails if there is insufficient space for the
+    /// requested partition.  There must be an empty slot in the partition table (the table will not
+    /// be resized).
+    strict AddPartition(resource table {
+        1: transaction zx.Handle:EVENTPAIR;
+        // Must be set to a non-zero value.
+        2: num_blocks uint64;
+        // Must be set to a non-empty value.
+        3: name string:fuchsia.storage.block.NAME_LENGTH;
+        // Must be set to a non-nil value.
+        4: type_guid fuchsia.storage.block.Guid;
+        // If unset, a GUID is generated.
+        5: instance_guid fuchsia.storage.block.Guid;
+        6: flags uint64;
+    }) -> () error zx.Status;
+};
+
+/// Describes a partition entry for use with `PartitionsAdmin.ResetPartitionTable`.
+type PartitionEntry = struct {
+    // Must be non-empty.
+    name string:fuchsia.storage.block.NAME_LENGTH;
+    // Must be non-zero.
+    type_guid fuchsia.storage.block.Guid;
+    // Must be non-zero.
+    instance_guid fuchsia.storage.block.Guid;
+    // The target range must not overlap with any other partition or the GPT metadata.
+    start_block uint64;
+    num_blocks uint64;
+    flags uint64;
+};
+
+// This limit is arbitrary and can change as needed.
+const MAX_PARTITIONS uint32 = 128;
+
+@discoverable
+closed protocol PartitionsAdmin {
+    /// Wipes and re-initializes the partition table.  This is a destructive operation!
+    /// If there are any active clients of existing partitions, their connections will be severed.
+    /// This function is only intended to be used in product configurations where nothing is
+    /// actively using any partitions, so there's no need to make this operation graceful.
+    ///
+    /// Partitions table entries are assigned in the specified order.  Empty entries are permitted
+    /// (i.e. all fields set to 0) and will result in an empty slot in the partition table, which
+    /// allows the table size to be set appropriately.
+    strict ResetPartitionTable(struct {
+        partitions vector<PartitionEntry>:MAX_PARTITIONS;
+    }) -> () error zx.Status;
+};
+
+/// Each partition exposes this service.  The instance names are unique for each partition but
+/// otherwise have no special meaning.  In practice they correspond to the index in the GPT.
+service PartitionService {
+    /// Always present.
+    volume client_end:fuchsia.storage.block.Block;
+    /// Present when the underlying block device supports mapping.
+    mapper client_end:fuchsia.storage.block.Mapper;
+    /// Present for partitions which are actual GPT partitions.
+    partition client_end:Partition;
+    /// Present for partitions which are overlays (i.e. a logical merge of several contiguous
+    /// partitions).
+    overlay client_end:OverlayPartition;
+};

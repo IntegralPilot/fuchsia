@@ -1,0 +1,186 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.bluetooth.sys;
+
+using fuchsia.bluetooth as bt;
+
+@strict_audit(bug="https://fxbug.dev/467127725", state="PENDING_REVIEW")
+type Error = strict enum {
+    /// Operation could not be performed.
+    FAILED = 1;
+
+    /// The peer designated for the operation was not found.
+    PEER_NOT_FOUND = 2;
+
+    /// The time limit for the operation has expired.
+    TIMED_OUT = 3;
+
+    /// The operation was canceled.
+    CANCELED = 4;
+
+    /// Operation already in progress.
+    IN_PROGRESS = 5;
+
+    /// Operation not supported.
+    NOT_SUPPORTED = 6;
+
+    /// The operation was given an invalid set of arguments.
+    INVALID_ARGUMENTS = 7;
+};
+
+/// Represents an active procedure. The validity of a handle that supports this protocol is tied to
+/// the activity of the procedure that it is attached to. To elaborate:
+///
+///   1. Closing a token handle ends the procedure that it is attached to.
+///   2. The system closes a token handle to communicate that a procedure was internally terminated.
+closed protocol ProcedureToken {};
+
+/// Protocol that abstracts the operational modes and procedures defined in the Bluetooth Generic
+/// Access Profile (see Core Specification v5.1, Vol 3, Part C).
+///
+/// The procedures under this protocol apply to the system as a whole. The Bluetooth controller that
+/// plays an active role in these procedures can be managed using the HostWatcher protocol.
+///
+/// The procedures initiated by an Access protocol instance are terminated when the underlying
+/// channel is closed.
+@discoverable(server="platform")
+closed protocol Access {
+    /// Assign a PairingDelegate to respond to drive pairing procedures. The delegate will be
+    /// configured to use the provided I/O capabilities to determine the pairing method.
+    ///
+    /// Only one PairingDelegate can be registered at a time. Closing a PairingDelegate aborts all
+    /// on-going pairing procedures associated with a delegate and closes the PairingDelegate
+    /// previously assigned for this Access instance.
+    ///
+    /// + request `input` Bluetooth input capability
+    /// + request `output` Bluetooth output capability
+    /// + request `delegate` The client end of a PairingDelegate channel.
+    /// # Deprecation - This method is folded into the fuchsia.bluetooth.sys/Pairing protocol. See
+    ///   https://fxbug.dev/42180744 for more details on the migration.
+    @available(added=7, deprecated=HEAD, note="Use `sys.Pairing/SetPairingDelegate` instead")
+    strict SetPairingDelegate(resource struct {
+        input InputCapability;
+        output OutputCapability;
+        delegate client_end:PairingDelegate;
+    });
+
+    /// Assign a local name for the Bluetooth system. This name will be visible to nearby peers
+    /// when the system is in discoverable mode and during name discovery procedures.
+    ///
+    /// + request `name` The complete local name to assign to the system.
+    strict SetLocalName(struct {
+        name bt.DeviceName;
+    });
+
+    /// Set the local device class that will be visible to nearby peers when the system is in
+    /// discoverable mode.
+    ///
+    /// + request `device_class` The device class to assign to the system.
+    strict SetDeviceClass(struct {
+        device_class bt.DeviceClass;
+    });
+
+    /// Put the system into the "General Discoverable" mode on the BR/EDR transport. The active
+    /// host will respond to general inquiry (by regularly entering the inquiry scan mode).
+    ///
+    /// + request `token` [`fuchsia.bluetooth.sys/ProcedureToken`] that will remain valid while a
+    ///   discoverable mode session is active. NOTE: The system may remain discoverable until all
+    ///   [`fuchsia.bluetooth.sys/Access`] clients drop their tokens.
+    /// * error Reports Error.FAILED if inquiry mode cannot be entered.
+    strict MakeDiscoverable(resource struct {
+        token server_end:ProcedureToken;
+    }) -> () error Error;
+
+    /// Set the BR/EDR and LE connection policy for the active host.
+    ///
+    /// * error Reports Error.FAILED if the requested connection policy couldn't be applied.
+    @available(added=HEAD)
+    strict SetConnectionPolicy(resource table {
+        /// Suppress all new connections over the BR/EDR transport. The active host will disable
+        /// page scan while the `ProcedureToken` is held open.
+        /// NOTE: The system will remain non-connectable until all [`fuchsia.bluetooth.sys/Access`]
+        /// clients drop their tokens.
+        1: suppress_bredr_connections server_end:ProcedureToken;
+    }) -> () error Error;
+
+    /// Start a general discovery procedure. All general discoverable BR/EDR, LE,
+    /// and BR/EDR/LE devices will appear in the peer list, which can be observed by calling
+    /// [`fuchsia.bluetooth.sys/Access.WatchPeers`].
+    ///
+    /// + request `token` [`fuchsia.bluetooth.sys/ProcedureToken`] that will remain valid while
+    ///   discovery is in progress. NOTE: The radio will continue performing discovery until all
+    ///   [`fuchsia.bluetooth.sys/Access`] drop their tokens.
+    /// * error Reports Error.FAILED if discovery on either transport cannot be initiated.
+    strict StartDiscovery(resource struct {
+        token server_end:ProcedureToken;
+    }) -> () error Error;
+
+    /// Returns a list of all peers (connectable Bluetooth devices) known to the system. The first
+    /// call results in a snapshot of all known peers to be sent immediately in the `updated` return
+    /// paremeter. Subsequent calls receive a response only when one or more entries have been
+    /// added, modified, or removed from the entries reported since the most recent call.
+    ///
+    /// - response `updated` Peers that were added or updated since the last call to WatchPeers().
+    /// - response `removed` Ids of peers that were removed since the last call to WatchPeers().
+    // TODO(https://fxbug.dev/42144165): Implement a pagination scheme for this method and apply suitable
+    // vectors bounds. MAX will likely not prevent this method from overfilling a FIDL message if
+    // the client falls behind. This can happen during device discovery as it can involve high
+    // volume of peer updates.
+    strict WatchPeers() -> (struct {
+        updated vector<Peer>:MAX;
+        removed vector<bt.PeerId>:MAX;
+    });
+
+    /// Initiate a connection to the peer with the given `id`. This method connects both BR/EDR and
+    /// LE transports depending on the technologies that the peer is known to support.
+    ///
+    /// + request `id` The id of the peer to connect.
+    /// * error Reports `Error.FAILED` if a connection to the peer cannot be initiated.
+    /// * error Reports `Error.PEER_NOT_FOUND` if `id` is not recognized.
+    strict Connect(struct {
+        id bt.PeerId;
+    }) -> () error Error;
+
+    /// Disconnect all logical links to the peer with the given `id`. This includes LE and
+    /// BR/EDR links that have been initiated using all Access and fuchsia.bluetooth.le protocol
+    /// instances.
+    ///
+    /// + request `id` The id of the peer to disconnect.
+    /// * error Reports `Error.PEER_NOT_FOUND` if `id` is not recognized.
+    strict Disconnect(struct {
+        id bt.PeerId;
+    }) -> () error Error;
+
+    /// Initiate a pairing to the remote `id` with the given `options`.
+    /// This call completes only once the pairing procedure has completed or aborted.
+    /// Returns an error if no connected peer with `id` is found or the pairing procedure fails.
+    /// If the named peer is already paired, this returns immediately with a success value - unless
+    /// the pairing is over LE and the PairingOptions.le_security_level is more secure than the
+    /// current security level, in which case we will attempt to raise security to the requested
+    /// level.
+    ///
+    /// Pairing will take place over whichever transport is indicated by `options.transport`. If
+    /// that transport isn't currently connected, the pairing will fail with `Error.PEER_NOT_FOUND`.
+    /// Currently, if DUAL_MODE is requested, we will attempt to pair over the LE transport.
+    ///
+    /// + request `id` The id of the peer to initiate pairing with
+    /// + request `options` The configuration options to use for this pairing request
+    /// * error Reports `Error.PEER_NOT_FOUND` if `id` is not recognized, or the peer is not
+    ///   connected on the requested transport.
+    /// * error Reports `Error.INVALID_ARGUMENTS` if ill-formed options are passed
+    /// * error Reports `Error.FAILED` if an error occurs during pairing
+    strict Pair(struct {
+        id bt.PeerId;
+        options PairingOptions;
+    }) -> () error Error;
+
+    /// Removes all bonding information and disconnects any existing links with the peer with the
+    /// given `id`.
+    ///
+    /// + request `id` The id of the peer to forget.
+    /// * error Reports `Error.PEER_NOT_FOUND` if `id` is not recognized.
+    strict Forget(struct {
+        id bt.PeerId;
+    }) -> () error Error;
+};

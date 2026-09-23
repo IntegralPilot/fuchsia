@@ -1,0 +1,300 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#  ________  _________  ________  ________
+# |\   ____\|\___   ___\\   __  \|\   __  \
+# \ \  \___|\|___ \  \_\ \  \|\  \ \  \|\  \
+#  \ \_____  \   \ \  \ \ \  \\\  \ \   ____\
+#   \|____|\  \   \ \  \ \ \  \\\  \ \  \___|
+#     ____\_\  \   \ \__\ \ \_______\ \__\
+#    |\_________\   \|__|  \|_______|\|__|
+#    \|_________|
+#
+# Here to enable an unstable feature? All unstable features require special
+# approval because they create risk and may have stable alternatives that better
+# fit our needs. See the "Unstable features" section for more information.
+
+import("//build/board.gni")
+import("//build/rust/config.gni")
+import("//build/toolchain/rbe.gni")
+import("//build/toolchain/runtime/rust_runtime.gni")
+
+declare_args() {
+  # Controls whether the rust compiler uses v0 symbol mangling scheme
+  # (see https://github.com/rust-lang/rfcs/blob/HEAD/text/2603-rust-symbol-name-mangling-v0.md).
+  rust_v0_symbol_mangling = true
+
+  # Enable the rust parallel front-end with N threads
+  rust_parallel_frontend_threads = false
+}
+
+if (is_fuchsia) {
+  rust_runtime_link_config("rust-libstd-so-ldflags") {
+    name = "libstd"
+  }
+}
+
+# Turns on the rust compilation analysis generator. This will produce a
+# directory $OUT/save-analysis-temp, which will dump all the source analysis
+# that the compiler collected while analyzing the source.  This config is
+# included conditionally, see //build/config/BUILDCONFIG.gn for details.
+config("analysis") {
+  rustflags = [ "-Zsave-analysis" ]
+}
+
+config("self-profile") {
+  rustflags = [
+    "-Zself-profile",
+    "-Zself-profile-events=default,args",
+  ]
+}
+
+config("time-passes") {
+  rustflags = [ "-Ztime-passes" ]
+}
+
+config("edition_2024") {
+  rustflags = [ "--edition=2024" ]
+}
+
+config("edition_2021") {
+  rustflags = [ "--edition=2021" ]
+}
+
+config("edition_2018") {
+  rustflags = [ "--edition=2018" ]
+}
+
+config("edition_2015") {
+  rustflags = [ "--edition=2015" ]
+}
+
+config("no_features") {
+  rustflags = [ "-Zallow-features=" ]
+}
+
+# TODO(https://fxbug.dev/556328773): Use next generation trait solver after compile time regression is addressed.
+config("next_solver") {
+  rustflags = [ "-Znext-solver=coherence" ]
+}
+
+config("error_format_human") {
+  rustflags = [ "--error-format=human" ]
+}
+
+config("incremental") {
+  if (rust_incremental != "") {
+    if (rust_rbe_enable) {
+      # Hide incremental mode from remote execution; do not attempt to
+      # use any local incremental cache state (which would surely
+      # result in a cache miss).
+      # Caveat: Local and remote outputs may no longer be bit-identical
+      # when adding such local-only options.  Use with care.
+      rustflags = [ "--local-only=-Cincremental=" + rust_incremental ]
+    } else {
+      rustflags = [ "-Cincremental=" + rust_incremental ]
+    }
+  }
+}
+
+config("one_codegen_unit") {
+  # Disable codegen parallelism.
+  # Trades incremental rebuild speed for smaller code size.
+  # See: https://fxbug.dev/42154118, https://fxbug.dev/42160867
+  if (rust_incremental == "") {
+    rustflags = [ "-Ccodegen-units=1" ]
+  }
+}
+
+config("codegen_units_16") {
+  # Enable default codegen parallelism (rustc default).
+  # This will increase code size over `:one_codegen_unit` above.
+  #
+  # Used without any lto option, this will also enable thin-local lto.
+  # https://doc.rust-lang.org/rustc/codegen-options/index.html#lto
+  if (rust_incremental == "") {
+    rustflags = [ "-Ccodegen-units=16" ]
+
+    # Use the larger RBE workers when using 16 threads for codegen.
+    configs = [ "//build/config/rbe:big_rbe_machine" ]
+  }
+}
+
+config("parallel_frontend_threads") {
+  if (rust_parallel_frontend_threads != false) {
+    # Use the parallel front-end with up to N threads, set by the
+    # rust_parallel_frontend_threads GN arg.
+    rustflags = [
+      "-Z",
+      "threads=${rust_parallel_frontend_threads}",
+    ]
+  }
+}
+
+config("debug_assertions") {
+  rustflags = [ "-Cdebug-assertions=yes" ]
+}
+
+config("no_debug_assertions") {
+  rustflags = [ "-Cdebug-assertions=no" ]
+}
+
+config("default_debug_assertions") {
+  if (rust_debug_assertions) {
+    configs = [ ":debug_assertions" ]
+  } else {
+    configs = [ ":no_debug_assertions" ]
+  }
+}
+
+# Best practices for Rust binaries that go into size-constrained bootfs.
+config("bootfs") {
+  # Optimize for size.
+  # TODO(https://fxbug.dev/42165168): use "z" when resolved.
+  rustflags = [ "-Copt-level=s" ]
+
+  if (target_cpu == "arm64" && is_debug) {
+    # Debug builds produce large Rust binaries.
+    # So large they might not fit in the ZBI.
+    # Force ThinLTO to squeeze Rust binaries further.
+    # See: https://fxbug.dev/42160867
+    # See: https://fxbug.dev/42172876
+    configs = [ "//build/config/lto:thinlto" ]
+  }
+}
+
+config("proc_macro_test") {
+  rustflags = [
+    "--extern",
+    "proc_macro",
+  ]
+}
+
+config("2018_idioms") {
+  rustflags = [ "-Wrust-2018-idioms" ]
+}
+
+config("target") {
+  rustflags = [
+    "--target",
+    rust_target,
+  ]
+}
+
+config("cap_lints") {
+  if (rust_rbe_enable && rust_rbe_exec_strategy == "local" &&
+      rust_cap_lints != rust_cap_lints_default) {
+    # The local exec strategy tries to see if there's an RBE cache hit before
+    # running the command locally. The RBE cache is often populated by infra
+    # builders which never have this flag, so we want to include it *only* when
+    # checking for a cache hit. This flag doesn't affect the output of the
+    # artifact, so it's safe to reuse it.
+    rustflags = [
+      "--remote-only=--cap-lints=$rust_cap_lints_default",
+      "--local-only=--cap-lints=$rust_cap_lints",
+    ]
+  } else {
+    rustflags = [ "--cap-lints=$rust_cap_lints" ]
+  }
+}
+
+config("cap_lints_allow") {
+  # This does not change for RBE as this config is used by targets to specify
+  # that they need specific lint handling, and should override the setting from
+  # `:cap_lints` above.
+  rustflags = [ "--cap-lints=allow" ]
+}
+
+config("panic_abort") {
+  rustflags = [
+    "-Cpanic=abort",
+    "-Cforce-unwind-tables=yes",
+    "-Zpanic_abort_tests",
+  ]
+}
+
+config("v0_symbol_mangling") {
+  if (rust_v0_symbol_mangling) {
+    rustflags = [ "-Csymbol-mangling-version=v0" ]
+  }
+}
+
+# TODO(https://fxbug.dev/42148577) remove this allowance
+config("allow_legacy_derive_helpers") {
+  rustflags = [ "-Alegacy-derive-helpers" ]
+}
+
+config("coverage") {
+  rustflags = [ "-Cinstrument-coverage" ]
+}
+
+# TODO(https://fxbug.dev/42176241): Eliminate or identify all sources of output dir leaks.
+# This option makes it explicit that a particular build action is sensitive
+# to the output dir path, and informs remote execution to refrain from
+# normalizing the output dir, which improves caching.
+# As a goal, we should aim to minimize the need for this config.
+config("output_dir_sensitive") {
+  if (rust_rbe_enable) {
+    # --remote-flag=* is a pseudo flag that is intercepted by
+    # build/rbe/rustc_remote_wrapper.py and forwarded to rewrapper (reclient).
+    rustflags = [ "--remote-flag=--canonicalize_working_dir=false" ]
+  }
+}
+
+# Force local compilation for Rust.
+# This could be suitable for actions that run OOM on RBE workers.
+# See also options for running on bigger remote workers
+# in //build/toolchain/concurrent_jobs.gni.
+config("rbe_disable") {
+  if (rust_rbe_enable) {
+    # --remote-disable is a pseudo flag intercepted by
+    # build/rbe/rustc_remote_wrapper.py, and never exposed to rustc.
+    rustflags = [ "--remote-disable" ]
+  }
+}
+
+# On remote-cache miss, execute locally.
+# This mode will not attempt any remote execution, and thus,
+# not warm the remote cache.
+# This may be an attractive option for targets that are large,
+# frequently miss the cache, frequently on the critical path and
+# thus, benefit from local build speeds.
+config("rbe_strategy_local") {
+  if (rust_rbe_enable) {
+    # --remote-flag=* is a pseudo flag that is intercepted by
+    # build/rbe/rustc_remote_wrapper.py and forwarded to rewrapper (reclient).
+    rustflags = [ "--remote-flag=--exec_strategy=local" ]
+  }
+}
+
+# On cache-miss, use whichever succeeds first between local and remote.
+# There is a limited number of local execution slots.
+# The remote cache is warmed by this mode, so the next time the same
+# action is encountered, it will cache hit.
+config("rbe_strategy_racing") {
+  if (rust_rbe_enable) {
+    # --remote-flag=* is a pseudo flag that is intercepted by
+    # build/rbe/rustc_remote_wrapper.py and forwarded to rewrapper (reclient).
+    rustflags = [ "--remote-flag=--exec_strategy=racing" ]
+  }
+}
+
+# Disable downloading outputs, and instead write download stubs that can be
+# used to fetch remote outputs later as needed.
+# Even in this mode, depfiles are always still downloaded.
+config("no_download") {
+  if (rust_rbe_enable) {
+    # --remote-flag=* is a pseudo flag that is intercepted by
+    # build/rbe/rustc_remote_wrapper.py and forwarded to rewrapper (reclient).
+    rustflags = [ "--remote-flag=--download_outputs=false" ]
+  }
+}
+# Unstable features
+#
+# These configs enable unstable Rust features. Configs that enable unstable
+# features must go through an approval process before they may be added. See:
+# https://fuchsia.dev/fuchsia-src/development/languages/rust/unstable#the_process
+#
+# When adding a new config, make sure to add a TODO with a link to the tracking
+# issue.

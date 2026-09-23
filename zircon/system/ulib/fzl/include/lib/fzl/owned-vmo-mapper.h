@@ -1,0 +1,76 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef LIB_FZL_OWNED_VMO_MAPPER_H_
+#define LIB_FZL_OWNED_VMO_MAPPER_H_
+
+#include <lib/fzl/vmar-manager.h>
+#include <lib/fzl/vmo-mapper.h>
+#include <lib/zx/vmo.h>
+
+#include <utility>
+
+#include <fbl/macros.h>
+#include <fbl/ref_counted.h>
+#include <fbl/ref_ptr.h>
+
+namespace fzl {
+
+// OwnedVmoWrapper is a convenience wrapper around the underlying VmoMapper
+// which also takes ownership of the underlying VMO.
+class OwnedVmoMapper : protected VmoMapper {
+ public:
+  OwnedVmoMapper() = default;
+  ~OwnedVmoMapper() { Reset(); }
+  DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(OwnedVmoMapper);
+
+  // Move support
+  OwnedVmoMapper(OwnedVmoMapper&& other) { MoveFromOther(&other); }
+
+  OwnedVmoMapper& operator=(OwnedVmoMapper&& other) {
+    Reset();
+    MoveFromOther(&other);
+    return *this;
+  }
+
+  // See |VmoMapper::CreateAndMap|.
+  zx_status_t CreateAndMap(uint64_t size, const char* name,
+                           zx_vm_option_t map_options = ZX_VM_PERM_READ | ZX_VM_PERM_WRITE,
+                           fbl::RefPtr<VmarManager> vmar_manager = nullptr,
+                           uint32_t cache_policy = 0, uint32_t vmo_options = 0);
+
+  // See |VmoMapper::Map|.
+  zx_status_t Map(zx::vmo vmo, uint64_t offset, uint64_t size, zx_vm_option_t map_options,
+                  fbl::RefPtr<VmarManager> vmar_manager = nullptr);
+
+  // Reset the VMO from whichever VMAR it was mapped into, then release.
+  void Reset() {
+    vmo_.reset();
+    VmoMapper::Unmap();
+  }
+
+  zx::vmo Release() {
+    VmoMapper::Unmap();
+    return std::move(vmo_);
+  }
+
+  const zx::vmo& vmo() const { return vmo_; }
+
+  using VmoMapper::manager;
+  using VmoMapper::size;
+  using VmoMapper::start;
+
+ protected:
+  void MoveFromOther(OwnedVmoMapper* other) {
+    vmo_ = std::move(other->vmo_);
+    VmoMapper::MoveFromOther(other);
+  }
+
+ private:
+  zx::vmo vmo_;
+};
+
+}  // namespace fzl
+
+#endif  // LIB_FZL_OWNED_VMO_MAPPER_H_

@@ -1,0 +1,111 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/python/python_action.gni")
+import("//build/python/python_binary.gni")
+import("../layers.gni")
+
+# To prevent confusion, restrict default visibility.
+visibility = [ ":*" ]
+
+executable("validation-server-bin") {
+  output_name = "validation-server"
+
+  sources = [ "validation_server.cc" ]
+
+  deps = [
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/fdio",
+    "//sdk/lib/sys/cpp",
+    "//sdk/lib/vfs/cpp",
+    "//src/lib/fxl",
+  ]
+}
+
+group("vulkan_validation_layers") {
+  deps = [
+    ":vklayer_khronos_validation_json",
+    "//third_party/Vulkan-ValidationLayers/src:vulkan_validation_layers",
+  ]
+}
+
+# Modify the validation layer json to reference the correct library path.
+action("process_layer_json") {
+  deps = [ "//third_party/Vulkan-ValidationLayers/src:vulkan_gen_json_files" ]
+  script = "process_layer_json.py"
+  sources = [ "${vulkan_data_dir}/VkLayer_khronos_validation.json" ]
+  outputs = [ "$target_gen_dir/VkLayer_khronos_validation.json" ]
+  args = [
+    rebase_path(outputs[0], root_build_dir),
+    rebase_path(sources[0], root_build_dir),
+  ]
+}
+
+resource("vklayer_khronos_validation_json") {
+  target_outputs = get_target_outputs(":process_layer_json")
+  sources = [ target_outputs[0] ]
+  outputs = [ "data/vulkan/explicit_layer.d/VkLayer_khronos_validation.json" ]
+  deps = [ ":process_layer_json" ]
+}
+
+fuchsia_component("validation-server-component") {
+  manifest = "meta/validation-server.cml"
+  component_name = "validation-server"
+  deps = [
+    ":validation-server-bin",
+    ":vulkan_validation_layers",
+  ]
+}
+
+fuchsia_package("validation-server-pkg") {
+  visibility += [ "*" ]
+  deps = [ ":validation-server-component" ]
+}
+
+group("vulkan-validation-pkg") {
+  visibility += [ "*" ]
+  deps = [ ":validation-server-pkg" ]
+}
+
+python_binary("make_validation_client_cml") {
+  main_source = "make_validation_client_cml.py"
+  deps = [ "//build/python/modules/assembly" ]
+}
+
+if (current_toolchain == target_toolchain) {
+  # Generate a cml that includes a specific version of vulkan-validation-pkg.
+  python_action("cml") {
+    package_manifest_file =
+        get_label_info(":validation-server-pkg", "target_out_dir") +
+        "/validation-server-pkg/package_manifest.json"
+
+    # The package_manifest.json file contains the current package hash.
+    deps = [ ":validation-server-pkg" ]
+    binary_label = ":make_validation_client_cml"
+    inputs = [ package_manifest_file ]
+    outputs = [ "$target_gen_dir/validation-client.cml" ]
+    args = [
+      rebase_path(outputs[0], root_build_dir),
+      rebase_path(package_manifest_file, root_build_dir),
+    ]
+  }
+}
+
+# Clients that want access to Vulkan validation layers should depend on this.
+fuchsia_component("validation-client") {
+  component_name = "validation-client"
+
+  # This package component isn't ready for production use. Most clients should
+  # depend on //src/lib/vulkan/validation_layers instead.
+  visibility += [ "//src/graphics/tests/vkvalidation:*" ]
+
+  cml_target = ":cml($target_toolchain)"
+
+  manifest_deps = [ cml_target ]
+
+  manifest = get_label_info(manifest_deps[0], "target_gen_dir") +
+             "/validation-client.cml"
+}

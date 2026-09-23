@@ -1,0 +1,777 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/host.gni")
+import("//build/python/python_action.gni")
+import("//build/python/python_binary.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_embed_files.gni")
+import("//build/testing/host_test.gni")
+import("//build/testing/host_test_data.gni")
+
+# Declares a host-side Python E2E Mobly test.
+#
+# Mobly is an open-source Python test framework
+# that specializes at E2E tests with complex testbeds
+# such as multi-device testing.
+#
+# Subtargets:
+#  * $target_name.hermetic
+#    - A host_test() target that runs in hermetic-mode (Rust-compiled Lacewing application).
+#  * $target_name.binary_and_config
+#    - The associated group target that contains metadata information on the
+#      test binary and test config.
+#
+# Example
+# ```
+# python_mobly_test("hello_world_test") {
+#   main_source = "my_mobly_test.py"
+#   sources = [
+#     "test_helpers_foo.py",
+#     "test_helpers_bar.py",
+#   ]
+#   libraries = [
+#     "//path/to/foo:lib",
+#     "//path/to/bar:lib",
+#   ]
+#   extra_args = [ "--a_mobly_test_flag" ]
+#   local_config_source = "mobly_config.yaml"
+#   params_source = "mobly_params.yaml"
+#  }
+# ```
+#
+# Example local Mobly config YAML content
+# ```
+# TestBeds:
+#   - Name: LocalTestbed
+#     Controllers:
+#       FuchsiaDevice:
+#         - nodename: "fuchsia-LOCAL_NODE_NAME"
+# ```
+#
+# Example Mobly test params YAML content
+# ```
+# bool_param: True
+# str_param: some_string
+# dict_param:
+#   fld_1: val_1
+#   fld_2: val_2
+# list_param:
+#   - 1
+#   - 2
+#   - 3
+#   - 4
+# ```
+#
+# Parameters
+#
+#  main_source (required)
+#    The Mobly .py test file that will be interpreted.
+#    Type: path
+#
+#  test_name (optional)
+#    The name of the generated test.
+#    Type: string
+#    Default: target_name
+#
+#  test_cases (optional)
+#    List of test cases to run. Defaults to running all test cases.
+#    Type: list(string)
+#    Default: empty list
+#
+#  sources (optional)
+#    Other files that are used in the Mobly test.
+#    Type: list(path)
+#    Default: empty list
+#
+#  libraries (optional)
+#    Paths to python_libraries this Mobly test imports.
+#    Type: list(string)
+#    Default: empty list
+#
+#  data_sources (optional)
+#    See build/python/python_binary.gni
+#
+#  data_package_name (required if |data_sources| is provided, else optional)
+#    See build/python/python_binary.gni
+#
+#  test_dir (optional)
+#    Path to where the test executes.
+#    Type: string
+#    Default: "${target_out_dir}/${target_name}"
+#
+#  extra_args (optional)
+#    Additional arguments to pass to the test.
+#    Type: list(string)
+#    Default: empty list
+#
+#  local_config_source (optional)
+#    Path to the Mobly YAML config file to use for local execution.
+#    If not provided, Mobly test will generate a best-effort config based on the
+#    host environment. Note that config generation assumes connected Fuchsia
+#    devices are provisioned using the SSH credentials from Fuchsia.git
+#    workflows. If provisioned via other means (e.g. SDK, Sonic), users are
+#    advised to provide a local config instead.
+#    Type: string
+#
+#  params_source (optional)
+#    Path to the Mobly test params config file (typically YAML or JSON).
+#    If not provided, Mobly test will execute without test params.
+#    Type: string
+#
+#  params (optional)
+#    The mobly test params defined in GN. If this is present `params_source` must not
+#    be present.
+#    Type: object
+#
+#  honeydew_config (optional)
+#    JSON dict containing the honeydew configuration.
+#    Type: object
+#    Format:
+#     {
+#       transports = {
+#         <transport_name> = {
+#           <key1> = <value1>
+#           <key2> = <value2>
+#           ...
+#         }
+#         ...
+#       }
+#       affordances = {
+#         <affordance_name> = {
+#           <key1> = <value1>
+#           <key2> = <value2>
+#           ...
+#         }
+#         ...
+#       }
+#       ...
+#     }
+#    Example:
+#     {
+#       transports = {
+#         ffx = {
+#           timeout = 30
+#         }
+#         fuchsia-controller = {
+#           use_daemon = true
+#         }
+#       }
+#       affordances = {
+#         bluetooth = {
+#           "implementation" = "fuchsia-controller"
+#         }
+#       }
+#     }
+#    Note:
+#      Mobly-Driver on receiving this information from python_mobly_test, will update the dict with
+#      the following FFX related information:
+#         ffx = {
+#           bin_path =" <path>"  # Path where FFX binary can be found
+#           subtools_path = "<path>"  # Path where FFX subtools can be found
+#         }
+#      Even if these keys are present in the original user specified honeydew_config, they will be
+#      over written by mobly-driver with appropriate information.
+#
+#  ssh_path (optional)
+#    Path to the ssh binary to be used by Antlion connectivity testbeds for connecting
+#    to access points.
+#    Type: String
+#
+#  ssh_key_path (optional)
+#    Path to the SSH key to be used for connecting to Fuchsia devices.
+#    Type: String
+#
+#  test_data_deps (optional)
+#    List of test data GN targets that are needed at runtime.
+#    Type: list(string)
+#    Default: empty list
+#
+#  package_deps (optional)
+#    List of `fuchsia_package` labels that are needed at runtime. These are forwarded
+#    to the host_test() template which forwards it to the test_spec() template and may
+#    also need to be included in the build graph separately in universe to be included
+#    in the package repo because the package repo doesn't depend on tests that are
+#    included in host_labels.
+#    Type: list(string)
+#    Default: empty list
+#
+#  multi_fuchsia_device (optional)
+#    Whether a test is a multi-device test (requires 2+ fuchsia devices).
+#    Type: boolean
+#    Default: false
+#
+#  enable_hermetic_exe (optional)
+#    Whether to also build a hermetic self-extracting executable and define a
+#    corresponding host_test().
+#    Type: boolean
+#    Default: false
+#
+#  timeout_secs (optional)
+#    [int] The infra timeout in seconds for the test.
+#
+#  cleanup_period_secs (optional)
+#    [int] If set, we send SIGTERM to the test this many seconds before the
+#    test times out. Requires timeout_secs to be set.
+#
+#  isolated (optional)
+#    [bool] Whether the test needs to be run in isolation to other tests.
+#
+#  environments
+#    Optional: what environments this test should target. Only applies to
+#    host tests. See //build/testing/test_spec.gni for more details.
+#    Type: list of scopes.
+#    Default: emu_env
+#
+#  enable_mypy (optional)
+#    If true, enable MyPy type checking on the target and respective deps.
+#    Type: boolean
+#    Default: true
+#
+#  main_callable (optional)
+#    The python symbol in main_source that is the entrypoint for the tests.
+#    Type: string
+#    Default: test_runner.main
+#
+#  testonly (optional)
+#    GN Usual. Allow option to set to false for IDK inclusion.
+#    See https://cs.opensource.google/fuchsia/fuchsia/+/main:sdk/BUILD.gn;l=161-167;drc=aa7ba9d998556f7124fe8e2edc6604c9c1592d01
+#    Type: boolean
+#    Default: true
+#
+#  target_address_type (optional)
+#    This option determines whether to use the fuchsia device's name or ip for host-target
+#    interactions when using FFX and Fuchsia-Controller transports. It is only applicable for
+#    local runs; infrastructure runs always use "ip". Valid values are "ip", "name".
+#    Type: String
+#    Default: "ip"
+#
+#  list_cases_argument (optional)
+#    Argument to pass to the test binary to list test cases.
+#    Type: string
+#    Default: "list_mobly_tests"
+#
+#  deps
+#  visibility
+#
+# Metadata
+#
+#  hermetic_test_sources (if |enable_hermetic_exe| is set and for
+#    $target_name.binary_and_config targets only)
+#    List of scopes for each test-specific file including the name and path of
+#    the source (relative to root).
+
+template("python_mobly_test") {
+  assert(defined(invoker.main_source), "main_source is required")
+
+  _test_name = "${target_name}"
+  if (defined(invoker.test_name)) {
+    _test_name = invoker.test_name
+  }
+
+  _testonly = true
+  if (defined(invoker.testonly)) {
+    _testonly = invoker.testonly
+  }
+
+  _enable_mypy = true
+  if (defined(invoker.enable_mypy)) {
+    _enable_mypy = invoker.enable_mypy
+  }
+
+  _enable_hermetic_exe = false
+  if (defined(invoker.enable_hermetic_exe)) {
+    _enable_hermetic_exe = invoker.enable_hermetic_exe
+  }
+
+  if (defined(invoker.target_address_type)) {
+    assert(
+        invoker.target_address_type == "ip" ||
+            invoker.target_address_type == "name",
+        "'target_address_type' should be either 'ip' or 'name' but received: " +
+            "'" + invoker.target_address_type + "'")
+  }
+
+  # Mobly-specific entry point.
+  _main_callable = "test_runner.main"
+  if (defined(invoker.main_callable)) {
+    _main_callable = invoker.main_callable
+  }
+
+  _list_cases_argument = "list_mobly_tests"
+  if (defined(invoker.list_cases_argument)) {
+    _list_cases_argument = invoker.list_cases_argument
+  }
+
+  #
+  # Define Mobly test python_binary().
+  #
+  _test_binary_name = "${_test_name}.pyz"
+  _test_binary_target = "${_test_name}_python_binary"
+  python_binary(_test_binary_target) {
+    forward_variables_from(invoker,
+                           [
+                             "main_source",
+                             "sources",
+                             "data_sources",
+                             "data_package_name",
+                           ])
+    testonly = _testonly
+    enable_mypy = _enable_mypy
+    visibility = [ ":*" ]
+
+    output_name = _test_binary_name
+
+    main_callable = _main_callable
+
+    deps = []
+    if (_testonly) {
+      deps += [ "//third_party/mobly" ]
+    } else {
+      deps += [ "//third_party/mobly:mobly_no_testonly" ]
+    }
+    if (defined(invoker.test_data_deps)) {
+      deps += invoker.test_data_deps
+    }
+    if (defined(invoker.libraries)) {
+      deps += invoker.libraries
+    }
+  }
+
+  _test_dir = "${target_out_dir}/${_test_name}"
+  if (defined(invoker.test_dir)) {
+    _test_dir = invoker.test_dir
+  }
+
+  #
+  # Define Mobly test host_test_data().
+  #
+  _mobly_test_data_target = "${_test_name}_test_data"
+  host_test_data(_mobly_test_data_target) {
+    visibility = [ ":*" ]
+    testonly = _testonly
+    sources = [ get_label_info(":${_test_binary_target}", "target_out_dir") +
+                "/${_test_binary_name}" ]
+    outputs = [ "${_test_dir}/${_test_binary_name}" ]
+    deps = [ ":${_test_binary_target}" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+
+  #
+  # Define SSH binary host_test_data().
+  #
+
+  # This is currently required by Honeydew for auxiliary device (access points
+  # and
+  # iperf servers) interactions when running wlan end-to-end tests.
+
+  _ssh_binary_test_data_target = "${_test_name}_test_data_ssh"
+  host_test_data(_ssh_binary_test_data_target) {
+    testonly = true
+    visibility = [ ":*" ]
+    sources = [
+      "//prebuilt/third_party/openssh-portable/${host_os}-${host_cpu}/bin/ssh",
+    ]
+    outputs = [ "${_test_dir}/ssh" ]
+  }
+
+  #
+  # Construct host test arguments.
+  #
+
+  # Mobly Driver is provided as the first host test argument so that it's the
+  # interpreter's entry-point. This allows Mobly Driver to wrap the execution
+  # lifecycle of the underlying Mobly test.
+  #
+  # We define Mobly Driver outside of this template so that the Mobly Driver
+  # binary is built only once but can be used/referenced for any Mobly tests.
+
+  _md_test_data_dir =
+      get_label_info("//src/testing/end_to_end/mobly_driver", "target_out_dir")
+  _common_host_test_args = [
+    "--ffx-path",
+    rebase_path("${host_tools_dir}/ffx", root_build_dir),
+    "--ffx-subtools-path",
+    rebase_path(host_tools_dir, root_build_dir),
+    "--ssh-path",
+    rebase_path("${_test_dir}/ssh", root_build_dir),
+  ]
+  if (defined(invoker.multi_fuchsia_device) && invoker.multi_fuchsia_device) {
+    _common_host_test_args += [ "--multi-device" ]
+  }
+  if (defined(invoker.target_address_type)) {
+    _common_host_test_args += [
+      "--target-address-type",
+      invoker.target_address_type,
+    ]
+  }
+
+  _additional_deps = []
+  if (defined(invoker.ssh_key_path)) {
+    _ssh_key_data_target = "${_test_name}_ssh_key_data"
+    host_test_data(_ssh_key_data_target) {
+      sources = [ invoker.ssh_key_path ]
+      outputs = [ "${_test_dir}/ssh_key" ]
+    }
+    _common_host_test_args += [
+      "--ssh-key",
+      rebase_path("${_test_dir}/ssh_key", root_build_dir),
+    ]
+    _additional_deps += [ ":${_ssh_key_data_target}" ]
+  }
+
+  # If specified, define test params data target and data path add to host args.
+  if (defined(invoker.params_source)) {
+    assert(!defined(invoker.params),
+           "Only one of params or params_source can be defined")
+    _params_source = invoker.params_source
+    _params_deps = []
+  } else if (defined(invoker.params)) {
+    _generated_params_target = "${target_name}_generated_params"
+    _params_source = "${target_gen_dir}/${target_name}_params.json"
+    generated_file(_generated_params_target) {
+      output_conversion = "json"
+      contents = invoker.params
+      outputs = [ _params_source ]
+    }
+    _params_deps = [ ":${_generated_params_target}" ]
+  }
+
+  if (defined(_params_source)) {
+    _param_yaml_data_target = "${_test_name}_params_data"
+    host_test_data(_param_yaml_data_target) {
+      testonly = _testonly
+      sources = [ _params_source ]
+      outputs = [ "${_test_dir}/test_params.yaml" ]
+      deps = _params_deps
+    }
+
+    _common_host_test_args += [
+      "--params-yaml-path",
+      rebase_path("${_test_dir}/test_params.yaml", root_build_dir),
+    ]
+
+    _additional_deps += [ ":${_param_yaml_data_target}" ]
+  }
+
+  if (defined(invoker.timeout_secs)) {
+    _common_host_test_args += [
+      "--test-timeout-sec",
+      "${invoker.timeout_secs}",
+    ]
+  }
+
+  if (defined(invoker.cleanup_period_secs)) {
+    assert(defined(invoker.timeout_secs),
+           "cleanup_period_secs requires timeout_secs to be set")
+    _common_host_test_args += [
+      "--cleanup-period-sec",
+      "${invoker.cleanup_period_secs}",
+    ]
+  }
+
+  if (defined(invoker.honeydew_config)) {
+    _generated_honeydew_config_target =
+        "${target_name}_generated_honeydew_config"
+    _honeydew_config_source =
+        "${target_gen_dir}/${target_name}_honeydew_config.json"
+    generated_file(_generated_honeydew_config_target) {
+      output_conversion = "json"
+      contents = invoker.honeydew_config
+      outputs = [ _honeydew_config_source ]
+    }
+    _honeydew_config_deps = [ ":${_generated_honeydew_config_target}" ]
+
+    _honeydew_config_json_data_target = "${_test_name}_honeydew_config_data"
+    host_test_data(_honeydew_config_json_data_target) {
+      testonly = _testonly
+      sources = [ _honeydew_config_source ]
+      outputs = [ "${_test_dir}/honeydew_config.json" ]
+      deps = _honeydew_config_deps
+    }
+
+    _common_host_test_args += [
+      "--honeydew-config-json-path",
+      rebase_path("${_test_dir}/honeydew_config.json", root_build_dir),
+    ]
+
+    _additional_deps += [ ":${_honeydew_config_json_data_target}" ]
+  }
+
+  # If specified, define test config data target and add data path to host args.
+  if (defined(invoker.local_config_source)) {
+    _config_yaml_data_target = "${_test_name}_config_data"
+    host_test_data(_config_yaml_data_target) {
+      testonly = _testonly
+      sources = [ invoker.local_config_source ]
+      outputs = [ "${_test_dir}/config.yaml" ]
+    }
+
+    _common_host_test_args += [
+      "--config-yaml-path",
+      rebase_path("${_test_dir}/config.yaml", root_build_dir),
+    ]
+
+    _additional_deps += [ ":${_config_yaml_data_target}" ]
+  }
+
+  if (defined(invoker.extra_args)) {
+    _common_host_test_args += invoker.extra_args
+  }
+
+  if (defined(invoker.test_cases)) {
+    _common_host_test_args += [ "--test_cases" ]
+    _common_host_test_args += invoker.test_cases
+  }
+
+  common_environments = []
+  if (defined(invoker.environments)) {
+    common_environments = invoker.environments
+  } else {
+    common_environments = [ emu_env ]
+  }
+
+  #
+  # Define the Mobly host_test().
+  #
+  _python_exe_data_target = "${_test_name}_python_exe_data"
+  host_test_data(_python_exe_data_target) {
+    sources = [ python_exe_src ]
+  }
+  host_test(_test_name) {
+    forward_variables_from(invoker,
+                           [
+                             "isolated",
+                             "package_deps",
+                             "product_bundle",
+                             "timeout_secs",
+                             "visibility",
+                           ])
+
+    # Mobly E2E tests are target-bound and communicate with the device over SSH.
+    # Therefore, they always require expects_ssh = true.
+    expects_ssh = true
+
+    list_cases_argument = _list_cases_argument
+
+    binary_path = get_label_info("//tools/mobly_test_parser", "root_out_dir") +
+                  "/mobly_test_parser"
+
+    # Disable Python's output buffering when launching Mobly Driver.
+    args = [
+             rebase_path(python_exe_src, root_build_dir),
+             "-u",
+             rebase_path("${_md_test_data_dir}/test_data/mobly_driver.pyz",
+                         root_build_dir),
+             rebase_path("${_test_dir}/${_test_binary_name}", root_build_dir),
+           ] + _common_host_test_args
+
+    data_deps = [ "//src/developer/ffx:suite_test_data" ]
+
+    deps =
+        [
+          ":${_mobly_test_data_target}",
+          ":${_python_exe_data_target}",
+          ":${_ssh_binary_test_data_target}",
+          "//build/python:interpreter",
+          "//src/testing/end_to_end/mobly_driver:mobly_driver_test_data_target",
+          "//tools/mobly_test_parser",
+        ] + _additional_deps
+    if (defined(invoker.test_data_deps)) {
+      deps += invoker.test_data_deps
+    }
+
+    environments = common_environments
+  }
+
+  #
+  # Hermetic Python Binary
+  #
+  if (_enable_hermetic_exe) {
+    _labels = {
+      fidl_ir_list = "${_test_name}_fidl_ir_list"
+      compress_artifacts = "${_test_name}_compress_artifacts"
+    }
+
+    _files = {
+      fidl_ir_list = "${target_gen_dir}/${_test_name}_fidl_ir_infos.json"
+      compress_artifacts =
+          "${target_gen_dir}/${_test_name}_lacewing_artifacts.zip"
+    }
+
+    _hermetic_test_binary_label = "${_test_name}_hermetic_python_binary"
+
+    generated_file(_labels.fidl_ir_list) {
+      testonly = _testonly
+
+      visibility = [ ":*" ]
+
+      public_deps = [ ":${_test_binary_target}" ]
+
+      outputs = [ _files.fidl_ir_list ]
+      output_conversion = "json"
+      data_keys = [ "fidl_ir_info" ]
+    }
+
+    python_action(_labels.compress_artifacts) {
+      forward_variables_from(invoker, [ "visibility" ])
+      testonly = _testonly
+      binary_label = "//build/python:compress_lacewing_inputs"
+      inputs = [
+        _files.fidl_ir_list,
+        python_exe_src,
+        "${root_out_dir}/libfidl_codec.so",
+        "${root_out_dir}/libfuchsia_controller_internal.so",
+        get_label_info(":${_test_binary_target}", "target_out_dir") +
+            "/${_test_binary_name}",
+      ]
+      outputs = [ _files.compress_artifacts ]
+      depfile = "${target_out_dir}/${target_name}.d"
+      args = [
+        "--cpython",
+        rebase_path(python_exe_src, root_build_dir),
+        "--cpython-stdlibs",
+        rebase_path("//prebuilt/third_party/python3/${host_platform}/lib",
+                    root_build_dir),
+        "--test-pyz",
+        rebase_path(get_label_info(":${_test_binary_target}",
+                                   "target_out_dir") + "/${_test_binary_name}",
+                    root_build_dir),
+        "--fidl-ir-list",
+        rebase_path(_files.fidl_ir_list, root_build_dir),
+        "--c-extension-library-tree",
+        rebase_path(
+                get_label_info(
+                    "//src/developer/ffx/lib/fuchsia-controller/cpp:libfidl_codec",
+                    "root_out_dir"),
+                root_build_dir) + "/libfidl_codec.so",
+        rebase_path(
+                get_label_info(
+                    "//src/developer/ffx/lib/fuchsia-controller:libfuchsia_controller_internal",
+                    "root_out_dir"),
+                root_build_dir) + "/libfuchsia_controller_internal.so",
+        "--output",
+        rebase_path(_files.compress_artifacts, root_build_dir),
+        "--depfile",
+        rebase_path(depfile, root_build_dir),
+      ]
+      deps = [
+        ":${_labels.fidl_ir_list}",
+        ":${_test_binary_target}",
+        "//src/developer/ffx/lib/fuchsia-controller/cpp:libfidl_codec",
+        "//src/developer/ffx/lib/fuchsia-controller/cpp:libfuchsia_controller_internal",
+      ]
+    }
+
+    _output_file_name = "$root_out_dir/${_hermetic_test_binary_label}"
+
+    python_action(_hermetic_test_binary_label) {
+      forward_variables_from(invoker, [ "visibility" ])
+      testonly = _testonly
+      binary_label = "//build/python:python_hermetic_concatenate"
+      inputs = [
+        "$root_out_dir/self_extracting_binary",
+        _files.compress_artifacts,
+      ]
+      outputs = [ _output_file_name ]
+      args = [
+        "--executable",
+
+        # This path is from //build/python/self_extracting_binary
+        rebase_path("$root_out_dir/self_extracting_binary", root_build_dir),
+        "--zip-file",
+        rebase_path("${_files.compress_artifacts}", root_build_dir),
+        "--output",
+        rebase_path(_output_file_name, root_build_dir),
+      ]
+      deps = [
+        ":${_labels.compress_artifacts}",
+        "//build/python/self_extracting_binary",
+      ]
+    }
+
+    group("${target_name}.binary_and_config") {
+      testonly = _testonly
+      deps = [ ":${_hermetic_test_binary_label}" ]
+
+      metadata = {
+        hermetic_test_sources = [
+          {
+            # Add PYZ as a test source.
+            name = "${_test_name}_bin"
+            path = rebase_path("$root_out_dir/${_hermetic_test_binary_label}",
+                               root_build_dir)
+          },
+        ]
+      }
+
+      if (defined(_params_source)) {
+        metadata.hermetic_test_sources += [
+          {
+            name = "params.yaml"
+            path = rebase_path(_params_source, root_build_dir)
+          },
+        ]
+      }
+    }
+
+    #
+    # Define Hermetic Mobly test host_test_data().
+    #
+    _hermetic_mobly_test_data_target =
+        "${_test_name}_hermetic_python_binary_test_data"
+    host_test_data(_hermetic_mobly_test_data_target) {
+      visibility = [ ":*" ]
+      testonly = _testonly
+      sources = [ "$root_out_dir/${_hermetic_test_binary_label}" ]
+      outputs = [ "${_test_dir}/${_hermetic_test_binary_label}" ]
+      deps = [ ":${_hermetic_test_binary_label}" ]
+    }
+
+    host_test("${_test_name}.hermetic") {
+      forward_variables_from(invoker,
+                             [
+                               "isolated",
+                               "visibility",
+                               "timeout_secs",
+                             ])
+
+      # Mobly E2E tests are target-bound and communicate with the device over
+      # SSH. Therefore, they always require expects_ssh = true.
+      expects_ssh = true
+
+      binary_path = get_label_info("//tools/mobly_test_parser",
+                                   "root_out_dir") + "/mobly_test_parser"
+
+      # Disable Python's output buffering when launching Mobly Driver.
+      args = [
+               rebase_path(python_exe_src, root_build_dir),
+               "-u",
+               rebase_path("${_md_test_data_dir}/test_data/mobly_driver.pyz",
+                           root_build_dir),
+               rebase_path("${_test_dir}/${_hermetic_test_binary_label}",
+                           root_build_dir),
+               "--hermetic",
+             ] + _common_host_test_args
+
+      data_deps = [ "//src/developer/ffx:suite_test_data" ]
+
+      deps = [
+               ":${_hermetic_mobly_test_data_target}",
+               ":${_python_exe_data_target}",
+               ":${_ssh_binary_test_data_target}",
+               "//build/python:interpreter",
+               "//src/testing/end_to_end/mobly_driver:mobly_driver_test_data_target",
+               "//tools/mobly_test_parser",
+             ] + _additional_deps
+      if (defined(invoker.test_data_deps)) {
+        deps += invoker.test_data_deps
+      }
+
+      environments = common_environments
+    }
+  }
+}

@@ -1,0 +1,370 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/test.gni")
+import("//src/storage/testing/driver_test_realm.gni")
+
+source_set("options") {
+  public = [ "adapter_options.h" ]
+}
+
+source_set("blobfs-partition") {
+  sources = [ "blobfs_partition.cc" ]
+  public = [ "blobfs_partition.h" ]
+  public_deps = [
+    ":options",
+    "//sdk/lib/fit",
+    "//src/storage/volume_image:partition",
+    "//src/storage/volume_image/fvm:options",
+    "//src/storage/volume_image/utils:io-interfaces",
+  ]
+  deps = [
+    "//src/storage/blobfs",
+    "//src/storage/fvm",
+    "//src/storage/volume_image/utils:block-utils",
+  ]
+}
+
+source_set("minfs-partition") {
+  sources = [ "minfs_partition.cc" ]
+  public = [ "minfs_partition.h" ]
+  public_deps = [
+    ":options",
+    "//sdk/lib/fit",
+    "//src/storage/volume_image:partition",
+    "//src/storage/volume_image/fvm:options",
+    "//src/storage/volume_image/utils:io-interfaces",
+  ]
+  deps = [
+    "//src/storage/fvm",
+    "//src/storage/minfs",
+    "//src/storage/volume_image/utils:block-utils",
+  ]
+}
+
+source_set("empty-partition") {
+  sources = [ "empty_partition.cc" ]
+  public = [ "empty_partition.h" ]
+  public_deps = [
+    ":options",
+    "//sdk/lib/fit",
+    "//src/storage/volume_image:partition",
+    "//src/storage/volume_image/fvm:options",
+    "//src/storage/volume_image/utils:io-interfaces",
+  ]
+  deps = [ "//src/storage/fvm" ]
+}
+
+source_set("commands") {
+  sources = [
+    "commands/arguments.cc",
+    "commands/create.cc",
+    "commands/extend.cc",
+    "commands/pave.cc",
+    "commands/size.cc",
+  ]
+  public = [ "commands.h" ]
+
+  public_deps = [
+    ":options",
+    "//sdk/lib/fit",
+    "//src/storage/volume_image/fvm:options",
+  ]
+
+  deps = [
+    ":blobfs-partition",
+    ":empty-partition",
+    ":minfs-partition",
+    "//src/storage/fvm",
+    "//src/storage/minfs",
+    "//src/storage/volume_image/fvm:fvm-descriptor",
+    "//src/storage/volume_image/fvm:fvm-image-extend",
+    "//src/storage/volume_image/fvm:fvm-sparse-image",
+    "//src/storage/volume_image/utils:block-io",
+    "//src/storage/volume_image/utils:fd-io",
+    "//src/storage/volume_image/utils:lz4-compression",
+  ]
+}
+
+test_blob_image_label = ":test-blobfs-image-gen($default_toolchain)"
+test_blob_image_path =
+    get_label_info(test_blob_image_label, "target_out_dir") + "/test_blobfs.blk"
+test_files = [
+  "test_data/file1.ext1",
+  "test_data/file2.ext2",
+  "test_data/file3.ext3",
+]
+
+compiled_action("test-blobfs-image-gen") {
+  testonly = true
+  visibility = [ ":*" ]
+  tool = "//src/storage/blobfs/tools:blobfs"
+  inputs = test_files
+  outputs = [ test_blob_image_path ]
+  args = [
+    rebase_path(test_blob_image_path, root_build_dir),
+    "create",
+  ]
+
+  foreach(test_file, test_files) {
+    args += [
+      "--blob",
+      rebase_path(test_file, root_build_dir),
+    ]
+  }
+}
+
+test_minfs_image_label = ":test-minfs-image-gen($default_toolchain)"
+test_minfs_image_path =
+    get_label_info(test_minfs_image_label, "target_out_dir") + "/test_minfs.blk"
+test_minfs_image_manifest_path =
+    get_label_info(test_minfs_image_label, "target_out_dir") +
+    "/test_minfs.manifest"
+
+generated_file("test-minfs-image-manifest") {
+  outputs = [ test_minfs_image_manifest_path ]
+  output_conversion = "list lines"
+  contents = []
+  foreach(test_file, test_files) {
+    test_file_path =
+        rebase_path(test_file,
+                    get_label_info(test_minfs_image_label, "target_out_dir"))
+    contents += [ "$test_file=$test_file_path" ]
+  }
+}
+
+compiled_action("test-minfs-image-gen") {
+  testonly = true
+  visibility = [ ":*" ]
+  tool = "//src/storage/minfs/tools:minfs"
+  inputs = test_files + [ test_minfs_image_manifest_path ]
+  outputs = [ test_minfs_image_path ]
+  args = [
+    rebase_path(test_minfs_image_path, root_build_dir),
+    "create",
+  ]
+
+  args += [
+    "--manifest",
+    rebase_path(test_minfs_image_manifest_path, root_build_dir),
+  ]
+
+  deps = [ ":test-minfs-image-manifest" ]
+}
+
+test_fvm_sparse_image_label = ":test-fvm-sparse-image-gen($default_toolchain)"
+test_fvm_sparse_image_path =
+    get_label_info(test_fvm_sparse_image_label, "target_out_dir") +
+    "/test_fvm.sparse.blk"
+compiled_action("test-fvm-sparse-image-gen") {
+  testonly = true
+  visibility = [ ":*" ]
+  tool = "//src/storage/bin/fvm"
+  inputs = [
+    test_minfs_image_path,
+    test_blob_image_path,
+  ]
+  outputs = [ test_fvm_sparse_image_path ]
+  args = [
+    rebase_path(test_fvm_sparse_image_path, root_build_dir),
+    "sparse",
+    "--compress",
+    "lz4",
+    "--slice",
+    "8388608",
+    "--blob",
+    rebase_path(test_blob_image_path, root_build_dir),
+    "--data",
+    rebase_path(test_minfs_image_path, root_build_dir),
+    "--minimum-inodes",
+    "600000",
+    "--minimum-data-bytes",
+    "10M",
+    "--maximum-bytes",
+    "218103808",
+    "--reserve-slices",
+    "4",
+  ]
+
+  deps = [
+    ":test-blobfs-image-gen",
+    ":test-minfs-image-gen",
+  ]
+}
+
+test_fvm_sparse_small_image_label =
+    ":test-fvm-sparse-small-image-gen($default_toolchain)"
+test_fvm_sparse_small_image_path =
+    get_label_info(test_fvm_sparse_small_image_label, "target_out_dir") +
+    "/test_fvm_small.sparse.blk"
+compiled_action("test-fvm-sparse-small-image-gen") {
+  testonly = true
+  visibility = [ ":*" ]
+  tool = "//src/storage/bin/fvm"
+  inputs = [
+    test_minfs_image_path,
+    test_blob_image_path,
+  ]
+  outputs = [ test_fvm_sparse_small_image_path ]
+  args = [
+    rebase_path(test_fvm_sparse_small_image_path, root_build_dir),
+    "sparse",
+    "--compress",
+    "lz4",
+    "--slice",
+    "32k",
+    "--blob",
+    rebase_path(test_blob_image_path, root_build_dir),
+    "--data",
+    rebase_path(test_minfs_image_path, root_build_dir),
+    "--reserve-slices",
+    "4",
+  ]
+
+  deps = [
+    ":test-blobfs-image-gen",
+    ":test-minfs-image-gen",
+  ]
+}
+
+config("test-image-path") {
+  if (is_host) {
+    output_path =
+        rebase_path(get_label_info("host-test-images", "root_out_dir"),
+                    root_build_dir)
+    defines = [ "STORAGE_VOLUME_IMAGE_ADAPTER_TEST_IMAGE_PATH=\"$output_path/adapter_test_images/\"" ]
+  } else {
+    defines = [
+      "STORAGE_VOLUME_IMAGE_ADAPTER_TEST_IMAGE_PATH=\"pkg/data/test_images/\"",
+    ]
+  }
+}
+
+if (is_host) {
+  host_test_data("host-test-images") {
+    sources = [
+      test_blob_image_path,
+      test_fvm_sparse_image_path,
+      test_fvm_sparse_small_image_path,
+      test_minfs_image_path,
+    ]
+    deps = [
+      ":test-blobfs-image-gen($default_toolchain)",
+      ":test-fvm-sparse-image-gen($default_toolchain)",
+      ":test-fvm-sparse-small-image-gen($default_toolchain)",
+      ":test-minfs-image-gen($default_toolchain)",
+    ]
+    outputs = [ "$root_out_dir/adapter_test_images/{{source_file_part}}" ]
+  }
+}
+
+resource("adapter-test-images") {
+  testonly = true
+  sources = [
+    "$target_out_dir/test_blobfs.blk",
+    "$target_out_dir/test_fvm.sparse.blk",
+    "$target_out_dir/test_fvm_small.sparse.blk",
+    "$target_out_dir/test_minfs.blk",
+  ]
+  outputs = [ "data/test_images/{{source_file_part}}" ]
+  deps = [
+    ":test-blobfs-image-gen",
+    ":test-fvm-sparse-image-gen",
+    ":test-fvm-sparse-small-image-gen",
+    ":test-minfs-image-gen",
+  ]
+}
+
+source_set("adapter-tests") {
+  testonly = true
+  sources = [
+    "blobfs_partition_test.cc",
+    "commands/arguments_test.cc",
+    "commands/create_test.cc",
+    "commands/extend_test.cc",
+    "commands/file_client.cc",
+    "commands/file_client.h",
+    "commands/pave_test.cc",
+    "commands/size_test.cc",
+    "empty_partition_test.cc",
+    "minfs_partition_test.cc",
+  ]
+  deps = [
+    ":blobfs-partition",
+    ":commands",
+    ":empty-partition",
+    ":minfs-partition",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/storage/blobfs",
+    "//src/storage/fvm",
+    "//src/storage/gpt",
+    "//src/storage/minfs",
+    "//src/storage/volume_image/fvm:fvm-image-extend",
+    "//src/storage/volume_image/fvm:fvm-sparse-image",
+    "//src/storage/volume_image/utils:block-utils",
+    "//src/storage/volume_image/utils:fd-io",
+    "//src/storage/volume_image/utils:fd-test-helper",
+    "//src/storage/volume_image/utils:lz4-compression",
+    "//third_party/googletest:gmock",
+    "//third_party/googletest:gtest",
+  ]
+
+  configs += [ ":test-image-path" ]
+
+  if (is_host) {
+    deps += [ ":host-test-images" ]
+  }
+}
+
+test("adapter-integration-test") {
+  sources = [ "adapter_integration_test.cc" ]
+  configs += [ ":test-image-path" ]
+  deps = [
+    ":blobfs-partition",
+    ":empty-partition",
+    ":minfs-partition",
+    "//sdk/fidl/fuchsia.storage.block:fuchsia.storage.block_cpp",
+    "//sdk/lib/fdio-caller",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/storage/blobfs",
+    "//src/storage/fvm",
+    "//src/storage/lib/block_client/cpp",
+    "//src/storage/lib/fs_management/cpp:fs-management",
+    "//src/storage/testing:storage_driver_test_support",
+    "//src/storage/volume_image/fvm:fvm-descriptor",
+    "//src/storage/volume_image/fvm:fvm-sparse-image",
+    "//src/storage/volume_image/utils:block-utils",
+    "//src/storage/volume_image/utils:fd-io",
+    "//third_party/googletest:gmock",
+    "//third_party/googletest:gtest",
+  ]
+}
+
+storage_driver_test_realm_component("adapter-integration-test-component") {
+  component_name = "adapter-integration-test"
+  manifest = "adapter-integration-test.cml"
+  deps = [
+    ":adapter-integration-test",
+    ":adapter-test-images",
+  ]
+}
+
+fuchsia_test_package("storage-volume-image-adapter-integration-tests") {
+  test_specs = {
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+  test_components = [ ":adapter-integration-test-component" ]
+  deps = [
+    "//src/storage/blobfs/bin:component",
+    "//src/storage/minfs/bin:minfs-component",
+  ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [ ":storage-volume-image-adapter-integration-tests" ]
+}

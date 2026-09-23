@@ -1,0 +1,189 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test fx remote scripts
+
+# Source platform.sh so that we can point to jq and include it as a runtime dependency. We need to
+# do it in a subfunction since platform.sh defines readonly variables, and it gets re-sourced to
+# avoid conflicts.
+function read_host_platform() {
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/../../lib/platform.sh" || exit $?
+  echo "$HOST_PLATFORM"
+}
+
+BT_FILE_DEPS=(
+  "scripts/fx"
+  "prebuilt/third_party/jq/$(read_host_platform)/bin/jq"
+  "tools/devshell/flash-remote"
+  "tools/devshell/serve-remote"
+  "tools/devshell/lib/fvm.sh"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-flash.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/fx-remote.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/platform.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/verify-default-keys.sh"
+  "tools/devshell/lib/updates.sh"
+  "tools/devshell/jq.fx"
+)
+
+declare fx ssh_mock scp_mock compare_remote_and_local_mock
+
+
+BT_SET_UP() {
+  source "${BT_TEMP_DIR}/tools/devshell/lib/vars.sh"
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+  ssh_mock=$(btf::make_mock_binary "ssh")
+  btf::add_binary_to_path "$ssh_mock"
+
+  scp_mock=$(btf::make_mock_binary "scp")
+  btf::add_binary_to_path "$scp_mock"
+  btf::make_mock "${compare_remote_and_local_mock}"
+  {
+    echo "function compare_remote_and_local { ${compare_remote_and_local_mock} \"\$@\"; }"
+  } >> "${BT_TEMP_DIR}/tools/devshell/lib/verify-default-keys.sh"
+
+}
+
+_create_mock_ffx() {
+  local serve_updates_port="$1"
+
+  local ffx="$(btf::make_installed_hosttools_mock ffx)"
+  local started_server="${BT_TEMP_DIR}/started-server"
+  local stopped_server="${BT_TEMP_DIR}/stopped-server"
+  cat > "${ffx}.mock_side_effects" <<EOF
+if [[ "\$@" == "config get repository.server.mode" ]]; then
+  echo "\"ffx\""
+elif [[ "\$@" == "config get repository.server.listen" ]]; then
+  echo "\"[::]:${serve_updates_port}\""
+elif [[ "\$@" == "repository server start --address [::]:${serve_updates_port}" ]]; then
+  touch "${started_server}"
+  exit 0
+elif [[ "\$@" == "repository server stop" ]]; then
+  touch "${stopped_server}"
+  exit 0
+elif [[ "\$@" == "--config ffx_repository=true --machine json repository server status" ]]; then
+  if [ -e "${started_server}" ]; then
+    echo "{\"state\": \"running\", \"address\": \"[::]:${serve_updates_port}\"}"
+  else
+    echo "{\"state\": \"stopped\"}"
+  fi
+else
+  echo "127.0.0.1"
+fi
+EOF
+}
+
+# test if the host/dir info is correctly stored in the cache file
+TEST_fx-remote-config-file() {
+  local testhost=myhostname.my.server.com
+  local testdir=~/myfuchsia/directory
+  local out="${BT_TEMP_DIR}/output.log"
+
+  # Listen on a unique port.
+  local serve_updates_port=9183
+
+  BT_ASSERT _create_mock_ffx "${serve_updates_port}"
+
+  BT_EXPECT ${fx} serve-remote --repo-port "${serve_updates_port}" "$testhost" "$testdir" >>${out} 2>&1
+  BT_EXPECT_FILE_CONTAINS "${BT_TEMP_DIR}/.fx-remote-config" "${testhost}:${testdir}:"
+}
+
+# test if the cache file is used when no argument is given
+TEST_fx-remote-default-args() {
+  local testhost=myhostname.my.server.com
+  local testdir=~/myfuchsia/directory
+  local out="${BT_TEMP_DIR}/output.log"
+
+  # Listen on a unique port.
+  local serve_updates_port=9184
+
+  BT_ASSERT _create_mock_ffx "${serve_updates_port}"
+
+  echo "${testhost}:${testdir}:" > "${BT_TEMP_DIR}/.fx-remote-config"
+  BT_EXPECT ${fx} serve-remote --repo-port "${serve_updates_port}" >>${out} 2>&1
+  btf::does-mock-args-contain "${ssh_mock}.mock_state.1" "$testhost"
+}
+
+# test if the given host is used even when there's a cache file, and that the
+# cache file is updated with the given host
+TEST_fx-remote-args-given() {
+  local testhost=myhostname.my.server.com
+  local testdir=~/myfuchsia/directory
+  local anotherhost=myhostname.my.server.com
+  local out="${BT_TEMP_DIR}/output.log"
+
+  # Listen on a unique port.
+  local serve_updates_port=9185
+
+  BT_ASSERT _create_mock_ffx "${serve_updates_port}"
+
+  echo "${testhost}:${testdir}:" > "${BT_TEMP_DIR}/.fx-remote-config"
+  BT_EXPECT ${fx} serve-remote --repo-port "${serve_updates_port}" "$anotherhost" "${testdir}" >>${out} 2>&1
+  BT_EXPECT_FILE_CONTAINS "${BT_TEMP_DIR}/.fx-remote-config" "${anotherhost}:${testdir}:"
+  btf::does-mock-args-contain "${ssh_mock}.mock_state.1" "$anotherhost"
+}
+
+# keep in sync with //tools/ssh-keys/gen-ssh-keys.sh
+readonly _ERROR_NO_KEY=112
+readonly _ERROR_MISMATCHED_KEYS=113
+# // keep in sync with //tools/ssh-keys/gen-ssh-keys.sh
+
+# test flash-remote if the fetched manifest from fx-remote is properly
+# forwarded to the fx-flash layer
+TEST_fx-flash-remote-manifest() {
+  local testhost=myhostname.my.server.com
+  local testdir=~/myfuchsia/directory
+  local out="${BT_TEMP_DIR}/output.log"
+  local artifact_dir="${BT_TEMP_DIR}/out/fetched"
+  local args_file="${BT_TEMP_DIR}/flash.args"
+
+  {
+    echo "function fetch_remote_flash_source { echo flash-manifest:flash.json; }"
+    echo "function fetch_remote_build_artifacts { :; }"
+    echo "function fetch_remote_artifacts { :; }"
+    echo "function fetch_or_build_tool { :; }"
+  } >> "${BT_TEMP_DIR}/tools/devshell/lib/fx-remote.sh"
+
+  {
+    echo "function fx-flash { echo "\$3" > ${args_file} ; }"
+  } >> "${BT_TEMP_DIR}/tools/devshell/lib/fx-flash.sh"
+
+  mkdir -p "${artifact_dir}"
+  BT_EXPECT ${fx} flash-remote "$testhost" "${testdir}" >>${out} 2>&1
+  BT_EXPECT_FILE_CONTAINS "$args_file" "${artifact_dir}/flash.json"
+}
+
+# test flash-remote if the fetched product bundle from fx-remote is properly
+# forwarded to the fx-flash layer
+TEST_fx-flash-remote-product-bundle() {
+  local testhost=myhostname.my.server.com
+  local testdir=~/myfuchsia/directory
+  local out="${BT_TEMP_DIR}/output.log"
+  local artifact_dir="${BT_TEMP_DIR}/out/fetched"
+  local args_file="${BT_TEMP_DIR}/flash.args"
+
+  {
+    echo "function fetch_remote_flash_source { echo product-bundle:product_bundle; }"
+    echo "function fetch_remote_build_artifacts { :; }"
+    echo "function fetch_remote_artifacts { :; }"
+    echo "function fetch_or_build_tool { :; }"
+  } >> "${BT_TEMP_DIR}/tools/devshell/lib/fx-remote.sh"
+
+  {
+    echo "function fx-flash { echo "\$4" > ${args_file} ; }"
+  } >> "${BT_TEMP_DIR}/tools/devshell/lib/fx-flash.sh"
+
+  mkdir -p "${artifact_dir}"
+  BT_EXPECT ${fx} flash-remote "$testhost" "${testdir}" >>${out} 2>&1
+  BT_EXPECT_FILE_CONTAINS "$args_file" "${artifact_dir}/product_bundle"
+}
+
+BT_RUN_TESTS "$@"

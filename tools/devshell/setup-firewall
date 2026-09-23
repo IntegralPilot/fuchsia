@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Other
+### setup Linux firewall rules to allow Fuchsia device and emulator traffic.
+## Setup Linux firewall via iptables to allow Fuchsia device and emulator traffic.
+##
+## This command detects whether iptables is installed,
+## and if so, will add special rules to allow Fuchsia-specific traffic to
+## go through the link-local IPv6 network interfaces used by Fuchsia devices
+## and emulators. If `ufw` (Uncomplicated Firewall) is installed on the system,
+## we will abort, and recommend the script `fx setup-ufw`.
+##
+## NOTE: This script uses sudo and will thus ask for your password!
+##
+##   -n|--dry-run         Just print all steps, don't do any configuration
+##   -u|--undo            Remove all firewall rules installed by this script
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  fx-error "This script can only be used on Linux!"
+  exit 1
+fi
+
+if which ufw >/dev/null 2>&1; then
+  fx-error "UFW is installed on the system. Please use `fx setup-ufw` instead."
+  exit 1
+fi
+
+if ! which iptables >/dev/null 2>&1; then
+  fx-error "iptables is not found on the system. This script cannot continue."
+  exit 1
+fi
+
+dryrun=false
+undo_all=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  -n|--dry-run)
+    dryrun=true
+    ;;
+  -u|--undo)
+    undo_all=true
+    ;;
+  -h|--help|*)
+    fx-command-help
+    exit 1
+    ;;
+  esac
+  shift
+done
+
+dryer() {
+  if ! "$dryrun"; then
+    "${@}"
+    return $?
+  fi
+  echo >&2 "+ $*"
+  return 0
+}
+
+# Does a check before running an iptables firewall rule, preventing setting
+# rules multiple times. In addition, prevents multiple removals for rules that
+# do not exist.
+do_firewall_checked() {
+  ARG="$1"
+  shift
+  if dryer sudo ip6tables -C "$@" 2>/dev/null; then
+    if [[ "$ARG" ==  "-A" ]]; then
+      fx-info "Skipping add via 'sudo ip6tables -A $*'. Rule already set."
+      return 0
+    fi
+  else
+    if [[ "$ARG" ==  "-D" ]]; then
+      fx-info "Skipping removal 'sudo ip6tables -D $*'. Rule doesn't exist."
+      return 0
+    fi
+  fi
+  dryer sudo ip6tables "$ARG" "$@"
+}
+
+ARG="-A"
+if "$undo_all"; then
+  ARG="-D"
+fi
+
+for SRC_ADDR in "fe80::/10" "fc00::/7"; do
+  do_firewall_checked "$ARG" INPUT -p udp -s "$SRC_ADDR" -m multiport --dport 33331:33340 -m comment --comment 'Fuchsia Netboot Protocol' -j ACCEPT
+  do_firewall_checked "$ARG" INPUT -p tcp -s "$SRC_ADDR" --dport 8083 -m comment --comment 'Fuchsia Package Server' -j ACCEPT
+  do_firewall_checked "$ARG" INPUT -p udp -s "$SRC_ADDR" --sport 33340 -m comment --comment 'Fuchsia Netboot TFTP Source Port' -j ACCEPT
+  do_firewall_checked "$ARG" INPUT -p udp -s "$SRC_ADDR" --sport 5353 -m comment --comment 'Fuchsia MDNS' -j ACCEPT
+done
+echo "Done!"

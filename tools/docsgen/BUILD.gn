@@ -1,0 +1,457 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/config/build_api_module.gni")
+import("//build/python/python_binary.gni")
+import("//build/python/python_host_test.gni")
+import("//build/sdk/sdk_documentation.gni")
+
+assert(!is_host, "These rules assume a non-host toolchain.")
+
+group("docsgen") {
+  testonly = true
+  deps = [ ":generated_docs" ]
+  if (current_toolchain == default_toolchain) {
+    deps += [
+      ":clidoc_checker",
+      ":reference_doc_checker",
+    ]
+  }
+}
+
+# Runs one time python assemblydoc generation script.
+compiled_action("invoke_assemblydoc") {
+  tool = "//tools/assemblydoc:assemblydoc_bin"
+  tool_output_name = "assemblydoc"
+  deps = [ "//tools/assemblydoc($host_toolchain)" ]
+  args = [
+    "--archive-output",
+    rebase_path("$target_out_dir/assemblydoc.tar.gz", root_build_dir),
+  ]
+
+  metadata = {
+    # Record metadata for the //tools/docsgen build API.
+    generated_docset = [
+      {
+        name = "assemblydoc"
+        archive = {
+          origin_file =
+              rebase_path("$target_out_dir/assemblydoc.tar.gz", root_build_dir)
+          base_folder = "assemblydoc"
+        }
+        dest_folder = "sdk/assembly"
+      },
+    ]
+  }
+  outputs = [ "$target_out_dir/assemblydoc.tar.gz" ]
+}
+
+_fidldoc_transforms_script_target = "fidldoc_transforms"
+python_binary(_fidldoc_transforms_script_target) {
+  main_source = "//build/fidl/gen_fidldocs.py"
+  output_name = "gen_fidldocs.pyz"
+  sources = []
+  deps = []
+}
+
+# Runs one time python fidldoc generation script.
+action("invoke_fidldoc") {
+  script_output = get_target_outputs(":${_fidldoc_transforms_script_target}")
+  script = script_output[0]
+  metadata = {
+    # Record metadata for the //tools/docsgen build API.
+    generated_docset = [
+      {
+        name = "fidldoc"
+        archive = {
+          origin_file =
+              rebase_path("$target_out_dir/fidldoc.zip", root_build_dir)
+          base_folder = "fidldoc"
+        }
+        dest_folder = "sdk/fidl"
+      },
+    ]
+  }
+  inputs = [
+    "$root_build_dir/host-tools/fidldoc",
+    "$root_build_dir/host-tools/fidldoc.config.json",
+    "$root_build_dir/sdk_fidl_json.json",
+  ]
+
+  outputs = [ "$target_out_dir/fidldoc.zip" ]
+  depfile = "$target_out_dir/$target_name.d"
+
+  args = [
+    "--zipped-result",
+    "--build-dir",
+    rebase_path(root_build_dir, root_build_dir),
+    "--out-dir",
+    rebase_path(target_out_dir, root_build_dir),
+    "--dep-file",
+    rebase_path(depfile, root_build_dir),
+  ]
+
+  deps = [
+    ":${_fidldoc_transforms_script_target}",
+    "//build/fidl:sdk_fidl",
+    "//tools/fidl/fidldoc:fidldoc_copy_config($host_toolchain)",
+    "//tools/fidl/fidldoc($host_toolchain)",
+  ]
+}
+
+clidoc_tarfile = "${target_out_dir}/clidoc_out.tar.gz"
+_clidoc_label = "//tools/clidoc:clidoc_bin($host_toolchain)"
+_clidoc_path = get_label_info(_clidoc_label, "root_out_dir") + "/clidoc"
+
+# The list of tools in the IDK to be documented comes from the
+# `idk_host_tools_collection` target, which generates a manifest we
+# can use and ensures the tool executables are built before clidoc runs.
+_idk_host_tools_label =
+    "//sdk:idk_host_tools_collection_generate_meta_files($host_toolchain)"
+_idk_host_tools_out_dir = get_label_info(_idk_host_tools_label, "root_out_dir")
+_idk_host_tools_manifest = "${_idk_host_tools_out_dir}/sdk/exported/idk_host_tools_collection/meta/manifest.json"
+
+action("invoke_clidoc") {
+  script = "clidoc_run.py"
+  depfile = "$target_out_dir/$target_name.d"
+  deps = [
+    "//src/developer/ffx:ffx_build_dir_config_file",
+    "//src/developer/ffx:tool_manifest($host_toolchain)",
+    "//src/developer/ffx/frontends/ffx:ffx_bin_unversioned($host_toolchain)",
+    _clidoc_label,
+    _idk_host_tools_label,
+  ]
+
+  metadata = {
+    # Record metadata for the //tools/docsgen build API.
+    generated_docset = [
+      {
+        name = "clidoc"
+        archive = {
+          origin_file = rebase_path(clidoc_tarfile, root_build_dir)
+          base_folder = "clidoc"
+        }
+        dest_folder = "tools/sdk"
+      },
+    ]
+
+    # Do not include `_idk_host_tools_label` in the prebuild data. This target
+    # is a dependency of an IDK collection that already depends on
+    # `_idk_host_tools_label`'s dependencies, so they are already included. In
+    # addition, `_idk_host_tools_label` is an IDK collection, and including it
+    # would result in multiple  "collection" entries in the prebuild data, which
+    # is not allowed.
+    idk_atom_prebuild_info_barrier = deps - [ _idk_host_tools_label ]
+  }
+
+  inputs = [
+    _clidoc_path,
+    "${root_out_dir}/ffx_tools.json",
+    "${root_out_dir}/ffx-config.json",
+    _idk_host_tools_manifest,
+  ]
+  outputs = [ clidoc_tarfile ]
+  args = [
+    "--clidoc",
+    rebase_path(_clidoc_path, root_build_dir),
+    "--input",
+    rebase_path(_idk_host_tools_manifest, root_build_dir),
+    "--output",
+    rebase_path(clidoc_tarfile, root_build_dir),
+    "--depfile",
+    rebase_path(depfile, root_build_dir),
+    "--isolate-dir",
+    rebase_path(target_gen_dir, root_build_dir),
+    "--subtool-manifest",
+    rebase_path("${root_out_dir}/ffx_tools.json", root_build_dir),
+    "--excludes",
+    "device-finder",
+    "far",
+    "fvm",
+    "merkleroot",
+  ]
+}
+
+_helpdoc_script_target = "helpdoc_generation"
+helpdoc_tarfile = "helpdoc_out.tar.gz"
+python_binary(_helpdoc_script_target) {
+  main_source = "//tools/docsgen/gen_helpdocs.py"
+  output_name = "gen_helpdocs.pyz"
+  sources = []
+  deps = []
+}
+
+_docsgen_transforms_script_target = "docsgen_transforms"
+python_binary(_docsgen_transforms_script_target) {
+  main_source = "//tools/docsgen/docsgen_transforms.py"
+  output_name = "docsgen_transforms.pyz"
+  sources = []
+  deps = []
+}
+
+# Runs one time python helpdoc generation script.
+action("invoke_helpdoc") {
+  # TODO(https://fxbug.dev/42168642): Remove this exception when this action no
+  # longer executes fx tools.
+  hermetic_deps = false
+
+  script_output = get_target_outputs(":${_helpdoc_script_target}")
+  script = script_output[0]
+  depfile = "$target_out_dir/$target_name.d"
+  metadata = {
+    # Record metadata for the //tools/docsgen build API.
+    generated_docset = [
+      {
+        name = "helpdoc"
+        archive = {
+          origin_file =
+              rebase_path("$target_out_dir/$helpdoc_tarfile", root_build_dir)
+          base_folder = "helpdoc"
+        }
+        dest_folder = "tools/fx"
+      },
+    ]
+  }
+  outputs = [
+    "$target_out_dir/$helpdoc_tarfile",
+    "$target_gen_dir/helpdoc.log",
+  ]
+
+  args = [
+    "--out-path",
+    rebase_path("$target_out_dir/$helpdoc_tarfile", root_build_dir),
+    "--src-dir",
+    rebase_path("//", root_build_dir),
+    "--log-to-file",
+    rebase_path("$target_gen_dir/helpdoc.log", root_build_dir),
+    "--depfile",
+    rebase_path(depfile, root_build_dir),
+  ]
+
+  deps = [ ":${_helpdoc_script_target}" ]
+}
+
+action("create_syscall_docs") {
+  script = "gen_syscalls_toc.py"
+
+  deps = [ "//zircon/vdso:syscall_docs.zip" ]
+  inputs = [ get_label_info(deps[0], "target_out_dir") + "/syscall_docs.zip" ]
+  outputs = [ "${target_out_dir}/syscalls.zip" ]
+
+  args = [
+    "--input",
+    rebase_path(inputs[0], root_build_dir),
+    "--output",
+    rebase_path(outputs[0], root_build_dir),
+    "--reference-root",
+    "/reference/syscalls",
+  ]
+
+  metadata = {
+    generated_docset = [
+      {
+        name = "syscalls"
+        archive = {
+          origin_file = rebase_path(outputs[0], root_build_dir)
+        }
+        dest_folder = "syscalls"
+      },
+    ]
+  }
+}
+
+compiled_action("invoke_cmldoc") {
+  tool = "//tools/cmc:cmc"
+  tool_output_name = "cmc"
+  metadata = {
+    # Record metadata for the //tools/docsgen build API.
+    generated_docset = [
+      {
+        name = "cmldoc"
+        origin_files = [ rebase_path("$target_out_dir/cmldoc_out/index.md",
+                                     root_build_dir) ]
+        dest_folder = "sdk/cml"
+      },
+    ]
+  }
+  outputs = [ "$target_out_dir/cmldoc_out/index.md" ]
+  args = [
+    "print-cml-reference",
+    "-o",
+    rebase_path("$target_out_dir/cmldoc_out/index.md", root_build_dir),
+  ]
+  deps = [ "//tools/cmc($host_toolchain)" ]
+}
+
+# This exposes relevant reference doc paths for infra to upload.
+#
+# Type: list(scope)
+#
+#   name:
+#     Required: name of the reference docs to be generated. This name
+#     will be used to identify the ref doc git commit process downstream
+#     in the docsgen recipe.
+#     Type: string
+#
+#   archive:
+#     Optional: If this key is present, this denotes that the ref docs
+#     are compressed. This is most likely to adhere to hermetic builds.
+#     Additional specific parameters will be included pertaining to archive
+#     paths.
+#     Type: scope
+#
+#     origin_file:
+#        Required: path to compressed archived file holding ref docs.
+#        Type: path relative to $root_build_dir
+#
+#     base_folder:
+#        Optional: base folder containing all ref docs once origin file
+#        is decompresssed. Alternatively if base folder is not specified.
+#        all reference docs are simply decompressed into the current dir.
+#        Type: string
+#
+#   origin_files:
+#     Optional: If this key is present, this denotes that the ref docs
+#     can be listed and are decompressed.
+#     Type: list of file paths relative to $root_build_dir
+#
+#   dest_folder:
+#     Required: path to destination folder within reference docs repo
+#     Type: path relative to reference docs repo root directory
+#
+
+build_api_module("generated_docs") {
+  testonly = true
+  data_keys = [ "generated_docset" ]
+  deps = [
+    ":create_syscall_docs",
+    ":invoke_assemblydoc",
+    ":invoke_clidoc",
+    ":invoke_cmldoc",
+    ":invoke_fidldoc",
+    ":invoke_helpdoc",
+    "//build/bazel/bazel_sdk/docs",
+    "//bundles/drivers:create_all_drivers_doc",
+  ]
+}
+
+# Set up targets and files for sdk_documentation
+
+sdk_docs = [
+  {
+    target = ":invoke_assemblydoc"
+    file = "assemblydoc.tar.gz"
+  },
+  {
+    target = ":invoke_cmldoc"
+    file = "cmldoc_out/index.md"
+  },
+  {
+    target = ":invoke_fidldoc"
+    file = "fidldoc.zip"
+  },
+  {
+    target = ":invoke_helpdoc"
+    file = "helpdoc_out.tar.gz"
+  },
+  {
+    target = ":invoke_clidoc"
+    file = "clidoc_out.tar.gz"
+  },
+]
+
+sdk_doc_files = []
+sdk_doc_targets = []
+foreach(sdk_doc, sdk_docs) {
+  src_dir = get_label_info(sdk_doc.target, "target_out_dir")
+  sdk_doc_file = sdk_doc.file
+
+  sdk_doc_files += [
+    {
+      source = "$src_dir/$sdk_doc_file"
+      dest = "docs/$sdk_doc_file"
+    },
+  ]
+  sdk_doc_targets += [ sdk_doc.target ]
+}
+
+sdk_documentation("ref_docs_sdk") {
+  name = "ref_docs"
+  category = "partner"
+
+  files = sdk_doc_files
+  non_sdk_deps = sdk_doc_targets
+}
+
+if (current_toolchain == default_toolchain) {
+  action("reference_doc_checker") {
+    testonly = true
+    script = "reference_doc_checker_test.py"
+    depfile = "${target_out_dir}/${target_name}.d"
+    deps = [
+      ":create_syscall_docs",
+      ":generated_docs",
+      ":invoke_assemblydoc",
+      ":invoke_clidoc",
+      ":invoke_cmldoc",
+      ":invoke_fidldoc",
+      ":invoke_helpdoc",
+      "//build/bazel/bazel_sdk/docs",
+      "//bundles/drivers:create_all_drivers_doc",
+      "//tools/doc_checker:doc_checker_host_tool($host_toolchain)",
+    ]
+    _doc_checker_dir = get_label_info(
+            "//tools/doc_checker::doc_checker_host_tool($host_toolchain)",
+            "target_out_dir")
+    _manifests = get_target_outputs(":generated_docs")
+    inputs = _manifests
+    inputs += [
+      "$target_out_dir/assemblydoc.tar.gz",
+      "$target_out_dir/syscalls.zip",
+      "$target_out_dir/fidldoc.zip",
+      "$target_out_dir/helpdoc_out.tar.gz",
+      "$target_out_dir/clidoc_out.tar.gz",
+      "${target_out_dir}/cmldoc_out/index.md",
+      "${root_build_dir}/gen/build/bazel/bazel_sdk/docs/docs.zip",
+      "${root_build_dir}/gen/bundles/drivers/_all_drivers_doc.yaml",
+      "$root_build_dir/host-tools/doc-checker",
+    ]
+    outputs = [ "${target_out_dir}/all_docs.zip" ]
+    args = [
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+      "--doc-checker",
+      rebase_path("$root_build_dir/host-tools/doc-checker", root_build_dir),
+      "--src-root",
+      rebase_path("//", root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+    foreach(i, _manifests) {
+      args += [
+        "--input",
+        rebase_path(i, root_build_dir),
+      ]
+    }
+  }
+
+  action("clidoc_checker") {
+    script = "clidoc_test.py"
+    inputs = [ clidoc_tarfile ]
+    deps = [ ":invoke_clidoc" ]
+    outputs = [ "${target_out_dir}/clidoc_contents.txt" ]
+    args = [
+      "--input",
+      rebase_path(clidoc_tarfile, root_build_dir),
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+    ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [ "tests($host_toolchain)" ]
+}

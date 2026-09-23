@@ -1,0 +1,5303 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+load("@fuchsia_icu_config//:constants.bzl", "icu_flavors")
+load(
+    "//build/bazel/rules/assembly:assembly_input_bundle.bzl",
+    "assembly_input_bundle",
+    "assembly_resources_directory",
+)
+load("//build/bazel/rules/assembly:platform_artifacts.bzl", "platform_artifacts")
+load("//build/bazel/rules/icu:icu_assembly_input_bundle.bzl", "icu_assembly_input_bundle")
+load("//build/bazel/rules/icu:icu_names.bzl", "icu_flavored_name")
+load("//third_party/sbase:binaries.bzl", "sbase_binaries")
+load(
+    ":platform_aibs.bzl",
+    "bringup_platform_aib_names",
+    "icu_platform_aib_base_names",
+    "platform_aib_names",
+)
+
+########
+# Guaranteed Invariants
+#
+#
+# Invariants that are guaranteed by these platform-defined Assembly Input
+# Bundles (AIBs):
+#
+# 1) Their contents are bitwise identical for all boards and products, for a
+#    given architecture and "debug" vs. "release".  They could be built once-
+#    each for the following, and then used as prebuilts if the build supported
+#    that:
+#      - x64-release
+#      - x64-debug
+#      - arm64-release
+#      - arm64-debug
+#
+# 2) Any single artifact is only included in one AIB.
+
+########
+# Maintenance Guidelines
+#
+# DO:  Prefer verboseness and clarity over abstractions and delegation.
+#
+# DO NOT: import a file that defines, for example, a list of labels or a set of
+# config_data entries, that are added to an AIB using a variable.
+#
+# Importing other files which define variables used to provide the contents for
+# an AIB reduces the clarity of how an artifact gets included first in AIBs, and
+# later the assembled image.  This makes it harder to reason about how and when
+# the artifacts are included within the assembled product.
+
+package(
+    default_applicable_licenses = ["//:license"],
+    default_visibility = ["//visibility:public"],
+)
+
+platform_artifacts(
+    name = "bringup",
+    assembly_input_bundles = [":" + name for name in bringup_platform_aib_names],
+)
+
+platform_artifacts(
+    name = "platform",
+    assembly_input_bundles = [
+        ":" + name
+        for name in platform_aib_names + [
+            icu_flavored_name(base_name, flavor)
+            for base_name in icu_platform_aib_base_names
+            for flavor in icu_flavors
+        ]
+    ],
+)
+
+########
+#
+# The Zircon kernel images by build type
+#
+# This uses a specialized template to create the AIB.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "zircon_eng",
+    kernel = "@gn_targets//bundles/assembly/bazel_inputs:zircon_eng_kernel",
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "zircon_user",
+    kernel = "@gn_targets//bundles/assembly/bazel_inputs:zircon_user_kernel",
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "zircon_userdebug",
+    kernel = "@gn_targets//bundles/assembly/bazel_inputs:zircon_userdebug_kernel",
+)
+
+########
+#
+# The /bootstrap realm AIBs
+#
+# The most-common, most-basic, Assembly Input Bundles that are included by all
+# assembled systems.  No system can function without these.
+#
+# These provide the `/bootstrap` realm and its children that are always present
+# in each of the build-types.
+#
+# The most-common, most-basic, AIB that is included in all assembled systems,
+# regardless of build-type.
+#
+# WARNING:  The only way to remove items from this AIB for a given product is to
+# move them to other AIBs that are included by all other products.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "embeddable",
+    auto_include_in = [
+        "everything",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:embeddable.bootfs_files_package",
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/critical-services:package",
+        "//bundles/assembly/bazel_inputs/src/diagnostics/archivist:package",
+        "//bundles/assembly/bazel_inputs/src/power/shutdown-shim:package",
+    ],
+    root_shards = [
+        "//src/sys/root:root.cml",
+    ],
+    bootstrap_shards = [
+        "//src/diagnostics/archivist:meta/archivist.bootstrap_shard.cml",
+        "//src/sys/bootstrap:meta/bootstrap.cml",
+    ],
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/bus/drivers/platform:package",
+            "driver_components": ["meta/platform-bus.cm"],
+        },
+    ],
+)
+
+# This AIB contains Component Manager without tracing enabled.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "component_manager",
+    scrutiny_required = [
+        "everything",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:component_manager.bootfs_files_package",
+)
+
+# This AIB contains Component Manager with tracing, which should not
+# be used in memory-constrained builds.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "component_manager_with_tracing",
+    allowed_in = [
+        "eng",
+        "userdebug",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:component_manager_with_tracing.bootfs_files_package",
+    root_shards = [
+        "//src/sys/component_manager:meta/component_manager_root_trace.root_shard.cml",
+    ],
+)
+
+# This AIB contains Component Manager linked with with tracing and the Heapdump
+# instrumentation library for memory profiling. It should not be used in
+# production.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "component_manager_with_tracing_and_heapdump",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:component_manager_with_tracing_and_heapdump.bootfs_files_package",
+)
+
+# The most minimal AIB that is included in assembled systems that are meant to be
+# standalone, regardless of build-type.
+
+_BOOTSTRAP_AIB_BOOTSTRAP_PKGS = [
+    "//bundles/assembly/bazel_inputs/src/bringup/bin/device-name-provider:package",
+    "//bundles/assembly/bazel_inputs/src/bringup/bin/kernel-args-forwarder:package",
+    "//bundles/assembly/bazel_inputs/src/bringup/bin/sysinfo:package",
+    "//bundles/assembly/bazel_inputs/src/sysmem/server:pkg",
+    "//bundles/assembly/bazel_inputs/src/zircon/bin/role_manager:package",
+]
+
+_BOOTSTRAP_AIB_BOOTSTRAP_SHARDS = [
+    "//src/bringup/bin/kernel-args-forwarder:meta/kernel_args_forwarder.bootstrap_shard.cml",
+    "//src/bringup/bin/sysinfo:meta/sysinfo.shard.cml",
+    "//src/sysmem/server:meta/sysmem.bootstrap_shard.cml",
+    "//src/bringup/bin/device-name-provider:meta/device-name-provider.bootstrap_shard.cml",
+    "//src/zircon/bin/role_manager:meta/role_manager.bootstrap_shard.cml",
+]
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bootstrap",
+    auto_include_in = [
+        "bootstrap",
+        "utility",
+        "standard",
+    ],
+    bootfs_packages = select({
+        "//conditions:default": _BOOTSTRAP_AIB_BOOTSTRAP_PKGS,
+        # Enabling profiling fundamentally changes how the platform is
+        # compiled and requires the addition of instrumentation_data_processor
+        # package in bootfs packages to collect and process profiles.
+        "//build/bazel/config/select/is_profile:true": _BOOTSTRAP_AIB_BOOTSTRAP_PKGS + [
+            "//bundles/assembly/bazel_inputs/src/sys/instrumentation_data_processor:instrumentation_data_processor_pkg",
+        ],
+    }),
+    bootstrap_shards = select({
+        "//conditions:default": _BOOTSTRAP_AIB_BOOTSTRAP_SHARDS,
+        # Enabling profiling fundamentally changes how the platform is
+        # compiled and requires the addition of instrumentation_data_processor
+        # shard to the bootstrap shard list.
+        "//build/bazel/config/select/is_profile:true": _BOOTSTRAP_AIB_BOOTSTRAP_SHARDS + [
+            "//src/sys/instrumentation_data_processor:meta/instrumentation_data_processor.bootstrap_shard.cml",
+        ],
+    }),
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/adc/drivers/adc:package",
+            "driver_components": ["meta/adc.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/block/drivers/sdmmc:package",
+            "driver_components": ["meta/sdmmc.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/clock/drivers/clock:package",
+            "driver_components": ["meta/clock.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/gpio/drivers/gpio:package",
+            "driver_components": ["meta/gpio.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/i2c/drivers/i2c:package",
+            "driver_components": ["meta/i2c.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/spi/drivers/spi:package",
+            "driver_components": ["meta/spi.cm"],
+        },
+    ],
+)
+
+# This AIB composes with AIBs which add base drivers to route storage acccess to
+# base drivers.
+assembly_input_bundle(
+    name = "base_drivers_storage",
+    allowed_in = [
+        "standard",
+        "utility",
+    ],
+    bootstrap_shards = [
+        "//src/devices/bin/driver_framework:meta/base_drivers_storage.bootstrap_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "display_drivers_boot",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/graphics/display/drivers/coordinator:package",
+            "driver_components": ["meta/display-coordinator.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "display_drivers_base",
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/graphics/display/drivers/coordinator:package",
+            "driver_components": ["meta/display-coordinator.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "pwm_driver",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/pwm/drivers/pwm:package",
+            "driver_components": ["meta/pwm.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "power_driver",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/power/drivers/power:package",
+            "driver_components": ["meta/power.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "registers_driver",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/registers/drivers/registers:package",
+            "driver_components": ["meta/registers.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_cdc_function_boot",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/usb-cdc-function:package",
+            "driver_components": ["meta/usb-cdc-function.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_cdc_function_base",
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/usb-cdc-function:package",
+            "driver_components": ["meta/usb-cdc-function.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_zero_function_base",
+    allowed_in = [
+        "standard::eng",
+        "utility::eng",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/usb/drivers/usb-zero-function:package",
+            "driver_components": ["meta/usb-zero-function.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_policy",
+    experimental = True,
+    allowed_in = [
+        "standard::eng",
+        "standard::userdebug",
+        "utility::eng",
+        "utility::userdebug",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/usb/usb-policy",
+        "//bundles/assembly/bazel_inputs/src/devices/usb/bin/usb-cli",
+    ],
+    core_shards = [
+        "//src/devices/usb/usb-policy:meta/usb-policy.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_policy_starnix",
+    experimental = True,
+    allowed_in = [
+        "standard::eng",
+        "standard::userdebug",
+        "utility::eng",
+        "utility::userdebug",
+    ],
+    core_shards = [
+        "//src/devices/usb/usb-policy:meta/usb-policy-starnix.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "network_drivers_boot",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/ethernet/netdevice-migration:package",
+            "driver_components": ["meta/netdevice-migration.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/network/drivers/network-device:package",
+            "driver_components": ["meta/network-device.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "network_drivers_base",
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/ethernet/netdevice-migration:package",
+            "driver_components": ["meta/netdevice-migration.cm"],
+        },
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/network/drivers/network-device:package",
+            "driver_components": ["meta/network-device.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_peripheral_drivers_boot",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/usb/drivers/usb-peripheral:package",
+            "driver_components": ["meta/usb-peripheral.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_peripheral_drivers_base",
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/usb/drivers/usb-peripheral:package",
+            "driver_components": ["meta/usb-peripheral.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "input_drivers",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/ui/input/drivers/buttons:package",
+            "driver_components": ["meta/buttons.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/ui/input/drivers/hid:package",
+            "driver_components": ["meta/hid.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/ui/input/drivers/hid-input-report:package",
+            "driver_components": ["meta/hid-input-report.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_host_drivers",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/usb/drivers/usb-bus:package",
+            "driver_components": ["meta/usb-bus.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/hci/transport/usb:package",
+            "driver_components": ["meta/bt-transport-usb.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/block/drivers/usb-mass-storage:package",
+            "driver_components": ["meta/usb-mass-storage.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/usb-cdc-ecm:package",
+            "driver_components": ["meta/usb-cdc-ecm.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/ml/drivers/usb-harriet:package",
+            "driver_components": ["meta/usb-harriet.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/serial/drivers/usb-cdc-acm:package",
+            "driver_components": ["meta/usb-cdc-acm.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/usb/drivers/usb-composite:package",
+            "driver_components": ["meta/usb-composite.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/usb/drivers/usb-hub:package",
+            "driver_components": ["meta/usb-hub.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/media/audio/drivers/usb-audio:package",
+            "driver_components": ["meta/usb-audio.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/ui/input/drivers/usb-hid:package",
+            "driver_components": ["meta/usb-hid.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/serial/drivers/ftdi:package",
+            "driver_components": ["meta/ftdi.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/asix-88179:package",
+            "driver_components": ["meta/asix-88179.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/asix-88772b:package",
+            "driver_components": ["meta/asix-88772b.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_rndis_function",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/rndis-function:package",
+            "driver_components": ["meta/rndis-function.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_ums_function",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/block/drivers/ums-function:package",
+            "driver_components": ["meta/ums-function.cm"],
+        },
+    ],
+)
+
+# The most-common, most-basic, AIB that is included in all userdebug and eng
+# systems.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "embeddable_userdebug",
+    auto_include_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:embeddable_userdebug.bootfs_files_package",
+    # tools
+    # shell
+    bootfs_packages = [
+        # Developer console allows SSH and FFX to start consoles.
+        "//bundles/assembly/bazel_inputs/src/developer/console:package",
+    ],
+    root_shards = [
+        "//src/developer/toolbox:meta/toolbox.root_shard.cml",
+    ],
+    bootstrap_shards = [
+        "//src/developer/toolbox:meta/toolbox.bootstrap_shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "name": "toolbox",
+            "bootfs_package": True,
+            "components": [
+                {
+                    "component_name": "toolbox",
+                    "shards": [
+                        "//src/developer/toolbox:meta/toolbox.cml",
+                        "//src/developer/console:meta/developer-console.toolbox_shard.cml",
+                    ],
+                    "cmc_features": ["use_dictionaries"],
+                },
+            ],
+        },
+    ],
+)
+
+# The most minimal AIB that is included in userdebug and eng assembled systems
+# that are meant to be standalone.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bootstrap_userdebug",
+    auto_include_in = [
+        "bootstrap::userdebug",
+        "bootstrap::eng",
+        "standard::userdebug",
+        "standard::eng",
+        "utility::userdebug",
+        "utility::eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:bootstrap_userdebug.bootfs_files_package",
+)
+
+# The most-common, most-basic, AIB that is included in all eng systems.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "embeddable_eng",
+    auto_include_in = [
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/bootpkg:package",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver_tools:package",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/lsdev:package",
+        "//bundles/assembly/bazel_inputs/src/diagnostics/iquery:package",
+    ],
+    shell_commands = [
+        {
+            "bootfs_package": True,
+            "package": "bootpkg",
+            "components": ["bootpkg"],
+        },
+        {
+            "bootfs_package": True,
+            "package": "driver",
+            "components": ["driver"],
+        },
+        {
+            "bootfs_package": True,
+            "package": "lsdev",
+            "components": ["lsdev"],
+        },
+        {
+            "bootfs_package": True,
+            "package": "iquery",
+            "components": [
+                "iquery",
+                "inspect",
+            ],
+        },
+    ],
+)
+
+# AIB for the bt-transport-uart driver.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bt_transport_uart_driver",
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/hci/transport/uart/cpp:uart",
+            "driver_components": ["meta/bt-transport-uart.cm"],
+        },
+    ],
+)
+
+# AIB for the bus-pci driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bus_pci_driver",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/pci/drivers/pci:bus-pci-package",
+            "driver_components": ["meta/bus-pci.cm"],
+        },
+    ],
+)
+
+# AIB for the realtek-8211f driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "realtek_8211f_driver",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/ethernet/drivers/realtek-8211f:package",
+            "driver_components": ["meta/realtek-8211f.cm"],
+        },
+    ],
+)
+
+# AIB for the xHCI driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "xhci_driver",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/usb/drivers/xhci:package",
+            "driver_components": ["meta/xhci.cm"],
+        },
+    ],
+)
+
+# AIB for the fake-battery driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fake_battery_driver",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/power/testing/fake-battery:fake_battery",
+            "driver_components": ["meta/fake-battery.cm"],
+        },
+    ],
+)
+
+# AIB for the fake-powersensor driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fake_power_sensor",
+    allowed_in = [
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/testing/fake-powersensor:fake_power_sensor_package",
+    ],
+    core_shards = [
+        "//src/power/testing/fake-powersensor:meta/fake-power-sensor.core_shard.cml",
+    ],
+)
+
+# AIB for the fake-display-stack-host
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fake_display_stack_host",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/graphics/display/testing/fake-display-stack-host:bazel_input",
+    ],
+    core_shards = [
+        "//src/graphics/display/testing/fake-display-stack-host:meta/fake-display-core-child.shard.cml",
+    ],
+)
+
+# AIB for the sdhci driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "sdhci_driver",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/block/drivers/sdhci:package",
+            "driver_components": ["meta/sdhci.cm"],
+        },
+    ],
+)
+
+# AIB for the cqhci driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "cqhci_driver",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/block/drivers/cqhci:package",
+            "driver_components": ["meta/cqhci.cm"],
+        },
+    ],
+)
+
+# AIB for the ufs driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "ufs_pci_driver",
+    allowed_in = [
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/block/drivers/ufs:ufs-pci-package",
+            "driver_components": ["meta/ufs-pci.cm"],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "ufs_pdev_driver",
+    allowed_in = [
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/block/drivers/ufs:ufs-pdev-package",
+            "driver_components": ["meta/ufs-pdev.cm"],
+        },
+    ],
+)
+
+# AIB for the interconnect core driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "interconnect_driver",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/interconnect/drivers/interconnect:package",
+            "driver_components": ["meta/interconnect.cm"],
+        },
+    ],
+)
+
+# AIB for the Vulkan Loader
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "vulkan_loader",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/graphics/bin/vulkan_loader",
+    ],
+)
+
+# AIB for the Lavapipe ICD Package
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "lavapipe_pkg",
+    # TODO(https://fxbug.dev/541271630): Restrict lavapipe to eng build types.
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = select({
+        "//build/bazel/platforms:is_fuchsia_riscv64": [],
+        "//conditions:default": [
+            "//bundles/assembly/bazel_inputs/src/graphics/lib/lavapipe-vulkan:lavapipe_pkg",
+        ],
+    }),
+)
+
+# Trusted execution environment.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "trusted_execution_environment",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/microfuchsia/tee/manager:ta-manager",
+        "//bundles/assembly/bazel_inputs/src/microfuchsia/tee/binder-proxy",
+        "//bundles/assembly/bazel_inputs/src/microfuchsia/tee",
+    ],
+    bootstrap_shards = [
+        "//src/microfuchsia/tee:meta/tee.bootstrap_shard.cml",
+    ],
+)
+
+# The most minimal AIB that is included in eng assembled systems that are meant
+# to be standalone.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bootstrap_eng",
+    auto_include_in = [
+        "bootstrap::eng",
+        "utility::eng",
+        "standard::eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:bootstrap_eng.bootfs_files_package",
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/power/bin/vreg-ctl:vreg_ctl_pkg",
+        "//bundles/assembly/bazel_inputs/src/power/thermal-sensor-manager-cli:thermal-sensor-manager-cli",
+    ],
+)
+
+# hrtimer-ctl shell utility. Used in products that use hrtimer and have shell commands enabled.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "hrtimer-ctl",
+    allowed_in = [
+        "standard::eng",
+        "utility::eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/hrtimer/bin:hrtimer-ctl",
+    ],
+)
+
+# lspci shell utility. Used in products that use PCI and have shell commands enabled.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "lspci",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:lspci.bootfs_files_package",
+)
+
+# ufsutil shell utility. Used in products that use UFS and have shell commands enabled.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "ufsutil",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:ufsutil.bootfs_files_package",
+)
+
+# The kernel_debug_broker AIB is included by all eng and userdebug products.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_debug_broker_userdebug",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/kernel_debug_broker:pkg",
+    ],
+    bootstrap_shards = [
+        "//src/bringup/bin/kernel_debug_broker:meta/kernel_debug_broker_userdebug.bootstrap_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_debug_broker_user",
+    allowed_in = [
+        "user",
+    ],
+    bootstrap_shards = [
+        "//src/bringup/bin/kernel_debug_broker:meta/kernel_debug_broker_user.bootstrap_shard.cml",
+    ],
+)
+
+# Legacy AIB for migration purposes.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "paver_legacy",
+    bootfs_or_base_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/paver:package",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "paver_shards_bootstrap",
+    bootstrap_shards = [
+        "//src/bringup/bin/paver:meta/paver.bootstrap_shard.cml",
+    ],
+    root_shards = [
+        "//src/bringup/bin/paver:meta/paver.bootfs.root_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "auto_slot_committer",
+    allowed_in = [
+        # The real system-update-committer handles slot management on
+        # higher-featured builds, so we should only use auto-slot-committer
+        # for bootstrap. We also restrict to userdebug/eng builds, there's a
+        # higher bar for adding components to user builds and we don't need it
+        # for bringup.
+        "bootstrap::userdebug",
+        "bootstrap::eng",
+    ],
+    bootstrap_shards = [
+        "//src/bringup/bin/auto-slot-committer:meta/auto-slot-committer.bootstrap_shard.cml",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/auto-slot-committer:package",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "paver_shards_core",
+    core_shards = [
+        "//src/bringup/bin/paver:meta/paver.core_shard.cml",
+    ],
+    root_shards = [
+        "//src/bringup/bin/paver:meta/paver.base.root_shard.cml",
+    ],
+)
+
+# The console AIB is included by all eng and userdebug products, and can be
+# optionally included by user products.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "console",
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/console:package",
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/console-launcher:package",
+    ],
+    bootstrap_shards = [
+        "//src/bringup/bin/console:meta/console.shard.cml",
+    ],
+)
+
+# The console-eng AIB is used in eng products instead of console
+assembly_input_bundle(
+    name = "console-eng",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/console:package",
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/console-launcher:package-eng",
+    ],
+    bootstrap_shards = [
+        "//src/bringup/bin/console:meta/console.shard.cml",
+        "//src/bringup/bin/console:meta/console_eng.shard.cml",
+    ],
+)
+
+# The ptysvc AIB is included by all eng and userdebug products.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "ptysvc",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/ptysvc:package",
+    ],
+    bootstrap_shards = [
+        "//src/bringup/bin/ptysvc:meta/ptysvc.bootstrap_shard.cml",
+    ],
+)
+
+# The virtcon AIB is included by all eng and userdebug products, and can be
+# optionally included by user products.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "virtcon",
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/virtcon:package",
+    ],
+    bootstrap_shards = [
+        "//src/bringup/bin/virtcon:meta/virtual-console.shard.cml",
+    ],
+)
+
+# The netsvc AIB is included by all eng products.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "netsvc",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/bringup/bin/netsvc:package",
+    ],
+    bootstrap_shards = [
+        "//src/bringup/bin/netsvc:meta/netsvc.shard.cml",
+    ],
+)
+
+# All eng build type products will include this Assembly Input Bundle.
+# These kernel args should be refactored so that the AIBs have logical names.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_args_eng",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    kernel_cmdline = [
+        "console.shell=true",
+        "kernel.enable-debugging-syscalls=true",
+        "kernel.enable-serial-syscalls=true",
+        "netsvc.all-features=true",
+        "netsvc.disable=false",
+    ],
+)
+
+# All userdebug build type products will include this Assembly Input Bundle.
+# These kernel args should be refactored so that the AIBs have logical names.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_args_userdebug",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    kernel_cmdline = [
+        "console.shell=false",
+        "kernel.enable-serial-syscalls=output-only",
+        "netsvc.disable=true",
+    ],
+)
+
+# All user build type products will include this Assembly Input Bundle.
+#
+# These are all the default values, so this AIB can be safely removed, but we
+# are keeping it around for now so that we can assert that nothing changed
+# during refactor.
+#
+# These kernel args should be refactored so that the AIBs have logical names.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_args_user",
+    kernel_cmdline = [
+        "console.shell=false",
+        "kernel.enable-debugging-syscalls=false",
+        "kernel.enable-serial-syscalls=false",
+        "netsvc.disable=true",
+    ],
+)
+
+# Added when a board supports the PMM checker (ie, it's real hardware that can
+# do this without a large performance penalty), and when desired by the product
+# (based on build-type).
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_pmm_checker_enabled",
+    allowed_in = [
+        "eng",
+    ],
+    kernel_cmdline = [
+        # Enable PMM checker to detect certain kinds of buffer overrun and
+        # use-after-free bugs.
+        "kernel.pmm-checker.enable=true",
+        # Use a small fill size to minimize performance impact.  In practice,
+        # corruption tends to happen at the start of a page so filling/checking only
+        # the first 16 bytes provides decent coverage without sacrificing
+        # performance.
+        "kernel.pmm-checker.fill-size=16",
+    ],
+)
+
+# Added when a board might support the PMM checker, but wants to defer to a run
+# time check to determine if it's real hardware or not.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_pmm_checker_enabled_auto",
+    allowed_in = [
+        "eng",
+    ],
+    kernel_cmdline = [
+        # Enable PMM checker to detect certain kinds of buffer overrun and
+        # use-after-free bugs.
+        "kernel.pmm-checker.enable=auto",
+        # Use a small fill size to minimize performance impact.  In practice,
+        # corruption tends to happen at the start of a page so filling/checking only
+        # the first 16 bytes provides decent coverage without sacrificing
+        # performance.
+        "kernel.pmm-checker.fill-size=16",
+    ],
+)
+
+# sl4f: Scripting Layer for Fuchsia
+#
+# Often used for manipulating device during E2E tests.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "sl4f",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        # We currently include SL4F in base to support E2E tests that
+        # either do not download fuchsia packages or cannot start
+        # package serving due to network limitations.
+        "//bundles/assembly/bazel_inputs/src/testing/sl4f",
+        "//bundles/assembly/bazel_inputs/src/sys/bin/start_sl4f",
+    ],
+    shell_commands = [
+        {
+            "package": "start_sl4f",
+            "components": ["start_sl4f"],
+        },
+    ],
+    core_shards = [
+        "//src/testing/sl4f:meta/sl4f_assembly.core_shard.cml",
+    ],
+)
+
+# Includes the bin/clock and clkctl developer tools
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "clock_development_tools",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:clock_development_tools.bootfs_files_package",
+)
+
+# Includes the CLIs necessary for the Fuchsia installer.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "partitioning_tools",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:partitioning_tools.bootfs_files_package",
+)
+
+########
+#
+# The /core realm AIBs
+#
+# These are the Assembly Input Bundles that are included by all assembled
+# systems that include the `/core` realm.
+# core_realm
+#
+# This AIB adds the `/core` realm itself, and it's mandatory children.  The
+# other AIBs in this group add shards and optional children of `/core`.
+#
+# This is "less than minimal".  "utility" systems include this to get a `/core`
+# realm, but do not include the `common_standard` AIB as that brings in too much
+# functionality for these specialized systems.
+#
+# All children in `/core` receive InspectSink and LogSink.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "core_realm",
+    auto_include_in = [
+        "standard",
+        "utility",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/pkg-cache",
+    ],
+    base_packages = [
+        # This is a required dependency of pkg-cache
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/system-update-committer",
+        # Build-Information
+        "//bundles/assembly/bazel_inputs/src/developer/build_info:build-info-service",
+        # Developer.
+        "//bundles/assembly/bazel_inputs/src/developer/forensics:pkg",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            # Fallback driver for uart nodes.
+            "package_target": "//bundles/assembly/bazel_inputs/src/devices/serial/drivers/serial:package",
+            "driver_components": ["meta/serial.cm"],
+        },
+    ],
+    root_shards = [
+        "//src/sys/core:meta/core.root_shard.cml",
+    ],
+    bootstrap_shards = [
+        "//src/devices/bin/driver_framework:meta/base_drivers.bootstrap_shard.cml",
+        "//src/sys/pkg/bin/pkg-cache:meta/pkg-cache.bootstrap_shard.cml",
+    ],
+    core_shards = [
+        "//src/sys/core:meta/core.cml",
+
+        # TODO:  These shards should be folded into the above
+        # `core.cml` file itself as they are never omitted from it.
+        # TODO:  These shards should be folded into the above
+        # `core.cml` file itself as they are never omitted from it.
+        "//src/developer/build_info:meta/build_info.core_shard.cml",
+        "//src/developer/forensics:forensics.core_shard.cml",
+        "//sdk/lib/inspect:offer.shard.cml",
+    ],
+    compiled_packages = [
+        {
+            # These are not included into the core.cml directly, but may be included
+            # via other shards.
+            "component_includes": [
+                {
+                    "source": "//sdk/lib/inspect:offer.shard.cml",
+                    "destination": "inspect/offer.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/syslog:offer.shard.cml",
+                    "destination": "syslog/offer.shard.cml",
+                },
+                {
+                    "source": "//src/connectivity/bluetooth/profiles/bt-a2dp:meta/bt-a2dp-common.core_shard.cml",
+                    "destination": "src/connectivity/bluetooth/profiles/bt-a2dp/meta/bt-a2dp-common.core_shard.cml",
+                },
+                {
+                    "source": "//src/intl/intl_services:meta/intl.core_shard.base.cml",
+                    "destination": "src/intl/intl_services/meta/intl.core_shard.base.cml",
+                },
+                {
+                    "source": "//src/recovery/system/meta/core_shards:base.shard.cml",
+                    "destination": "src/recovery/system/meta/core_shards/base.shard.cml",
+                },
+                {
+                    "source": "//src/recovery/system/meta/core_shards:ui.shard.cml",
+                    "destination": "src/recovery/system/meta/core_shards/ui.shard.cml",
+                },
+                {
+                    "source": "//src/session/bin/session_manager:meta/session_manager.core_shard.cml",
+                    "destination": "src/session/bin/session_manager/meta/session_manager.core_shard.cml",
+                },
+                {
+                    "source": "//src/settings/service:meta/setui_service_base.core_shard.cml",
+                    "destination": "src/settings/service/meta/setui_service_base.core_shard.cml",
+                },
+                {
+                    "source": "//src/testing/sl4f:meta/sl4f_base.core_shard.cml",
+                    "destination": "src/testing/sl4f/meta/sl4f_base.core_shard.cml",
+                },
+                {
+                    "source": "//src/ui:meta/ui_routes_base.shard.cml",
+                    "destination": "src/ui/meta/ui_routes_base.shard.cml",
+                },
+            ],
+            "name": "core",
+        },
+        {
+            "name": "system-update-realm",
+            "components": [
+                {
+                    "component_name": "system-update-realm",
+                    "shards": ["//src/sys/pkg:meta/system-update-realm.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Global Heapdump collector instance for heap memory profiling
+#
+# This AIB adds an instance of the Heapdump collector `/core/heapdump-collector`
+# whose `fuchsia.memory.heapdump.process.Registry` capability is then routed to
+# `/`.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "heapdump_global_collector",
+    allowed_in = [
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/performance/memory/heapdump/collector",
+    ],
+    root_shards = [
+        "//src/sys/core:meta/heapdump.root_shard.cml",
+    ],
+    core_shards = [
+        "//src/sys/core:meta/heapdump.core_shard.cml",
+    ],
+)
+
+# core_realm_networking
+#
+# This AIB adds all the children of `/core` that are expected to be present if
+# networking is enabled.
+#
+# It does _not_ include either the `network` or `netstack` packages themselves,
+# as which specific variant of those is added is controllable by the product, so
+# they are in separate AIBs.
+#
+# "Utility" systems get this in the 'user' build-type only if they request that
+# networking is added.  All other build-types (and all "standard" systems) get
+# this AIB by mandatory inclusion.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "core_realm_networking",
+    base_packages = [
+        # Hardware Information
+        "//bundles/assembly/bazel_inputs/src/hwinfo",
+        # System Time
+        "//bundles/assembly/bazel_inputs/src/sys/time/timekeeper:timekeeper-without-config",
+        "//bundles/assembly/bazel_inputs/src/sys/time/httpsdate_time_source:httpsdate-time-source-pull",
+        # Other
+        "//bundles/assembly/bazel_inputs/src/sys/stash:pkg",
+    ],
+)
+
+# If config allows, timekeeper will be given some persistent storage to use.
+# Should only be allowed in eng builds.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "timekeeper_persistence",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    core_shards = [
+        "//src/sys/time/timekeeper:timekeeper-persistence.core_shard.cml",
+    ],
+)
+
+# The bundle supporting wake alarms through Timekeeper.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "timekeeper_wake_alarms",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    core_shards = [
+        "//src/sys/time/timekeeper:timekeeper-wake-alarms.core_shard.cml",
+    ],
+)
+
+# Network realm definition.
+#
+# This AIB defines the base network package, which lays out the network realm.
+# It must be used in conjunction with network_realm_packages or
+# network_realm_packages_gub.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "network_realm",
+    compiled_packages = [
+        {
+            "name": "network",
+            "components": [
+                {
+                    "component_name": "network",
+                    "shards": ["//src/connectivity/network:meta/common.shard.cml"],
+                },
+            ],
+            "component_includes": [
+                {
+                    "source": "//sdk/lib/inspect:offer.shard.cml",
+                    "destination": "inspect/offer.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/trace:offer.shard.cml",
+                    "destination": "trace/offer.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/syslog:offer.shard.cml",
+                    "destination": "syslog/offer.shard.cml",
+                },
+            ],
+        },
+    ],
+)
+
+# Network realm packages without unified binary.
+#
+# This AIB includes all the packages that are common across all products that
+# require networking. It provides the network realm using packages that utilize
+# separate, more-optimized, binaries, trading space for performance. This is
+# the default implementation used.
+#
+# It is mutually-exclusive with 'network_realm_packages_gub'.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "network_realm_packages",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/dhcpv4/server:package",
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/dhcpv6/client:package",
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/dns:package",
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/http-client:package",
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/http-client:google_package",
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/reachability:package",
+    ],
+)
+
+# Network realm packages with unified binary.
+#
+# This AIB is equivalent to network_realm_packages. It provides the network
+# realm using packages that utilize a "grand unified binary" (GUB), saving space
+# at the cost of a minor loss in performance.  This is for space- constrained
+# devices that don't have the space for the non-GUB binaries.
+#
+# It is mutually-exclusive with 'network_realm_packages'.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "network_realm_packages_gub",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/dhcpv4/server:package_gub",
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/dhcpv6/client:package_gub",
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/dns:package_gub",
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/http-client:package_gub",
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/http-client:google_package_gub",
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/reachability:package_gub",
+    ],
+)
+
+# networking_with_virtualization
+#
+# This AIB adds the networking capabilities that include virtualization support.
+# It is mutually-exclusive with networking_basic.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "networking_with_virtualization",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/netcfg:package-advanced",
+    ],
+    compiled_packages = [
+        {
+            "name": "network",
+            "components": [
+                {
+                    "component_name": "network",
+                    "shards": ["//src/connectivity/network:meta/network-with-virtualization.shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Basic networking.
+#
+# This AIB adds the basic networking capabilities. It is mutually-exclusive with
+# networking_with_virtualization.
+#
+# It must be used in conjunction with either network_basic_packages or
+# network_basic_packages_gub.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "networking_basic",
+    compiled_packages = [
+        {
+            "name": "network",
+            "components": [
+                {
+                    "component_name": "network",
+                    "shards": ["//src/connectivity/network:meta/network-basic.shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Basic networking packages without unified binary.
+#
+# This AIB provides packages for the networking_basic configuration. It is
+# mutually exlucisve with networking_basic_packages_gub.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "networking_basic_packages",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/netcfg:package-basic",
+    ],
+)
+
+# Basic networking packages with unified binary.
+#
+# This AIB provides space-saving equivalent packages for the networking_basic
+# configuration as found in networking_basic_packages. It is mutually exlucisve
+# with networking_basic_packages.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "networking_basic_packages_gub",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/netcfg:package-basic_gub",
+    ],
+)
+
+# This is common across all eng-mode products that include the core realm.
+#
+# This is mutually-exclusive with the `core_realm_user_and_userdebug` AIB.
+#
+_sbase_bins_in_base = [
+    # Always include 'ls'
+    "ls",
+
+    # These are used by Chromium test infrastructure, and need to always be
+    # available.
+    "cat",
+    "sha1sum",
+
+    # These are used by vendor test infrastructure, and need to always be
+    # available.
+    "grep",
+
+    # These are used by test infrastructure, and always need to be available.
+    "mkdir",
+]
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "core_realm_eng",
+    auto_include_in = [
+        "utility::eng",
+        "standard::eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/pkg-resolver:pkg-resolver-eng",
+        # Dash launcher should be available in every engineering-mode product.
+        "//bundles/assembly/bazel_inputs/src/sys/tools/debug-dash-launcher",
+        # The fs_realm component should be available in every engineering-mode product.
+        "//bundles/assembly/bazel_inputs/src/storage/fs_realm",
+        "//bundles/assembly/bazel_inputs/src/storage/bin:fs_realm_tools",
+    ] + [
+        "//bundles/assembly/bazel_inputs/third_party/sbase:%s_pkg" % bin
+        for bin in _sbase_bins_in_base
+    ],
+    shell_commands = [
+        {
+            "package": "fs_realm_tools",
+            "components": [
+                "mkfs",
+                "fsck",
+                "mount",
+                "umount",
+            ],
+        },
+        {
+            "package": "donut",
+            "components": ["donut"],
+        },
+        {
+            "package": "time",
+            "components": ["time"],
+        },
+        {
+            "package": "uname",
+            "components": ["uname"],
+        },
+        {
+            "package": "sched",
+            "components": ["sched"],
+        },
+        {
+            "package": "far",
+            "components": ["far"],
+        },
+        {
+            "package": "trace",
+            "components": ["trace"],
+        },
+        {
+            "package": "thrasher",
+            "components": ["thrasher"],
+        },
+        {
+            "package": "camera_benchmark",
+            "components": ["camera_benchmark_bin"],
+        },
+        {
+            "package": "camera_sensor_cli",
+            "components": ["camera_sensor_cli_bin"],
+        },
+        {
+            "package": "lowpanctl",
+            "components": ["lowpanctl"],
+        },
+        {
+            "package": "nc",
+            "components": ["nc"],
+        },
+        {
+            "package": "sockscripter",
+            "components": ["sockscripter"],
+        },
+        {
+            "package": "iperf3",
+            "components": ["iperf3"],
+        },
+        {
+            "package": "tcpdump",
+            "components": ["tcpdump"],
+        },
+        {
+            "package": "mdns-util",
+            "components": ["mdns-util"],
+        },
+        {
+            "package": "net-cli",
+            "components": ["net"],
+        },
+        {
+            "package": "dai-info",
+            "components": ["dai-info"],
+        },
+        {
+            "package": "bt-bredr-profile",
+            "components": ["bt-bredr-profile"],
+        },
+        {
+            "package": "bt-cli",
+            "components": ["bt-cli"],
+        },
+        {
+            "package": "bt-le-broadcast-assistant",
+            "components": ["bt-le-broadcast-assistant"],
+        },
+        {
+            "package": "bt-le-central",
+            "components": ["bt-le-central"],
+        },
+        {
+            "package": "bt-le-peripheral",
+            "components": ["bt-le-peripheral"],
+        },
+        {
+            "package": "bt-pairing-tool",
+            "components": ["bt-pairing-tool"],
+        },
+        {
+            "package": "bt-snoop-cli",
+            "components": ["bt-snoop-cli"],
+        },
+        {
+            "package": "bt-fct-hci",
+            "components": ["bt-fct-hci"],
+        },
+        {
+            "package": "bt-hci-tool",
+            "components": ["bt-hci-tool"],
+        },
+        {
+            "package": "bt-avdtp-tool",
+            "components": ["bt-avdtp-tool"],
+        },
+        {
+            "package": "bt-avrcp-controller",
+            "components": ["bt-avrcp-controller"],
+        },
+        {
+            "package": "bt-hfp-hf-tool",
+            "components": ["bt-hfp-hf-tool"],
+        },
+        {
+            "package": "bt-map-mce-tool",
+            "components": ["bt-map-mce-tool"],
+        },
+        {
+            "package": "display-test",
+            "components": ["display-test"],
+        },
+        {
+            "package": "magma-info",
+            "components": ["magma-info"],
+        },
+        {
+            "package": "mediasession_cli_tool",
+            "components": ["mediasession_cli_tool"],
+        },
+        {
+            "package": "fdr_cli",
+            "components": ["fdr"],
+        },
+        {
+            "package": "export-ffs",
+            "components": ["export-ffs"],
+        },
+        {
+            "package": "activity-ctl",
+            "components": ["activity_ctl"],
+        },
+        {
+            "package": "input",
+            "components": ["input"],
+        },
+        {
+            "package": "boringssl_tool",
+            "components": ["bssl"],
+        },
+        {
+            "package": "curl",
+            "components": ["curl"],
+        },
+        {
+            "package": "ssh-keygen",
+            "components": ["ssh-keygen"],
+        },
+        {
+            "package": "ssh",
+            "components": ["ssh"],
+        },
+        {
+            "package": "cowsay",
+            "components": ["cowsay"],
+        },
+        {
+            "package": "hwstress-cli",
+            "components": ["hwstress"],
+        },
+    ] + [
+        {
+            "package": bin,
+            "components": [bin],
+        }
+        for bin in sbase_binaries
+    ],
+    core_shards = [
+        # The process_resolver core shard (either the base-resolver or
+        # pkg-resolver variant) should only be present in
+        # the `core_realm_development_access` AIB, but it's required
+        # here to avoid a userdebug and eng variant of that AIB.
+        #
+        # eng uses the pkg-resolver, as opposed to the base-resolver,
+        # to support ephemeral resolution of shell packages.
+        "//src/sys/process-resolver:meta/process_resolver.pkg-resolver.core_shard.cml",
+        "//src/sys/core:meta/core-env-full-resolver.core_shard.cml",
+        "//src/sys/core:meta/unrestricted-storage.core_shard.cml",
+        "//src/sys/tools/debug-dash-launcher:meta/debug_dash_launcher.core_shard.cml",
+        "//src/storage/fs_realm:meta/fs_realm.core_shard.cml",
+    ],
+    # Add the sbase_binaries to on_demand_packages, unless they've already been added to
+    # base_packages (via _sbase_bins_in_base).
+    on_demand_packages = [
+        "//bundles/assembly/bazel_inputs/third_party/sbase:%s_pkg" % bin
+        for bin in sbase_binaries
+        if bin not in _sbase_bins_in_base
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "dso_runner",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/runners/dso:package",
+    ],
+    core_shards = [
+        "//src/sys/runners/dso:meta/dso_runner.core_shard.cml",
+    ],
+)
+
+# This is common across all user and userdebug products that include the core
+# realm.
+#
+# This is mutually-exclusive with the `core_realm_eng` AIB.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "core_realm_user_and_userdebug",
+    auto_include_in = [
+        "standard::user",
+        "standard::userdebug",
+        "utility::user",
+        "utility::userdebug",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/pkg-resolver",
+    ],
+    core_shards = [
+        # user and userdebug only have the base resolver, not the full
+        # resolver.
+        "//src/sys/core:meta/core-env-base-resolver.core_shard.cml",
+
+        # The process_resolver core shard (either the base-resolver or
+        # pkg-resolver variant) should only be present in
+        # the `core_realm_development_access` AIB, but it's required
+        # here to avoid a userdebug and eng variant of that AIB.
+        #
+        # user and userdebug only have the base-resolver, not the
+        # pkg-resolver.
+        "//src/sys/process-resolver:meta/process_resolver.base-resolver.core_shard.cml",
+
+        # user and userdebug restrict access to the Storage capability
+        # to registered component ids.
+        "//src/sys/core:meta/restricted-storage.core_shard.cml",
+    ],
+)
+
+# Core realm shard for restricted SWD routing (used when trust_store is set to restricted).
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "swd_trust_store_restricted",
+    core_shards = [
+        "//src/sys/core:meta/restricted_swd.core_shard.cml",
+    ],
+)
+
+# Core realm shard for unrestricted SWD routing (used when trust_store is set to public).
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "swd_trust_store_public",
+    core_shards = [
+        "//src/sys/core:meta/unrestricted_swd.core_shard.cml",
+    ],
+)
+
+# This is the AIB that adds the services necessary for developers to access a
+# target running Fuchsia from their development host using tools like `ffx`.
+#
+# This is included with all eng and userdebug build-type systems.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "core_realm_development_access",
+    auto_include_in = [
+        "utility::userdebug",
+        "utility::eng",
+        "standard::userdebug",
+        "standard::eng",
+    ],
+    base_packages = [
+        # SSH is necessary for remote access for development
+        "//bundles/assembly/bazel_inputs/src/developer/sshd-host",
+        "//bundles/assembly/bazel_inputs/third_party/openssh-portable:scp-shell-pkg",
+        # Process resolver enables cli commands to be resolved to components.
+        "//bundles/assembly/bazel_inputs/src/sys/process-resolver",
+        # ffx's remote-control (remote access) components:
+        "//bundles/assembly/bazel_inputs/src/developer/remote-control:remote-control-package",
+        # The developer snapshot tool.
+        "//bundles/assembly/bazel_inputs/src/developer/forensics/snapshot:pkg",
+        # log_listener shell tool.
+        "//bundles/assembly/bazel_inputs/src/diagnostics/log_listener:log_listener_shell_pkg",
+    ],
+    core_shards = [
+        "//src/developer/debug/debug_agent:meta/debug_agent.core_shard.cml",
+        "//src/developer/remote-control:meta/laboratory.core_shard.cml",
+        "//src/developer/remote-control:meta/remote-control.core_shard.cml",
+        "//src/developer/sshd-host:meta/sshd-host.core_shard.cml",
+        "//src/developer/toolbox:meta/toolbox.core_shard.cml",
+    ],
+    toolbox_shards = [
+        "//src/sys/core:meta/core.toolbox_shard.cml",
+    ],
+    shell_commands = [
+        {
+            "package": "remote-control",
+            "components": [
+                "fdomain_runner",
+                "remote_control_runner",
+                "remote_control_bin",
+            ],
+        },
+        {
+            "package": "scp",
+            "components": ["scp"],
+        },
+        {
+            "package": "snapshot",
+            "components": ["snapshot"],
+        },
+        {
+            "package": "log_listener_shell",
+            "components": [
+                "log",
+                "log_listener",
+            ],
+        },
+    ],
+)
+
+# Configuration that goes along with core_realm_development_access which is
+# suitable for userdebug builds.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "core_realm_development_access_userdebug",
+    auto_include_in = [
+        "standard::userdebug",
+        "utility::userdebug",
+    ],
+    config_data = [
+        {
+            "package_name": "sshd-host",
+            "files": [
+                {
+                    "source": "//third_party/openssh-portable:sshd_config",
+                    "destination": "sshd_config",
+                },
+            ],
+        },
+    ],
+)
+
+# Configuration that goes along with core_realm_development_access which is
+# suitable for eng builds.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "core_realm_development_access_eng",
+    auto_include_in = [
+        "utility::eng",
+        "standard::eng",
+    ],
+    config_data = [
+        {
+            "package_name": "sshd-host",
+            "files": [
+                {
+                    "source": "//third_party/openssh-portable:sshd_config_eng",
+                    "destination": "sshd_config",
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bootstrap_realm_development_access",
+    auto_include_in = [
+        "embeddable::userdebug",
+        "embeddable::eng",
+        "bootstrap::userdebug",
+        "bootstrap::eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/process-resolver",
+        "//bundles/assembly/bazel_inputs/src/sys/tools/debug-dash-launcher",
+    ],
+    bootstrap_shards = [
+        "//src/sys/process-resolver:meta/process_resolver.bootstrap_shard.cml",
+        "//src/sys/tools/debug-dash-launcher:meta/debug_dash_launcher.bootstrap_shard.cml",
+    ],
+    root_shards = [
+        "//src/sys/process-resolver:meta/process_resolver.root_shard.cml",
+        "//src/sys/tools/debug-dash-launcher:meta/debug_dash_launcher.root_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bootstrap_realm_vsock_development_access",
+    experimental = True,
+    allowed_in = [
+        "embeddable::userdebug",
+        "embeddable::eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:bootstrap_realm_vsock_development_access.bootfs_files_package",
+    bootfs_packages = [
+        # SSH is necessary for remote access for development
+        "//bundles/assembly/bazel_inputs/src/developer/vsock-sshd-host",
+        # ffx's remote-control (remote access) components:
+        "//bundles/assembly/bazel_inputs/src/developer/remote-control:remote-control-package",
+    ],
+    bootstrap_shards = [
+        "//src/developer/remote-control:meta/remote-control.bootstrap_shard.cml",
+        "//src/developer/vsock-sshd-host:meta/vsock-sshd-host.bootstrap_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "mdns",
+    auto_include_in = [
+        "utility::userdebug",
+        "utility::eng",
+        "standard",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/mdns/service:mdns",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "mdns_fuchsia_device_wired_service",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    config_data = [
+        {
+            "package_name": "mdns",
+            "files": [
+                {
+                    "source": "//src/connectivity/network/mdns/service/config:fuchsia_udp.config",
+                    "destination": "fuchsia_udp.config",
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "core_realm_development_access_rcs_usb",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/developer/remote-control/usb:usb-vsock-package",
+            "driver_components": [
+                "meta/usb-vsock-service.cm",
+                "meta/vsock-usb.cm",
+            ],
+        },
+    ],
+)
+
+# Development and debug support tools for general networking
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "development_support_tools_connectivity_networking",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/tools/nc",
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/tools/sockscripter:package",
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/mdns/util:mdns-util",
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/net-cli",
+        "//bundles/assembly/bazel_inputs/third_party/iperf:iperf3_pkg",
+        "//bundles/assembly/bazel_inputs/third_party/tcpdump",
+    ],
+)
+
+# Development and debug support tools for wlan
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "development_support_tools_connectivity_wlan",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/wlan/wlancfg/tool:donut",
+    ],
+)
+
+# Development and debug support tools for the Thread protocol
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "development_support_tools_connectivity_thread",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/lowpan/tools/lowpanctl",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "radar_proxy_with_injector",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/radar/bin/radar-proxy:radar-proxy-with-injector",
+    ],
+    core_shards = [
+        "//src/devices/radar/bin/radar-proxy:meta/radar-proxy-with-injector.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "radar_proxy_without_injector",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/radar/bin/radar-proxy:radar-proxy-without-injector",
+    ],
+    core_shards = [
+        "//src/devices/radar/bin/radar-proxy:meta/radar-proxy-without-injector.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "no_remote_feedback_id",
+    core_shards = [
+        "//src/developer/forensics/feedback_id:meta/no_remote_feedback_id.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "cobalt_user_config",
+    config_data = [
+        {
+            "package_name": "cobalt",
+            "files": [
+                {
+                    "source": "//src/cobalt/bin/app/configs:user_config.json",
+                    "destination": "config.json",
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "cobalt_userdebug_config",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    config_data = [
+        {
+            "package_name": "cobalt",
+            "files": [
+                {
+                    "source": "//src/cobalt/bin/app/configs:userdebug_config.json",
+                    "destination": "config.json",
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "cobalt_default_config",
+    allowed_in = [
+        "eng",
+    ],
+    config_data = [
+        {
+            "package_name": "cobalt",
+            "files": [
+                {
+                    "source": "//src/cobalt/bin/app/configs:default_config.json",
+                    "destination": "config.json",
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "factory_reset_trigger",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/recovery/factory-reset-trigger",
+    ],
+    core_shards = [
+        "//src/recovery/factory-reset-trigger:meta/factory-reset-trigger.core_shard.cml",
+    ],
+)
+
+########
+#
+# The "standard" AIBs
+#
+# These historically corresponded to the use of "minimal.gni" as a basis for
+# other products.
+#
+# All components here receive InspectSink and LogSink.
+#
+# TODO(https://fxbug.dev/42065169) Move the contents of common_standard to the right
+# feature- or subsystem-specific AIBs (if not to the core realm AIBs).
+#
+# WARNING:  The only way to remove items from this AIB for a given product is to
+# move them to other AIBs that are included by all other products.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "common_standard",
+    auto_include_in = [
+        "standard",
+    ],
+    memory_buckets = ["//src/developer/memory/buckets:buckets.json5"],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:common_standard.bootfs_files_package",
+    base_packages = [
+        # The SWD stack artifacts that enable OTAs
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/system-updater",
+        # Cobalt
+        "//bundles/assembly/bazel_inputs/src/cobalt/bin/app:cobalt",
+        "//bundles/assembly/bazel_inputs/src/cobalt/bin/system-metrics:cobalt_system_metrics",
+        # Diagnostics
+        "//bundles/assembly/bazel_inputs/src/diagnostics/persistence:diagnostics-persistence",
+        "//bundles/assembly/bazel_inputs/src/diagnostics/sampler",
+        # Internationalization
+        "//bundles/assembly/bazel_inputs/src/intl/tzdata_provider:tzdata_provider_pkg",
+        # Activity
+        "//bundles/assembly/bazel_inputs/src/sys/activity",
+        # Memory pressure monitoring
+        "//bundles/assembly/bazel_inputs/src/developer/memory/pressure_signaler",
+        # Security
+        "//src/security/bin/root_ssl_certificates",
+        "//src/security/bin/google_root_ssl_certificates",
+    ],
+    config_data = [
+        {
+            "package_name": "cobalt",
+            "files": [
+                {
+                    "source": "@gn_targets//src/cobalt/bin/app:global_metrics_registry_pb",
+                    "destination": "global_metrics_registry.pb",
+                },
+            ],
+        },
+        {
+            "package_name": "triage-detect",
+            "files": [
+                {
+                    "source": "//src/diagnostics/config/triage/detect:session-detect.triage",
+                    "destination": "session-detect.triage",
+                },
+                {
+                    "source": "//src/diagnostics/config/triage/detect:sysmem-detect.triage",
+                    "destination": "sysmem-detect.triage",
+                },
+                {
+                    "source": "//src/diagnostics/config/triage/detect:wlan-detect.triage",
+                    "destination": "wlan-detect.triage",
+                },
+            ],
+        },
+        {
+            "package_name": "diagnostics-persistence",
+            "files": [
+                {
+                    "source": "//src/diagnostics/config/persistence:dhcp_client.persist",
+                    "destination": "dhcp_client.persist",
+                },
+                {
+                    "source": "//src/diagnostics/config/persistence:netstack.persist",
+                    "destination": "netstack.persist",
+                },
+                {
+                    "source": "//src/diagnostics/config/persistence:netstack3.persist",
+                    "destination": "netstack3.persist",
+                },
+                {
+                    "source": "//src/diagnostics/config/persistence:wlan.persist",
+                    "destination": "wlan.persist",
+                },
+                {
+                    "source": "//src/diagnostics/config/persistence:power.persist",
+                    "destination": "power.persist",
+                },
+                {
+                    "source": "//src/diagnostics/config/persistence:network_policy.persist",
+                    "destination": "network_policy.persist",
+                },
+                {
+                    "source": "//src/diagnostics/config/persistence:memory.persist",
+                    "destination": "memory.persist",
+                },
+            ],
+        },
+    ],
+    core_shards = [
+        "//src/diagnostics/realm:meta/diagnostics.core_shard.cml",
+        "//src/diagnostics/persistence:meta/diagnostics-persistence.core_shard.cml",
+        "//src/diagnostics/sampler:meta/sampler.core_shard.cml",
+        "//src/connectivity/network:meta/persistence.core_shard.cml",
+        "//src/intl/tzdata_provider:meta/tzdata_provider.core_shard.cml",
+        "//src/sys/pkg/bin/system-updater:meta/system_updater.core_shard.cml",
+        "//src/developer/memory/pressure_signaler:meta/memory_pressure_signaler.core_shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "name": "diagnostics",
+            "components": [
+                {
+                    "component_name": "diagnostics",
+                    "shards": [
+                        "//src/diagnostics/realm:meta/diagnostics_realm.cml",
+                        "//sdk/lib/inspect:offer.shard.cml",
+                    ],
+                },
+            ],
+            "component_includes": [
+                {
+                    "source": "//sdk/lib/inspect:offer.shard.cml",
+                    "destination": "inspect/offer.shard.cml",
+                },
+            ],
+        },
+        {
+            "name": "system-update-realm",
+            "components": [
+                {
+                    "component_name": "system-update-realm",
+                    "shards": ["//src/sys/pkg/bin/system-updater:meta/system_updater.system_update_shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# This is exclusive to userdebug builds on the minimal support level.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "standard_userdebug",
+    auto_include_in = [
+        "standard::userdebug",
+    ],
+    config_data = [
+        {
+            "package_name": "triage-detect",
+            "files": [
+                {
+                    "source": "//src/diagnostics/detect/configs:enable-filing.json",
+                    "destination": "config.json",
+                },
+                {
+                    "source": "//src/diagnostics/detect/configs:cobalt-detect.triage",
+                    "destination": "cobalt-detect.triage",
+                },
+            ],
+        },
+    ],
+)
+
+# This is common across all eng-mode products, at the minimal or higher service
+# level.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "standard_eng",
+    auto_include_in = [
+        "standard::eng",
+    ],
+    base_packages = [
+        # Needed to resolve driver components from "full" packages
+        "//bundles/assembly/bazel_inputs/src/sys/loopback_resolver:loopback_resolver_pkg",
+    ],
+    # Needed to resolve driver components from "full" packages
+    cache_packages = [
+        # Backend for ffx process command.
+        "//bundles/assembly/bazel_inputs/src/developer/process_explorer:process_explorer_package",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver_playground:pkg",
+        "//bundles/assembly/bazel_inputs/src/power/metrics-logger:metrics-logger-pkg",
+    ],
+    core_shards = [
+        "//src/developer/process_explorer:meta/process_explorer.core_shard.cml",
+        "//src/devices/bin/driver_playground:meta/driver_playground.core_shard.cml",
+        "//src/power/metrics-logger:meta/metrics-logger.core_shard.cml",
+    ],
+)
+
+# This is common across all eng-mode and user-debug products, at the minimal or
+# higher service level.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "standard_userdebug_and_eng",
+    auto_include_in = [
+        "standard::userdebug",
+        "standard::eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/diagnostics/detect:triage-detect",
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/pkgctl",
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/update",
+    ],
+    shell_commands = [
+        {
+            "package": "pkgctl",
+            "components": ["pkgctl"],
+        },
+        {
+            "package": "update-bin",
+            "components": ["update"],
+        },
+    ],
+    root_shards = [
+        "//src/diagnostics/detect:meta/detect_userdebug.root_shard.cml",
+    ],
+    core_shards = [
+        "//src/diagnostics/detect:meta/detect.core_shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "name": "diagnostics",
+            "components": [
+                {
+                    "component_name": "diagnostics",
+                    "shards": ["//src/diagnostics/detect:meta/detect.realm_shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Assembly support for memory_monitor (v1).
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "memory_monitor",
+    base_packages = [
+        # memory_monitor with profiling disabled.
+        "//bundles/assembly/bazel_inputs/src/developer/memory/monitor:monitor_without_memory_sampler",
+    ],
+    core_shards = [
+        "//src/developer/memory/monitor:meta/memory_monitor.core_shard.cml",
+    ],
+)
+
+# Assembly support for memory_monitor (v1) with memory profiling enabled.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "memory_monitor_with_memory_sampler",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        # memory_monitor with profiling enabled.
+        "//bundles/assembly/bazel_inputs/src/developer/memory/monitor:monitor_with_memory_sampler",
+        "//bundles/assembly/bazel_inputs/src/performance/memory/sampler:memory_sampler",
+    ],
+    core_shards = [
+        "//src/developer/memory/monitor:meta/memory_monitor.core_shard.cml",
+        "//src/developer/memory/monitor:meta/memory_monitor_with_memory_sampler.core_shard.cml",
+        "//src/performance/memory/sampler:meta/memory_sampler.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "memory_monitor_critical_reports",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    config_data = [
+        {
+            "package_name": "memory_monitor",
+            "files": [
+                {
+                    "source": "//src/developer/memory/monitor/config:send_critical_pressure_crash_reports",
+                    "destination": "send_critical_pressure_crash_reports",
+                },
+            ],
+        },
+    ],
+)
+
+# Assembly support for memory_monitor2.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "memory_monitor2",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/performance/memory/attribution/monitor:monitor",
+    ],
+    core_shards = [
+        "//src/performance/memory/attribution/monitor:meta/memory_monitor2.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "memory_monitor_page_refaults",
+    auto_include_in = [
+        "standard",
+    ],
+    core_shards = [
+        "//src/performance/memory/attribution/monitor:meta/page_refaults.core_shard.cml",
+    ],
+    root_shards = [
+        "//src/performance/memory/attribution/monitor:meta/page_refaults.root_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "detect_user",
+    root_shards = [
+        "//src/diagnostics/detect:meta/detect_user.root_shard.cml",
+    ],
+)
+
+########
+#
+# Feature- and Subsystem-specific AIBs
+#
+# These are optionally present in all products that include the `/core` realm
+# (via the `:core_realm` AIB).  Each should list which feature_set_level and
+# build type that it is valid for.
+########
+#
+# Bluetooth Support
+# Bluetooth profile support: A2DP
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_a2dp",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/profiles/bt-a2dp:without-config",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/profiles/bt-a2dp:meta/bt-a2dp-eager.core_shard.cml",
+    ],
+)
+
+# For configurations without A2DP support to enable A2DP testing.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_a2dp_with_consumer",
+    allowed_in = [
+        "eng",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/profiles/bt-a2dp:meta/bt-a2dp-eager-with-audio-consumer.core_shard.cml",
+        "//src/media/audio/consumer:meta/audio_consumer.core_shard.cml",
+    ],
+)
+
+# Bluetooth profile support: AVRCP
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_avrcp",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/profiles/bt-avrcp",
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/profiles/bt-avrcp-target",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/profiles/bt-avrcp:meta/bt-avrcp.core_shard.cml",
+    ],
+)
+
+# Bluetooth core support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_core",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/core/bt-host",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/core/bt-init",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/core/bt-init:meta/bt-init.core_shard.cml",
+    ],
+)
+
+# Bluetooth RFCOMM support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_rfcomm",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/profiles/bt-rfcomm",
+    ],
+)
+
+# Bluetooth profile support: Device Identification
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_device_id",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/profiles/bt-device-id:without-config",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/profiles/bt-device-id:meta/bt-device-id.core_shard.cml",
+    ],
+)
+
+# Bluetooth profile support: HFP - Audio Gateway
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_hfp_ag",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/profiles/bt-hfp-audio-gateway:without-config",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/profiles/bt-hfp-audio-gateway:meta/bt-hfp-audio-gateway.core_shard.cml",
+    ],
+)
+
+# Bluetooth profile support: HFP - Hands Free
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_hfp_hf",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/profiles/bt-hfp-hands-free:without-config",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/profiles/bt-hfp-hands-free:meta/bt-hfp-hands-free.core_shard.cml",
+    ],
+)
+
+# Bluetooth profile support: MAP - MCE
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_map_mce",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/profiles/bt-map-mce",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/profiles/bt-map-mce:meta/bt-map-mce.core_shard.cml",
+    ],
+)
+
+# Bluetooth snoop support
+#
+# This AIB provides packages for the Bluetooth snoop configuration which lazily starts. It is
+# mutually exclusive with the `bluetooth_snoop_eager` AIB.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_snoop_lazy",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/tools/bt-snoop",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/tools/bt-snoop:meta/bt-snoop.core_shard.cml",
+    ],
+)
+
+# Bluetooth snoop support
+#
+# This AIB provides packages for the Bluetooth snoop configuration which eagerly starts at device
+# boot. It is mutually exclusive with the `bluetooth_snoop_lazy` AIB.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_snoop_eager",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/tools/bt-snoop",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/tools/bt-snoop:meta/bt-snoop-eager.core_shard.cml",
+    ],
+)
+
+# Basic Bluetooth workflows for automated testing and tooling.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_affordances",
+    allowed_in = [
+        "eng",
+    ],
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/bluetooth/testing/bt-affordances:bt-affordances-server",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/testing/bt-affordances:meta/bt-affordances-server.core_shard.cml",
+    ],
+)
+
+# Support for Pandora Bluetooth test interface server and virtual HCI with Rootcanal.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "bluetooth_pandora",
+    allowed_in = [
+        "eng",
+    ],
+    core_shards = [
+        "//src/connectivity/bluetooth/testing/pandora/bt-pandora-server:meta/bt-pandora-server.core_shard.cml",
+        "//src/connectivity/bluetooth/tools/bt-rootcanal:meta/bt-rootcanal.core_shard.cml",
+    ],
+)
+
+#
+# Diagnostics Triage Support
+
+# Triage-detect support for magma arm mali devices
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "diagnostics_triage_detect_mali",
+    config_data = [
+        {
+            "package_name": "triage-detect",
+            "files": [
+                {
+                    "source": "//src/diagnostics/config/triage/detect:mali-detect.triage",
+                    "destination": "mali-detect.triage",
+                },
+            ],
+        },
+    ],
+)
+
+# Driver Framework Support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "driver_framework_common",
+    auto_include_in = [
+        "everything",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/bin/devfs:package",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver_manager/devfs:package",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver-index:package",
+    ],
+    bootstrap_shards = [
+        "//src/devices/bin/driver_framework:meta/driver_framework.bootstrap_shard.cml",
+    ],
+)
+
+# Rust Driver Framework Support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "driver_framework_rust",
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver_manager_rust:package",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver-host:package",
+    ],
+)
+
+# Rust Driver Framework Support. Linked with the Heapdump instrumentation library
+# for memory profiling.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "driver_framework_rust_with_heapdump",
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver_manager_rust:package_with_heapdump",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver-host:package_with_heapdump",
+    ],
+    bootstrap_shards = [
+        "//src/devices/bin/driver_framework:meta/heapdump.bootstrap_shard.cml",
+    ],
+)
+
+# Driver Framework Support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "driver_framework_no_instrumentation",
+    scrutiny_required = [
+        "everything",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver_manager:package",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver-host:package",
+    ],
+)
+
+# This AIB contains Driver Manager and Driver Host linked with the Heapdump
+# instrumentation library for memory profiling.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "driver_framework_with_heapdump",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver_manager:package_with_heapdump",
+        "//bundles/assembly/bazel_inputs/src/devices/bin/driver-host:package_with_heapdump",
+    ],
+    bootstrap_shards = [
+        "//src/devices/bin/driver_framework:meta/heapdump.bootstrap_shard.cml",
+    ],
+)
+
+# Full Package Driver Support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "full_drivers",
+    allowed_in = [
+        "eng",
+    ],
+    bootstrap_shards = [
+        "//src/devices/bin/driver_framework:meta/full_drivers.bootstrap_shard.cml",
+    ],
+)
+
+# Core starnix support.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "starnix_support",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/starnix/runner:starnix_package",
+    ],
+    root_shards = [
+        "//src/starnix/runner:meta/starnix_runner.root_shard.cml",
+    ],
+    core_shards = [
+        "//src/starnix/runner:meta/starnix_runner.core_shard.cml",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:starnix_support.bootfs_files_package",
+    memory_buckets = ["//src/developer/memory/buckets:starnix.json5"],
+)
+
+# EROFS support for Starnix.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "erofs_support",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/storage/erofs:erofs",
+    ],
+    core_shards = [
+        "//src/storage/erofs/component:meta/erofs.core_shard.cml",
+    ],
+)
+
+# Core adb support. Does not include daemon. Daemon should be included separately.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "usb_adb_function",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/developer/adb/drivers/usb-adb-function:package",
+            "driver_components": ["meta/usb-adb-function.cm"],
+        },
+    ],
+)
+
+# Userspace fastboot over usb support.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fastbootd_usb_support",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/firmware/fastboot-usb:package",
+    ],
+    core_shards = [
+        "//src/firmware/fastboot-usb:meta/fastboot_usb.core_shard.cml",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/firmware/drivers/usb-fastboot-function:pkg",
+            "driver_components": ["meta/usb-fastboot-function.cm"],
+        },
+    ],
+)
+
+# Core Nanohub support. Does not include driver. Driver should be included separately.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "nanohub_support",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/starnix/modules/nanohub:google_backlight",
+        "//bundles/assembly/bazel_inputs/src/starnix/modules/nanohub:google_display",
+        "//bundles/assembly/bazel_inputs/src/starnix/modules/nanohub:google_nanohub",
+        "//bundles/assembly/bazel_inputs/src/starnix/modules/nanohub:sockettunnel",
+    ],
+    core_shards = [
+        "//src/starnix/modules/nanohub:meta/backlight.core_shard.cml",
+        "//src/starnix/modules/nanohub:meta/display.core_shard.cml",
+        "//src/starnix/modules/nanohub:meta/nanohub.core_shard.cml",
+        "//src/starnix/modules/nanohub:meta/sockettunnel.core_shard.cml",
+    ],
+)
+
+# Core FastRPC support. Does not include driver. Driver should be included separately.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fastrpc_support",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/starnix/modules/fastrpc:google_fastrpc",
+    ],
+    core_shards = [
+        "//src/starnix/modules/fastrpc:meta/fastrpc.core_shard.cml",
+    ],
+)
+
+# hvdcp_opti support. Does not include driver. Driver should be included separately.
+#
+# optional: product must specify its inclusion
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "hvdcp_opti_support",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/starnix/modules/hvdcp_opti:hvdcp_opti",
+    ],
+    core_shards = [
+        "//src/starnix/modules/hvdcp_opti:meta/hvdcp_opti.core_shard.cml",
+    ],
+)
+
+# This AIB enables minimal testing support for bootstrap environments, and is meant to be used with
+# the `bootstrap_eng` AIB.
+#
+# This includes testing support in the bootfs packages.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "testing_support_bootstrap",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_packages = [
+        # The test runner command.
+        "//bundles/assembly/bazel_inputs/src/sys/run_test_suite:package",
+        # test-manager and all of its runners, dependencies, and testing realms
+        # are in the same package and loaded using relative urls.
+        "//bundles/assembly/bazel_inputs/src/sys/test_manager:pkg_for_bootstrap",
+    ],
+    bootstrap_shards = [
+        "//src/sys/test_manager:meta/test_manager.bootstrap_shard.cml",
+        "//src/sys/testing:meta/test_realm.bootstrap_shard.cml",
+    ],
+    shell_commands = [
+        {
+            "bootfs_package": True,
+            "package": "run-test-suite",
+            "components": ["run-test-suite"],
+        },
+    ],
+)
+
+# This AIB enables tracing support for userdebug configs
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "tracing",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/performance/trace_manager",
+    ],
+    core_shards = [
+        "//src/performance/trace_manager:meta/trace_manager.core_shard.cml",
+    ],
+)
+
+# This AIB enables testing support, and is meant to be used with either the
+# `common_standard_eng` and `common_standard_userdebug` AIBs.
+#
+# This includes testing support in the platform `base` package set, not just
+# via `universe`
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "testing_support",
+    auto_include_in = [
+        "standard::eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:testing_support.bootfs_files_package",
+    cache_packages = [
+        # test-manager and all of its runners:
+        "//bundles/assembly/bazel_inputs/src/sys/test_manager:pkg",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/elf:elf-test-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/elf:elf-test-ambient-exec-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/elf:elf-test-create-raw-processes-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/elf:elf-test-create-raw-processes-ambient-exec-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/fuzz:fuzz-test-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/gotests:go-test-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/gtest:gtest-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/gtest:zxtest-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/gunit:gunit-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/inspect:inspect-test-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/lib_loader_cache:lib_loader_runner_cache",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/rust:rust-test-create-raw-processes-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/gtest:gtest-create-raw-processes-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/rust:rust-test-next-vdso-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/rust:rust-test-runner",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/starnix:starnix-test-runners",
+        "//bundles/assembly/bazel_inputs/src/sys/test_runners/stress_test:stress-test-runner",
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/testing/netemul/runner:package",
+        # required dependencies of test-manager
+        "//bundles/assembly/bazel_inputs/src/sys/testing:testing",
+        # The test_realm component's package
+        "//bundles/assembly/bazel_inputs/src/lib/fuchsia-component-test/realm_builder_server:pkg",
+        "//bundles/assembly/bazel_inputs/src/sys/fuzzing:fuzz-manager",
+        "//bundles/assembly/bazel_inputs/src/sys/fuzzing:fuzz-registry",
+        "//bundles/assembly/bazel_inputs/src/sys/fuzzing/fuzzctl",
+        "//bundles/assembly/bazel_inputs/src/sys/run_test_suite:run_test_suite",
+        # CPU profiler
+        "//bundles/assembly/bazel_inputs/src/performance/cpu_profiler",
+    ],
+    root_shards = [
+        "//src/sys/testing:meta/test_realm.root_shard.cml",
+    ],
+    core_shards = [
+        "//src/performance/cpu_profiler:meta/cpu_profiler.core_shard.cml",
+        "//src/sys/test_manager:meta/test_manager.core_shard.cml",
+        "//src/sys/fuzzing:meta/fuzzing.core-shard.cml",
+        "//src/sys/testing:meta/test_realm.core_shard.cml",
+    ],
+    shell_commands = [
+        {
+            "package": "run_test_suite",
+            "components": ["run-test-suite"],
+        },
+        {
+            "package": "fuzzctl",
+            "components": ["fuzz_ctl"],
+        },
+    ],
+)
+
+# Basic camera support
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "camera",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/camera/bin/device:camera_device",
+        "//bundles/assembly/bazel_inputs/src/camera/bin/device_watcher:camera_device_watcher",
+    ],
+    core_shards = [
+        "//src/camera:meta/camera.core_shard.cml",
+    ],
+    memory_buckets = ["//src/developer/memory/buckets:camera_buckets.json5"],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "factory_data",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/factory/factory_store_providers",
+    ],
+    core_shards = [
+        "//src/factory/factory_store_providers:meta/factory_store_providers.core_shard.cml",
+    ],
+)
+
+# AIB containing bootfs resources needed by all fshost variants
+#
+# There are "pervasively routed" capability shards included here because there
+# is currently no better mechanism for providing them to the fshost component itself.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_common",
+    bootstrap_shards = [
+        "//src/storage/fshost:meta/fshost.bootstrap_shard.cml",
+    ],
+    root_shards = [
+        "//src/storage/fshost:meta/fshost.root_shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "packages": ["//bundles/assembly/bazel_inputs/src/storage/fshost:pkg"],
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": [
+                        "//src/storage/fshost:meta/base_fshost.cml",
+                        "//src/storage/lib/fs_management:client.shard.cml",
+                        "//src/storage/fshost:meta/config.cml",
+                    ],
+                },
+            ],
+            "component_includes": [
+                {
+                    "source": "//sdk/lib/inspect:client.shard.cml",
+                    "destination": "inspect/client.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/inspect:offer.shard.cml",
+                    "destination": "inspect/offer.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/inspect:use.shard.cml",
+                    "destination": "inspect/use.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/syslog:client.shard.cml",
+                    "destination": "syslog/client.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/syslog:offer.shard.cml",
+                    "destination": "syslog/offer.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/syslog:use.shard.cml",
+                    "destination": "syslog/use.shard.cml",
+                },
+                {
+                    "source": "//src/storage/lib/fs_management:client.shard.cml",
+                    "destination": "src/storage/lib/fs_management/client.shard.cml",
+                },
+                {
+                    "source": "//src/storage/fshost:meta/fxblob_fshost_base.shard.cml",
+                    "destination": "src/storage/fshost/meta/fxblob_fshost_base.shard.cml",
+                },
+                {
+                    "source": "//src/storage/fshost:meta/non_gpt_fshost.shard.cml",
+                    "destination": "src/storage/fshost/meta/non_gpt_fshost.shard.cml",
+                },
+                {
+                    "source": "//src/storage/fshost:meta/gpt_fshost.shard.cml",
+                    "destination": "src/storage/fshost/meta/gpt_fshost.shard.cml",
+                },
+                {
+                    "source": "//src/storage/fshost:meta/fvm_fshost.cml",
+                    "destination": "src/storage/fshost/meta/fvm_fshost.cml",
+                },
+                {
+                    "source": "//src/storage/fshost:meta/fvm_fshost_base.shard.cml",
+                    "destination": "src/storage/fshost/meta/fvm_fshost_base.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/trace:client.shard.cml",
+                    "destination": "trace/client.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/trace:offer.shard.cml",
+                    "destination": "trace/offer.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/trace:use.shard.cml",
+                    "destination": "trace/use.shard.cml",
+                },
+            ],
+        },
+    ],
+)
+
+# AIB adding eng-build debug capabilities to fshost.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_eng",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:fshost_eng.bootfs_files_package",
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": ["//src/storage/fshost:meta/eng_fshost.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# AIB that stubs out eng-build debug capabilities for non-eng builds
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_non_eng",
+    allowed_in = [
+        "user",
+        "userdebug",
+    ],
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": ["//src/storage/fshost:meta/non_eng_fshost.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# AIB adding recovery capabilities to fshost.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_recovery",
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": ["//src/storage/fshost:meta/recovery_fshost.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# AIB that stubs out recovery capabilities for builds that don't require recovery capabilities.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_non_recovery",
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": ["//src/storage/fshost:meta/non_recovery_fshost.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# AIB adding support for storage, needed by all fshost variants that use anything more than bootfs
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_storage",
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": [
+                        "//src/storage/fshost:meta/core_fshost.cml",
+                    ],
+                },
+            ],
+        },
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/storage/memfs:package",
+    ],
+)
+
+# AIB containing the fshost with fxfs.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_fxfs",
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": [
+                        "//src/storage/fshost:meta/fxblob_fshost.cml",
+                        "//src/storage/fshost:meta/fxblob_fshost_base.shard.cml",
+                        "//src/storage/fshost:meta/gpt_fshost.shard.cml",
+                    ],
+                },
+            ],
+        },
+    ],
+    memory_buckets = ["//src/developer/memory/buckets:fxfs_buckets.json5"],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/storage/gpt/component:package",
+        "//bundles/assembly/bazel_inputs/src/storage/fxfs:package",
+        "//bundles/assembly/bazel_inputs/src/storage/crypt/fxfs:package",
+    ],
+)
+
+# AIB for fshost's storage-host configuration with GPT+FVM+Minfs.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_gpt_fvm_minfs",
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": [
+                        "//src/storage/fshost:meta/fvm_fshost.cml",
+                        "//src/storage/fshost:meta/fvm_fshost_base.shard.cml",
+                        "//src/storage/fshost:meta/gpt_fshost.shard.cml",
+                    ],
+                },
+            ],
+        },
+    ],
+    memory_buckets = [
+        "//src/developer/memory/buckets:blobfs_buckets.json5",
+        "//src/developer/memory/buckets:minfs_buckets.json5",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/storage/gpt/component:package",
+        "//bundles/assembly/bazel_inputs/src/storage/blobfs/bin:package",
+        "//bundles/assembly/bazel_inputs/src/storage/minfs/bin:package",
+        "//bundles/assembly/bazel_inputs/src/storage/fvm:package",
+    ],
+)
+
+# AIB for fshost's storage-host configuration with GPT+FVM+F2fs.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_gpt_fvm_f2fs",
+    allowed_in = ["eng"],
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": [
+                        "//src/storage/fshost:meta/fvm_fshost.cml",
+                        "//src/storage/fshost:meta/fvm_fshost_base.shard.cml",
+                        "//src/storage/fshost:meta/gpt_fshost.shard.cml",
+                    ],
+                },
+            ],
+        },
+    ],
+    memory_buckets = ["//src/developer/memory/buckets:blobfs_buckets.json5"],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/storage/gpt/component:package",
+        "//bundles/assembly/bazel_inputs/src/storage/blobfs/bin:package",
+        "//bundles/assembly/bazel_inputs/src/storage/f2fs/bin:package",
+        "//bundles/assembly/bazel_inputs/src/storage/fvm:package",
+    ],
+)
+
+# AIB containing fshost support for provisioning fxfs.
+# Should be included with fshost_fxfs when migration is necessary.
+#
+# requires: fshost_fxfs
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_provision_fxfs",
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": ["//src/storage/fshost:meta/provision_fxfs_fshost.shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# AIB containing fshost support for minfs. Not compatible with fxfs.
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fshost_fvm_minfs",
+    compiled_packages = [
+        {
+            "bootfs_package": True,
+            "name": "fshost",
+            "components": [
+                {
+                    "component_name": "fshost",
+                    "shards": [
+                        "//src/storage/fshost:meta/non_gpt_fshost.shard.cml",
+                        "//src/storage/fshost:meta/fvm_fshost.cml",
+                        "//src/storage/fshost:meta/fvm_fshost_base.shard.cml",
+                    ],
+                },
+            ],
+        },
+    ],
+    memory_buckets = [
+        "//src/developer/memory/buckets:minfs_buckets.json5",
+        "//src/developer/memory/buckets:blobfs_buckets.json5",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/storage/blobfs/bin:package",
+        "//bundles/assembly/bazel_inputs/src/storage/minfs/bin:package",
+        "//bundles/assembly/bazel_inputs/src/storage/fvm:package",
+    ],
+)
+
+# Automatic garbage collection for mutable storage
+#
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "storage_cache_manager",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/cache_manager",
+    ],
+    core_shards = [
+        "//src/sys/cache_manager:meta/cache_manager.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "system_update_checker",
+    allowed_in = [
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/system-update-checker",
+    ],
+    core_shards = [
+        "//src/sys/pkg/bin/system-update-checker:meta/system_update_checker.core_shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "name": "system-update-realm",
+            "components": [
+                {
+                    "component_name": "system-update-realm",
+                    "shards": ["//src/sys/pkg/bin/system-update-checker:meta/system_update_checker.system_update_shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "omaha_client",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/omaha-client:omaha-client-unconfigured",
+    ],
+    core_shards = [
+        "//src/sys/pkg/bin/omaha-client:meta/omaha_client_service.core_shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "name": "system-update-realm",
+            "components": [
+                {
+                    "component_name": "system-update-realm",
+                    "shards": ["//src/sys/pkg/bin/omaha-client:meta/omaha_client_service.system_update_shard.cml"],
+                },
+            ],
+        },
+    ],
+    config_data = [
+        {
+            "package_name": "triage-detect",
+            "files": [
+                {
+                    "source": "//src/diagnostics/config/triage/detect:omaha-client-detect.triage",
+                    "destination": "omaha-client-detect.triage",
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "omaha_client_empty_eager_config",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    config_data = [
+        {
+            "package_name": "omaha-client",
+            "files": [
+                {
+                    "source": "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/omaha-client:empty_eager_package_config",
+                    "destination": "eager_package_config.json",
+                },
+            ],
+        },
+        {
+            "package_name": "pkg-resolver",
+            "files": [
+                {
+                    "source": "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/omaha-client:empty_eager_package_config",
+                    "destination": "eager_package_config.json",
+                },
+            ],
+        },
+    ],
+)
+
+# Used on builds where the product provides its own update checker outside of the core/system-update
+# realm (i.e. neither system_update_checker nor omaha_client is included).
+# Like "no_update_checker" except the system-update realm still exposes the build's OTA channel.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "product_provided_update_checker",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/null-update-checker:package",
+    ],
+    core_shards = [
+        "//src/sys/pkg/bin/null-update-checker:meta/null_update_checker.core_shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "name": "system-update-realm",
+            "components": [
+                {
+                    "component_name": "system-update-realm",
+                    "shards": ["//src/sys/pkg/bin/null-update-checker:meta/null_update_checker.system_update_shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Used on builds that do not include an update checker, i.e. neither system_update_checker nor omaha_client.
+# This is needed to expose the update protocols from `void` in #system-update.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "no_update_checker",
+    compiled_packages = [
+        {
+            "name": "system-update-realm",
+            "components": [
+                {
+                    "component_name": "system-update-realm",
+                    "shards": ["//src/sys/pkg:meta/no_update_checker.system_update_shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Include the system-update-configurator component as part of the SWD subsystem.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "system_update_configurator",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/system-update-configurator",
+    ],
+    core_shards = [
+        "//src/sys/pkg/bin/system-update-configurator:meta/core-shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "name": "system-update-realm",
+            "components": [
+                {
+                    "component_name": "system-update-realm",
+                    "shards": ["//src/sys/pkg/bin/system-update-configurator:meta/system-update-shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "pkgfs_disable_executability_restrictions",
+    allowed_in = [
+        "eng",
+    ],
+    system_packages = [
+        "//bundles/assembly/bazel_inputs/src/sys/pkg/bin/pkg-cache:disable-executability-restrictions",
+    ],
+)
+
+# AIB to enable virtualization support.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "virtualization_support",
+    # TODO(https://fxbug.dev/42079015): Move to the list above once build errors are resolved.
+    base_packages = select({
+        "//build/bazel/platforms:is_fuchsia_riscv64": [],
+        "//conditions:default": [
+            "//bundles/assembly/bazel_inputs/src/virtualization/bin/vmm_launcher:vmm_launcher",
+        ],
+    }),
+    shell_commands = [
+        {
+            "package": "guest",
+            "components": ["guest"],
+        },
+    ],
+    core_shards = select({
+        "//build/bazel/platforms:is_fuchsia_riscv64": [],
+        "//conditions:default": [
+            "//src/connectivity/network:meta/virtualization.core_shard.cml",
+            "//src/virtualization/bin/vmm_launcher:meta/vmm_launcher.core_shard.cml",
+            "//src/virtualization/bin/guest_manager:meta/debian_guest_manager.core_shard.cml",
+            "//src/virtualization/bin/guest_manager:meta/zircon_guest_manager.core_shard.cml",
+        ],
+    }),
+)
+
+# AIB to enable running Fuchsia as a virtualized guest.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "vsock_service",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/paravirtualization/vsock:vsock_service",
+    ],
+    core_shards = [
+        "//src/paravirtualization/vsock:meta/vsock_service.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "vsock_service_bootstrap",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/paravirtualization/vsock:vsock_service",
+    ],
+    bootstrap_shards = [
+        "//src/paravirtualization/vsock:meta/vsock_service.bootstrap_shard.cml",
+    ],
+)
+
+# AIB to include Netstack2 as the netstack for use by base networking.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "netstack2",
+    # The Go toolchain used for netstack2 does not support RISC-V.
+    base_packages = select({
+        "//build/bazel/platforms:is_fuchsia_riscv64": [],
+        "//conditions:default": [
+            "//bundles/assembly/bazel_inputs/src/connectivity/network:netstack2",
+        ],
+    }),
+    compiled_packages = [
+        {
+            "name": "network",
+            "components": [
+                {
+                    "component_name": "network",
+                    "shards": ["//src/connectivity/network:meta/netstack2.shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Netstack3 as the netstack for use by base networking.
+#
+# To be used in conjunction with netstack3_packages or netstack3_packages_gub.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "netstack3",
+    compiled_packages = [
+        {
+            "name": "network",
+            "components": [
+                {
+                    "component_name": "network",
+                    "shards": ["//src/connectivity/network:meta/netstack3.shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Netstack3 packages without unified binary.
+#
+# This AIB provides packages for the netstack3 configuration. It is mutually
+# exclusive with netstack3_packages_gub.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "netstack3_packages",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/network:netstack3",
+    ],
+)
+
+# Netstack3 packages without unified binary.
+#
+# This AIB provides space-saving equivalent packages for the netstack3
+# configuration as found in netstack3_packages. It is mutually exclusive with
+# netstack3_packages.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "netstack3_packages_gub",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/network:netstack3_gub",
+    ],
+)
+
+# Enable netpol network-socket-proxy. Either this or
+# network-socket-proxy-disabled must be included.
+#
+# To be used in conjunction with socket_proxy_packages.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "socket-proxy-enabled",
+    compiled_packages = [
+        {
+            "name": "network",
+            "components": [
+                {
+                    "component_name": "network",
+                    "shards": ["//src/connectivity/network:meta/socket-proxy-enabled.shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Disable netpol network-socket-proxy. Either this or
+# network-socket-proxy-enabled must be included.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "socket-proxy-disabled",
+    compiled_packages = [
+        {
+            "name": "network",
+            "components": [
+                {
+                    "component_name": "network",
+                    "shards": ["//src/connectivity/network:meta/socket-proxy-disabled.shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Netpol socket-proxy packages without unified binary.
+#
+# This AIB provides packages for the socket-proxy-enabled configuration.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "socket_proxy_packages",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/policy/socket-proxy:package",
+    ],
+)
+
+# Netstack-migration as the netstack for use by base networking.
+#
+# Must be used in conjunction with netstack_migration_packages or
+# netstack_migration_packages_gub.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "netstack_migration",
+    core_shards = select({
+        "//build/bazel/platforms:is_fuchsia_riscv64": [],
+        "//conditions:default": [
+            "//src/connectivity/network:meta/netstack-migration.core.shard.cml",
+        ],
+    }),
+    compiled_packages = [
+        {
+            "name": "network",
+            "components": [
+                {
+                    "component_name": "network",
+                    "shards": ["//src/connectivity/network:meta/netstack-migration.shard.cml"],
+                },
+            ],
+        },
+    ],
+)
+
+# Netstack migration packages without unified binary.
+#
+# This AIB provides packages for the netstack_migration configuration. It is
+# mutually exclusive with netstack_migration_packages_gub.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "netstack_migration_packages",
+    base_packages = select({
+        "//build/bazel/platforms:is_fuchsia_riscv64": [],
+        "//conditions:default": [
+            "//bundles/assembly/bazel_inputs/src/connectivity/network:netstack-migration",
+        ],
+    }),
+)
+
+# Netstack migration packages with unified binary.
+#
+# This AIB provides packages for the netstack_migration configuration. It is
+# mutually exclusive with netstack_migration_packages.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "netstack_migration_packages_gub",
+    base_packages = select({
+        "//build/bazel/platforms:is_fuchsia_riscv64": [],
+        "//conditions:default": [
+            "//bundles/assembly/bazel_inputs/src/connectivity/network:netstack-migration_gub",
+        ],
+    }),
+)
+
+# Includes network-tun functionality.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "network_tun",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/network/tun/network-tun",
+    ],
+    core_shards = [
+        "//src/connectivity/network/tun/network-tun:meta/network-tun.core_shard.cml",
+    ],
+)
+
+# Includes thread LoWPAN functionality.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "thread_lowpan",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/lowpan/drivers/lowpan-ot-driver",
+        "//bundles/assembly/bazel_inputs/src/connectivity/lowpan/service:lowpanservice",
+    ],
+    core_shards = [
+        "//src/connectivity/lowpan/service:meta/lowpanservice.core_shard.cml",
+        "//src/connectivity/lowpan/drivers/lowpan-ot-driver:meta/lowpan-ot-driver.core_shard.cml",
+    ],
+    memory_buckets = ["//src/developer/memory/buckets:thread_lowpan_buckets.json5"],
+)
+
+# WLAN policy component
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "wlan_policy",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/location/regulatory_region",
+        "//bundles/assembly/bazel_inputs/src/connectivity/wlan/wlancfg",
+    ],
+    core_shards = [
+        "//src/connectivity/wlan/wlancfg:meta/wlancfg.core_shard.cml",
+    ],
+)
+
+# WLAN development support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "wlan_development",
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/wlan/tools/wlantool:wlan-dev",
+    ],
+    shell_commands = [
+        {
+            "package": "wlan",
+            "components": ["wlan-dev"],
+        },
+    ],
+)
+
+# WLAN support for WEP and WPA
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "wlan_legacy_privacy_support",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/wlan/wlandevicemonitor:wlandevicemonitor-legacy-privacy",
+    ],
+    core_shards = [
+        "//src/connectivity/wlan/wlandevicemonitor:meta/wlandevicemonitor.core_shard.cml",
+    ],
+)
+
+# WLAN support for WPA2 and later
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "wlan_contemporary_privacy_only_support",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/wlan/wlandevicemonitor:wlandevicemonitor",
+    ],
+    core_shards = [
+        "//src/connectivity/wlan/wlandevicemonitor:meta/wlandevicemonitor.core_shard.cml",
+    ],
+)
+
+# WLAN support for drivers that provide their own MAC
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "wlan_fullmac_support",
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/wlan/drivers/wlanif:wlanif",
+            "driver_components": ["meta/wlanif.cm"],
+        },
+    ],
+)
+
+# WLAN support for drivers that utilize a software MAC
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "wlan_softmac_support",
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/wlan/drivers/wlansoftmac:wlansoftmac",
+            "driver_components": ["meta/wlansoftmac.cm"],
+        },
+    ],
+)
+
+# AIB for the wlan-virtio-hwsim driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "wlan_virtio_hwsim_driver",
+    allowed_in = [
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/connectivity/wlan/drivers/wlan-virtio-hwsim:package",
+            "driver_components": ["meta/wlan-virtio-hwsim.cm"],
+        },
+    ],
+)
+
+# WLAN support for interfacing with starnix.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "wlan_wlanix",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/wlan/wlanix",
+    ],
+    core_shards = [
+        "//src/connectivity/wlan/wlanix:meta/wlanix.core_shard.cml",
+    ],
+)
+
+# Emergency Location provider
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "location_emergency",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/location/emergency",
+    ],
+    core_shards = [
+        "//src/connectivity/location/emergency:meta/emergency.core_shard.cml",
+    ],
+)
+
+# Intel High-Definition Audio class driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "intel_hda",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_files_package = "//bundles/assembly/bazel_inputs:intel_hda.bootfs_files_package",
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/media/audio/drivers/intel-hda/codecs/hdmi:package",
+            "driver_components": ["meta/hdmi-audio-codec.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/media/audio/drivers/intel-hda/codecs/realtek:package",
+            "driver_components": ["meta/realtek-audio-codec.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/media/audio/drivers/intel-hda/controller:package",
+            "driver_components": ["meta/intel-hda.cm"],
+        },
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/media/audio/drivers/intel-hda/codecs/qemu:package",
+            "driver_components": ["meta/qemu-audio-codec.cm"],
+        },
+    ],
+)
+
+# Support for interactive debugging/development of platform audio
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_development_support",
+    auto_include_in = [
+        "standard::eng",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/audio/services/ffxdaemon:audio_ffx_daemon",
+    ],
+    core_shards = [
+        "//src/media/audio/services/ffxdaemon:meta/audio_ffx_daemon.core_shard.cml",
+    ],
+)
+
+# Modern virtual-audio driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "virtual_audio_driver",
+    allowed_in = [
+        "standard::eng",
+        "utility::eng",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/media/audio/drivers/virtual-audio:virtual-audio",
+            "driver_components": ["meta/virtual-audio-driver.cm"],
+        },
+    ],
+)
+
+# Tools for interactive debugging/development of audio drivers
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_driver_development_tools",
+    allowed_in = [
+        "standard::eng",
+        "utility::eng",
+    ],
+)
+
+# Modern virtual-audio utility
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "virtual_audio_util",
+    allowed_in = [
+        "standard::eng",
+        "utility::eng",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/virtual_audio_util",
+    ],
+    shell_commands = [
+        {
+            "package": "virtual_audio_util",
+            "components": ["virtual_audio"],
+        },
+    ],
+)
+
+# Previous-generation test fixture: virtual-audio-legacy driver
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "virtual_audio_legacy_driver",
+    allowed_in = [
+        "standard::eng",
+        "utility::eng",
+    ],
+    drivers = [
+        {
+            "set": "base",
+            "package_target": "//bundles/assembly/bazel_inputs/src/media/audio/drivers/virtual-audio-legacy:virtual-audio-legacy",
+            "driver_components": ["meta/virtual-audio-legacy-driver.cm"],
+        },
+    ],
+)
+
+# Legacy virtual-audio utility
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "virtual_audio_legacy_util",
+    allowed_in = [
+        "standard::eng",
+        "utility::eng",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/virtual_audio_legacy_util",
+    ],
+    shell_commands = [
+        {
+            "package": "virtual_audio_legacy_util",
+            "components": ["virtual_audio_legacy_util"],
+        },
+    ],
+)
+
+# Tools for interactive debugging/development of previous-generation (legacy) audio drivers
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_legacy_driver_tools",
+    allowed_in = [
+        "standard::eng",
+        "utility::eng",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/audio-codec-ctl",
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/audio-driver-ctl",
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/dsputil",
+    ],
+
+    # From //src/media/audio/tools.
+    shell_commands = [
+        {
+            "package": "audio-codec-ctl",
+            "components": ["audio-codec-ctl"],
+        },
+        {
+            "package": "audio-driver-ctl",
+            "components": ["audio-driver-ctl"],
+        },
+        {
+            "package": "dsputil",
+            "components": ["dsputil"],
+        },
+    ],
+)
+
+# Tools for interactive debugging/development of platform full-stack audio
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_full_stack_development_tools",
+    allowed_in = [
+        "standard::eng",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/audio-capture-timestamp-validator",
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/audio-effects-ctl",
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/audio_listener",
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/signal_generator",
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/vol",
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/wav_player",
+        "//bundles/assembly/bazel_inputs/src/media/audio/tools/wav_recorder",
+    ],
+    # From //src/media/audio/tools.
+    shell_commands = [
+        {
+            "package": "audio-capture-timestamp-validator",
+            "components": ["audio-capture-timestamp-validator"],
+        },
+        {
+            "package": "audio-effects-ctl",
+            "components": ["audio-effects-ctl"],
+        },
+        {
+            "package": "audio_listener",
+            "components": ["audio_listener"],
+        },
+        {
+            "package": "signal_generator",
+            "components": ["signal_generator"],
+        },
+        {
+            "package": "vol",
+            "components": ["vol"],
+        },
+        {
+            "package": "wav_player",
+            "components": ["wav_player"],
+        },
+        {
+            "package": "wav_recorder",
+            "components": ["wav_recorder"],
+        },
+    ],
+)
+
+# Component that manages platform audio devices
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_device_registry",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/audio/services/device_registry",
+    ],
+    core_shards = [
+        "//src/media/audio/services/device_registry:meta/audio_device_registry.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_device_registry_demand",
+    core_shards = [
+        "//src/media/audio/services/device_registry:meta/audio_device_registry.demand.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_device_registry_eager",
+    allowed_in = [
+        "eng",
+    ],
+    core_shards = [
+        "//src/media/audio/services/device_registry:meta/audio_device_registry.eager.core_shard.cml",
+    ],
+)
+
+# Component that routes audio on Smart Displays
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_core",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/audio/audio_core",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_core_routing",
+    core_shards = [
+        "//src/media/audio/audio_core:meta/audio_core.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "audio_core_use_adc_device",
+    core_shards = [
+        "//src/media/audio/audio_core:meta/audio_core.core_shard.use_adc_device.cml",
+    ],
+)
+
+# Component that plays audio files using audio_core protocols.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "soundplayer",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/sounds/soundplayer",
+    ],
+    core_shards = [
+        "//src/media/sounds/soundplayer:meta/soundplayer.core_shard.cml",
+    ],
+)
+
+# Tools for interactive debugging/development of display drivers
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "display_driver_development_tools",
+    allowed_in = [
+        "eng",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/graphics/display/bin/display-tool",
+        "//bundles/assembly/bazel_inputs/src/graphics/display/bin/display-tweak",
+    ],
+    shell_commands = [
+        {
+            "package": "display-tool",
+            "components": ["display-tool"],
+        },
+        {
+            "package": "display-tweak",
+            "components": ["display-tweak"],
+        },
+    ],
+)
+
+# Platform-provided video and audio decoders and encoders.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "media_codecs",
+    flexible_packages = select({
+        "//build/bazel/platforms:is_fuchsia_riscv64": [],
+        "//conditions:default": [
+            "//bundles/assembly/bazel_inputs/src/media/codec:codec_factory",
+        ],
+    }),
+    core_shards = [
+        "//src/media/codec/factory:meta/codec_factory.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "video_development_support",
+    allowed_in = [
+        "eng",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/codec/examples:encode-file",
+    ],
+    shell_commands = [
+        {
+            "package": "encode-file",
+            "components": ["encode-file"],
+        },
+    ],
+)
+
+# Service that allows active media players (sessions) to be published and discovered.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "media_sessions",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/media/sessions:mediasession",
+    ],
+    core_shards = [
+        "//src/media/sessions:meta/mediasession.core_shard.cml",
+    ],
+)
+
+# Session manager support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "session_manager",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/session/bin/session_manager",
+    ],
+    core_shards = [
+        "//src/session/bin/session_manager:meta/session_manager.core_shard.cml",
+    ],
+)
+
+# Element manager support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "element_manager",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/session/bin/element_manager",
+    ],
+)
+
+# UI support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "ui",
+    core_shards = [
+        "//src/ui:meta/ui.core_shard.cml",
+    ],
+)
+
+# UI support for eng build types
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "ui_eng",
+    allowed_in = [
+        "eng",
+    ],
+    icu_cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/a11y/bin/a11y_manager:a11y-manager",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/bin/scene_manager",
+        "//bundles/assembly/bazel_inputs/src/ui/bin/text:text_manager",
+        "//bundles/assembly/bazel_inputs/src/ui/scenic:scenic_pkg",
+        "//bundles/assembly/bazel_inputs/src/ui/bin/virtual_keyboard_manager",
+    ],
+)
+
+# UI support for eng build types, with dso components
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "ui_eng_dso",
+    experimental = True,
+    allowed_in = [
+        "eng",
+        # Experimental AIBs must be allowed on userdebug
+        "userdebug",
+    ],
+    icu_cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/a11y/bin/a11y_manager:a11y-manager",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/bin/text:text_manager",
+        "//bundles/assembly/bazel_inputs/src/ui/scenic:scenic_pkg_dso",
+        "//bundles/assembly/bazel_inputs/src/ui/bin/scene_manager:scene_manager_dso",
+        "//bundles/assembly/bazel_inputs/src/ui/bin/virtual_keyboard_manager",
+    ],
+)
+
+# UI support for user and userdebug build types
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "ui_user_and_userdebug",
+    allowed_in = [
+        "user",
+        "userdebug",
+    ],
+    icu_base_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/a11y/bin/a11y_manager:a11y-manager",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/bin/scene_manager",
+        "//bundles/assembly/bazel_inputs/src/ui/bin/text:text_manager",
+        "//bundles/assembly/bazel_inputs/src/ui/scenic:scenic_pkg",
+        "//bundles/assembly/bazel_inputs/src/ui/bin/virtual_keyboard_manager",
+    ],
+)
+
+# UI support for user and userdebug build types, with dso components
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "ui_userdebug_dso",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+    ],
+    icu_base_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/a11y/bin/a11y_manager:a11y-manager",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/bin/text:text_manager",
+        "//bundles/assembly/bazel_inputs/src/ui/scenic:scenic_pkg_dso",
+        "//bundles/assembly/bazel_inputs/src/ui/bin/scene_manager:scene_manager_dso",
+        "//bundles/assembly/bazel_inputs/src/ui/bin/virtual_keyboard_manager",
+    ],
+)
+
+# UI support for eng build types
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "ui_package_eng",
+    allowed_in = [
+        "eng",
+    ],
+    cache_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui:ui_package",
+    ],
+)
+
+# UI support for user and userdebug build types
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "ui_package_user_and_userdebug",
+    allowed_in = [
+        "user",
+        "userdebug",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui:ui_package",
+    ],
+)
+
+# UI support for builds wants synthetic device support
+#
+# Use PlatformUiConfig.with_synthetic_device_support to select this bundle
+# over ui_package_eng / ui_package_user_and_userdebug.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "ui_package_eng_userdebug_with_synthetic_device_support",
+    flexible_packages = ["//bundles/assembly/bazel_inputs/src/ui:ui_with_synthetic_device_support_package"],
+)
+
+# Fan support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fan",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/devices/thermal/bin/fan-controller",
+    ],
+    core_shards = [
+        "//src/devices/thermal/bin/fan-controller:meta/fan-controller.core_shard.cml",
+    ],
+)
+
+# Battery support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "battery_manager",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/battery-manager",
+    ],
+    core_shards = [
+        "//src/power/battery-manager:meta/battery_manager.core_shard.cml",
+    ],
+)
+
+# TopologyTestDaemon support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "topology_test_daemon",
+    allowed_in = [
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/testing/topology-test-daemon:package",
+    ],
+    core_shards = [
+        "//src/power/testing/topology-test-daemon:meta/topology-test-daemon.core_shard.cml",
+    ],
+)
+
+# Power metrics recorder support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "power_metrics_recorder",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/metrics-logger:metrics-logger-standalone-pkg",
+    ],
+    core_shards = [
+        "//src/power/metrics-logger:meta/metrics-logger-standalone.core_shard.cml",
+    ],
+)
+
+# Sensors support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "sensors_framework",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sensors",
+    ],
+    core_shards = [
+        "//src/sensors:meta/sensors.core_shard.cml",
+    ],
+)
+
+# Sensor playback support.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "sensors_framework_eng",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/sensors:sensors_eng",
+    ],
+    core_shards = [
+        "//src/sensors:meta/sensors_eng.core_shard.cml",
+    ],
+)
+
+# Brightness Manager support
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "brightness_manager",
+    flexible_packages = [
+        "//bundles/assembly/bazel_inputs/src/ui/bin/brightness_manager:brightness_manager_pkg",
+    ],
+    core_shards = [
+        "//src/ui/bin/brightness_manager:meta/brightness_manager.core_shard.cml",
+    ],
+)
+
+# Legacy Power Framework support. Avoids including more modern power framework components.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "legacy_power_framework",
+    auto_include_in = [
+        "standard",
+        "utility",
+        "bootstrap",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/power-manager:package",
+    ],
+    bootstrap_shards = [
+        "//src/power:meta/power-framework.shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "power_framework_eager_shard",
+    bootstrap_shards = [
+        "//src/power:meta/power-framework-eager.shard.cml",
+    ],
+)
+
+# Power Framework CPU Manager.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "cpu_manager",
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/cpu-manager:package",
+    ],
+    bootstrap_shards = [
+        "//src/power:meta/cpu-manager.bootstrap_shard.cml",
+    ],
+)
+
+# Power Framework System Activity Governor.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "power_framework_sag",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/system-activity-governor:package",
+    ],
+    bootstrap_shards = [
+        "//src/power:meta/sag.shard.cml",
+    ],
+)
+
+# Power Framework power broker.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "power_framework_broker",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/broker:package",
+    ],
+)
+
+# Power Framework System Activity Governor for testing. This provides extra controls over the
+# internal state that should only happen for testing.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "power_framework_testing_sag",
+    allowed_in = [
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/system-activity-governor:config-use-suspender",
+        "//bundles/assembly/bazel_inputs/src/power/system-activity-governor:config-wait-for-token",
+        "//bundles/assembly/bazel_inputs/src/power/system-activity-governor/fake:package",
+        "//bundles/assembly/bazel_inputs/src/power/testing/fake-shutdown-shim:package",
+        "//bundles/assembly/bazel_inputs/src/power/testing/fake-suspend:fake-suspend-pkg",
+    ],
+)
+
+# An AIB for our power test related platform drivers.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "power_test_platform_drivers",
+    allowed_in = [
+        "eng",
+    ],
+    drivers = [
+        {
+            "set": "bootfs",
+            "package_target": "//bundles/assembly/bazel_inputs/src/power/testing/system-integration/example/test-driver:power-system-integration-example-test-driver",
+            "driver_components": ["meta/power-system-integration-example-test-driver.cm"],
+        },
+    ],
+)
+
+# Power framework cli tools and ffx power support components
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "power_framework_development_support",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    bootfs_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/tools/cli:package",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/power/system-activity-governor-controller:package",
+    ],
+    # When the power framework becomes available on user builds by default,
+    # these tools should be moved to core_realm_development_access
+    core_shards = [
+        "//src/power/system-activity-governor-controller:meta/system-activity-governor-controller.core_shard.cml",
+    ],
+    shell_commands = [
+        {
+            "bootfs_package": True,
+            "package": "powerutil",
+            "components": ["powerutil"],
+        },
+    ],
+)
+
+# Example assembly input bundle for testing
+#
+# Restricted for testing assembly itself (and to provide example code)
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "example_assembly_bundle",
+    allowed_in = [
+        "eng",
+        # Some host e2e tests use this AIB and are using utility::user.
+        "utility::user",
+    ],
+    core_shards = [
+        "//src/tests/assembly/assemble_image/compiled_package:meta/test.core_shard.cml",
+    ],
+    compiled_packages = [
+        # Main definition for another package
+        {
+            "name": "for-test",
+            # Test that multiple components work
+            "components": [
+                {
+                    "component_name": "bar",
+                    "shards": ["//src/tests/assembly/assemble_image/compiled_package:meta/bar.cml"],
+                },
+                {
+                    "component_name": "baz",
+                    "shards": ["//src/tests/assembly/assemble_image/compiled_package:meta/test.cml"],
+                },
+            ],
+            # Test that component includes for bootfs packages work
+            "component_includes": [
+                {
+                    "source": "//src/tests/assembly/assemble_image/compiled_package:meta/test.include.cml",
+                    "destination": "test/include.cml",
+                },
+            ],
+        },
+        {
+            "name": "for-test2",
+            "components": [
+                {
+                    "component_name": "qux",
+                    "shards": ["//src/tests/assembly/assemble_image/compiled_package:meta/test.cml"],
+                },
+            ],
+            # Test that component includes for bootfs packages work
+            "component_includes": [
+                {
+                    "source": "//src/tests/assembly/assemble_image/compiled_package:meta/test.include.cml",
+                    "destination": "test/include.cml",
+                },
+            ],
+            # Test that bootfs packages work
+            "bootfs_package": True,
+        },
+    ],
+)
+
+########
+#
+# Hardware Support AIBs
+#
+# These are used to provide support for specific hardware
+
+# Emulator Support
+#
+# This is the "emulator support" bundle, which provides the kernel that can be
+# booted by an emulator, and which knows how to then boot the Fuchsia kernel
+# itself (Zircon).
+#
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "emulator_support",
+    qemu_kernel = "@gn_targets//bundles/assembly/bazel_inputs:qemu_kernel",
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "no_intl_timezones",
+    core_shards = [
+        "//src/intl/intl_services:meta/no_intl_timezones.core_shard.cml",
+    ],
+)
+
+# Assembly may select at most one bundle with intl_services name prefix.
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "intl_services",
+    icu_base_packages = [
+        "//bundles/assembly/bazel_inputs/src/intl/intl_services:pkg",
+    ],
+    core_shards = [
+        "//src/intl/intl_services:meta/intl.core_shard.cml",
+    ],
+)
+
+# Assembly may select at most one bundle with intl_services name prefix.
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "intl_services_small",
+    icu_base_packages = [
+        "//bundles/assembly/bazel_inputs/src/intl/intl_services:pkg_small",
+    ],
+    core_shards = [
+        "//src/intl/intl_services:meta/intl_small_timezones.core_shard.cml",
+        "//src/intl/intl_services:meta/intl_small.core_shard.cml",
+    ],
+)
+
+# Assembly may select at most one bundle with intl_services name prefix.
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "intl_services_small_with_timezone",
+    icu_base_packages = [
+        "//bundles/assembly/bazel_inputs/src/intl/intl_services:pkg_small",
+        "//bundles/assembly/bazel_inputs/src/intl/time_zone_info_service:pkg",
+    ],
+    core_shards = [
+        "//src/intl/intl_services:meta/intl_small.core_shard.cml",
+        "//src/intl/time_zone_info_service:meta/time-zone-info-service.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "setui",
+    icu_base_packages = [
+        "//bundles/assembly/bazel_inputs/src/settings/service:setui_service",
+    ],
+    core_shards = [
+        "//src/settings/service:meta/setui_service.core_shard.cml",
+    ],
+    memory_buckets = ["//src/developer/memory/buckets:setui_buckets.json5"],
+)
+
+# buildifier: leave-alone
+icu_assembly_input_bundle(
+    name = "setui_with_camera",
+    icu_base_packages = [
+        "//bundles/assembly/bazel_inputs/src/settings/service:setui_service",
+    ],
+    core_shards = [
+        "//src/settings/service:meta/setui_service_with_camera.core_shard.cml",
+    ],
+    memory_buckets = ["//src/developer/memory/buckets:setui_buckets.json5"],
+)
+
+# Legacy fonts setup: fonts sourced from config-data.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fonts",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/fonts:pkg",
+    ],
+)
+
+# Hermetic fonts setup: fonts sourced from a component.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "fonts_hermetic",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/fonts/asset_providers:server.package",
+        "//bundles/assembly/bazel_inputs/src/fonts/asset_providers:provider.package",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "tee_manager",
+    core_shards = [
+        "//src/security/bin/tee_manager:meta/tee_manager.core_shard.cml",
+    ],
+    compiled_packages = [
+        {
+            "name": "tee_manager",
+            "packages": ["//bundles/assembly/bazel_inputs/src/security/bin/tee_manager:pkg"],
+            "components": [
+                {
+                    "component_name": "tee_manager",
+                    "shards": [],
+                },
+            ],
+            "component_includes": [
+                {
+                    "source": "//sdk/lib/syslog:client.shard.cml",
+                    "destination": "syslog/client.shard.cml",
+                },
+                {
+                    "source": "//src/security/bin/tee_manager:meta/tee_manager.base.cml",
+                    "destination": "tee_manager.base.cml",
+                },
+                {
+                    "source": "//sdk/lib/inspect:offer.shard.cml",
+                    "destination": "inspect/offer.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/syslog:offer.shard.cml",
+                    "destination": "syslog/offer.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/inspect:use.shard.cml",
+                    "destination": "inspect/use.shard.cml",
+                },
+                {
+                    "source": "//sdk/lib/syslog:use.shard.cml",
+                    "destination": "syslog/use.shard.cml",
+                },
+            ],
+        },
+    ],
+)
+
+# Static resources files to make available to product assembly subsystems.
+# buildifier: leave-alone
+assembly_resources_directory(
+    name = "resources",
+    sources = [
+        "//src/sys/core:core_component_id_index.json5",
+        "//build/info:version",
+
+        # Platform configs for the component_manager config.
+        "//src/security/policy:component_manager_policy.json5",
+        "//src/security/policy:component_manager_policy_base.json5",
+        "//src/security/policy:component_manager_policy_build_type_base.json5",
+        "//src/security/policy:component_manager_policy_eng.json5",
+        "//src/security/policy:component_manager_policy_user.json5",
+        "//src/security/policy:component_manager_policy_userdebug.json5",
+        "//src/security/policy:subsystems/component_manager_policy_starnix.json5",
+        "//src/security/policy:subsystems/component_manager_policy_vulkan_loader.json5",
+        "//src/sys/component_manager/configs:bootfs_config.json5",
+
+        # Networking resources.
+        "//src/connectivity/policy/netcfg/config:netcfg_default.json5",
+
+        # ICU resources.
+        "//:prebuilt/third_party/tzres/metaZones.res",
+        "//:prebuilt/third_party/tzres/timezoneTypes.res",
+        "//:prebuilt/third_party/tzres/zoneinfo64.res",
+        "@gn_targets//src/lib/icu/tzdata:revision",
+
+        # Diagnostics sampler resources.
+        "@gn_targets//src/diagnostics/config/sampler:default-config",
+
+        # Core shard templates.
+        "//src/connectivity/weave:meta/weavestack.core_shard.cml.template",
+        "//src/developer/forensics/feedback_id:flash_ts/meta/flash_ts_feedback_id.core_shard.cml.template",
+        "//src/developer/forensics/feedback_id:sysinfo/meta/sysinfo_feedback_id.core_shard.cml.template",
+        "//src/lib/assembly/platform_configuration:src/subsystems/meta/tee-clients.core_shard.cml",
+        "//src/media/audio:meta/multizone_leader.core_shard.cml.template",
+        "//src/media/audio:meta/multizone_leader.core_shard_eng.cml",
+        "//src/recovery/system:meta/bootfs_recovery.bootstrap_shard.cml.template",
+        "//src/security/bin/tee_manager:meta/no_tee_manager.core_shard.cml",
+        "//src/security/bin/tee_manager:meta/no_tee_manager.session.core_shard.cml",
+        "//src/security/bin/tee_manager:meta/proprietary_tee_manager.no_session.core_shard.cml.template",
+        "//src/security/bin/tee_manager:meta/proprietary_tee_manager.session.core_shard.cml.template",
+        "//src/security/bin/tee_manager:meta/tee_manager.core_shard.cml",
+        "//src/sys/core:meta/lavapipe.core_shard.cml",
+        "//src/sys/core:meta/lavapipe-disabled.core_shard.cml",
+
+        # Default recovery logo
+        "//src/recovery/system:res/fuchsia-logo.riv",
+    ],
+)
+
+# Sets a low timeout for rebooting when the device runs out-of-memory.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_oom_reboot_timeout_low",
+    allowed_in = [
+        "eng",
+    ],
+    kernel_cmdline = [
+        "kernel.oom.reboot-timeout-ms=8000",
+    ],
+)
+
+# Enables jobkilling when the device runs out-of-memory.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_oom_behavior_jobkill",
+    allowed_in = [
+        "eng",
+    ],
+    kernel_cmdline = [
+        "kernel.oom.behavior=jobkill",
+    ],
+)
+
+# Disable kernel oom handling behavior.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_oom_behavior_disable",
+    allowed_in = [
+        "eng",
+    ],
+    kernel_cmdline = [
+        "kernel.oom.enable=false",
+    ],
+)
+
+# Enables log output to legacy serial console.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_serial_legacy",
+    allowed_in = [
+        "eng",
+    ],
+    kernel_cmdline = [
+        "kernel.serial=legacy",
+    ],
+)
+
+# Enables in kernel compression of anonymous memory with some common configuration options.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_anonymous_memory_compression",
+    kernel_cmdline = [
+        "kernel.compression.strategy=lz4",
+        "kernel.compression.storage-strategy=slot",
+        "kernel.compression.reclaim_anonymous=true",
+        "kernel.compression.reclaim_zero_forks=true",
+        "kernel.compression.at_memory_pressure=true",
+    ],
+)
+
+# Enables in kernel contiguous physical pages with some common configuration options.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_contiguous_physical_pages",
+    # Physical page loaning and borrowing.
+    #
+    # "k ppb stats" (see also "k ppb help") can be used to check whether the
+    # vast majority of loaned pages are absorbed by using them for pager-backed
+    # VMOs when running a relevant workload (not just mostly idle), or if some
+    # loaned pages remain stranded even as the system approaches OOM. As long as
+    # loaned free pages hits a low fraction of this value before any overall
+    # OOM, pages aren't being stranded when it really matters.
+    kernel_cmdline = [
+        "kernel.ppb.loan=true",
+        "kernel.ppb.borrow-on-mru=true",
+        "kernel.ppb.replace-on-unloan=true",
+    ],
+)
+
+# Extends compression to happen eagerly as part of queue rotation, only has meaning if
+# "kernel_compression" is also included.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_anonymous_memory_compression_eager_lru",
+    kernel_cmdline = [
+        "kernel.page-scanner.lru-action=compress_only",
+    ],
+)
+
+# Makes the kernel age pages faster; this allows more pages to be reclaimed by reducing the working
+# set.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_page_scanner_aging_fast",
+    kernel_cmdline = [
+        "kernel.page-scanner.min-aging-interval-ms=0",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_logs_in_reboot_info",
+    kernel_cmdline = [
+        "kernel.render-dlog-to-crashlog=true",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_arm64_event_stream_disable",
+    kernel_cmdline = [
+        "kernel.arm64.event-stream.enable=false",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_page_table_eviction_never",
+    kernel_cmdline = [
+        "kernel.page-scanner.page-table-eviction-policy=never",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "kernel_page_table_eviction_on_request",
+    kernel_cmdline = [
+        "kernel.page-scanner.page-table-eviction-policy=on_request",
+    ],
+)
+
+# Assembly selects whether to include this AIB or not.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "zoneinfo",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/intl/tzdata_provider:zoneinfo_provider_pkg",
+    ],
+    core_shards = [
+        "//src/intl/tzdata_provider:meta/zoneinfo_provider.core_shard.cml",
+    ],
+)
+
+# Assembly support for performing factory resets
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "factory_reset",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/recovery/factory_reset:factory_reset_pkg",
+    ],
+    core_shards = [
+        "//src/recovery/factory_reset:meta/factory_reset.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "factory_reset_tee",
+    core_shards = [
+        "//src/recovery/factory_reset:meta/factory_reset.tee.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "factory_reset_no_tee",
+    core_shards = [
+        "//src/recovery/factory_reset:meta/factory_reset.no_tee.core_shard.cml",
+    ],
+)
+
+# Assembly support for recovery-fdr
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "recovery_fdr",
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/recovery/system:system_recovery_fdr",
+    ],
+    core_shards = [
+        "//src/recovery/system/meta/core_shards:system_recovery_fdr.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "recovery_android",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/recovery/system:system_recovery_android",
+        "//bundles/assembly/bazel_inputs/src/developer/adb/bin:adb",
+        "//bundles/assembly/bazel_inputs/src/cobalt/bin/app:cobalt",
+        "//src/security/bin/root_ssl_certificates",
+        "//src/security/bin/google_root_ssl_certificates",
+    ],
+    core_shards = [
+        "//src/recovery/system/meta/core_shards:system_recovery_android.core_shard.cml",
+        "//src/developer/adb/bin/adb:meta/adb.core_shard.cml",
+        "//src/developer/adb/bin/adb-file-sync:meta/adb-file-sync.core_shard.cml",
+        "//src/developer/adb/bin/adb-reboot:meta/adb-reboot.core_shard.cml",
+        "//src/developer/adb/bin/adb-sideload:meta/adb-sideload.core_shard.cml",
+    ],
+    config_data = [
+        {
+            "package_name": "cobalt",
+            "files": [
+                {
+                    "source": "@gn_targets//src/cobalt/bin/app:global_metrics_registry_pb",
+                    "destination": "global_metrics_registry.pb",
+                },
+            ],
+        },
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "session_manager_enable_pkg_cache",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    core_shards = [
+        "//src/session/bin/session_manager:meta/session_manager_enable_pkg_cache.core_shard.cml",
+    ],
+)
+
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "session_manager_disable_pkg_cache",
+    core_shards = [
+        "//src/session/bin/session_manager:meta/session_manager_disable_pkg_cache.core_shard.cml",
+    ],
+)
+
+# Includes GNSS functionality.
+# buildifier: leave-alone
+assembly_input_bundle(
+    name = "gnss",
+    experimental = True,
+    allowed_in = [
+        "userdebug",
+        "eng",
+    ],
+    base_packages = [
+        "//bundles/assembly/bazel_inputs/src/connectivity/location/gnss:gnss_service",
+    ],
+    core_shards = [
+        "//src/connectivity/location/gnss:meta/gnss-service.core-shard.cml",
+    ],
+)

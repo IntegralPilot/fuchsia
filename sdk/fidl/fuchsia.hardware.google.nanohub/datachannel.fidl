@@ -1,0 +1,164 @@
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.google.nanohub;
+
+using zx;
+
+/// Maximum sized message that is supported
+const MAX_MESSAGE_SIZE uint32 = 255;
+const MAX_ID_NAME_SIZE uint32 = 100;
+
+/// Signal that will be active on event handle if the Read() method
+/// will return data.
+const SIGNAL_READABLE uint32 = 0x01000000; // ZX_USER_SIGNAL_0
+
+/// Signal that will be active on event handle if the Write() method
+/// will accept data.
+const SIGNAL_WRITABLE uint32 = 0x02000000; // ZX_USER_SIGNAL_1
+
+/// Signal that will be asserted when SIGNAL_READABLE is set and remains
+/// asserted until a driver-defined timeout passes after the call to Read
+/// This is primarily intended for integration with Starnix
+const SIGNAL_WAKELOCK uint32 = 0x04000000; // ZX_USER_SIGNAL_2
+
+
+/// Provides both service instance disambiguation as well as a notion of a disconnected data channel
+/// via bind interface. Callers should use this protocol to acquire a bound WaitableDataChannel.
+open protocol UnboundWaitableDataChannel {
+    /// Set event used to signal device state, using the signals above,
+    /// and returns a bound client.
+    /// Will return ZX_ERR_ALREADY_BOUND if no instances are available.
+    flexible Bind(resource table {
+        1: event zx.Handle:EVENT;
+        2: server server_end:WaitableDataChannel;
+    }) -> () error zx.Status;
+
+    /// Returns the identifier associated with this connection.
+    flexible GetIdentifier() -> (table {
+        1: name string:MAX_ID_NAME_SIZE;
+    });
+};
+
+/// Provides a bound / connected session to a particular DataChannel. New connections should use the
+/// UnboundWaitableDataChannel to open a session of this procotol.
+/// Calls to Read() on a WaitableDataChannel will operate as a non-blocking operation. Callers
+/// will need to use the event exchanged in the Bind() call to flag when data is available to read
+open protocol WaitableDataChannel {
+    /// The call will return the next datagram to be read from the channel.
+    /// If there is more data to be read, SIGNAL_READABLE will remain asserted
+    /// after this call returns.
+    /// If there is no data to be read, this call will return ZX_ERR_SHOULD_WAIT
+    flexible Read() -> (resource table {
+        1: data vector<byte>:MAX_MESSAGE_SIZE;
+    }) error zx.Status;
+
+    /// The call will return once the data is fully committed.
+    ///
+    /// If the driver is not ready for a write, it will return
+    /// ZX_ERR_NO_RESOURCES and the caller should await SIGNAL_WRITABLE to be
+    /// asserted.
+    flexible Write(table {
+        1: data vector<byte>:MAX_MESSAGE_SIZE;
+    }) -> () error zx.Status;
+};
+
+// Provides both service instance disambiguation as well as a notion of a disconnected data channel
+// via bind interface. Callers should use this protocol to acquire a bound HangingDataChannel.
+open protocol UnboundHangingDataChannel {
+    /// Returns a bound client
+    /// Will return ZX_ERR_ALREADY_BOUND if no instances are available
+    flexible Bind(resource table {
+        1: server server_end:HangingDataChannel;
+    }) -> () error zx.Status;
+
+    /// Returns the identifier associated with this connection.
+    flexible GetIdentifier() -> (table {
+        1: name string:MAX_ID_NAME_SIZE;
+    });
+};
+
+/// Provides a bound / connected session to a particular DataChannel. New connections should use the
+/// UnboundHangingDataChannel to open a session of this procotol.
+/// Calls to Read() on a HangingDataChannel will operate as a Hanging-Get, only returning once data
+/// becomes available.
+open protocol HangingDataChannel {
+    /// The call will return the next datagram to be read from the channel.
+    /// This call has hanging get semantics and will return once data is available.
+    flexible Read() -> (resource table {
+        1: data vector<byte>:MAX_MESSAGE_SIZE;
+        2: wake_lease zx.Handle:EVENTPAIR;
+    }) error zx.Status;
+
+    /// The call will return once the data is fully committed.
+    ///
+    /// If the driver is not ready for a write, it will return
+    /// ZX_ERR_NO_RESOURCES
+    flexible Write(table {
+        1: data vector<byte>:MAX_MESSAGE_SIZE;
+    }) -> () error zx.Status;
+};
+
+/// Service for driver clients.
+service DriverDataChannelService {
+    hanging client_end:UnboundHangingDataChannel;
+    waitable client_end:UnboundWaitableDataChannel;
+    lifecycle client_end:LifecycleObserver;
+};
+
+/// Service for Non-driver clients
+/// Separated from Driver Service to allow for selectively exposing endpoints
+service StarnixDataChannelService {
+    hanging client_end:UnboundHangingDataChannel;
+    waitable client_end:UnboundWaitableDataChannel;
+    lifecycle client_end:LifecycleObserver;
+};
+
+
+/// DataChannel Implementation
+// TODO(b/448182287) Remove this once clients are migrated
+
+open protocol DataChannel {
+    /// Set event used to signal device state. Discards existing event
+    /// after having transferred device state to the new event.
+    /// This must be called before invoking Read or Write, and can fail with
+    /// ZX_ERR_NO_RESOURCES if the underlying channel is busy.
+    flexible Register(resource struct {
+        event zx.Handle:EVENT;
+    }) -> () error zx.Status;
+
+    /// Returns the identifier associated with this connection.
+    flexible GetIdentifier() -> (table {
+        1: name string:MAX_ID_NAME_SIZE;
+    });
+
+    /// The call will return the next datagram to be read from the channel.
+    /// If there is more data to be read, SIGNAL_READABLE will remain asserted
+    /// after this call returns.
+    flexible Read(table {
+        /// If specified and set to false, then the call will return immediately
+        /// if there is no data to read with ZX_ERR_SHOULD_WAIT. Otherwise the
+        /// call has hanging get semantics and will return once data is available.
+        1: blocking bool;
+    }) -> (resource table {
+        1: data vector<byte>:MAX_MESSAGE_SIZE;
+        2: wake_lease zx.Handle:EVENTPAIR;
+    }) error zx.Status;
+
+    /// The call will return once the data is fully committed.
+    ///
+    /// If the driver is not ready for a write, it will return
+    /// ZX_ERR_NO_RESOURCES and the caller should await SIGNAL_WRITABLE to be
+    /// asserted.
+    flexible Write(table {
+        1: data vector<byte>:MAX_MESSAGE_SIZE;
+    }) -> () error zx.Status;
+};
+
+/// Service for clients.
+///
+/// The data channel is pre-bound to a particular identifier as per bind rules.
+service DataChannelService {
+    device client_end:DataChannel;
+    lifecycle client_end:LifecycleObserver;
+};

@@ -1,0 +1,112 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/python/python_action.gni")
+
+# Generate a final IDK archive, based on an `idk` target.
+#
+# The generated archive will go into
+# $root_build_dir/sdk/archive/{output_name}
+#
+# Arguments:
+#    idk: (required)
+#      Label for an `idk` target that will be built and then archived.
+#
+#    idk_output_name: (optional)
+#      `output_name` argument provided to the `idk` target, if any. By default,
+#      this will be the name of the `idk` target.
+#
+#    output_name: (optional)
+#      Full name of the archive file, including `.tar.gz`. By default, this will
+#      be `idk_output_name` followed by `.tar.gz`
+#
+#    testonly, visibility
+#      Usual GN meaning.
+#
+template("idk_archive") {
+  assert(defined(invoker.idk), "idk must be specified for $target_name")
+
+  _idk_output_name = get_label_info(invoker.idk, "name")
+  if (defined(invoker.idk_output_name)) {
+    _idk_output_name = invoker.idk_output_name
+  }
+
+  _archive_output_name = "${_idk_output_name}.tar.gz"
+  if (defined(invoker.output_name)) {
+    _archive_output_name = invoker.output_name
+  }
+
+  targets = {
+    tarmaker_manifest = "${target_name}.tarmaker"
+  }
+
+  files = {
+    exported_dir = root_build_dir + "/sdk/exported/${_idk_output_name}"
+    output_archive = root_build_dir + "/sdk/archive/${_archive_output_name}"
+
+    tarmaker_manifest = "${target_gen_dir}/${target_name}.tarmaker"
+  }
+
+  # Walks the exported IDK directory and generates a manifest of its contents.
+  python_action(targets.tarmaker_manifest) {
+    forward_variables_from(invoker, [ "testonly" ])
+
+    inputs = []  # Directories don't count as inputs.
+    outputs = [ files.tarmaker_manifest ]
+    deps = [ invoker.idk ]
+
+    binary_label = "//build/sdk:generate_archive_manifest_from_idk_directory"
+
+    args = [
+      "--input-dir",
+      rebase_path(files.exported_dir, root_build_dir),
+      "--output",
+      rebase_path(files.tarmaker_manifest, root_build_dir),
+    ]
+  }
+
+  # Generates the final archive.
+  compiled_action(target_name) {
+    tool = "//build/tools/tarmaker"
+    outputs = [ files.output_archive ]
+    inputs = [ files.tarmaker_manifest ]
+
+    mnemonic = "IDK_ARCHIVE"
+    args = [
+      "--manifest",
+      rebase_path(inputs[0], root_build_dir),
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+      "--use-parallel-gzip=true",
+    ]
+    deps = [
+      ":${targets.tarmaker_manifest}",
+      invoker.idk,
+    ]
+
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    metadata = {
+      sdk_archives = [
+        {
+          name = _idk_output_name
+
+          # TODO(https://fxbug.dev/42077025): Determine which values are
+          # appropriate, since the archive contains binaries for all
+          # Fuchsia CPU architectures (but only one, or even two in
+          # the case of Linux) host CPU architectures!
+          os = current_os
+          cpu = current_cpu
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          path = rebase_path(files.output_archive, root_build_dir)
+        },
+      ]
+    }
+  }
+}

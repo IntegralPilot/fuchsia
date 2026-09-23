@@ -1,0 +1,147 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/zircon/c_utils.gni")
+
+# Defines an hermetic code blob, which is defined by the following properties
+# (enforced at link-time):
+#
+# * the named function (`entrypoint`) is first in the link order and all of the
+#   sources/deps together form a closed set that is collectively hermetic;
+# * no dynamic relocations.
+#
+# It produces the raw binary content of a position-indepdendent executable,
+# output to "$target_out_dir/$output_name.bin".  This is the output file of the
+# primary target. If $public, $public_configs, or $public_deps is provided
+# (even if empty), then a "$target_name.public" source_set() target will also
+# be defined; that can be used in $deps of compiling targets that use the
+# $public headers.
+#
+# Parameters
+#
+#   * allow_rodata
+#     - Optional: If true, .rodata* sections in the hermetic code are allowed.
+#     By default, only .text* (executable code) sections are permitted.
+#     - Type: bool
+#     - Default: false
+#
+#   * add_configs
+#     - Optional: Additional configs added to the default list for compilation.
+#     - Type: list(label)
+#     - Default: []
+#
+#   * entrypoint
+#     - Optional: The name of the symbol (or C function) that is the entrypoint
+#     to this code blob.
+#     - Type: string
+#     - Default: $target_name.
+#
+#   * output_name
+#     - Optional: The output file will be "$target_out_dir/$output_name.bin".
+#     - Type: string
+#     - Default: target_name
+#
+#   * public, public_deps, public_configs
+#     - Optional: As for source_set(). These are passed on to the
+#     "$target_name.public" target rather than the main target.
+#     The underlying executable() target implicitly depends on that
+#     target, so it gets these configs and deps indirectly and can
+#     use the $public headers itself.
+#
+# Other parameters are as for executable(), except for the `output_*`
+# parameters.
+#
+template("hermetic_code_blob") {
+  image_target = target_name
+  executable_target = "_hermetic_code_blob.$target_name.executable"
+
+  if (defined(invoker.entrypoint)) {
+    entrypoint = invoker.entrypoint
+  } else {
+    entrypoint = target_name
+  }
+
+  allow_rodata = defined(invoker.allow_rodata) && invoker.allow_rodata
+
+  if (defined(invoker.public) || defined(invoker.public_configs) ||
+      defined(invoker.public_deps)) {
+    public_target = "$target_name.public"
+    public_target_deps = [ ":$public_target" ]
+  } else {
+    public_target_deps = []
+  }
+
+  executable(executable_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+
+    deps = []
+    ldflags = []
+    exclude_toolchain_tags = []
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "add_configs",
+                             "allow_rodata",
+                             "configs",
+                             "entrypoint",
+                             "metadata",
+                             "output_dir",
+                             "output_extension",
+                             "public",
+                             "public_configs",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    deps += public_target_deps
+
+    output_dir = target_out_dir
+
+    configs += [ "//build/config/zircon:hermetic-code-blob" ]
+    configs += [ "//build/config/zircon:static-pie-link" ]
+    configs -= [ "//build/config/zircon:static-pie-link" ]
+    if (defined(invoker.add_configs)) {
+      configs += invoker.add_configs
+    }
+
+    ldflags += [ "-Wl,-defsym,HERMETIC_ENTRY=$entrypoint" ]
+    if (allow_rodata) {
+      ldflags += [ "-Wl,-defsym,HERMETIC_RODATA_OK=1" ]
+    }
+
+    # This code should use the normal toolchain for its containing environment,
+    # kernel vs kernel.phys, etc.  But it cannot use any fancy variants.
+    exclude_toolchain_tags += [ "instrumented" ]
+  }
+
+  image_binary(image_target) {
+    forward_variables_from(invoker,
+                           [
+                             "output_name",
+                             "metadata",
+                             "visibility",
+                             "testonly",
+                           ])
+    deps = [ ":$executable_target" ]
+    output_dir = target_out_dir
+  }
+
+  if (public_target_deps != []) {
+    source_set(public_target) {
+      forward_variables_from(invoker,
+                             [
+                               "public",
+                               "public_configs",
+                               "public_deps",
+                               "testonly",
+                               "visibility",
+                             ])
+      if (defined(visibility)) {
+        visibility += [ ":*" ]
+      }
+    }
+  }
+}

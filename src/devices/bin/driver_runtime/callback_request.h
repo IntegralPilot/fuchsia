@@ -1,0 +1,143 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_DEVICES_BIN_DRIVER_RUNTIME_CALLBACK_REQUEST_H_
+#define SRC_DEVICES_BIN_DRIVER_RUNTIME_CALLBACK_REQUEST_H_
+
+#include <lib/fdf/types.h>
+#include <lib/fit/function.h>
+
+#include <optional>
+
+#include <fbl/intrusive_double_list.h>
+
+#include "src/devices/bin/driver_runtime/object.h"
+#include "src/devices/bin/driver_runtime/thread_context.h"
+
+// Defined in "src/devices/bin/driver_runtime/dispatcher.h"
+namespace driver_runtime {
+class Dispatcher;
+}  // namespace driver_runtime
+
+namespace driver_runtime {
+
+class CallbackRequest;
+// The inline target size is configured to fit the 3 arguments captured by the callback request
+// created in |Dispatcher::ScheduleTokenCallback|.
+using Callback =
+    fit::inline_callback<void(std::unique_ptr<CallbackRequest>, zx_status_t), sizeof(void*) * 3>;
+
+// Wraps a callback so that it can be added to a list.
+class CallbackRequest
+    : public fbl::DoublyLinkedListable<std::unique_ptr<CallbackRequest>,
+                                       fbl::NodeOptions::AllowRemoveFromContainer> {
+ public:
+  virtual ~CallbackRequest() = default;
+
+  enum class RequestType {
+    kIrq,
+    kWait,
+    kTask,
+    kOther,
+    kWakeIrq,
+    kWakeWait,
+    kAlwaysOnTask,
+    kAlwaysOnWait,
+    kAlwaysOnOther,
+  };
+
+  explicit CallbackRequest(RequestType request_type = RequestType::kOther)
+      : request_type_(request_type) {}
+
+  static bool IsAlwaysOn(RequestType type) {
+    return type == RequestType::kAlwaysOnTask || type == RequestType::kAlwaysOnWait ||
+           type == RequestType::kAlwaysOnOther;
+  }
+
+  bool IsAlwaysOn() const { return IsAlwaysOn(request_type_); }
+
+  // Initializes the callback to be queued.
+  // Sets the dispatcher, and the callback that will be called by |Call|.
+  // |async_operation| is the async_dispatcher_t operation that this callback request manages.
+  void SetCallback(driver_runtime::Dispatcher* dispatcher, Callback callback,
+                   void* async_operation = nullptr) {
+    ZX_ASSERT(!dispatcher_);
+    ZX_ASSERT(!callback_);
+    ZX_ASSERT(!async_operation_);
+    dispatcher_ = dispatcher;
+    callback_ = std::move(callback);
+    if (async_operation) {
+      async_operation_ = async_operation;
+    }
+    initiating_driver_ = thread_context::GetCurrentDriver();
+    initiating_dispatcher_ = thread_context::GetCurrentDispatcher();
+  }
+
+  // Calls the callback, returning ownership of the request back the original requester,
+  void Call(std::unique_ptr<CallbackRequest> callback_request, zx_status_t status) {
+    // If no particular callback reason was set, we will use the status provided by the dispatcher.
+    if (reason_.has_value() && (*reason_ != ZX_OK)) {
+      status = *reason_;
+    }
+    dispatcher_ = nullptr;
+    reason_ = std::nullopt;
+    async_operation_ = std::nullopt;
+    callback_(std::move(callback_request), status);
+  }
+
+  void SetCallbackReason(zx_status_t callback_reason) { reason_ = callback_reason; }
+
+  // Returns whether a callback has been set via |SetCallback| and not yet been called.
+  bool IsPending() { return !!callback_; }
+
+  // Clears the callback request state.
+  void Reset() {
+    dispatcher_ = nullptr;
+    reason_ = std::nullopt;
+    async_operation_ = std::nullopt;
+    callback_ = nullptr;
+  }
+
+  // Returns whether this callback manages an async_dispatcher_t operation.
+  bool has_async_operation() const { return async_operation_.has_value() && *async_operation_; }
+
+  // Returns whether this callback manages |operation|.
+  bool holds_async_operation(void* operation) const {
+    return async_operation_.has_value() && *async_operation_ == operation;
+  }
+
+  RequestType request_type() { return request_type_; }
+  void set_request_type(RequestType type) { request_type_ = type; }
+
+  void* async_operation() { return async_operation_.value_or(nullptr); }
+
+  void set_handle(zx_handle_t handle) { handle_ = handle; }
+  zx_handle_t handle() const { return handle_; }
+
+  void set_signals(zx_signals_t signals) { signals_ = signals; }
+  zx_signals_t signals() const { return signals_; }
+
+  const void* initiating_driver() { return initiating_driver_; }
+  driver_runtime::Dispatcher* initiating_dispatcher() { return initiating_dispatcher_; }
+
+ private:
+  RequestType request_type_;
+
+  driver_runtime::Dispatcher* dispatcher_ = nullptr;
+  Callback callback_;
+  // Reason for scheduling the callback.
+  std::optional<zx_status_t> reason_;
+  // The async_dispatcher_t operation that this callback request is wrapping around.
+  std::optional<void*> async_operation_;
+
+  // This is for tracking who caused the callback request to be queued.
+  const void* initiating_driver_ = nullptr;
+  driver_runtime::Dispatcher* initiating_dispatcher_ = nullptr;
+  zx_handle_t handle_ = ZX_HANDLE_INVALID;
+  zx_signals_t signals_ = 0;
+};
+
+}  // namespace driver_runtime
+
+#endif  // SRC_DEVICES_BIN_DRIVER_RUNTIME_CALLBACK_REQUEST_H_

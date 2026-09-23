@@ -1,0 +1,284 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/toolchain/generated_ifs_file.gni")
+import("//build/toolchain/ifs_shared_library.gni")
+
+# Generate an ld::RemotePerfectSymbolFilterMaker function.
+#
+# This takes a static list of symbol names and emits generated C++ code for a
+# filter allowing only those symbols.  The generated function takes a runtime
+# ld::RemoteDecodedModule and returns an ld::RemoteLoadModule::SymbolFilter
+# that can be attached to it.  See <lib/ld/remote-perfect-symbol-filter.h> for
+# the complete C++ details.  What's generated is actually a function templated
+# on the elfldltl::Elf<...> instantiation for the runtime ELF format in use.  A
+# generated "$target_name.h" header declares the function template and one or
+# more explicit extern instantiations.  An isolated file of generated code
+# defines those function template instantiations.
+#
+# This template produces three targets:
+#
+#  * "$target_name" is a source_set() that must be added to $deps in order
+#    to call the generated $output_name C++ function.  This enables using
+#    `#include "$target_name.h"` to get the generated function(s) declared.
+#
+#  * "$target_name.ifs" is a generated_ifs_file() that represents the shared
+#     library ABI exposed through the filter.  This target is only instantiated
+#     in $default_toolchain, with output in "$target_gen_dir/$target_name.ifs".
+#
+#  * "$target_name.link" is an ifs_shared_library() using that ABI.  If modules
+#    that will be loaded at runtime are linked against this at build time in
+#    lieu of their real runtime dependency, those builds will fail if they
+#    reference any symbols not permitted by the filter.
+#
+# Parameters
+#
+#  * output_name
+#    - Required: C++ (unscoped) identifier of the function template to define.
+#    - Type: string
+#
+#  * diagnostics
+#    - Required: C++ class meeting the elfldltl Diagnostics API, the parameter
+#    to the ld::RemotePerfectSymbolFilterMaker template.  This class should be
+#    declared in some header file listed in $includes.
+#    - Type: string
+#
+#  * namespace
+#    - Optional: C++ namespace to contain $output_name.  If omitted, then
+#    $output_name is declared in the global namespace.
+#    - Type: string
+#
+#  * includes
+#    - Optional: List of `#include` directives; each one is the verbatim string
+#    to emit after `#include `, i.e. including `<...>` or `"..."` quotes.
+#    Note that $include_dirs and $deps can be passed to
+#    - Type: list(string)
+#
+#  * symbols
+#    - Required: The allow-list of symbols the filter will recognize.
+#    - Type: list(string)
+#
+#   * allow_undefs
+#     - Optional: If true, the $output_name function will ignore any symbol in
+#     the $symbols list that is not found in the runtime module.  By default,
+#     the $diagnostics object's `UndefinedSymbol` method will be called and
+#     can choose whether the function will continue or fail.
+#     - Type: bool
+#     - Default: false
+#
+#   * max_overhead
+#     - Optional: This can set a compile-time limit on the overhead of the
+#     elfldltl::PerfectSymbolSet.  Since GN doesn't have floating-point
+#     numbers, here this is expressed as a percentage, so the C++ template
+#     parameter is $max_overhead / 100.0.  The default value and meaning are
+#     described fully in <lib/elfldltl/perfect-symbol-table.h>.
+#     - Type: integer
+#
+#  * soname
+#    - Optional: Passed to generated_ifs_file().
+#    - Type: string
+#
+#  * deps, data_deps, include_dirs, public_deps, testonly, visibility
+#    - Optional: See source_set().
+#
+#  * elves
+#    - Optional: List of elfldltl::Elf<...> instantiations for which the
+#    $output_name function will be defined.  By default, only the default
+#    template instantiation will be defined, for the ELF format for which the
+#    remote dynamic linking code itself was compiled.
+#    - Type: list(string)
+#    - Default: [ "" ]
+#
+template("remote_perfect_symbol_filter") {
+  main_target = target_name
+  ifs_target = "$target_name.ifs"
+  stub_target = "$target_name.link"
+
+  cc_target = "_perfect_symbol_filter.$target_name.cc"
+  h_target = "_perfect_symbol_filter.$target_name.h"
+  config_target = "_perfect_symbol_filter.$target_name.config"
+
+  gen_dir =
+      get_label_info(":$main_target($default_toolchain)", "target_gen_dir")
+
+  source_set(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "data_deps",
+                             "deps",
+                             "include_dirs",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    public = [ "$gen_dir/$main_target.h" ]
+    public_configs = [ ":$config_target" ]
+    sources = [ "$gen_dir/$main_target.cc" ]
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [
+      ":$cc_target($default_toolchain)",
+      ":$h_target($default_toolchain)",
+      "//sdk/lib/ld:headers",
+    ]
+  }
+
+  ifs_shared_library(stub_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    if (defined(visibility)) {
+      visibility += [ ":$ifs_target" ]
+    }
+
+    abi = "$gen_dir/$ifs_target.ifs"
+    deps = [ ":$ifs_target" ]
+  }
+
+  config(config_target) {
+    visibility = [ ":$main_target" ]
+    include_dirs = [ gen_dir ]
+  }
+
+  if (current_toolchain == default_toolchain) {
+    gen_label = get_label_info(":$main_target", "label_no_toolchain")
+
+    generated_ifs_file(ifs_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                               "symbols",
+                               "soname",
+                             ])
+    }
+
+    if (defined(invoker.elves)) {
+      elves = invoker.elves
+    } else {
+      elves = [ "" ]
+    }
+
+    if (defined(invoker.max_overhead)) {
+      overhead = ", (${invoker.max_overhead} / 100.0)"
+    } else {
+      overhead = ""
+    }
+
+    allow_undefs = defined(invoker.allow_undefs) && invoker.allow_undefs
+
+    namespace = {
+      if (defined(invoker.namespace)) {
+        start = [
+          "namespace ${invoker.namespace} {",
+          "",
+        ]
+        end = [
+          "",
+          "}  // namespace ${invoker.namespace}",
+        ]
+      } else {
+        start = []
+        end = []
+      }
+    }
+
+    generated_file(h_target) {
+      visibility = [ ":$main_target" ]
+      forward_variables_from(invoker, [ "testonly" ])
+
+      outputs = [ "$gen_dir/$main_target.h" ]
+      output_conversion = "list lines"
+      contents = [
+        "// Generated by $gen_label. DO NOT EDIT!",
+        "",
+        "#pragma once",
+        "",
+        "#include <lib/ld/remote-perfect-symbol-filter.h>",
+      ]
+      if (defined(invoker.includes)) {
+        foreach(file, invoker.includes) {
+          contents += [ "#include $file" ]
+        }
+      }
+      contents += [ "" ]
+      contents += namespace.start
+      contents += [
+        "template <class Elf = elfldltl::Elf<>>",
+        "ld::RemoteLoadModule<Elf>::SymbolFilter " + "${invoker.output_name}(" +
+            "${invoker.diagnostics}&, " +
+            "typename RemoteDecodedModule<Elf>::Ptr module);",
+        "",
+      ]
+      foreach(elf, elves) {
+        contents +=
+            [ "extern template ld::RemotePerfectSymbolFilterMaker<" +
+              "${invoker.diagnostics}, $elf> ${invoker.output_name}<$elf>;" ]
+      }
+      contents += namespace.end
+    }
+
+    generated_file(cc_target) {
+      visibility = [ ":$main_target" ]
+      forward_variables_from(invoker, [ "testonly" ])
+
+      outputs = [ "$gen_dir/$main_target.cc" ]
+      output_conversion = "list lines"
+      contents = [
+        "// Generated by $gen_label. DO NOT EDIT!",
+        "",
+        "#include \"$main_target.h\"",
+        "",
+        "namespace {",
+        "",
+        "constexpr auto kSymbols = elfldltl::PerfectSymbolTable({",
+      ]
+      foreach(symbol, invoker.symbols) {
+        if (symbol == "$symbol") {
+          contents += [ "    \"$symbol\"," ]
+        } else {
+          contents += [ "    \"${symbol.name}\"," ]
+        }
+      }
+      contents += [
+        "});",
+        "",
+        "}  // namespace ",
+        "",
+      ]
+      contents += namespace.start
+      contents += [
+        "template <class Elf>",
+        "ld::RemoteLoadModule<Elf>::SymbolFilter ${invoker.output_name}(",
+        "    ${invoker.diagnostics}& diag,",
+        "    typename RemoteDecodedModule<Elf>::Ptr decoded_module) {",
+        "  return ld::RemotePerfectSymbolFilter<kSymbols, Elf$overhead>(",
+        "      diag, std::move(decoded_module), $allow_undefs);",
+        "}",
+        "",
+      ]
+      foreach(elf, elves) {
+        contents +=
+            [ "template ld::RemotePerfectSymbolFilterMaker<" +
+              "${invoker.diagnostics}, $elf> ${invoker.output_name}<$elf>;" ]
+      }
+      contents += namespace.end
+    }
+  } else {
+    not_needed(invoker,
+               [
+                 "diagnostics",
+                 "elves",
+                 "includes",
+                 "max_overhead",
+                 "namespace",
+                 "output_name",
+                 "soname",
+                 "symbols",
+               ])
+  }
+}

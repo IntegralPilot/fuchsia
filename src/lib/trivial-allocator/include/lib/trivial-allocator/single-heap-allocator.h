@@ -1,0 +1,91 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_LIB_TRIVIAL_ALLOCATOR_INCLUDE_LIB_TRIVIAL_ALLOCATOR_SINGLE_HEAP_ALLOCATOR_H_
+#define SRC_LIB_TRIVIAL_ALLOCATOR_INCLUDE_LIB_TRIVIAL_ALLOCATOR_SINGLE_HEAP_ALLOCATOR_H_
+
+#include <cstddef>
+#include <span>
+
+namespace trivial_allocator {
+
+// This returns an AllocateFunction-compatible callable object (lambda) that
+// simply hands out a single span as its available buffer space.  (See comments
+// in <lib/trivial-allocator/basic-leaky-allocator.h> for more API details.)
+// The "smart pointer" objects it returns never actually hold any ownership.
+
+class SingleHeapAllocator {
+ public:
+  using Bytes = std::span<std::byte>;
+
+  // This is the non-owning "smart pointer" type returned below.
+  // It's sufficient for BasicLeakyAllocator's API requirements.
+  class Allocation {
+   public:
+    constexpr Allocation() = default;
+
+    constexpr Allocation(const Allocation&) = delete;
+
+    constexpr Allocation(Allocation&& other) noexcept : ptr_(other.release()) {}
+
+    constexpr Allocation& operator=(Allocation&& other) noexcept {
+      void* other_ptr = other.ptr_;
+      other.ptr_ = ptr_;
+      ptr_ = other_ptr;
+      return *this;
+    }
+
+    constexpr explicit operator bool() const { return ptr_; }
+
+    constexpr void* get() { return ptr_; }
+
+    [[nodiscard]] constexpr void* release() {
+      void* ptr = ptr_;
+      ptr_ = nullptr;
+      return ptr;
+    }
+
+   private:
+    friend SingleHeapAllocator;
+
+    void* ptr_ = nullptr;
+  };
+
+  constexpr SingleHeapAllocator() = default;
+
+  constexpr SingleHeapAllocator(const SingleHeapAllocator&) = delete;
+
+  constexpr SingleHeapAllocator(SingleHeapAllocator&& other) noexcept : heap_(other.heap_) {
+    other.heap_ = {};
+  }
+
+  explicit constexpr SingleHeapAllocator(std::span<std::byte> heap) : heap_(heap) {}
+
+  constexpr SingleHeapAllocator& operator=(SingleHeapAllocator&& other) noexcept {
+    auto other_heap = other.heap_;
+    other.heap_ = heap_;
+    heap_ = other_heap;
+    return *this;
+  }
+
+  Allocation operator()(size_t& size, size_t alignment) {
+    Allocation result;
+    if (size <= heap_.size()) {
+      // We always ignore the alignment requested and just give back the whole
+      // heap the first time it's enough, leaving nothing for the second time.
+      // Update the caller's value to reflect exactly how much we have.
+      size = heap_.size_bytes();
+      result.ptr_ = heap_.data();
+      heap_ = {};
+    }
+    return result;
+  }
+
+ private:
+  std::span<std::byte> heap_;
+};
+
+}  // namespace trivial_allocator
+
+#endif  // SRC_LIB_TRIVIAL_ALLOCATOR_INCLUDE_LIB_TRIVIAL_ALLOCATOR_SINGLE_HEAP_ALLOCATOR_H_

@@ -1,0 +1,168 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+load("@fuchsia_rules_common//build_flags:build_flags.bzl", "build_flags")
+load("//build/bazel/rules/cc:fx_cc_binary.bzl", "fx_cc_binary")
+load("//build/bazel/rules/cc:fx_cc_library.bzl", "fx_cc_library")
+load("//build/bazel/rules/host_tests:host_test.bzl", "host_test")
+load(
+    ":host_tests.bzl",
+    "build_flags_cc_binary_host_test",
+    "build_flags_cc_library",
+)
+
+package(default_applicable_licenses = ["//:license"])
+
+test_suite(
+    name = "tests",
+    visibility = ["//build/bazel/rules/build_flags/tests:__pkg__"],
+)
+
+# A single build_flags() target defining several attributes for C and C++
+build_flags(
+    name = "flags1",
+    cflags = ["-DCFLAGS=1"],
+    cflags_c = ["-DCONLYFLAG=1"],
+    cflags_cc = ["-DCPPFLAG=1"],
+    defines = ["A_MACRO=42"],
+)
+
+# NOTE: Many tests in this file are designed such that they will fail to build if build_flags
+# flags are not propagated correctly to compilation and linking actions. Other tests actually
+# perform runtime checks instead.
+
+# Define a list of test names, each one will correspond to
+# a build_flags_cc_binary_host_test() definition that uses
+# either ${name}.cc or ${name}.c in its `srcs` value, based
+# on the name. All these use 'build_flags = ":flags1"'
+TEST_NAMES = [
+    # Two tests that check that 'cflags' is pased to both
+    # C++ and C source files.
+    "check_cflags_conly",
+    "check_cflags_cpp",
+
+    # Two tests to check that 'cflags_c' is only passed
+    # to C source files.
+    "check_cflags_c_conly",
+    "check_cflags_c_cpp",
+
+    # Two tests to check that 'cflags_cc' is only passed
+    # to C++ source files.
+    "check_cflags_cc_conly",
+    "check_cflags_cc_cpp",
+
+    # Two tests to check that 'defines' is passed to
+    # both C and C++ source files.
+    "check_defines_conly",
+    "check_defines_cpp",
+]
+
+# Now define all tests using a loop expression
+[
+    build_flags_cc_binary_host_test(
+        name = test_name,
+        srcs = [
+            "{}.c".format(test_name),
+        ] if test_name.endswith("_conly") else [
+            "{}.cc".format(test_name),
+        ],
+        build_flags = [":flags1"],
+    )
+    for test_name in TEST_NAMES
+]
+
+# A test that verify that disable_build_flags removes flags
+# that were passed to build_flags, even when using
+# different label expressions to address the same build_flags()
+# target.
+build_flags_cc_binary_host_test(
+    name = "check_with_and_without_remove_flags",
+    srcs = ["check_with_and_without_remove_flags.cc"],
+    build_flags = [":flags1"],
+    disable_build_flags = ["//build/bazel/rules/build_flags/tests/cc:flags1"],
+)
+
+# A test to verify that 'includes' (via include_dirs) and 'lib_dirs'
+# attributes of build_flags() are correctly passed to compiler & linker.
+
+build_flags(
+    name = "flags_includes_and_lib_dirs",
+    include_dirs = ["build/bazel/rules/build_flags/tests/cc/test_include_dir"],
+    ldflags = ["-ltest_prebuilt"],
+    lib_dirs = ["build/bazel/rules/build_flags/tests/cc/test_lib_dir"],
+)
+
+build_flags_cc_binary_host_test(
+    name = "check_includes_and_lib_dirs",
+    srcs = [
+        "check_includes_and_lib_dirs.cc",
+        # Ensure that this header file appears in the sandbox. However,
+        # it is included as "test_header.h" in the .cc source file,
+        # which works because of the 'include_dirs' attribute of
+        # 'flags_includes_and_lib_dirs'.
+        "test_include_dir/test_header.h",
+    ],
+
+    # This is required to ensure that the test library appears in the
+    # sandbox of the linking action. This does *not* add this path to the
+    # link command though, which uses '-L<path> -ltest_prebuilt' based on
+    # the definition of 'flags_includes_and_lib_dirs'.
+    additional_linker_inputs = ["test_lib_dir/libtest_prebuilt.a"],
+    build_flags = [":flags_includes_and_lib_dirs"],
+)
+
+# A test to verify that 'ldflags' on a cc_library do not transitively propagate
+# and fail the build of dependent binaries.
+
+build_flags(
+    name = "flags_invalid_ldflags",
+    ldflags = ["-Wl,--this-is-an-invalid-linker-flag-xyz"],
+)
+
+build_flags_cc_library(
+    name = "check_library_with_ldflags_lib",
+    srcs = ["check_library_with_ldflags.cc"],
+    build_flags = [":flags_invalid_ldflags"],
+)
+
+build_flags_cc_binary_host_test(
+    name = "check_library_with_ldflags",
+    srcs = ["check_library_with_ldflags_main.cc"],
+    deps = [":check_library_with_ldflags_lib"],
+)
+
+# Checks for fx_cc_binary() and fx_cc_library()
+
+build_flags(
+    name = "fx_cc_library_flags",
+    defines = ["IN_FX_CC_LIBRARY=1"],
+)
+
+fx_cc_library(
+    name = "fx_cc_library_for_test",
+    srcs = ["fx_cc_library_for_test.cc"],
+    build_flags = [":fx_cc_library_flags"],
+    disable_build_flags = [":flags2"],
+)
+
+build_flags(
+    name = "flags2",
+    defines = ["SHOULD_NOT_BE_DEFINED"],
+)
+
+fx_cc_binary(
+    name = "fx_cc_binary_test_bin",
+    srcs = ["fx_cc_binary_test.cc"],
+    build_flags = [
+        ":flags1",
+        ":flags2",
+    ],
+    disable_build_flags = [":flags2"],
+    deps = [":fx_cc_library_for_test"],
+)
+
+host_test(
+    name = "fx_cc_binary_test",
+    binary = ":fx_cc_binary_test_bin",
+)

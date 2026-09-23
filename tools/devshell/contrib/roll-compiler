@@ -1,0 +1,278 @@
+#!/usr/bin/env fuchsia-vendored-python
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+## Roll a new compiler (really, any CIPD package) into Fuchsia
+
+## Usage: See `fx roll-compiler --help`
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+FUCHSIA_DIR = os.path.normpath(
+    os.path.join(__file__, os.pardir, os.pardir, os.pardir, os.pardir)
+)
+JIRI_BIN = os.path.join(FUCHSIA_DIR, ".jiri_root", "bin")
+CIPD = os.path.join(JIRI_BIN, "cipd")
+JIRI = os.path.join(JIRI_BIN, "jiri")
+
+
+def CallCipd(args):
+    with tempfile.NamedTemporaryFile(mode="r", suffix=".json") as f:
+        cmd = [CIPD] + args + ["-json-output", f.name]
+        with open(os.devnull, "w") as devnull:
+            subprocess.check_call(cmd, stdout=devnull)
+        return json.load(f)["result"]
+
+
+def ResolvePackage(package, version):
+    return CallCipd(["describe", package, "-version", version])
+
+
+def GetSplitRustToolchainPaths(packages, host_platforms, target_platforms=None):
+    """
+    Separating `package = rust` into Host/Target packages. This function will
+    remove the unified `rust` package when separating into Host/Target packages.
+    """
+    CIPD_RUST_PREFIX = "fuchsia/third_party/rust"
+    DEFAULT_TARGET_PLATFORMS = [
+        "aarch64-unknown-linux-gnu",
+        "fuchsia",
+        "riscv64gc-unknown-linux-gnu",
+        # Currently disabled; see https://fxbug.dev/325488864.
+        # "wasm32-unknown-unknown",
+        "x86_64-unknown-linux-gnu",
+    ] + (
+        [
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        ]
+        if any("mac-" in plat for plat in host_platforms)
+        else []
+    )
+    rust_toolchain_packages = []
+    if "rust" not in packages:
+        return rust_toolchain_packages
+
+    if target_platforms is None:
+        target_platforms = DEFAULT_TARGET_PLATFORMS
+
+    host_packages = [
+        "%s/%s/%s" % (CIPD_RUST_PREFIX, "host", host_platform)
+        for host_platform in host_platforms
+    ]
+
+    target_packages = [
+        "%s/%s/%s" % (CIPD_RUST_PREFIX, "target", target_platform)
+        for target_platform in target_platforms
+    ]
+
+    rust_toolchain_packages = host_packages + target_packages
+
+    # Removing unified `rust` package
+    packages.remove("rust")
+
+    return rust_toolchain_packages
+
+
+def GetRustToolchainCommands(rust_toolchain_packages, tag):
+    rust_command = []
+    if not rust_toolchain_packages:
+        return rust_command
+
+    # Only download ${platform} Host toolchain packages
+    rust_command += [
+        "-package",
+        "fuchsia/third_party/rust/host/${platform}=%s" % (tag),
+    ]
+
+    for package in rust_toolchain_packages:
+        # Skip host packages, keep all target
+        if "fuchsia/third_party/rust/host" in package:
+            continue
+        rust_command += ["-package", "%s=%s" % (package, tag)]
+
+    return rust_command
+
+
+def GetResolvedClangFromRust(tag, platforms):
+    tokens = tag.split(":", 2)
+    if len(tokens) != 2 or tokens[0] != "git_revisions":
+        sys.stderr.write(
+            f"{tag} not in expected format `git_revisions:<rust>,<llvm>`\n"
+        )
+        sys.exit(1)
+    revisions = tokens[1].split(",")
+    if len(revisions) != 2:
+        sys.stderr.write(
+            f"{tag} lists {len(revisions)} revisions, expected only 2"
+        )
+        sys.exit(1)
+    clang_tag = f"git_revision:{revisions[1]}"
+    # This will fail check_call if the tag is not found for each platform.
+    for platform in platforms:
+        ResolvePackage(f"fuchsia/third_party/clang/{platform}", clang_tag)
+    return clang_tag
+
+
+def main():
+    default_jiri_manifest = None
+    abs_path = os.path.join(FUCHSIA_DIR, "manifests", "toolchain")
+    if os.path.exists(abs_path):
+        default_jiri_manifest = abs_path
+
+    assert default_jiri_manifest, "failed to locate toolchain manifest"
+
+    parser = argparse.ArgumentParser(
+        "fx roll-compiler",
+        description="Roll a new compiler into Fuchsia",
+        epilog="""
+With multiple --package switches, all packages must resolve successfully
+before commands are run for any package.
+""",
+    )
+    parser.add_argument(
+        "version",
+        nargs="?",
+        default="latest",
+        help="CIPD version to promote. Defaults to latest. Example: git_revision:507c05bead4026ed8841512095b4218119eb479f",
+    )
+    parser.add_argument(
+        "--package", "-p", action="append", help="CIPD package name"
+    )
+    parser.add_argument(
+        "--manifest",
+        default=default_jiri_manifest,
+        help="Jiri manifest file to edit",
+    )
+    parser.add_argument(
+        "--tag", default="git_revision", help="CIPD tag to publish"
+    )
+    parser.add_argument(
+        "--platforms",
+        action="append",
+        metavar="PLATFORM",
+        help="CIPD host platforms with matching packages",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_const",
+        default=False,
+        const=True,
+        help="Only print final command but do not run it",
+    )
+    args = parser.parse_args()
+
+    if not args.package:
+        args.package = ["clang", "rust"]
+
+    if default_platforms := not args.platforms:
+        args.platforms = ["linux-arm64", "linux-amd64", "mac-amd64"]
+        if args.package == ["clang"]:
+            args.platforms.append("windows-amd64")
+
+    # If rolling rust and clang together, only resolve rust.
+    if clang_from_rust := "rust" in args.package and "clang" in args.package:
+        args.package = [
+            package for package in args.package if package != "clang"
+        ]
+
+    # Rust separate host/target toolchain
+    rust_toolchain_packages = GetSplitRustToolchainPaths(
+        args.package, args.platforms
+    )
+
+    packages = [
+        package if "/" in package else "fuchsia/third_party/" + package
+        for package in args.package
+    ]
+
+    def PackageTag(package):
+        [tag] = [
+            tag["tag"]
+            for tag in package["tags"]
+            if tag["tag"].startswith(args.tag)
+        ]
+        return tag
+
+    packages_to_resolve = [
+        "%s/%s" % (package, platform)
+        for platform in args.platforms
+        for package in packages
+    ] + rust_toolchain_packages
+
+    resolved_packages = [
+        ResolvePackage(package, args.version) for package in packages_to_resolve
+    ]
+
+    package_tags = {
+        package["pin"]["package"]: PackageTag(package)
+        for package in resolved_packages
+    }
+    tag_set = set(t for t in package_tags.values())
+    if len(tag_set) != 1:
+        sys.stderr.write(
+            f"Not all packages have matching {args.tag} tags at version {args.version}:\n"
+        )
+        json.dump(package_tags, sys.stderr, sort_keys=True, indent=4)
+        sys.stderr.write("\n")
+        sys.exit(1)
+    [tag] = tag_set
+
+    print(f"Resolved {args.version} to {tag}")
+
+    cmd = [JIRI, "edit"]
+    for package in packages:
+        cmd += ["-package", "%s/${platform}=%s" % (package, tag)]
+    cmd += GetRustToolchainCommands(rust_toolchain_packages, tag)
+
+    if clang_from_rust:
+        clang_platforms = args.platforms
+        if default_platforms:
+            clang_platforms.append("windows-amd64")
+        clang_tag = GetResolvedClangFromRust(tag, clang_platforms)
+        cmd.extend(
+            [
+                "-package",
+                "fuchsia/third_party/clang/${platform}=" + clang_tag,
+                "-package",
+                "fuchsia/third_party/clang/linux-arm64=" + clang_tag,
+            ]
+        )
+
+    cmd.append(args.manifest)
+
+    def DryRun(args, cwd=None):
+        print(args)
+
+    run = DryRun if args.dry_run else subprocess.check_call
+
+    run(cmd)
+
+    update_lockfiles = os.path.join(
+        FUCHSIA_DIR, "manifests", "update-lockfiles.sh"
+    )
+    if os.path.isfile(update_lockfiles):
+        run([update_lockfiles])
+    else:
+        sys.stderr.write(
+            "Warning: update-lockfiles.sh not found, falling back to jiri\n"
+        )
+        run(
+            [JIRI, "resolve", "-local-manifest"],
+            cwd=os.path.join(FUCHSIA_DIR, "integration"),
+        )
+
+    sys.stderr.write("\nRun this command to download the updated package:\n")
+    sys.stderr.write("$ jiri fetch-packages -local-manifest-project=fuchsia\n")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

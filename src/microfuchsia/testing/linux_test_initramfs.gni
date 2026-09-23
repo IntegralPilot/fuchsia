@@ -1,0 +1,125 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/dist/distribution_manifest.gni")
+
+# Constructs an initramfs image for use as a Linux ramdisk in testing.
+#
+# Creates the archive according to dependent `resource()`s and
+# `distribution_entries` metadata, and up to one product bundle. Any (system A)
+# boot shim in the product bundle will be given the destination of
+# "/data/kernel" in the archive, and any (system A) ZBI will be given that of
+# "/data/ramdisk".
+#
+# For the actual init program, a single instance of `linux_init()` should be
+# depended upon.
+#
+# Parameters:
+#
+#  * deps
+#    - Required: Should include `resource()` or `distribution_entries`
+#      metadata-contributing targets, and in particular one linux_init()
+#      target.
+#    - Type: list(label)
+#
+#  * visibility
+#    - Optional: The usual GN meanings.
+#
+template("linux_test_initramfs") {
+  main_target = target_name
+  if (current_toolchain == default_toolchain) {
+    assert(defined(invoker.deps),
+           "linux_initramfs($main_target): `deps` not defined")
+
+    dist_manifest_target =
+        "_linux_initramfs.${main_target}.distribution_manifest"
+    product_bundle_manifest_target =
+        "_linux_initramfs.${main_target}.product_bundle_manifest"
+
+    dist_manifest = "${target_gen_dir}/${main_target}.manifest.json"
+    distribution_manifest(dist_manifest_target) {
+      testonly = true
+      forward_variables_from(invoker,
+                             [
+                               "visibility",
+                               "deps",
+                             ])
+
+      if (defined(visibility)) {
+        visibility += [ ":*" ]
+      }
+
+      outputs = [ dist_manifest ]
+    }
+
+    product_bundle_manifest =
+        "$target_gen_dir/$main_target.product_bundles.json"
+    generated_file(product_bundle_manifest_target) {
+      testonly = true
+      forward_variables_from(invoker,
+                             [
+                               "deps",
+                               "visibility",
+                             ])
+      if (defined(visibility)) {
+        visibility += [ ":*" ]
+      }
+
+      data_keys = [ "product_bundles" ]
+      output_conversion = "json"
+      outputs = [ product_bundle_manifest ]
+    }
+
+    compiled_action(main_target) {
+      testonly = true
+      forward_variables_from(invoker, [ "visibility" ])
+
+      inputs = [
+        dist_manifest,
+        product_bundle_manifest,
+      ]
+      outputs = [ "$target_out_dir/$main_target.img" ]
+      depfile = outputs[0] + ".d"
+
+      tool = "//src/microfuchsia/testing:assemble-initramfs"
+      args = [
+        "--distribution-manifest",
+        rebase_path(inputs[0], root_build_dir),
+        "--product-bundle-manifest",
+        rebase_path(inputs[1], root_build_dir),
+        "--output",
+        rebase_path(outputs[0], root_build_dir),
+        "--depfile",
+        rebase_path(depfile, root_build_dir),
+      ]
+
+      deps = [
+        ":$dist_manifest_target",
+        ":$product_bundle_manifest_target",
+      ]
+
+      metadata = {
+        # Specifies a ZBI/ramdisk to contribute to an assembled system. While
+        # this is not actually a ZBI, it is intended to be treated as such by
+        # the emulator tooling.
+        kernel_aib_input_barrier = []
+        kernel_aib_input = [
+          {
+            label = get_label_info(":$target_name", "label_with_toolchain")
+            zbi = rebase_path(outputs[0], root_build_dir)
+          },
+        ]
+      }
+    }
+  } else {
+    group(main_target) {
+      testonly = true
+      forward_variables_from(invoker, [ "visibility" ])
+      deps = [ ":$main_target($default_toolchain)" ]
+    }
+
+    not_needed(invoker, "*", [ "visibility" ])
+  }
+}

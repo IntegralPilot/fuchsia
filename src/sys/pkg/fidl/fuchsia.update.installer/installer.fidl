@@ -1,0 +1,192 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.update.installer;
+
+using fuchsia.net.http;
+using fuchsia.pkg;
+
+alias AttemptId = string:36; // 36 == strlen("01234567-89ab-cdef-0123-456789abcdef")
+
+/// Updates the system.
+///
+/// This protocol is intended to be consumed by a component capable of
+/// discovering when to update and what version of the system to install.
+@discoverable
+closed protocol Installer {
+    /// Start an update if one is not running, or attach to a pending update
+    /// attempt if one is running and
+    /// [`Options.allow_attach_to_existing_attempt`] is true. If an update
+    /// attempt is started or attached to, provide status updates through
+    /// `monitor`.
+    ///
+    /// + request `url` The URL of the resource that describes the update. Must have one of the
+    /// following schemes:
+    ///     * "fuchsia-pkg": The resource is an [update package](https://fuchsia.dev/fuchsia-src/concepts/packages/update_pkg).
+    ///     * "http[s]": The resource is a blob-based update manifest.
+    ///       TODO(https://fxbug.dev/479283380): Link to RFC
+    /// + request `options` Configuration options for this update attempt.
+    ///     Ignored or merged with the existing `options` if an update attempt
+    ///     is already in progress.
+    /// + request `monitor` A protocol on which to receive progress updates.
+    /// + request `reboot_controller` An optional protocol to control the timing
+    ///     of the reboot into the update system. If not provided, the update
+    ///     attempt will initiate the reboot as soon as it is ready.
+    ///
+    /// - response `attempt_id` UUID identifying this update attempt. For
+    ///     updates that require a reboot, components may use this identifier to
+    ///     disambiguate the completion of this update attempt from new update
+    ///     attempts that start post-reboot.
+    strict StartUpdate(resource struct {
+        url fuchsia.pkg.PackageUrl;
+        options Options;
+        monitor client_end:Monitor;
+        reboot_controller server_end:<RebootController, optional>;
+    }) -> (struct {
+        attempt_id AttemptId;
+    }) error UpdateNotStartedReason;
+
+    /// Attempt to monitor a specific update attempt, if it exists. This request
+    /// will not start an update if one is not already running.
+    ///
+    /// + request `attempt_id` UUID identifying the requested update attempt. If
+    ///     not given, monitor any active update attempt.
+    /// + request `monitor` A protocol on which to receive progress updates.
+    ///
+    /// - response `attached` Whether or not the provided monitor was attached
+    ///     to an in-progress update attempt. If false, monitor will be closed
+    ///     by the server.
+    strict MonitorUpdate(resource struct {
+        attempt_id AttemptId:optional;
+        monitor client_end:Monitor;
+    }) -> (struct {
+        attached bool;
+    });
+
+    /// Suspend a specific update attempt, if it exists.
+    ///
+    /// + request `attempt_id` UUID identifying the requested update attempt. If
+    ///     not given, suspend any active update attempt.
+    strict SuspendUpdate(struct {
+        attempt_id AttemptId:optional;
+    }) -> () error SuspendError;
+
+    /// Resume a specific update attempt, if it exists.
+    ///
+    /// + request `attempt_id` UUID identifying the requested update attempt. If
+    ///     not given, resume any active update attempt.
+    strict ResumeUpdate(struct {
+        attempt_id AttemptId:optional;
+    }) -> () error ResumeError;
+
+    /// Cancel a specific update attempt, if it exists.
+    ///
+    /// + request `attempt_id` UUID identifying the requested update attempt. If
+    ///     not given, cancel any active update attempt.
+    strict CancelUpdate(struct {
+        attempt_id AttemptId:optional;
+    }) -> () error CancelError;
+};
+
+/// Controls the timing of the reboot into the updated system.
+///
+/// If the client end of a [`RebootController`] is closed without calling
+/// [`RebootController.Detach()`], the update attempt will fall back to the
+/// default behavior of rebooting as soon as it is ready.
+closed protocol RebootController {
+    /// Informs the update attempt that it may reboot when ready, unblocking a
+    /// pending reboot if it is already ready to reboot.
+    ///
+    /// If a controller is dropped without sending this request or
+    /// [`RebootController.Detach`], the update attempt reclaims control of the
+    /// timing of the reboot, behaving as if the update attempt was not given a
+    /// [`RebootController`] at all.
+    strict Unblock();
+
+    /// Informs the update attempt that it should wait to reboot indefinitely,
+    /// even if this [`RebootController`] connection is dropped.
+    strict Detach();
+};
+
+/// A byte range.
+type Range = struct {
+    /// The start offset of the range in bytes.
+    offset uint64;
+    /// The size of the range in bytes.
+    size uint64;
+};
+
+/// Configuration options for an update attempt.
+type Options = table {
+    /// What initiated this update attempt. Required.
+    1: initiator Initiator;
+
+    /// If an update is already in progress, it's acceptable to instead attach a
+    /// Monitor to that in-progress update instead of failing this request to
+    /// install the update.  Setting this option to true may convert situations
+    /// that would have resulted in the ALREADY_IN_PROGRESS to be treated as
+    /// non-error cases. A controller, if provided, will be ignored if the
+    /// running update attempt already has a controller.
+    2: allow_attach_to_existing_attempt bool;
+
+    /// Determines if the installer should update the recovery partition if an
+    /// update is available.  Defaults to true.
+    3: should_write_recovery bool;
+
+    /// The range of the resource indicated by the [`Installer.StartUpdate`] url that corresponds to
+    /// the manifest. Can only be set when the [`Installer.StartUpdate`] url has scheme "http[s]",
+    /// i.e. when using the blob-based update manifest. Defaults to the entire resource.
+    4: manifest_range Range;
+
+    /// The HTTP headers to include when fetching the manifest. Can only be set when the
+    /// [`Installer.StartUpdate`] url has scheme "http[s]".
+    5: manifest_headers vector<fuchsia.net.http.Header>:MAX;
+};
+
+/// Who or what initiated the update installation.
+type Initiator = strict enum {
+    /// The install was initiated by an interactive user, or the user is
+    /// otherwise blocked and waiting for the result of this update.
+    USER = 0;
+
+    /// The install was initiated by a service, in the background.
+    SERVICE = 1;
+};
+
+/// The set of values that are returned by an request to start an update.
+type UpdateNotStartedReason = strict enum {
+    /// There was already another update attempt in progress when this request was
+    /// made.  A new update attempt will not be started.
+    ALREADY_IN_PROGRESS = 1;
+};
+
+/// Why suspend failed.
+type SuspendError = strict enum {
+    /// There is no update attempt in progress.
+    NO_UPDATE_IN_PROGRESS = 1;
+    /// The current update attempt has reached its suspend limit.
+    SUSPEND_LIMIT_EXCEEDED = 2;
+    /// The given attempt id does not match the current update attempt.
+    ATTEMPT_ID_MISMATCH = 3;
+};
+
+/// Why resume failed.
+type ResumeError = strict enum {
+    /// There is no update attempt in progress.
+    NO_UPDATE_IN_PROGRESS = 1;
+    /// The given attempt id does not match the current update attempt.
+    ATTEMPT_ID_MISMATCH = 2;
+};
+
+/// Why cancel failed.
+type CancelError = strict enum {
+    /// There is no update attempt in progress.
+    NO_UPDATE_IN_PROGRESS = 1;
+    /// The update attempt has past the point that can be canceled.
+    UPDATE_CANNOT_BE_CANCELED = 2;
+    /// The given attempt id does not match the current update attempt.
+    ATTEMPT_ID_MISMATCH = 3;
+    /// The number of cancel requests has exceeded the limit.
+    CANCEL_LIMIT_EXCEEDED = 4;
+};

@@ -1,0 +1,94 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/dist/resource.gni")
+import("//src/starnix/build/args.gni")
+import("//src/starnix/kernel/starnix.gni")
+
+config("vdso_config") {
+  cflags = [ "-fPIC" ]
+  ldflags = [
+    "-shared",
+
+    # Make sure libc is not linked into the vDSO. Header-only use is OK.
+    "-nostdlib",
+  ]
+
+  # TODO(https://fxbug.dev/378658421): Disable lto on arm32 because it doesn't compile
+  if (!is_debug && current_cpu == "arm") {
+    configs = [ "//build/config/lto:no-lto" ]
+  }
+
+  # Use a custom linker script to ensure only one PT_LOAD header.
+  vdso_linker_script = "vdso.ld"
+  vdso_version_script = "vdso_${current_cpu}.map"
+  ldflags += [
+    "-Wl,--hash-style=both",
+    "-Wl,-T," + rebase_path(vdso_linker_script, root_build_dir),
+    "-Wl,--version-script," + rebase_path(vdso_version_script, root_build_dir),
+  ]
+}
+
+source_set("vdso_calculate_utc") {
+  sources = [ "vdso_calculate_utc.cc" ]
+  deps = [
+    "//zircon/kernel/lib/fasttime:headers",
+    "//zircon/system/public",
+    "//zircon/system/ulib/affine",
+    "//zircon/system/ulib/concurrent:concurrent_vdso",
+  ]
+  configs += [ ":vdso_config" ]
+}
+
+loadable_module("vdso_lib") {
+  sources = [
+    "vdso_${current_cpu}.cc",
+    "vdso_common.cc",
+  ]
+  if (current_cpu == "arm") {
+    sources += [ "vdso_arm_eabi.cc" ]
+  }
+
+  deps = [
+    ":vdso_calculate_utc",
+    "//zircon/kernel/lib/fasttime:headers",
+    "//zircon/system/public",
+    "//zircon/system/ulib/affine",
+  ]
+
+  output_name = "libvdso"
+  configs += [ ":vdso_config" ]
+  if (is_linux) {
+    # By default, Linux host libraries statically link libc++. Since this
+    # library specifies nostdlib this option is unused and generates a warning.
+    configs -= [ "//build/config/linux:implicit-host-libs" ]
+  }
+
+  exclude_toolchain_tags = [
+    "asan",
+    "hwasan",
+    "instrumented",
+  ]
+}
+
+resource("vdso_data") {
+  sources = [ "$root_out_dir/libvdso.so" ]
+  if (current_cpu != "arm") {
+    outputs = [ "data/libvdso.so" ]
+  } else {
+    outputs = [ "data/libvdso_arch32.so" ]
+  }
+  deps = [ ":vdso_lib" ]
+
+  # Use the group below to ensure the correct toolchain is in the dependency
+  # edge.
+  visibility = [ ":vdso" ]
+}
+
+group("vdso") {
+  deps = [ ":vdso_data($bionic_linux_toolchain)" ]
+  if (current_cpu == "arm64") {
+    deps += [ ":vdso_data($bionic_linux_arch32_toolchain)" ]
+  }
+}

@@ -1,0 +1,176 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/compiler.gni")
+import("//build/host.gni")
+import("//build/test.gni")
+import("//build/testing/environments.gni")
+import("//build/testing/host_test_data.gni")
+import("//build/testing/symbols_dir_test_data.gni")
+import("//src/developer/ffx/config.gni")
+
+if (is_host && has_board) {
+  # Directory to store debug symbols, which are required for the e2e test to
+  # run. The path is relative to the $root_out_dir, where zxdb_e2e_tests binary
+  # lives.
+  symbol_dir = "test_data/zxdb_e2e_tests/build-id"
+  scripts_dir = "test_data/zxdb_e2e_tests/scripts"
+
+  test("zxdb_e2e_tests") {
+    sources = [
+      "e2e_test.cc",
+      "e2e_test.h",
+      "ffx_debug_agent_bridge.cc",
+      "ffx_debug_agent_bridge.h",
+      "main.cc",
+      "script_test.cc",
+      "script_test.h",
+    ]
+
+    package_deps = [
+      "inferiors:zxdb_e2e_inferiors",
+      "//src/developer/debug/debug_agent",
+      "//src/developer/forensics/crasher",
+      "//src/developer/forensics/crasher:crasher_test",
+    ]
+    deps = [
+      # In variant builds the variant version of the test executable will be
+      # run. However, the test will expect it can still run the host_x64 default
+      # variant of ffx, which is still built regardless of build variant. But a
+      # simple dependency here would try to build an ASAN variant of ffx, which
+      # creates a conflict because then there are two ffx binaries in the path
+      # of the existing tooling, which causes the infra builds (and local
+      # attempts to invoke ffx) to fail horribly. ${toolchain_variant.base}
+      # specifies specifically to depend on the normal non-variant version of
+      # ffx that's built all the time so we don't create a second copy, and can
+      # expect the path to be consistent and predictable.
+      ":zxdb_e2e_symbols(${toolchain_variant.base})",
+      ":zxdb_e2e_test_data(${toolchain_variant.base})",
+      "//src/developer/debug/shared",
+      "//src/developer/debug/zxdb/client",
+      "//src/developer/debug/zxdb/common",
+      "//src/developer/debug/zxdb/common:test_support",
+      "//src/developer/debug/zxdb/console",
+      "//src/developer/debug/zxdb/console:test_support",
+      "//src/developer/debug/zxdb/symbols:test_support",
+      "//src/developer/ffx:test_data",
+      "//src/developer/ffx/plugins/debug:ffx_debug_plugin_tool_test_data",
+      "//src/lib/fxl/test:test_settings",
+      "//third_party/googletest:gtest",
+    ]
+
+    # The location of ffx binary and metadata (including ffx and the ffx-debug
+    # subtool) test data directory for the test to be able to find them.
+    _ffx_test_data_path = rebase_path(ffx_test_host_tools_out_dir, root_out_dir)
+
+    _is_lto = select_variant + [ "lto" ] - [ "lto" ] != select_variant
+    _is_thinlto =
+        select_variant + [ "thinlto" ] - [ "thinlto" ] != select_variant
+
+    build_type =
+        "optimize=$optimize:target_cpu=$target_cpu:is_lto=$_is_lto:" +
+        "is_thinlto=$_is_thinlto:is_asan=$is_asan:is_coverage=$is_coverage"
+
+    defines = [
+      "ZXDB_E2E_TESTS_BUILD_TYPE=\"" + build_type + "\"",
+      "ZXDB_E2E_TESTS_SYMBOL_DIR=\"" + symbol_dir + "\"",
+      "ZXDB_E2E_TESTS_SCRIPTS_DIR=\"" + scripts_dir + "\"",
+      "ZXDB_E2E_TESTS_FFX_TEST_DATA=\"" + _ffx_test_data_path + "\"",
+    ]
+
+    environments = all_fuchsia_envs
+
+    # TODO(https://fxbug.dev/42143551): The arm64 emulator is run from an arm64 host but we only
+    # support running tests on x64 hosts.
+    if (board_name == "arm64" || board_name == "qemu-arm64") {
+      environments -= [ emu_env ]
+    }
+
+    # TODO(b/319276232): Reenable sherlock when the flake is fixed.
+    #
+    # Note that sherlock cannot run the Starnix tests, which happen to be the
+    # only e2e tests that currently run on these environments (see below).
+    environments -= [ sherlock_env ]
+
+    # TODO(https://fxbug.dev/42109154): Re-enable astro/nelson when enabling non-Starnix
+    # breakpoint tests below. These environments cannot run the Starnix tests
+    # which are the only e2e tests that currently run on these environments.
+    environments -= [
+      astro_env,
+      nelson_env,
+    ]
+
+    # TODO(https://fxbug.dev/319163754): This test doesn't pass on GCE.
+    environments += [ gce_env ]
+    environments -= [ gce_env ]
+  }
+
+  host_test_data("zxdb_e2e_test_data") {
+    # These tests are reliable on all architectures.
+    sources = [
+      "scripts/starnix_proc_exception.script",
+      "scripts/starnix_proc_hardware_breakpoint.script",
+      "scripts/status.script",
+    ]
+
+    if (target_cpu == "arm64") {
+      sources += [
+        # This test requires a 32 bit ARM binary which is only built when we're
+        # building for an arm target.
+        "scripts/starnix_proc_exception32.script",
+      ]
+    } else {
+      # TODO(https://fxbug.dev/42109154): Enable software breakpoint tests on ARM64
+      # once they are stable.
+      sources += [
+        "scripts/async_backtrace.script",
+        "scripts/async_backtrace_any_thread.script",
+        "scripts/bitfield.script",
+        "scripts/break_dl_start.script",
+        "scripts/conditional_breakpoint.script",
+        "scripts/cpp_fn_arguments.script",
+        "scripts/cpp_fn_call.script",
+        "scripts/cpp_fn_return_values.script",
+        "scripts/inlined_frames.script",
+        "scripts/pretty_types.script",
+        "scripts/pretty_types_rust.script",
+        "scripts/rust_fn_arguments.script",
+        "scripts/rust_fn_call.script",
+        "scripts/rust_fn_return_values.script",
+        "scripts/rust_pretty_stack.script",
+        "scripts/simple_breakpoint.script",
+        "scripts/simple_template_names.script",
+        "scripts/starnix_proc.script",
+        "scripts/step_plt.script",
+        "scripts/template_functions.script",
+        "scripts/until.script",
+        "scripts/unwind_plt.script",
+      ]
+    }
+
+    outputs = [
+      "$root_out_dir/test_data/zxdb_e2e_tests/scripts/{{source_file_part}}",
+    ]
+  }
+
+  symbols_dir_test_data("zxdb_e2e_symbols") {
+    output_dir = "$root_out_dir/$symbol_dir"
+    deps = [
+      "inferiors:zxdb_e2e_inferiors($target_toolchain)",
+      "//src/developer/forensics/crasher:crasher($target_toolchain)",
+      "//src/developer/forensics/crasher:crasher_test($target_toolchain)",
+      "//src/starnix/kernel:starnix_kernel_package($target_toolchain)",
+    ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  if (has_board) {
+    deps = [
+      ":zxdb_e2e_tests($host_toolchain)",
+      "dap_integration_tests:e2e_tests",
+    ]
+  }
+}

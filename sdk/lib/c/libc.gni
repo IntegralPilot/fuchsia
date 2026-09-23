@@ -1,0 +1,906 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang_cpu.gni")
+import("//build/toolchain/hermetic_source_set.gni")
+import("//build/toolchain/zircon/user_basic_redirect.gni")
+import("//src/zircon/lib/zircon/libzircon.gni")
+
+# Source directory for Fucshia libc.
+libc = "//sdk/lib/c"
+
+# Root source directory for llvm-libc, scudo and GWP-ASan.
+llvm_libc = "//third_party/llvm-libc/src"
+scudo = "//third_party/scudo/src"
+gwp_asan = "//third_party/scudo/gwp_asan"
+
+declare_args() {
+  # **NOTE: Experimental** Use the llvm-libc implementations of string
+  # functions.
+  use_llvm_libc_string_functions = current_cpu == "riscv64"
+}
+
+libc_configs = [
+  # These configs are needed for the expectations of the source code,
+  # whether compiled into libc.so or into unit test code.
+  "$libc:llvm-libc.config",
+]
+
+# When compiled for unit tests, add only those.
+libc_testonly_configs = libc_configs + [ "$libc:testonly.config" ]
+
+# These additional configs are needed when compiling for the real libc.
+libc_configs += [ "$libc:llvm-libc-export.config" ]
+
+# These symbols are always allowed as undefined references in a
+# libc_source_set() using `basic_abi = true`.  The compiler generates calls to
+# some of these and they are defined in string/ using the basic ABI.
+libc_hermetic_undefs = [
+  "__unsanitized_memcpy",
+  "__unsanitized_memmove",
+  "__unsanitized_memset",
+  "memchr",
+  "memcmp",
+  "memcpy",
+  "memmove",
+  "memset",
+  "strlen",
+]
+if (is_ubsan) {
+  # The usual toolchain-provided ubsan runtime requires the compiler ABI, but
+  # these should never be called without a fatal error anyway.
+  libc_hermetic_undefs += [
+    "__ubsan_handle_add_overflow",
+    "__ubsan_handle_alignment_assumption",
+    "__ubsan_handle_builtin_unreachable",
+    "__ubsan_handle_cfi_bad_type",
+    "__ubsan_handle_cfi_check_fail",
+    "__ubsan_handle_divrem_overflow",
+    "__ubsan_handle_float_cast_overflow",
+    "__ubsan_handle_function_type_mismatch",
+    "__ubsan_handle_implicit_conversion",
+    "__ubsan_handle_invalid_builtin",
+    "__ubsan_handle_load_invalid_value",
+    "__ubsan_handle_missing_return",
+    "__ubsan_handle_mul_overflow",
+    "__ubsan_handle_negate_overflow",
+    "__ubsan_handle_nonnull_arg",
+    "__ubsan_handle_nonnull_return_v1",
+    "__ubsan_handle_nullability_arg",
+    "__ubsan_handle_nullability_return_v1",
+    "__ubsan_handle_out_of_bounds",
+    "__ubsan_handle_pointer_overflow",
+    "__ubsan_handle_shift_out_of_bounds",
+    "__ubsan_handle_sub_overflow",
+    "__ubsan_handle_type_mismatch_v1",
+    "__ubsan_handle_vla_bound_not_positive",
+  ]
+}
+
+if (is_gcc) {
+  # GNU ld sometimes produces a spurious undefined symbol for this even when
+  # it's not used in any relocations.
+  libc_hermetic_undefs += [ "_GLOBAL_OFFSET_TABLE_" ]
+}
+
+# Flipping this and then doing a failing build with -k0 is a handy way to see
+# what specific vDSO references are made from basic_abi libc_source_set()s.
+_diagnose_libzircon_refs = false  # true
+
+if (!_diagnose_libzircon_refs) {
+  # All vDSO references are OK, but only via the `_zx_*` symbols.  The `zx_*`
+  # names will be written to these.
+  libc_hermetic_undefs += libzircon_underscore_linkage_names
+}
+
+# The CMake builds of llvm-libc use `__llvm_libc`, so leave that for any
+# potential future case of building that code for testing or overlay cases
+# independent of the Fuchsia libc build, e.g. from a different LLVM source
+# version.  This name is used by the production libc that winds up in the
+# Fuchsia SDK sysroot that someone doing a local LLVM CMake build might be
+# using as the baseline system.  That will only be visible to users with a
+# statically-linked libc, but that will happen eventually.
+libc_namespace = "__fuchsia_libc"
+
+# This is used instead of $libc_namespace in the .testonly targets.
+libc_test_namespace = "fuchsia_libc_unittest"
+
+# Define source_set() targets for some libc code.
+#
+# This defines two source_set() targets, one with the main target name and one
+# called "$target_name.testonly".  They differ in the configs applied to the
+# code (before $configs is appended if set).  The main target is compiled for
+# libc proper and defines the public C entry points, while the testonly target
+# is compiled for unit test code and does not define the public C entry points.
+# A libc_test() target should have the corresponding ".testonly" target in its
+# $deps while the main target rolls up into the deps of libc proper.
+#
+# Parameters
+#
+#   * basic_abi
+#     - Optional: If true, $sources must be compiled for the basic machine ABI.
+#     via hermetic_source_set().  If present, $global_symbols is required.
+#     - Type: bool
+#     - Default: false
+#
+#   * global_symbols
+#     - Optional: Required if $basic_abi is true, as for hermetic_source_set().
+#     - Type: list(string)
+#
+#   * undefined_symbols
+#     - Optional: As for hermetic_source_set().
+#     - Type: list(string) or true
+#
+#   * allow_fini, allow_init
+#     - Optional: As for hermetic_source_set().
+#     - Type: bool
+#     - Default: false
+#
+#   * objfile_metadata
+#     - Optional: As for hermetic_source_set().
+#     - Type: scope
+#
+#   * configs
+#     - Optional: Extra configs to append.  Unlike source_set(), configs
+#     is not pre-set so defaults cannot be removed and += isn't used.
+#     - Type: list(config)
+#     - Default: []
+#
+#   * remove_configs
+#     - Optional: Configs to remove from the defaults.
+#     - Type: list(config)
+#     - Default: []
+#
+#   * libc_deps
+#     - Optional: Used for deps on other libc_source_set() targets; as if each
+#     label were in $non_test_deps, and "$label.testonly" in $testonly_deps.
+#     - Type: list(label)
+#     - Default: []
+#
+#   * libc_public_deps
+#     - Optional: Just like $libc_deps, but for $public_deps.
+#     - Type: list(label)
+#     - Default: []
+#
+#   * non_test_deps
+#     - Optional: Extra deps to append for the main target but
+#     not the testonly target.
+#     - Type: list(label)
+#     - Default: []
+#
+#   * non_test_vars
+#     - Optional: Extra parameters to pass through to source_set()
+#     in the main target but not in the testonly target.
+#     - Type: scope
+#     - Default: {}
+#
+#   * testonly_deps
+#     - Optional: Extra deps to append for the testonly target
+#     but not the main target.
+#     - Type: list(label)
+#     - Default: []
+#
+#   * testonly_public_deps
+#     - Optional: Extra public_deps to append for the testonly target
+#     but not the main target.
+#     - Type: list(label)
+#     - Default: []
+#
+#   * dir
+#     - Optional: Directory prefix for $sources file names.
+#     - Type: dir
+#     - Default: "."
+#
+#   * public
+#     - Optional: As for source_set(), but if $dir is set, it's prepended to
+#     relative paths.  This should list the headers intended to be used for
+#     other parts of libc and for unit tests.  Those targets will have deps on
+#     this one.
+#     - Type: list(file)
+#
+#   * sources
+#     - Required: As for source_set(), but $dir is prefixed if set.
+#     - Type: list(file)
+#
+#   * local_sources
+#     - Optional: As for source_set(); the $dir prefix is not added.
+#     - Type: list(file)
+#
+#   * visibility
+#     - Optional: Additional label patterns that can use this target.
+#     All targets have visibility limited to libc code by default.
+#     This can add additional label patterns to expose libc internal
+#     pieces to other parts of the build, but minimal patterns should
+#     be used and never broad wildcards.
+#     - Type: list(label_pattern)
+#     - Default: []
+#
+# See source_set() for the rest.
+#
+template("libc_source_set") {
+  set_vars = {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "allow_fini",
+                             "allow_init",
+                             "basic_abi",
+                             "configs",
+                             "dir",
+                             "global_symbols",
+                             "libc_deps",
+                             "libc_public_deps",
+                             "local_sources",
+                             "non_test_deps",
+                             "non_test_vars",
+                             "objfile_metadata",
+                             "public",
+                             "remove_configs",
+                             "sources",
+                             "testonly_deps",
+                             "testonly_public_deps",
+                             "undefined_symbols",
+                             "visibility",
+                           ])
+
+    visibility = [ "$libc/*" ]
+    if (defined(invoker.visibility)) {
+      visibility += invoker.visibility
+    }
+
+    if (defined(invoker.dir)) {
+      sources = []
+      foreach(file, invoker.sources) {
+        sources += [ "${invoker.dir}/$file" ]
+      }
+    } else {
+      sources = invoker.sources
+    }
+
+    if (defined(invoker.local_sources)) {
+      sources += invoker.local_sources
+    }
+
+    if (defined(invoker.public)) {
+      if (defined(invoker.dir)) {
+        public = []
+        foreach(file, invoker.public) {
+          if (file != get_path_info(file, "abspath")) {
+            file = "${invoker.dir}/$file"
+          }
+          public += [ file ]
+        }
+      } else {
+        public = invoker.public
+      }
+    }
+  }
+
+  set_configs = []
+  if (defined(invoker.configs)) {
+    set_configs = invoker.configs
+  }
+
+  # If basic_abi is set, then the main target will use user_basic_redirect()
+  # but the test targets are never compiled for the basic ABI.
+  basic_abi = defined(invoker.basic_abi) && invoker.basic_abi
+  need_redirect = basic_abi && toolchain_variant.tags + [ "no-compiler-abi" ] -
+                               [ "no-compiler-abi" ] == toolchain_variant.tags
+  if (is_linux) {
+    need_redirect = basic_abi && is_host
+  }
+
+  # The secondary .export target compiles the same functions but with an
+  # explicit use of the config to define LLVM_LIBC_FUNCTION for export in the
+  # shared library.  The main target redirector group in the user.libc
+  # environment will go to the .export target in the user.basic environment.
+  # Other environments use the main user.basic target that only provides
+  # hidden-visibility definitions.
+  compile_targets = [ "" ]
+  if (basic_abi) {
+    compile_targets += [ ".export" ]
+  }
+
+  if (need_redirect) {
+    group(target_name) {
+      forward_variables_from(set_vars, [ "visibility" ])
+      if (toolchain_environment == "user.libc") {
+        public_deps = [ ":$target_name.export.basic" ]
+      } else {
+        public_deps = [ ":$target_name.basic" ]
+      }
+    }
+    not_needed(invoker,
+               [
+                 "allow_fini",
+                 "allow_init",
+                 "global_symbols",
+                 "objfile_metadata",
+                 "undefined_symbols",
+               ])
+  } else {
+    if (basic_abi) {
+      assert(defined(invoker.global_symbols),
+             "libc_source_set() requires `global_symbols`" +
+                 " with `basic_abi = true`")
+      compile_target_type = "hermetic_source_set"
+    } else {
+      compile_target_type = "source_set"
+    }
+    foreach(suffix, compile_targets) {
+      target(compile_target_type, target_name + suffix) {
+        if (basic_abi) {
+          forward_variables_from(invoker,
+                                 [
+                                   "allow_fini",
+                                   "allow_init",
+                                   "global_symbols",
+                                   "objfile_metadata",
+                                 ])
+          undefined_symbols = libc_hermetic_undefs
+          if (defined(invoker.undefined_symbols)) {
+            undefined_symbols += invoker.undefined_symbols
+          }
+        }
+        if (defined(invoker.remove_configs)) {
+          configs += invoker.remove_configs
+          configs -= invoker.remove_configs
+        }
+        configs += libc_configs + set_configs
+        deps = []
+        public_deps = []
+        forward_variables_from(set_vars, "*")
+        if (defined(invoker.non_test_vars)) {
+          forward_variables_from(invoker.non_test_vars, "*")
+        }
+        if (defined(invoker.libc_deps)) {
+          deps += invoker.libc_deps
+        }
+        if (defined(invoker.libc_public_deps)) {
+          public_deps += invoker.libc_public_deps
+        }
+        if (defined(invoker.non_test_deps)) {
+          deps += invoker.non_test_deps
+        }
+        deps += [ "$libc:libc_source_set.deps" ]
+        if (basic_abi && !_diagnose_libzircon_refs) {
+          deps += [
+            "//src/zircon/lib/zircon:hermetic_source_set-underscores-rewrite",
+          ]
+        }
+        if (suffix != "") {
+          configs += [ "$libc:llvm-libc-function-attr.config" ]
+        }
+      }
+    }
+  }
+
+  if (basic_abi) {
+    foreach(suffix,
+            [
+              "",
+              ".objfile",
+            ]) {
+      foreach(target, compile_targets) {
+        target = target_name + target
+        user_basic_redirect("$target.basic$suffix") {
+          visibility = [ ":*" ]
+          public_deps = [ ":$target$suffix" ]
+        }
+      }
+    }
+  }
+
+  source_set("$target_name.testonly") {
+    testonly = true
+    if (defined(invoker.remove_configs)) {
+      configs += invoker.remove_configs
+      configs -= invoker.remove_configs
+    }
+    configs += libc_testonly_configs + set_configs
+    deps = []
+    public_deps = []
+    forward_variables_from(set_vars, "*")
+    if (defined(invoker.libc_deps)) {
+      foreach(label, invoker.libc_deps) {
+        deps += [ "$label.testonly" ]
+      }
+    }
+    if (defined(invoker.libc_public_deps)) {
+      foreach(label, invoker.libc_public_deps) {
+        public_deps += [ "$label.testonly" ]
+      }
+    }
+    if (defined(invoker.testonly_public_deps)) {
+      public_deps += invoker.testonly_public_deps
+    }
+    if (defined(invoker.testonly_deps)) {
+      deps += invoker.testonly_deps
+    }
+    deps += [ "$libc:libc_test.deps" ]
+  }
+}
+
+# Define a source_set() of libc unit test code.
+#
+# This defines a source_set() that will roll up into the libc-unittests
+# executable and the standalone Zircon core-tests executable.  It's expected to
+# use llvm-libc's unit test API, which acts as a wrapper for zxtest, or to use
+# the zxtest API directly.  Its $deps should include the "foo.testonly" target
+# defined by libc_source_set("foo") for the code under test, which is tested
+# via its C++ namespace-scoped entry points.
+#
+# Paramaters
+#
+#   * configs
+#     - Optional: Extra configs to append.  Unlike source_set(), configs
+#     is not pre-set so defaults cannot be removed and += isn't used.
+#     - Type: list(config)
+#     - Default: []
+#
+#   * remove_configs
+#     - Optional: Configs to remove from the defaults.
+#     - Type: list(config)
+#     - Default: []
+#
+#   * dir
+#     - Optional: Directory prefix for $sources file names.
+#     - Type: dir
+#     - Default: "."
+#
+#   * gtest
+#     - Optional: Use gtest instead of zxtest.
+#     - Type: boolean
+#     - Default: false
+#
+#   * public
+#     - Optional: As for source_set(), but $dir is prefixed if set.
+#     - Type: list(file)
+#
+#   * sources
+#     - Required: As for source_set(), but $dir is prefixed if set.
+#     - Type: list(file)
+#
+# See source_set() for the rest.
+#
+template("libc_test") {
+  source_set(target_name) {
+    testonly = true
+
+    assert_no_deps = []
+    deps = []
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "configs",
+                             "dir",
+                             "gtest",
+                             "public",
+                             "remove_configs",
+                             "sources",
+                             "testonly",
+                           ])
+
+    if (defined(invoker.dir)) {
+      sources = []
+      foreach(file, invoker.sources) {
+        sources += [ "${invoker.dir}/$file" ]
+      }
+      if (defined(invoker.public)) {
+        public = []
+        foreach(file, invoker.public) {
+          public += [ "${invoker.dir}/$file" ]
+        }
+      }
+    } else {
+      sources = invoker.sources
+      forward_variables_from(invoker, [ "public" ])
+    }
+
+    if (defined(invoker.remove_configs)) {
+      configs += invoker.remove_configs
+      configs -= invoker.remove_configs
+    }
+    configs += libc_testonly_configs
+    if (defined(invoker.configs)) {
+      configs += invoker.configs
+    }
+
+    deps += [ "$libc:libc_test.deps" ]
+    if (defined(invoker.gtest) && invoker.gtest) {
+      deps += [ "$libc:gtest" ]
+      assert_no_deps += [ "//zircon/system/ulib/zxtest/*" ]
+    } else {
+      deps += [ "$libc:zxtest" ]
+      assert_no_deps += [ "//third_party/googletest/*" ]
+    }
+  }
+}
+
+variant_replaces_allocator = toolchain_variant.tags + [ "replaces-allocator" ] -
+                             [ "replaces-allocator" ] != toolchain_variant.tags
+
+# Convenience wrapper over the pattern of creating a libc_source_set() and
+# libc_test() which is common when using llvm-libc functions.
+#
+# Parameters
+#
+#   * functions
+#     - Required: A list of functions to take from $llvm_libc/src/$dir, i.e.
+#       the name of the directory containing the invoking BUILD.gn file.
+#     - Type: list(string)
+#
+#   * dir
+#     - Optional: Subdirectory of $llvm_libc where source is found.
+#     - Type: relative dir
+#     - Default: get_path_info(target_out_dir, "name")
+#
+#   * test_dir
+#     - Optional: Directory where test sources are found.
+#     - Type: dir
+#     - Default: "$llvm_libc/test/$dir"
+#
+#   * asm_functions
+#     - Optional: A subset of $functions implemented in "$function.S" files.
+#       Note that this affects only the extension; the $cpu_functions and
+#       $os_functions still affect what directory will be used.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * cpu_functions
+#     - Optional: A subset of $functions whose implementations come from
+#       the $llvm_libc/src/$dir/$clang_cpu directory instead.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * os_functions
+#     - Optional: A subset of $functions that whose implementations come from
+#       the $llvm_libc/src/$dir/$current_os directory instead.  When
+#       $current_os is "fuchsia", this uses "fuchsia/$function.cc" to get a
+#       local implementation source file in the Fuchsia tree rather than
+#       "$dir/$function.cpp" to get the llvm-libc implementation source file.
+#       When a function is also in asm_functions or cpu_functions the local
+#       path will also use "fuchsia/$clang_cpu/..." and/or the ".S" extension.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * noncpu_dir
+#     - Optional: Subdir of $llvm_libc/src/$dir where implementations are found
+#       for $functions not found in $cpu_functions.
+#     - Type: string
+#
+#   * no_test_functions
+#     - Optional: A subset of $functions that don't have tests.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * preempt_header_functions
+#     - Optional: A subset of $functions whose public header files are found
+#       in "$libc/include-preempt/..." instead of "$llvm_libc/...".
+#     - Type: list(string)
+#     - Default: []
+#
+#   * deps
+#     - Optional: Other llvm_libc_source_set() targets this one depends on.
+#     Unlike deps in plain source_set(), this will expand to different actual
+#     corresponding targets in the production, testonly, and unittests targets.
+#     - Type: list(label)
+#
+#   * local_deps
+#     - Optional: As for source_set().  Use this for deps on other things that
+#     the code requires but that aren't also llvm_libc_source_set() targets.
+#     - Type: list(label)
+#
+#   * allow_fini, allow_init, basic_abi, configs, global_symbols, non_test_deps, testonly_deps, testonly_public_deps, undefined_symbols
+#     - Optional: See libc_source_set().  If $global_symbols is omitted
+#     and $basic_abi is true, then it defaults to $functions.
+#
+#   * local_sources, sources, public
+#     - Optional: See libc_source_set().
+#      These are combined with entries derived from `functions` et al.
+#
+#   * test_sources
+#     - Optional: Additional sources added to the libc_test() but not the
+#       libc_source_set().  These sources are found in the test directory
+#       like the `${function}_test.cpp` sources for the $functions list.
+#
+#   * deps, test_deps
+#     - Optional: See llvm_libc_group().
+#
+#   * defines, friend, include_dirs, public_configs, public_deps, visibility
+#     - Optional: See source_set().
+#
+template("llvm_libc_source_set") {
+  main_target = target_name
+  target_dir = rebase_path(".", libc)
+  test_target = "$target_name.unittests"
+
+  source_dir = target_dir
+  if (defined(invoker.dir)) {
+    # This doesn't affect the logic above, but overrides the subdir used below.
+    source_dir = invoker.dir
+  }
+
+  asm_functions = []
+  if (defined(invoker.asm_functions)) {
+    asm_functions = invoker.asm_functions
+  }
+  assert(asm_functions + invoker.functions - invoker.functions == [],
+         "asm_functions must be a subset of functions")
+
+  cpu_functions = []
+  if (defined(invoker.cpu_functions)) {
+    cpu_functions = invoker.cpu_functions
+  }
+  assert(cpu_functions + invoker.functions - invoker.functions == [],
+         "cpu_functions must be a subset of functions")
+
+  os_functions = []
+  if (defined(invoker.os_functions)) {
+    os_functions = invoker.os_functions
+  }
+  assert(os_functions + invoker.functions - invoker.functions == [],
+         "os_functions must be a subset of functions")
+
+  no_test_functions = []
+  if (defined(invoker.no_test_functions)) {
+    no_test_functions = invoker.no_test_functions
+  }
+  assert(no_test_functions + invoker.functions - invoker.functions == [],
+         "no_test_functions must be a subset of functions")
+
+  preempt_header_functions = []
+  if (defined(invoker.preempt_header_functions)) {
+    preempt_header_functions = invoker.preempt_header_functions
+  }
+  assert(preempt_header_functions + invoker.functions - invoker.functions == [],
+         "preempt_header_functions must be a subset of functions")
+
+  libc_source_set(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "allow_fini",
+                             "allow_init",
+                             "basic_abi",
+                             "configs",
+                             "defines",
+                             "global_symbols",
+                             "include_dirs",
+                             "local_sources",
+                             "non_test_deps",
+                             "non_test_vars",
+                             "public",
+                             "public_configs",
+                             "public_deps",
+                             "sources",
+                             "testonly_deps",
+                             "testonly_public_deps",
+                             "undefined_symbols",
+                             "visibility",
+                           ])
+
+    # The test target can always use private headers from $sources.
+    friend = [ ":$test_target" ]
+    if (defined(invoker.friend)) {
+      friend += invoker.friend
+    }
+
+    if (defined(basic_abi) && basic_abi && !defined(global_symbols)) {
+      global_symbols = invoker.functions
+    }
+
+    dir = "$llvm_libc/src/$source_dir"
+
+    if (!defined(invoker.public)) {
+      public = []
+    }
+    if (!defined(invoker.sources)) {
+      sources = []
+    }
+    if (!defined(invoker.local_sources)) {
+      local_sources = []
+    }
+
+    foreach(function, invoker.functions) {
+      if (preempt_header_functions + [ function ] - [ function ] !=
+          preempt_header_functions) {
+        public += [ "$libc/include-preempt/src/$source_dir/$function.h" ]
+      } else {
+        public += [ "$function.h" ]
+      }
+
+      prefix = ""
+      if (asm_functions + [ function ] - [ function ] != asm_functions) {
+        extension = "S"
+      } else {
+        extension = "cc"
+      }
+
+      if (os_functions + [ function ] - [ function ] != os_functions) {
+        prefix += "$current_os/"
+      }
+
+      if (cpu_functions + [ function ] - [ function ] != cpu_functions) {
+        prefix += "$clang_cpu/"
+        not_needed(invoker, [ "noncpu_dir" ])
+      } else if (defined(invoker.noncpu_dir)) {
+        prefix += "${invoker.noncpu_dir}/"
+      }
+
+      if (prefix == "fuchsia/") {
+        local_sources += [ "$function.$extension" ]
+      } else if (prefix == "fuchsia/$clang_cpu/") {
+        local_sources += [ "fuchsia/$clang_cpu/$function.$extension" ]
+      } else {
+        if (extension == "cc") {
+          extension = "cpp"
+        }
+        sources += [ "$prefix$function.$extension" ]
+      }
+    }
+
+    if (defined(invoker.local_deps)) {
+      deps = invoker.local_deps
+    }
+    if (defined(invoker.deps)) {
+      if (!defined(non_test_deps)) {
+        non_test_deps = []
+      }
+      if (!defined(testonly_deps)) {
+        testonly_deps = []
+      }
+      foreach(label, invoker.deps) {
+        assert(get_label_info(label, "label_with_toolchain") ==
+               get_label_info(label, "label_no_toolchain") +
+               "($current_toolchain)")
+        label = get_label_info(label, "label_no_toolchain")
+        non_test_deps += [ "$label" ]
+        testonly_deps += [ "$label.testonly" ]
+      }
+    }
+  }
+
+  libc_test(test_target) {
+    if (defined(invoker.test_dir)) {
+      dir = invoker.test_dir
+    } else {
+      dir = "$llvm_libc/test/src/$source_dir"
+    }
+
+    deps = [ ":$main_target.testonly" ]
+    sources = []
+
+    foreach(function, invoker.functions - no_test_functions) {
+      if (defined(invoker.test_dir)) {
+        sources += [ "${function}_test.cc" ]
+      } else {
+        sources += [ "${function}_test.cpp" ]
+      }
+    }
+
+    if (defined(invoker.test_sources)) {
+      sources += invoker.test_sources
+    }
+
+    if (defined(invoker.local_deps)) {
+      deps += invoker.local_deps
+    }
+
+    if (defined(invoker.test_deps)) {
+      deps += invoker.test_deps
+    }
+
+    if (defined(invoker.deps)) {
+      foreach(label, invoker.deps) {
+        assert(get_label_info(label, "label_with_toolchain") ==
+               get_label_info(label, "label_no_toolchain") +
+               "($current_toolchain)")
+        label = get_label_info(label, "label_no_toolchain")
+        deps += [
+          # Depend directly on the .testonly targets as well as on their tests,
+          # in case this target's test code uses headers from its dependencies.
+          "$label.testonly",
+          "$label.unittests",
+        ]
+      }
+    }
+  }
+
+  if (target_name == get_path_info(target_dir, "file")) {
+    group("unittests") {
+      testonly = true
+      public_deps = [ ":$test_target" ]
+    }
+  }
+}
+
+# Convenience wrapper for aggregating all the llvm_libc_source_set() subtargets
+# into a parallel set of targets with a collective name.  If the target_name
+# matches the directory name, there will also be a "unittests" target defined.
+#
+# Parameters
+#
+#   * deps
+#     - Required: A list of labels of llvm_libc_source_set() targets.
+#     - Type: list(label_without_toolchain)
+#
+#   * non_test_deps
+#     - Optional: A list of labels not used for test code.
+#     - Type: list(label_without_toolchain)
+#
+#   * test_deps
+#     - Optional: A list of labels used by tests themselves, rather than
+#       by any version of the code under test.  These are dependencies only
+#       of the unittests target, not the testonly target.
+#     - Type: list(label_without_toolchain)
+#
+#   * testonly_deps
+#     - Optional: A list of labels used *only* for testonly versions of code
+#       under test.  These are dependencies of the testonly target.
+#     - Type: list(label_without_toolchain)
+#
+template("llvm_libc_group") {
+  group_name = target_name
+  target_dir = rebase_path(".", libc)
+
+  foreach(suffix,
+          [
+            "",
+            "testonly",
+            "unittests",
+          ]) {
+    subtarget = group_name
+    if (suffix != "") {
+      subtarget += ".$suffix"
+    }
+    group(subtarget) {
+      if (suffix != "") {
+        testonly = true
+      }
+      deps = []
+      if (defined(invoker.deps)) {
+        foreach(label, invoker.deps) {
+          assert(get_label_info(label, "label_with_toolchain") ==
+                 get_label_info(label, "label_no_toolchain") +
+                 "($current_toolchain)")
+          label = get_label_info(label, "label_no_toolchain")
+          if (suffix != "") {
+            label += ".$suffix"
+          }
+          deps += [ label ]
+        }
+      }
+      if (suffix == "" && defined(invoker.non_test_deps)) {
+        deps += invoker.non_test_deps
+      }
+      if (suffix != "" && defined(invoker.testonly_deps)) {
+        foreach(label, invoker.testonly_deps) {
+          assert(get_label_info(label, "label_with_toolchain") ==
+                 get_label_info(label, "label_no_toolchain") +
+                 "($current_toolchain)")
+          label = get_label_info(label, "label_no_toolchain")
+          label += ".$suffix"
+          deps += [ label ]
+        }
+      }
+      if (suffix == "unittests" && defined(invoker.test_deps)) {
+        foreach(label, invoker.test_deps) {
+          assert(get_label_info(label, "label_with_toolchain") ==
+                 get_label_info(label, "label_no_toolchain") +
+                 "($current_toolchain)")
+          label = get_label_info(label, "label_no_toolchain")
+          label += ".$suffix"
+          deps += [ label ]
+        }
+      }
+    }
+  }
+
+  if (group_name == get_path_info(target_dir, "file")) {
+    group("unittests") {
+      testonly = true
+      public_deps = [ ":$group_name.unittests" ]
+    }
+  }
+}

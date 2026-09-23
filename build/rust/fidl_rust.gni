@@ -1,0 +1,371 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/fidl/toolchain.gni")
+import("//build/rust/config.gni")
+import("//build/rust/rustc_library.gni")
+
+# template invoked to generate fidl, common and fdomain crates
+template("_fidl_rust_crate") {
+  generation_target = "${target_name}_generate"
+  assert(defined(invoker.fidl_gen_dir))
+  assert(defined(invoker.fidl_ir_json))
+  assert(defined(invoker.fidl_ir_target))
+  assert(defined(invoker.crate_name))
+  assert(defined(invoker.fidlgen_args))
+  assert(defined(invoker.fidl_dep_suffix))
+
+  forward_variables_from(invoker,
+                         [
+                           "fidl_gen_dir",
+                           "crate_name",
+                           "fidlgen_args",
+                           "fidl_dep_suffix",
+                         ])
+
+  # won't be needed during generation or if there aren't any FIDL library deps.
+  not_needed([ "fidl_dep_suffix" ])
+
+  file_stem = "${fidl_gen_dir}/${crate_name}"
+
+  if (is_fidl_toolchain) {
+    filename = "${file_stem}.rs"
+    compiled_action(generation_target) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "fidl_ir_json",
+                               "disable_rustdoc",
+                               "fidl_ir_target",
+                             ])
+      visibility = [
+        ":*",
+        "//tools/fidl/fidlgen_rust:*",
+      ]
+
+      tool = "//tools/fidl/fidlgen_rust"
+      tool_output_name = "fidlgen_rust"
+      mnemonic = "FIDLGEN"
+
+      inputs = [
+        fidl_ir_json,
+        "//rustfmt.toml",
+        "$rustc_prefix/bin/rustfmt",
+        rustc_version_file,
+      ]
+
+      outputs = [ filename ]
+
+      args = [
+               "--json",
+               rebase_path(fidl_ir_json, root_build_dir),
+               "--output-filename",
+               rebase_path(filename, root_build_dir),
+               "--rustfmt",
+               "$rebased_rustc_prefix/bin/rustfmt",
+               "--rustfmt-config",
+               rebase_path("//rustfmt.toml", root_build_dir),
+             ] + fidlgen_args
+
+      deps = [ fidl_ir_target ]
+
+      metadata = {
+        generated_sources = rebase_path(outputs, root_build_dir)
+      }
+    }
+    not_needed(invoker,
+               [
+                 "deps",
+                 "public_deps",
+                 "visibility",
+                 "features",
+               ])
+  } else {
+    not_needed(invoker,
+               [
+                 "fidl_ir_json",
+                 "fidl_ir_target",
+               ])
+    not_needed([
+                 "common",
+                 "fidlgen_args",
+               ])
+
+    rustc_library(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "visibility",
+                               "disable_rustdoc",
+                               "features",
+                             ])
+
+      crate_name = crate_name
+      output_dir = "$target_out_dir/$target_name"
+      version = "0.1.0"
+      edition = "2018"
+      disable_clippy = true
+      allow_legacy_edition = true
+
+      deps = [
+        "//sdk/rust/zx-status",
+        "//src/lib/fidl/rust/fidl",
+        "//third_party/rust_crates:bitflags",
+        "//third_party/rust_crates:futures",
+      ]
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+      if (is_fuchsia) {
+        deps += [ "//sdk/rust/zx" ]
+      }
+
+      # TODO(https://fxbug.dev/42055130): Avoid this suppression. At the time of
+      # writing it is needed because this target might depend on another FIDL
+      # library *only* for type aliases; the generated Rust code will not
+      # reference this external alias, producing an unused crate dependency. We
+      # cannot know here whether that's the case or not, so we just suppress
+      # the warning.
+      configs += [ "//build/config/rust/lints:allow_unused_crate_dependencies" ]
+
+      if (defined(invoker.public_deps)) {
+        foreach(dep, invoker.public_deps) {
+          label = get_label_info(dep, "label_no_toolchain")
+          if (label == "//zircon/vdso/zx:zx") {
+            deps += [ "//sdk/rust/zx-types" ]
+          } else {
+            deps += [ "${label}_${fidl_dep_suffix}" ]
+          }
+        }
+      }
+
+      non_rust_deps = [ ":$generation_target($fidl_toolchain)" ]
+      source_root = "$file_stem.rs"
+      sources = [ "$file_stem.rs" ]
+
+      configs += [ "//build/config/rust/lints:deny_unused_results" ]
+    }
+  }
+}
+
+# template invoked to generate the flex crates
+template("_flex_crate") {
+  assert(defined(invoker.original_target_name))
+  original_target_name = invoker.original_target_name
+  assert(defined(invoker.original_crate_name))
+  original_crate_name = invoker.original_crate_name
+  assert(defined(invoker.crate_name))
+
+  generate_target_name = "${target_name}_generate"
+  generate_output_name = "${target_gen_dir}/${original_crate_name}_flex.rs"
+
+  generated_file(generate_target_name) {
+    contents = "pub use ${original_crate_name}::*;"
+    outputs = [ generate_output_name ]
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+  }
+
+  rustc_library(target_name) {
+    name = invoker.crate_name
+    sources = [ generate_output_name ]
+    source_root = generate_output_name
+    edition = "2024"
+    disable_rustdoc = true
+
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    deps = [
+      ":${generate_target_name}",
+      ":${original_target_name}",
+    ]
+    configs += [ "//build/config/rust/lints:deny_unused_results" ]
+  }
+}
+
+# Generates Rust bindings for a FIDL library.
+#
+# Parameters
+#
+#  * library_name
+#    - Required: The name of the FIDL library.
+#    - Type: string
+#
+#  * fidl_gen_dir
+#    - Required: The directory under which bindings should be generated.
+#    - Type: path
+#
+#  * fidl_ir_json
+#    - Required: The path to the associated FIDL IR JSON file.
+#    - Type: path
+#
+#  * fidl_ir_target
+#    - Required: The label of the target that generates the FIDL IR JSON file.
+#    - Type: label
+#
+#  * contains_drivers
+#    - Optional: The FIDL library contains drivers
+#    - Type: boolean
+#
+#  * deps
+#    - Optional: Dependencies added unaltered to the deps for this library.
+#         Used only to set non-fidl rust bindings. The use of public_deps is
+#         instead of deps is strongly advised.
+#
+#  * testonly, visibility, public_deps
+#    - Optional: Usual GN meanings.
+#
+template("fidl_rust") {
+  assert(defined(invoker.library_name),
+         "fidl_rust(\"$target_name\") must define `library_name`")
+  assert(defined(invoker.fidl_gen_dir),
+         "fidl_rust(\"$target_name\") must define `fidl_gen_dir`")
+  assert(defined(invoker.fidl_ir_json),
+         "fidl_rust(\"$target_name\") must define `fidl_ir_json`")
+  assert(defined(invoker.fidl_ir_target),
+         "fidl_rust(\"$target_name\") must define `fidl_ir_target`")
+
+  contains_drivers =
+      defined(invoker.contains_drivers) && invoker.contains_drivers
+
+  base_crate_name = string_replace(invoker.library_name, ".", "_")
+
+  common_target_name = "${target_name}_common"
+  common_crate_name = "fidl_${base_crate_name}_common"
+
+  fidl_target_name = target_name
+  fidl_crate_name = "fidl_${base_crate_name}"
+
+  fdomain_target_name = "${target_name}_fdomain"
+  fdomain_crate_name = "fdomain_${base_crate_name}"
+
+  flex_crate_name = "flex_${base_crate_name}"
+
+  shared_deps = []
+  shared_fidlgen_args = []
+  not_needed(invoker, [ "enable_api_coverage" ])
+  _enable_api_coverage =
+      fidl_api_coverage ||
+      (defined(invoker.enable_api_coverage) && invoker.enable_api_coverage)
+  if (_enable_api_coverage) {
+    shared_fidlgen_args += [ "--api-coverage=true" ]
+  }
+  shared_features = []
+  if (defined(invoker.deps)) {
+    shared_deps += invoker.deps
+  }
+  if (contains_drivers) {
+    shared_fidlgen_args += [ "--include-drivers" ]
+    if (is_fuchsia) {
+      shared_features = [ "driver" ]
+
+      shared_deps += [ "//src/lib/fidl/rust/fidl_driver" ]
+
+      # TODO: incorporate this into fidl_driver
+      shared_deps += [ "//sdk/lib/driver/runtime/rust" ]
+    }
+  }
+
+  # Standard "original flavour" Rust bindings.
+  _fidl_rust_crate(fidl_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "disable_rustdoc",
+                             "fidl_gen_dir",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    crate_name = fidl_crate_name
+    features = shared_features
+    fidl_dep_suffix = "rust"
+    deps = shared_deps + [ ":${common_target_name}" ]
+    fidlgen_args = shared_fidlgen_args + [ "--use_common=${common_crate_name}" ]
+  }
+
+  _flex_crate("${target_name}_flex") {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+    original_target_name = fidl_target_name
+    original_crate_name = fidl_crate_name
+    crate_name = flex_crate_name
+  }
+
+  # Common bindings - shared between standard and FDomain bindings.
+  _fidl_rust_crate(common_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "disable_rustdoc",
+                             "fidl_gen_dir",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    crate_name = common_crate_name
+    features = shared_features
+    fidl_dep_suffix = "rust_common"
+    deps = shared_deps
+    fidlgen_args = shared_fidlgen_args + [ "--common=true" ]
+  }
+
+  # FDomain bindings.
+  _fidl_rust_crate(fdomain_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "disable_rustdoc",
+                             "fidl_gen_dir",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    crate_name = fdomain_crate_name
+    features = shared_features
+    fidl_dep_suffix = "rust_fdomain"
+    deps = shared_deps + [
+             ":${common_target_name}",
+             "//src/lib/fdomain/client",
+           ]
+    fidlgen_args = shared_fidlgen_args + [
+                     "--fdomain=true",
+                     "--use_common=${common_crate_name}",
+                   ]
+  }
+
+  _flex_crate("${target_name}_fdomain_flex") {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    original_target_name = fdomain_target_name
+    original_crate_name = fdomain_crate_name
+    crate_name = flex_crate_name
+  }
+}

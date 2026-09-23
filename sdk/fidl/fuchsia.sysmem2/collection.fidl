@@ -1,0 +1,1239 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.sysmem2;
+
+using zx;
+
+@available(added=19)
+const MAX_COUNT_DUPLICATES uint32 = 64;
+
+/// The maximum number of token children of an OR group that can be created per
+/// call to [`fuchsia.sysmem2/BufferCollectionTokenGroup.CreateChildrenSync`].
+///
+/// Actually creating this many children isn't recommended in most typical
+/// scenarios, but isn't prevented, for testing reasons, and just in case an
+/// unusual scenario needs it. Mitigation of potentially high time complexity in
+/// sysmem will limit the actual number of group child combinations considered
+/// in aggregation attempts to a separate maximum that is not settable via
+/// sysmem protocols. The maximum number of total nodes in a sysmem token tree
+/// is limited to a separate maximum that is not settable via these protocols.
+@available(added=19)
+const MAX_COUNT_CREATE_CHILDREN int32 = 64;
+
+/// The max length in bytes of the `name` request field in
+/// [`fuchsia.sysmem2/Allocator.SetDebugClientInfo`] and
+/// [`fuchsia.sysmem2/Node.SetDebugClientInfo`].
+@available(added=19)
+const MAX_CLIENT_NAME_LENGTH int32 = 256;
+
+/// This protocol is the parent protocol for all nodes in the tree established
+/// by [`fuchsia.sysmem2/BufferCollectionToken`] creation and
+/// [`fuchsia.sysmem2/BufferCollectionTokenGroup`] creation, including
+/// [`fuchsia.sysmem2/BufferCollectionToken`](s) which have since been converted
+/// to a [`fuchsia.sysmem2/BufferCollection`] channel.
+///
+/// Epitaphs are not used in this protocol.
+@available(added=19)
+open protocol Node {
+    /// Ensure that previous messages have been received server side. This is
+    /// particularly useful after previous messages that created new tokens,
+    /// because a token must be known to the sysmem server before sending the
+    /// token to another participant.
+    ///
+    /// Calling [`fuchsia.sysmem2/BufferCollectionToken.Sync`] on a token that
+    /// isn't/wasn't a valid token risks the `Sync` stalling forever. See
+    /// [`fuchsia.sysmem2/Allocator.ValidateBufferCollectionToken`] for one way
+    /// to mitigate the possibility of a hostile/fake
+    /// [`fuchsia.sysmem2/BufferCollectionToken`] at the cost of one round trip.
+    /// Another way is to pass the token to
+    /// [`fuchsia.sysmem2/Allocator/BindSharedCollection`], which also validates
+    /// the token as part of exchanging it for a
+    /// [`fuchsia.sysmem2/BufferCollection`] channel, and
+    /// [`fuchsia.sysmem2/BufferCollection.Sync`] can then be used without risk
+    /// of stalling.
+    ///
+    /// After creating one or more [`fuchsia.sysmem2/BufferCollectionToken`](s)
+    /// and then starting and completing a `Sync`, it's then safe to send the
+    /// `BufferCollectionToken` client ends to other participants knowing the
+    /// server will recognize the tokens when they're sent by the other
+    /// participants to sysmem in a
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`] message. This is an
+    /// efficient way to create tokens while avoiding unnecessary round trips.
+    ///
+    /// Other options include waiting for each
+    /// [`fuchsia.sysmem2/BufferCollectionToken.Duplicate`] to complete
+    /// individually (using separate call to `Sync` after each), or calling
+    /// [`fuchsia.sysmem2/BufferCollection.Sync`] after a token has been
+    /// converted to a `BufferCollection` via
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`], or using
+    /// [`fuchsia.sysmem2/BufferCollectionToken.DuplicateSync`] which includes
+    /// the sync step and can create multiple tokens at once.
+    flexible Sync() -> ();
+
+    /// ###### On a [`fuchsia.sysmem2/BufferCollectionToken`] channel:
+    ///
+    /// Normally a participant will convert a `BufferCollectionToken` into a
+    /// [`fuchsia.sysmem2/BufferCollection`], but a participant can instead send
+    /// `Release` via the token (and then close the channel immediately or
+    /// shortly later in response to server closing the server end), which
+    /// avoids causing buffer collection failure. Without a prior `Release`,
+    /// closing the `BufferCollectionToken` client end will cause buffer
+    /// collection failure.
+    ///
+    /// ###### On a [`fuchsia.sysmem2/BufferCollection`] channel:
+    ///
+    /// By default the server handles unexpected closure of a
+    /// [`fuchsia.sysmem2/BufferCollection`] client end (without `Release`
+    /// first) by failing the buffer collection. Partly this is to expedite
+    /// closing VMO handles to reclaim memory when any participant fails. If a
+    /// participant would like to cleanly close a `BufferCollection` without
+    /// causing buffer collection failure, the participant can send `Release`
+    /// before closing the `BufferCollection` client end. The `Release` can
+    /// occur before or after `SetConstraints`. If before `SetConstraints`, the
+    /// buffer collection won't require constraints from this node in order to
+    /// allocate. If after `SetConstraints`, the constraints are retained and
+    /// aggregated, despite the lack of `BufferCollection` connection at the
+    /// time of constraints aggregation.
+    ///
+    /// ###### On a [`fuchsia.sysmem2/BufferCollectionTokenGroup`] channel:
+    ///
+    /// By default, unexpected closure of a `BufferCollectionTokenGroup` client
+    /// end (without `Release` first) will trigger failure of the buffer
+    /// collection. To close a `BufferCollectionTokenGroup` channel without
+    /// failing the buffer collection, ensure that AllChildrenPresent() has been
+    /// sent, and send `Release` before closing the `BufferCollectionTokenGroup`
+    /// client end.
+    ///
+    /// If `Release` occurs before
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup.AllChildrenPresent], the
+    /// buffer collection will fail (triggered by reception of `Release` without
+    /// prior `AllChildrenPresent`). This is intentionally not analogous to how
+    /// [`fuchsia.sysmem2/BufferCollection.Release`] without
+    /// [`fuchsia.sysmem2/BufferCollection.SetConstraints`] first doesn't cause
+    /// buffer collection failure. For a `BufferCollectionTokenGroup`, clean
+    /// close requires `AllChildrenPresent` (if not already sent), then
+    /// `Release`, then close client end.
+    ///
+    /// If `Release` occurs after `AllChildrenPresent`, the children and all
+    /// their constraints remain intact (just as they would if the
+    /// `BufferCollectionTokenGroup` channel had remained open), and the client
+    /// end close doesn't trigger buffer collection failure.
+    ///
+    /// ###### On all [`fuchsia.sysmem2/Node`] channels (any of the above):
+    ///
+    /// For brevity, the per-channel-protocol paragraphs above ignore the
+    /// separate failure domain created by
+    /// [`fuchsia.sysmem2/BufferCollectionToken.SetDispensable`] or
+    /// [`fuchsia.sysmem2/BufferCollection.AttachToken`]. When a client end
+    /// unexpectedly closes (without `Release` first) and that client end is
+    /// under a failure domain, instead of failing the whole buffer collection,
+    /// the failure domain is failed, but the buffer collection itself is
+    /// isolated from failure of the failure domain. Such failure domains can be
+    /// nested, in which case only the inner-most failure domain in which the
+    /// `Node` resides fails.
+    flexible Release();
+
+    /// Set a name for VMOs in this buffer collection.
+    ///
+    /// If the name doesn't fit in ZX_MAX_NAME_LEN, the name of the vmo itself
+    /// will be truncated to fit. The name of the vmo will be suffixed with the
+    /// buffer index within the collection (if the suffix fits within
+    /// ZX_MAX_NAME_LEN). The name specified here (without truncation) will be
+    /// listed in the inspect data.
+    ///
+    /// The name only affects VMOs allocated after the name is set; this call
+    /// does not rename existing VMOs. If multiple clients set different names
+    /// then the larger priority value will win. Setting a new name with the
+    /// same priority as a prior name doesn't change the name.
+    ///
+    /// All table fields are currently required.
+    ///
+    /// + request `priority` The name is only set if this is the first `SetName`
+    ///   or if `priority` is greater than any previous `priority` value in
+    ///   prior `SetName` calls across all `Node`(s) of this buffer collection.
+    /// + request `name` The name for VMOs created under this buffer collection.
+    flexible SetName(table {
+        1: priority uint32;
+        2: name string:64;
+    });
+
+    /// Set information about the current client that can be used by sysmem to
+    /// help diagnose leaking memory and allocation stalls waiting for a
+    /// participant to send [`fuchsia.sysmem2/BufferCollection.SetConstraints`].
+    ///
+    /// This sets the debug client info on this [`fuchsia.sysmem2/Node`] and all
+    /// `Node`(s) derived from this `Node`, unless overriden by
+    /// [`fuchsia.sysmem2/Allocator.SetDebugClientInfo`] or a later
+    /// [`fuchsia.sysmem2/Node.SetDebugClientInfo`].
+    ///
+    /// Sending [`fuchsia.sysmem2/Allocator.SetDebugClientInfo`] once per
+    /// `Allocator` is the most efficient way to ensure that all
+    /// [`fuchsia.sysmem2/Node`](s) will have at least some debug client info
+    /// set, and is also more efficient than separately sending the same debug
+    /// client info via [`fuchsia.sysmem2/Node.SetDebugClientInfo`] for each
+    /// created [`fuchsia.sysmem2/Node`].
+    ///
+    /// Also used when verbose logging is enabled (see `SetVerboseLogging`) to
+    /// indicate which client is closing their channel first, leading to subtree
+    /// failure (which can be normal if the purpose of the subtree is over, but
+    /// if happening earlier than expected, the client-channel-specific name can
+    /// help diagnose where the failure is first coming from, from sysmem's
+    /// point of view).
+    ///
+    /// All table fields are currently required.
+    ///
+    /// + request `name` This can be an arbitrary string, but the current
+    ///   process name (see `fsl::GetCurrentProcessName`) is a good default.
+    /// + request `id` This can be an arbitrary id, but the current process ID
+    ///   (see `fsl::GetCurrentProcessKoid`) is a good default.
+    flexible SetDebugClientInfo(table {
+        1: name string:MAX_CLIENT_NAME_LENGTH;
+        2: id uint64;
+    });
+
+    /// Sysmem logs a warning if sysmem hasn't seen
+    /// [`fuchsia.sysmem2/BufferCollection.SetConstraints`] from all clients
+    /// within 5 seconds after creation of a new collection.
+    ///
+    /// Clients can call this method to change when the log is printed. If
+    /// multiple client set the deadline, it's unspecified which deadline will
+    /// take effect.
+    ///
+    /// In most cases the default works well.
+    ///
+    /// All table fields are currently required.
+    ///
+    /// + request `deadline` The time at which sysmem will start trying to log
+    ///   the warning, unless all constraints are with sysmem by then.
+    flexible SetDebugTimeoutLogDeadline(table {
+        1: deadline zx.Time;
+    });
+
+    /// This enables verbose logging for the buffer collection.
+    ///
+    /// Verbose logging includes constraints set via
+    /// [`fuchsia.sysmem2/BufferCollection.SetConstraints`] from each client
+    /// along with info set via [`fuchsia.sysmem2/Node.SetDebugClientInfo`] (or
+    /// [`fuchsia.sysmem2/Allocator.SetDebugClientInfo`]) and the structure of
+    /// the tree of `Node`(s).
+    ///
+    /// Normally sysmem prints only a single line complaint when aggregation
+    /// fails, with just the specific detailed reason that aggregation failed,
+    /// with little surrounding context.  While this is often enough to diagnose
+    /// a problem if only a small change was made and everything was working
+    /// before the small change, it's often not particularly helpful for getting
+    /// a new buffer collection to work for the first time.  Especially with
+    /// more complex trees of nodes, involving things like
+    /// [`fuchsia.sysmem2/BufferCollection.AttachToken`],
+    /// [`fuchsia.sysmem2/BufferCollectionToken.SetDispensable`],
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup`] nodes, and associated
+    /// subtrees of nodes, verbose logging may help in diagnosing what the tree
+    /// looks like and why it's failing a logical allocation, or why a tree or
+    /// subtree is failing sooner than expected.
+    ///
+    /// The intent of the extra logging is to be acceptable from a performance
+    /// point of view, under the assumption that verbose logging is only enabled
+    /// on a low number of buffer collections. If we're not tracking down a bug,
+    /// we shouldn't send this message.
+    flexible SetVerboseLogging();
+
+    /// This gets a handle that can be used as a parameter to
+    /// [`fuchsia.sysmem2/Node.IsAlternateFor`] called on any
+    /// [`fuchsia.sysmem2/Node`]. This handle is only for use as proof that the
+    /// client obtained this handle from this `Node`.
+    ///
+    /// Because this is a get not a set, no [`fuchsia.sysmem2/Node.Sync`] is
+    /// needed between the `GetNodeRef` and the call to `IsAlternateFor`,
+    /// despite the two calls typically being on different channels.
+    ///
+    /// See also [`fuchsia.sysmem2/Node.IsAlternateFor`].
+    ///
+    /// All table fields are currently required.
+    ///
+    /// - response `node_ref` This handle can be sent via `IsAlternateFor` on a
+    ///   different `Node` channel, to prove that the client obtained the handle
+    ///   from this `Node`.
+    flexible GetNodeRef() -> (resource table {
+        1: node_ref zx.Handle:EVENT;
+    });
+
+    /// Check whether the calling [`fuchsia.sysmem2/Node`] is in a subtree
+    /// rooted at a different child token of a common parent
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup`], in relation to the
+    /// passed-in `node_ref`.
+    ///
+    /// This call is for assisting with admission control de-duplication, and
+    /// with debugging.
+    ///
+    /// The `node_ref` must be obtained using
+    /// [`fuchsia.sysmem2/Node.GetNodeRef`].
+    ///
+    /// The `node_ref` can be a duplicated handle; it's not necessary to call
+    /// `GetNodeRef` for every call to [`fuchsia.sysmem2/Node.IsAlternateFor`].
+    ///
+    /// If a calling token may not actually be a valid token at all due to a
+    /// potentially hostile/untrusted provider of the token, call
+    /// [`fuchsia.sysmem2/Allocator.ValidateBufferCollectionToken`] first
+    /// instead of potentially getting stuck indefinitely if `IsAlternateFor`
+    /// never responds due to a calling token not being a real token (not really
+    /// talking to sysmem).  Another option is to call
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`] with this token first
+    /// which also validates the token along with converting it to a
+    /// [`fuchsia.sysmem2/BufferCollection`], then call `IsAlternateFor`.
+    ///
+    /// All table fields are currently required.
+    ///
+    /// - response `is_alternate`
+    ///   - true: The first parent node in common between the calling node and
+    ///     the `node_ref` `Node` is a `BufferCollectionTokenGroup`.  This means
+    ///     that the calling `Node` and the `node_ref` `Node` will not have both
+    ///     their constraints apply - rather sysmem will choose one or the other
+    ///     of the constraints - never both.  This is because only one child of
+    ///     a `BufferCollectionTokenGroup` is selected during logical
+    ///     allocation, with only that one child's subtree contributing to
+    ///     constraints aggregation.
+    ///   - false: The first parent node in common between the calling `Node`
+    ///     and the `node_ref` `Node` is not a `BufferCollectionTokenGroup`.
+    ///     Currently, this means the first parent node in common is a
+    ///     `BufferCollectionToken` or `BufferCollection` (regardless of not
+    ///     `Release`ed).  This means that the calling `Node` and the `node_ref`
+    ///     `Node` may have both their constraints apply during constraints
+    ///     aggregation of the logical allocation, if both `Node`(s) are
+    ///     selected by any parent `BufferCollectionTokenGroup`(s) involved. In
+    ///     this case, there is no `BufferCollectionTokenGroup` that will
+    ///     directly prevent the two `Node`(s) from both being selected and
+    ///     their constraints both aggregated, but even when false, one or both
+    ///     `Node`(s) may still be eliminated from consideration if one or both
+    ///     `Node`(s) has a direct or indirect parent
+    ///     `BufferCollectionTokenGroup` which selects a child subtree other
+    ///     than the subtree containing the calling `Node` or `node_ref` `Node`.
+    /// * error `[fuchsia.sysmem2/Error.NOT_FOUND]` The node_ref wasn't
+    ///   associated with the same buffer collection as the calling `Node`.
+    ///   Another reason for this error is if the `node_ref` is an
+    ///   [`zx.Handle.EVENT`] handle with sufficient rights, but isn't actually
+    ///   a real `node_ref` obtained from `GetNodeRef`.
+    /// * error `[fuchsia.sysmem2/Error.PROTOCOL_DEVIATION]` The caller passed a
+    ///   `node_ref` that isn't a [`zx.Handle:EVENT`] handle , or doesn't have
+    ///   the needed rights expected on a real `node_ref`.
+    /// * No other failing status codes are returned by this call.  However,
+    ///   sysmem may add additional codes in future, so the client should have
+    ///   sensible default handling for any failing status code.
+    flexible IsAlternateFor(resource table {
+        1: node_ref zx.Handle:EVENT;
+    }) -> (table {
+        1: is_alternate bool;
+    }) error Error;
+
+    /// Get the buffer collection ID. This ID is also available from
+    /// [`fuchsia.sysmem2/Allocator.GetVmoInfo`] (along with the `buffer_index`
+    /// within the collection).
+    ///
+    /// This call is mainly useful in situations where we can't convey a
+    /// [`fuchsia.sysmem2/BufferCollectionToken`] or
+    /// [`fuchsia.sysmem2/BufferCollection`] directly, but can only convey a VMO
+    /// handle, which can be joined back up with a `BufferCollection` client end
+    /// that was created via a different path. Prefer to convey a
+    /// `BufferCollectionToken` or `BufferCollection` directly when feasible.
+    ///
+    /// Trusting a `buffer_collection_id` value from a source other than sysmem
+    /// is analogous to trusting a koid value from a source other than zircon.
+    /// Both should be avoided unless really necessary, and both require
+    /// caution. In some situations it may be reasonable to refer to a
+    /// pre-established `BufferCollection` by `buffer_collection_id` via a
+    /// protocol for efficiency reasons, but an incoming value purporting to be
+    /// a `buffer_collection_id` is not sufficient alone to justify granting the
+    /// sender of the `buffer_collection_id` any capability. The sender must
+    /// first prove to a receiver that the sender has/had a VMO or has/had a
+    /// `BufferCollectionToken` to the same collection by sending a handle that
+    /// sysmem confirms is a valid sysmem handle and which sysmem maps to the
+    /// `buffer_collection_id` value. The receiver should take care to avoid
+    /// assuming that a sender had a `BufferCollectionToken` in cases where the
+    /// sender has only proven that the sender had a VMO.
+    ///
+    /// - response `buffer_collection_id` This ID is unique per buffer
+    ///   collection per boot. Each buffer is uniquely identified by the
+    ///   `buffer_collection_id` and `buffer_index` together.
+    flexible GetBufferCollectionId() -> (table {
+        1: buffer_collection_id uint64;
+    });
+
+    /// Sets the current [`fuchsia.sysmem2/Node`] and all child `Node`(s)
+    /// created after this message to weak, which means that a client's `Node`
+    /// client end (or a child created after this message) is not alone
+    /// sufficient to keep allocated VMOs alive.
+    ///
+    /// All VMOs obtained from weak `Node`(s) are weak sysmem VMOs. See also
+    /// `close_weak_asap`.
+    ///
+    /// This message is only permitted before the `Node` becomes ready for
+    /// allocation (else the server closes the channel with `ZX_ERR_BAD_STATE`):
+    ///   * `BufferCollectionToken`: any time
+    ///   * `BufferCollection`: before `SetConstraints`
+    ///   * `BufferCollectionTokenGroup`: before `AllChildrenPresent`
+    ///
+    /// Currently, no conversion from strong `Node` to weak `Node` after ready
+    /// for allocation is provided, but a client can simulate that by creating
+    /// an additional `Node` before allocation and setting that additional
+    /// `Node` to weak, and then potentially at some point later sending
+    /// `Release` and closing the client end of the client's strong `Node`, but
+    /// keeping the client's weak `Node`.
+    ///
+    /// Zero strong `Node`(s) and zero strong VMO handles will result in buffer
+    /// collection failure (all `Node` client end(s) will see
+    /// `ZX_CHANNEL_PEER_CLOSED` and all `close_weak_asap` `client_end`(s) will
+    /// see `ZX_EVENTPAIR_PEER_CLOSED`), but sysmem (intentionally) won't notice
+    /// this situation until all `Node`(s) are ready for allocation. For initial
+    /// allocation to succeed, at least one strong `Node` is required to exist
+    /// at allocation time, but after that client receives VMO handles, that
+    /// client can `BufferCollection.Release` and close the client end without
+    /// causing this type of failure.
+    ///
+    /// This implies [`fuchsia.sysmem2/Node.SetWeakOk`] as well, but does not
+    /// imply `SetWeakOk` with `for_children_also` true, which can be sent
+    /// separately as appropriate.
+    flexible SetWeak();
+
+    /// This indicates to sysmem that the client is prepared to pay attention to
+    /// `close_weak_asap`.
+    ///
+    /// If sent, this message must be before
+    /// [`fuchsia.sysmem2/BufferCollection.WaitForAllBuffersAllocated`].
+    ///
+    /// All participants using a weak [`fuchsia.sysmem2/BufferCollection`] must
+    /// send this message before `WaitForAllBuffersAllocated`, or a parent
+    /// `Node` must have sent [`fuchsia.sysmem2/Node.SetWeakOk`] with
+    /// `for_child_nodes_also` true, else the `WaitForAllBuffersAllocated` will
+    /// trigger buffer collection failure.
+    ///
+    /// This message is necessary because weak sysmem VMOs have not always been
+    /// a thing, so older clients are not aware of the need to pay attention to
+    /// `close_weak_asap` `ZX_EVENTPAIR_PEER_CLOSED` and close all remaining
+    /// sysmem weak VMO handles asap. By having this message and requiring
+    /// participants to indicate their acceptance of this aspect of the overall
+    /// protocol, we avoid situations where an older client is delivered a weak
+    /// VMO without any way for sysmem to get that VMO to close quickly later
+    /// (and on a per-buffer basis).
+    ///
+    /// A participant that doesn't handle `close_weak_asap` and also doesn't
+    /// retrieve any VMO handles via `WaitForAllBuffersAllocated` doesn't need
+    /// to send `SetWeakOk` (and doesn't need to have a parent `Node` send
+    /// `SetWeakOk` with `for_child_nodes_also` true either). However, if that
+    /// same participant has a child/delegate which does retrieve VMOs, that
+    /// child/delegate will need to send `SetWeakOk` before
+    /// `WaitForAllBuffersAllocated`.
+    ///
+    /// + request `for_child_nodes_also` If present and true, this means direct
+    ///   child nodes of this node created after this message plus all
+    ///   descendants of those nodes will behave as if `SetWeakOk` was sent on
+    ///   those nodes. Any child node of this node that was created before this
+    ///   message is not included. This setting is "sticky" in the sense that a
+    ///   subsequent `SetWeakOk` without this bool set to true does not reset
+    ///   the server-side bool. If this creates a problem for a participant, a
+    ///   workaround is to `SetWeakOk` with `for_child_nodes_also` true on child
+    ///   tokens instead, as appropriate. A participant should only set
+    ///   `for_child_nodes_also` true if the participant can really promise to
+    ///   obey `close_weak_asap` both for its own weak VMO handles, and for all
+    ///   weak VMO handles held by participants holding the corresponding child
+    ///   `Node`(s). When `for_child_nodes_also` is set, descendent `Node`(s)
+    ///   which are using sysmem(1) can be weak, despite the clients of those
+    ///   sysmem1 `Node`(s) not having any direct way to `SetWeakOk` or any
+    ///   direct way to find out about `close_weak_asap`. This only applies to
+    ///   descendents of this `Node` which are using sysmem(1), not to this
+    ///   `Node` when converted directly from a sysmem2 token to a sysmem(1)
+    ///   token, which will fail allocation unless an ancestor of this `Node`
+    ///   specified `for_child_nodes_also` true.
+    flexible SetWeakOk(resource table {
+        1: for_child_nodes_also bool;
+    });
+
+    /// The server_end will be closed after this `Node` and any child nodes have
+    /// have released their buffer counts, making those counts available for
+    /// reservation by a different `Node` via
+    /// [`fuchsia.sysmem2/BufferCollection.AttachToken`].
+    ///
+    /// The `Node` buffer counts may not be released until the entire tree of
+    /// `Node`(s) is closed or failed, because
+    /// [`fuchsia.sysmem2/BufferCollection.Release`] followed by channel close
+    /// does not immediately un-reserve the `Node` buffer counts. Instead, the
+    /// `Node` buffer counts remain reserved until the orphaned node is later
+    /// cleaned up.
+    ///
+    /// If the `Node` exceeds a fairly large number of attached eventpair server
+    /// ends, a log message will indicate this and the `Node` (and the
+    /// appropriate) sub-tree will fail.
+    ///
+    /// The `server_end` will remain open when
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`] converts a
+    /// [`fuchsia.sysmem2/BufferCollectionToken`] into a
+    /// [`fuchsia.sysmem2/BufferCollection`].
+    ///
+    /// This message can also be used with a
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup`].
+    @available(added=24)
+    flexible AttachNodeTracking(resource table {
+        /// This field must be set. This evenpair end will be closed after the
+        /// `Node` is closed or failed and the node's buffer counts are no
+        /// longer in effect in the logical buffer collection.
+        1: server_end zx.Handle:EVENTPAIR;
+    });
+};
+
+/// A [`fuchsia.sysmem2/BufferCollectionToken`] is not a buffer collection, but
+/// rather is a way to identify a specific potential shared buffer collection,
+/// and a way to distribute that potential shared buffer collection to
+/// additional participants prior to the buffer collection allocating any
+/// buffers.
+///
+/// Epitaphs are not used in this protocol.
+///
+/// We use a channel for the `BufferCollectionToken` instead of a single
+/// `eventpair` (pair) because this way we can detect error conditions like a
+/// participant failing mid-create.
+// LINT.IfChange
+@available(added=19)
+open protocol BufferCollectionToken {
+    compose Node;
+
+    /// Create additional [`fuchsia.sysmem2/BufferCollectionToken`](s) from this
+    /// one, referring to the same buffer collection.
+    ///
+    /// The created tokens are children of this token in the
+    /// [`fuchsia.sysmem2/Node`] heirarchy.
+    ///
+    /// This method can be used to add more participants, by transferring the
+    /// newly created tokens to additional participants.
+    ///
+    /// A new token will be returned for each entry in the
+    /// `rights_attenuation_masks` array.
+    ///
+    /// If the called token may not actually be a valid token due to a
+    /// potentially hostile/untrusted provider of the token, consider using
+    /// [`fuchsia.sysmem2/Allocator.ValidateBufferCollectionToken`] first
+    /// instead of potentially getting stuck indefinitely if
+    /// [`fuchsia.sysmem2/BufferCollectionToken.DuplicateSync`] never responds
+    /// due to the calling token not being a real token.
+    ///
+    /// In contrast to [`fuchsia.sysmem2/BufferCollectionToken.Duplicate`], no
+    /// separate [`fuchsia.sysmem2/Node.Sync`] is needed after calling this
+    /// method, because the sync step is included in this call, at the cost of a
+    /// round trip during this call.
+    ///
+    /// All tokens must be turned in to sysmem via
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`] or
+    /// [`fuchsia.sysmem2/Node.Release`] for a `BufferCollection` to
+    /// successfully allocate buffers (or to logically allocate buffers in the
+    /// case of subtrees involving
+    /// [`fuchsia.sysmem2/BufferCollectionToken.AttachToken`]).
+    ///
+    /// All table fields are currently required.
+    ///
+    /// + request `rights_attenuation_mask` In each entry of
+    ///   `rights_attenuation_masks`, rights bits that are zero will be absent
+    ///   in the buffer VMO rights obtainable via the corresponding returned
+    ///   token. This allows an initiator or intermediary participant to
+    ///   attenuate the rights available to a participant. This does not allow a
+    ///   participant to gain rights that the participant doesn't already have.
+    ///   The value `ZX_RIGHT_SAME_RIGHTS` can be used to specify that no
+    ///   attenuation should be applied.
+    /// - response `tokens` The client ends of each newly created token.
+    flexible DuplicateSync(table {
+        1: rights_attenuation_masks vector<zx.Rights>:MAX_COUNT_DUPLICATES;
+    }) -> (resource table {
+        1: tokens vector<client_end:BufferCollectionToken>:MAX_COUNT_DUPLICATES;
+    });
+
+    /// Create an additional [`fuchsia.sysmem2/BufferCollectionToken`] from this
+    /// one, referring to the same buffer collection.
+    ///
+    /// The created token is a child of this token in the
+    /// [`fuchsia.sysmem2/Node`] heirarchy.
+    ///
+    /// This method can be used to add a participant, by transferring the newly
+    /// created token to another participant.
+    ///
+    /// This one-way message can be used instead of the two-way
+    /// [`fuchsia.sysmem2/BufferCollectionToken.DuplicateSync`] FIDL call in
+    /// performance sensitive cases where it would be undesireable to wait for
+    /// sysmem to respond to
+    /// [`fuchsia.sysmem2/BufferCollectionToken.DuplicateSync`] or when the
+    /// client code isn't structured to make it easy to duplicate all the needed
+    /// tokens at once.
+    ///
+    /// After sending one or more `Duplicate` messages, and before sending the
+    /// newly created child tokens to other participants (or to other
+    /// [`fuchsia.sysmem2/Allocator`] channels), the client must send a
+    /// [`fuchsia.sysmem2/Node.Sync`] and wait for the `Sync` response. The
+    /// `Sync` call can be made on the token, or on the `BufferCollection`
+    /// obtained by passing this token to `BindSharedCollection`.  Either will
+    /// ensure that the server knows about the tokens created via `Duplicate`
+    /// before the other participant sends the token to the server via separate
+    /// `Allocator` channel.
+    ///
+    /// All tokens must be turned in via
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`] or
+    /// [`fuchsia.sysmem2/Node.Release`] for a `BufferCollection` to
+    /// successfully allocate buffers.
+    ///
+    /// All table fields are currently required.
+    ///
+    /// + request `rights_attenuation_mask` The rights bits that are zero in
+    ///   this mask will be absent in the buffer VMO rights obtainable via the
+    ///   client end of `token_request`. This allows an initiator or
+    ///   intermediary participant to attenuate the rights available to a
+    ///   delegate participant. This does not allow a participant to gain rights
+    ///   that the participant doesn't already have. The value
+    ///   `ZX_RIGHT_SAME_RIGHTS` can be used to specify that no attenuation
+    ///   should be applied.
+    ///   + These values for rights_attenuation_mask result in no attenuation:
+    ///     + `ZX_RIGHT_SAME_RIGHTS` (preferred)
+    ///     + 0xFFFFFFFF (this is reasonable when an attenuation mask is
+    ///       computed)
+    ///     + 0 (deprecated - do not use 0 - an ERROR will go to the log)
+    /// + request `token_request` is the server end of a `BufferCollectionToken`
+    ///   channel. The client end of this channel acts as another participant in
+    ///   the shared buffer collection.
+    flexible Duplicate(resource table {
+        1: rights_attenuation_mask zx.Rights;
+        2: token_request server_end:BufferCollectionToken;
+    });
+
+    /// Set this [`fuchsia.sysmem2/BufferCollectionToken`] to dispensable.
+    ///
+    /// When the `BufferCollectionToken` is converted to a
+    /// [`fuchsia.sysmem2/BufferCollection`], the dispensable status applies to
+    /// the `BufferCollection` also.
+    ///
+    /// Normally, if a client closes a [`fuchsia.sysmem2/BufferCollection`]
+    /// client end without having sent
+    /// [`fuchsia.sysmem2/BufferCollection.Release`] first, the
+    /// `BufferCollection` [`fuchisa.sysmem2/Node`] will fail, which also
+    /// propagates failure to the parent [`fuchsia.sysmem2/Node`] and so on up
+    /// to the root `Node`, which fails the whole buffer collection. In
+    /// contrast, a dispensable `Node` can fail after buffers are allocated
+    /// without causing failure of its parent in the [`fuchsia.sysmem2/Node`]
+    /// heirarchy.
+    ///
+    /// The dispensable `Node` participates in constraints aggregation along
+    /// with its parent before buffer allocation. If the dispensable `Node`
+    /// fails before buffers are allocated, the failure propagates to the
+    /// dispensable `Node`'s parent.
+    ///
+    /// After buffers are allocated, failure of the dispensable `Node` (or any
+    /// child of the dispensable `Node`) does not propagate to the dispensable
+    /// `Node`'s parent. Failure does propagate from a normal child of a
+    /// dispensable `Node` to the dispensable `Node`.  Failure of a child is
+    /// blocked from reaching its parent if the child is attached using
+    /// [`fuchsia.sysmem2/BufferCollection.AttachToken`], or if the child is
+    /// dispensable and the failure occurred after allocation.
+    ///
+    /// A dispensable `Node` can be used in cases where a participant needs to
+    /// provide constraints, but after buffers are allocated, the participant
+    /// can fail without causing buffer collection failure from the parent
+    /// `Node`'s point of view.
+    ///
+    /// In contrast, `BufferCollection.AttachToken` can be used to create a
+    /// `BufferCollectionToken` which does not participate in constraints
+    /// aggregation with its parent `Node`, and whose failure at any time does
+    /// not propagate to its parent `Node`, and whose potential delay providing
+    /// constraints does not prevent the parent `Node` from completing its
+    /// buffer allocation.
+    ///
+    /// An initiator (creator of the root `Node` using
+    /// [`fuchsia.sysmem2/Allocator.AllocateSharedCollection`]) may in some
+    /// scenarios choose to initially use a dispensable `Node` for a first
+    /// instance of a participant, and then later if the first instance of that
+    /// participant fails, a new second instance of that participant my be given
+    /// a `BufferCollectionToken` created with `AttachToken`.
+    ///
+    /// Normally a client will `SetDispensable` on a `BufferCollectionToken`
+    /// shortly before sending the dispensable `BufferCollectionToken` to a
+    /// delegate participant. Because `SetDispensable` prevents propagation of
+    /// child `Node` failure to parent `Node`(s), if the client was relying on
+    /// noticing child failure via failure of the parent `Node` retained by the
+    /// client, the client may instead need to notice failure via other means.
+    /// If other means aren't available/convenient, the client can instead
+    /// retain the dispensable `Node` and create a child `Node` under that to
+    /// send to the delegate participant, retaining this `Node` in order to
+    /// notice failure of the subtree rooted at this `Node` via this `Node`'s
+    /// ZX_CHANNEL_PEER_CLOSED signal, and take whatever action is appropriate
+    /// (e.g. starting a new instance of the delegate participant and handing it
+    /// a `BufferCollectionToken` created using
+    /// [`fuchsia.sysmem2/BufferCollection.AttachToken`], or propagate failure
+    /// and clean up in a client-specific way).
+    ///
+    /// While it is possible (and potentially useful) to `SetDispensable` on a
+    /// direct child of a `BufferCollectionTokenGroup` `Node`, it isn't possible
+    /// to later replace a failed dispensable `Node` that was a direct child of
+    /// a `BufferCollectionTokenGroup` with a new token using `AttachToken`
+    /// (since there's no `AttachToken` on a group). Instead, to enable
+    /// `AttachToken` replacement in this case, create an additional
+    /// non-dispensable token that's a direct child of the group and make the
+    /// existing dispensable token a child of the additional token.  This way,
+    /// the additional token that is a direct child of the group has
+    /// `BufferCollection.AttachToken` which can be used to replace the failed
+    /// dispensable token.
+    ///
+    /// `SetDispensable` on an already-dispensable token is idempotent.
+    flexible SetDispensable();
+
+    /// Create a logical OR among a set of tokens, called a
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup`].
+    ///
+    /// Most sysmem clients and many participants don't need to care about this
+    /// message or about `BufferCollectionTokenGroup`(s). However, in some cases
+    /// a participant wants to attempt to include one set of delegate
+    /// participants, but if constraints don't combine successfully that way,
+    /// fall back to a different (possibly overlapping) set of delegate
+    /// participants, and/or fall back to a less demanding strategy (in terms of
+    /// how strict the [`fuchisa.sysmem2/BufferCollectionConstraints`] are,
+    /// across all involved delegate participants). In such cases, a
+    /// `BufferCollectionTokenGroup` is useful.
+    ///
+    /// A `BufferCollectionTokenGroup` is used to create a 1 of N OR among N
+    /// child [`fuchsia.sysmem2/BufferCollectionToken`](s).  The child tokens
+    /// which are not selected during aggregation will fail (close), which a
+    /// potential participant should notice when their `BufferCollection`
+    /// channel client endpoint sees PEER_CLOSED, allowing the participant to
+    /// clean up the speculative usage that didn't end up happening (this is
+    /// simimlar to a normal `BufferCollection` server end closing on failure to
+    /// allocate a logical buffer collection or later async failure of a buffer
+    /// collection).
+    ///
+    /// See comments on protocol `BufferCollectionTokenGroup`.
+    ///
+    /// Any `rights_attenuation_mask` or `AttachToken`/`SetDispensable` to be
+    /// applied to the whole group can be achieved with a
+    /// `BufferCollectionToken` for this purpose as a direct parent of the
+    /// `BufferCollectionTokenGroup`.
+    ///
+    /// All table fields are currently required.
+    ///
+    /// + request `group_request` The server end of a
+    ///   `BufferCollectionTokenGroup` channel to be served by sysmem.
+    flexible CreateBufferCollectionTokenGroup(resource table {
+        1: group_request server_end:BufferCollectionTokenGroup;
+    });
+};
+// LINT.ThenChange(//src/sysmem/drivers/sysmem/combined_token.fidl)
+
+/// [`fuchsia.sysmem2/BufferCollection`] is a connection directly from a
+/// participant to sysmem re. a buffer collection; often the buffer collection
+/// is shared with other participants which have their own `BufferCollection`
+/// client end(s) associated with the same buffer collection.  In other words,
+/// an instance of the `BufferCollection` interface is a view of a buffer
+/// collection, not the buffer collection itself.
+///
+/// The `BufferCollection` connection exists to facilitate async indication of
+/// when the buffer collection has been populated with buffers.
+///
+/// Also, the channel's closure by the sysmem server is an indication to the
+/// client that the client should close all VMO handles that were obtained from
+/// the `BufferCollection` ASAP.
+///
+/// Some buffer collections can use enough memory that it can be worth avoiding
+/// allocation overlap (in time) using
+/// [`fuchsia.sysmem2/BufferCollection.AttachLifetimeTracking`] so that the
+/// initiator can tell when enough buffers of the buffer collection have been
+/// fully deallocated prior to the initiator allocating a new buffer collection.
+///
+/// Epitaphs are not used in this protocol.
+@available(added=19)
+open protocol BufferCollection {
+    compose Node;
+
+    /// Provide [`fuchsia.sysmem2/BufferCollectionConstraints`] to the buffer
+    /// collection.
+    ///
+    /// A participant may only call
+    /// [`fuchsia.sysmem2/BufferCollection.SetConstraints`] up to once per
+    /// [`fuchsia.sysmem2/BufferCollection`].
+    ///
+    /// For buffer allocation to be attempted, all holders of a
+    /// `BufferCollection` client end need to call `SetConstraints` before
+    /// sysmem will attempt to allocate buffers.
+    flexible SetConstraints(resource table {
+        /// These are the constraints on the buffer collection imposed by the
+        /// sending client/participant.  The `constraints` field is not required
+        /// to be set. If not set, the client is not setting any actual
+        /// constraints, but is indicating that the client has no constraints to
+        /// set. A client that doesn't set the `constraints` field won't receive
+        /// any VMO handles, but can still find out how many buffers were
+        /// allocated and can still refer to buffers by their `buffer_index`.
+        1: constraints BufferCollectionConstraints;
+
+        /// This field should only be set if a client must force the new buffer
+        /// collection to have exactly identical SingleBufferSettings as a
+        /// previously-allocated collection, else the allocation must fail.
+        ///
+        /// Setting this field nails down all the constraints except the buffer
+        /// count, so clients shouldn't expect this to work unless the overall
+        /// set of participants on this logical buffer collection is the same as
+        /// for the previous allocation (though this isn't strictly required to
+        /// be true). Even then, if any participant indicates different
+        /// constraints than for this VMO's collection, the allocation is fairly
+        /// likely to fail. For these reasons, clients will want to avoid
+        /// setting this field unless it's really needed.
+        ///
+        /// The `must_match_vmo` handle must be a handle to a sysmem-provided
+        /// VMO, else the logical buffer collection will fail. To check whether
+        /// a VMO handle refers to a sysmem-provided VMO before setting this
+        /// field (if not already known), see
+        /// `[fuchsia.sysmem2/Allocator.GetVmoInfo]`.
+        ///
+        /// This still ensures that constraints of other participants are
+        /// satisfied as well, else the allocation will fail.
+        ///
+        /// This field is a VMO rather than SingleBufferSettings so that adding
+        /// a new field to SingleBufferSettings remains compatible with this
+        /// mechanism without needing to update/rebuild all clients using this
+        /// mechanism to copy the new field.
+        ///
+        /// This field is a VMO rather than a "handle to a SingleBufferSettings"
+        /// (or similar) to avoid this field causing allocation failure when
+        /// there are zero actual still-existing buffers to match (in which case
+        /// not setting this field is better than letting an already-gone buffer
+        /// dictate the settings for new buffers).
+        ///
+        /// Clients should avoid keeping a buffer alive just to use it with this
+        /// field; instead drop the old buffer when appropriate, and allocate
+        /// new buffer(s) like it's the first allocation after boot again.
+        ///
+        /// See also `[fuchsia.sysmem2/BufferCollection.AttachToken]` which is a
+        /// substantially different mechanism, but might be a workable
+        /// alternative to setting this feild in a few (but not all) situations
+        /// that would otherwise need to set this field.
+        ///
+        /// In most cases the constraints field should specify all the necessary
+        /// constraints known to the client, and this field should not be set.
+        @available(added=32)
+        2: must_match_vmo zx.Handle:VMO;
+    });
+
+    /// Wait until all buffers are allocated.
+    ///
+    /// This FIDL call completes when buffers have been allocated, or completes
+    /// with some failure detail if allocation has been attempted but failed.
+    ///
+    /// The following must occur before buffers will be allocated:
+    ///   * All [`fuchsia.sysmem2/BufferCollectionToken`](s) of the buffer
+    ///     collection must be turned in via `BindSharedCollection` to get a
+    ///     [`fuchsia.sysmem2/BufferCollection`] (for brevity, this is assuming
+    ///     [`fuchsia.sysmem2/BufferCollection.AttachToken`] isn't being used),
+    ///     or have had [`fuchsia.sysmem2/BufferCollectionToken.Release`] sent
+    ///     to them.
+    ///   * All [`fuchsia.sysmem2/BufferCollection`](s) of the buffer collection
+    ///     must have had [`fuchsia.sysmem2/BufferCollection.SetConstraints`]
+    ///     sent to them, or had [`fuchsia.sysmem2/BufferCollection.Release`]
+    ///     sent to them.
+    ///
+    /// - result `buffer_collection_info` The VMO handles and other related
+    ///   info.
+    /// * error `[fuchsia.sysmem2/Error.NO_MEMORY]` The request is valid but
+    ///   cannot be fulfilled due to resource exhaustion.
+    /// * error `[fuchsia.sysmem2/Error.PROTOCOL_DEVIATION`] The request is
+    ///   malformed.
+    /// * error `[fuchsia.sysmem2/Error.CONSTRAINTS_INTERSECTION_EMPTY`] The
+    ///   request is valid but cannot be satisfied, perhaps due to hardware
+    ///   limitations. This can happen if participants have incompatible
+    ///   constraints (empty intersection, roughly speaking). See the log for
+    ///   more info. In cases where a participant could potentially be treated
+    ///   as optional, see [`BufferCollectionTokenGroup`]. When using
+    ///   [`fuchsia.sysmem2/BufferCollection.AttachToken`], this will be the
+    ///   error code if there aren't enough buffers in the pre-existing
+    ///   collection to satisfy the constraints set on the attached token and
+    ///   any sub-tree of tokens derived from the attached token.
+    flexible WaitForAllBuffersAllocated() -> (resource table {
+        1: buffer_collection_info BufferCollectionInfo;
+    }) error Error;
+
+    /// Checks whether all the buffers have been allocated, in a polling
+    /// fashion.
+    ///
+    /// * If the buffer collection has been allocated, returns success.
+    /// * If the buffer collection failed allocation, returns the same
+    ///   [`fuchsia.sysmem2/Error`] as
+    ///   [`fuchsia.sysmem2/BufferCollection/WaitForAllBuffersAllocated`] would
+    ///   return.
+    /// * error [`fuchsia.sysmem2/Error.PENDING`] The buffer collection hasn't
+    ///   attempted allocation yet. This means that WaitForAllBuffersAllocated
+    ///   would not respond quickly.
+    @available(added=24)
+    flexible CheckAllBuffersAllocated() -> () error Error;
+
+    /// Create a new token to add a new participant to an existing logical
+    /// buffer collection, if the existing collection's buffer counts,
+    /// constraints, and participants allow.
+    ///
+    /// This can be useful in replacing a failed participant, and/or in
+    /// adding/re-adding a participant after buffers have already been
+    /// allocated.
+    ///
+    /// When [`fuchsia.sysmem2/BufferCollection.AttachToken`] is used, the sub
+    /// tree rooted at the attached [`fuchsia.sysmem2/BufferCollectionToken`]
+    /// goes through the normal procedure of setting constraints or closing
+    /// [`fuchsia.sysmem2/Node`](s), and then appearing to allocate buffers from
+    /// clients' point of view, despite the possibility that all the buffers
+    /// were actually allocated previously. This process is called "logical
+    /// allocation". Most instances of "allocation" in docs for other messages
+    /// can also be read as "allocation or logical allocation" while remaining
+    /// valid, but we just say "allocation" in most places for brevity/clarity
+    /// of explanation, with the details of "logical allocation" left for the
+    /// docs here on `AttachToken`.
+    ///
+    /// Failure of an attached `Node` does not propagate to the parent of the
+    /// attached `Node`. More generally, failure of a child `Node` is blocked
+    /// from reaching its parent `Node` if the child is attached, or if the
+    /// child is dispensable and the failure occurred after logical allocation
+    /// (see [`fuchsia.sysmem2/BufferCollectionToken.SetDispensable`]).
+    ///
+    /// A participant may in some scenarios choose to initially use a
+    /// dispensable token for a given instance of a delegate participant, and
+    /// then later if the first instance of that delegate participant fails, a
+    /// new second instance of that delegate participant my be given a token
+    /// created with `AttachToken`.
+    ///
+    /// From the point of view of the [`fuchsia.sysmem2/BufferCollectionToken`]
+    /// client end, the token acts like any other token. The client can
+    /// [`fuchsia.sysmem2/BufferCollectionToken.Duplicate`] the token as needed,
+    /// and can send the token to a different process/participant. The
+    /// `BufferCollectionToken` `Node` should be converted to a
+    /// `BufferCollection` `Node` as normal by sending
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`], or can be closed
+    /// without causing subtree failure by sending
+    /// [`fuchsia.sysmem2/BufferCollectionToken.Release`]. Assuming the former,
+    /// the [`fuchsia.sysmem2/BufferCollection.SetConstraints`] message or
+    /// [`fuchsia.sysmem2/BufferCollection.Release`] message should be sent to
+    /// the `BufferCollection`.
+    ///
+    /// Within the subtree, a success result from
+    /// [`fuchsia.sysmem2/BufferCollection.WaitForAllBuffersAllocated`] means
+    /// the subtree participants' constraints were satisfiable using the
+    /// already-existing buffer collection, the already-established
+    /// [`fuchsia.sysmem2/BufferCollectionInfo`] including image format
+    /// constraints, and the already-existing other participants (already added
+    /// via successful logical allocation) and their specified buffer counts in
+    /// their constraints. A failure result means the new participants'
+    /// constraints cannot be satisfied using the existing buffer collection and
+    /// its already-added participants. Creating a new collection instead may
+    /// allow all participants' constraints to be satisfied, assuming
+    /// `SetDispensable` is used in place of `AttachToken`, or a normal token is
+    /// used.
+    ///
+    /// A token created with `AttachToken` performs constraints aggregation with
+    /// all constraints currently in effect on the buffer collection, plus the
+    /// attached token under consideration plus child tokens under the attached
+    /// token which are not themselves an attached token or under such a token.
+    /// Further subtrees under this subtree are considered for logical
+    /// allocation only after this subtree has completed logical allocation.
+    ///
+    /// Assignment of existing buffers to participants'
+    /// [`fuchsia.sysmem2/BufferCollectionConstraints.min_buffer_count_for_camping`]
+    /// etc is first-come first-served, but a child can't logically allocate
+    /// before all its parents have sent `SetConstraints`.
+    ///
+    /// See also [`fuchsia.sysmem2/BufferCollectionToken.SetDispensable`], which
+    /// in contrast to `AttachToken`, has the created token `Node` + child
+    /// `Node`(s) (in the created subtree but not in any subtree under this
+    /// subtree) participate in constraints aggregation along with its parent
+    /// during the parent's allocation or logical allocation.
+    ///
+    /// Similar to [`fuchsia.sysmem2/BufferCollectionToken.Duplicate`], the
+    /// newly created token needs to be [`fuchsia.sysmem2/Node.Sync`]ed to
+    /// sysmem before the new token can be passed to `BindSharedCollection`. The
+    /// `Sync` of the new token can be accomplished with
+    /// [`fuchsia.sysmem2/BufferCollection.Sync`] after converting the created
+    /// `BufferCollectionToken` to a `BufferCollection`. Alternately,
+    /// [`fuchsia.sysmem2/BufferCollectionToken.Sync`] on the new token also
+    /// works. Or using [`fuchsia.sysmem2/BufferCollectionToken.DuplicateSync`]
+    /// works. As usual, a `BufferCollectionToken.Sync` can be started after any
+    /// `BufferCollectionToken.Duplicate` messages have been sent via the newly
+    /// created token, to also sync those additional tokens to sysmem using a
+    /// single round-trip.
+    ///
+    /// All table fields are currently required.
+    ///
+    /// + request `rights_attentuation_mask` This allows attenuating the VMO
+    ///   rights of the subtree. These values for `rights_attenuation_mask`
+    ///   result in no attenuation (note that 0 is not on this list):
+    ///   + ZX_RIGHT_SAME_RIGHTS (preferred)
+    ///   + 0xFFFFFFFF (this is reasonable when an attenuation mask is computed)
+    /// + request `token_request` The server end of the `BufferCollectionToken`
+    ///   channel. The client retains the client end.
+    flexible AttachToken(resource table {
+        1: rights_attenuation_mask zx.Rights;
+        2: token_request server_end:BufferCollectionToken;
+    });
+
+    /// Set up an eventpair to be signalled (`ZX_EVENTPAIR_PEER_CLOSED`) when
+    /// buffers have been allocated and only the specified number of buffers (or
+    /// fewer) remain in the buffer collection.
+    ///
+    /// [`fuchsia.sysmem2/BufferCollection.AttachLifetimeTracking`] allows a
+    /// client to wait until an old buffer collection is fully or mostly
+    /// deallocated before attempting allocation of a new buffer collection. The
+    /// eventpair is only signalled when the buffers of this collection have
+    /// been fully deallocated (not just un-referenced by clients, but all the
+    /// memory consumed by those buffers has been fully reclaimed/recycled), or
+    /// when allocation or logical allocation fails for the tree or subtree
+    /// including this [`fuchsia.sysmem2/BufferCollection`].
+    ///
+    /// The eventpair won't be signalled until allocation or logical allocation
+    /// has completed; until then, the collection's current buffer count is
+    /// ignored.
+    ///
+    /// If logical allocation fails for an attached subtree (using
+    /// [`fuchsia.sysmem2/BufferCollection.AttachToken`]), the server end of the
+    /// eventpair will close during that failure regardless of the number of
+    /// buffers potenitally allocated in the overall buffer collection. This is
+    /// for logical allocation consistency with normal allocation.
+    ///
+    /// The lifetime signalled by this event includes asynchronous cleanup of
+    /// allocated buffers, and this asynchronous cleanup cannot occur until all
+    /// holders of VMO handles to the buffers have closed those VMO handles.
+    /// Therefore, clients should take care not to become blocked forever
+    /// waiting for `ZX_EVENTPAIR_PEER_CLOSED` to be signalled if any of the
+    /// participants using the logical buffer collection (including the waiter
+    /// itself) are less trusted, less reliable, or potentially blocked by the
+    /// wait itself. Waiting asynchronously is recommended. Setting a deadline
+    /// for the client wait may be prudent, depending on details of how the
+    /// collection and/or its VMOs are used or shared. Failure to allocate a
+    /// new/replacement buffer collection is better than getting stuck forever.
+    ///
+    /// The sysmem server itself intentionally does not perform any waiting on
+    /// already-failed collections' VMOs to finish cleaning up before attempting
+    /// a new allocation, and the sysmem server intentionally doesn't retry
+    /// allocation if a new allocation fails due to out of memory, even if that
+    /// failure is potentially due to continued existence of an old collection's
+    /// VMOs. This `AttachLifetimeTracking` message is how an initiator can
+    /// mitigate too much overlap of old VMO lifetimes with new VMO lifetimes,
+    /// as long as the waiting client is careful to not create a deadlock.
+    ///
+    /// Continued existence of old collections that are still cleaning up is not
+    /// the only reason that a new allocation may fail due to insufficient
+    /// memory, even if the new allocation is allocating physically contiguous
+    /// buffers. Overall system memory pressure can also be the cause of failure
+    /// to allocate a new collection. See also
+    /// [`fuchsia.memorypressure/Provider`].
+    ///
+    /// `AttachLifetimeTracking` is meant to be compatible with other protocols
+    /// with a similar `AttachLifetimeTracking` message; duplicates of the same
+    /// `eventpair` handle (server end) can be sent via more than one
+    /// `AttachLifetimeTracking` message to different protocols, and the
+    /// `ZX_EVENTPAIR_PEER_CLOSED` will be signalled for the client end when all
+    /// the conditions are met (all holders of duplicates have closed their
+    /// server end handle(s)). Also, thanks to how eventpair endponts work, the
+    /// client end can (also) be duplicated without preventing the
+    /// `ZX_EVENTPAIR_PEER_CLOSED` signal.
+    ///
+    /// The server intentionally doesn't "trust" any signals set on the
+    /// `server_end`. This mechanism intentionally uses only
+    /// `ZX_EVENTPAIR_PEER_CLOSED` set on the client end, which can't be set
+    /// "early", and is only set when all handles to the server end eventpair
+    /// are closed. No meaning is associated with any of the other signals, and
+    /// clients should ignore any other signal bits on either end of the
+    /// `eventpair`.
+    ///
+    /// The `server_end` may lack `ZX_RIGHT_SIGNAL` or `ZX_RIGHT_SIGNAL_PEER`,
+    /// but must have `ZX_RIGHT_DUPLICATE` (and must have `ZX_RIGHT_TRANSFER` to
+    /// transfer without causing `BufferCollection` channel failure).
+    ///
+    /// All table fields are currently required.
+    ///
+    /// + request `server_end` This eventpair handle will be closed by the
+    ///   sysmem server when buffers have been allocated initially and the
+    ///   number of buffers is then less than or equal to `buffers_remaining`.
+    /// + request `buffers_remaining` Wait for all but `buffers_remaining` (or
+    ///   fewer) buffers to be fully deallocated. A number greater than zero can
+    ///   be useful in situations where a known number of buffers are
+    ///   intentionally not closed so that the data can continue to be used,
+    ///   such as for keeping the last available video frame displayed in the UI
+    ///   even if the video stream was using protected output buffers. It's
+    ///   outside the scope of the `BufferCollection` interface (at least for
+    ///   now) to determine how many buffers may be held without closing, but
+    ///   it'll typically be in the range 0-2.
+    flexible AttachLifetimeTracking(resource table {
+        1: server_end zx.Handle:EVENTPAIR;
+        2: buffers_remaining uint32;
+    });
+};
+
+/// The sysmem implementation is consistent with a logical / conceptual model of
+/// allocation / logical allocation as follows:
+///
+/// As usual, a logical allocation considers either the root and all nodes with
+/// connectivity to the root that don't transit a [`fuchsia.sysmem2/Node`]
+/// created with [`fuchsia.sysmem2/BufferCollection.AttachToken`], or a subtree
+/// rooted at an `AttachToken` `Node` and all `Node`(s) with connectivity to
+/// that subtree that don't transit another `AttachToken`.  This is called the
+/// logical allocation pruned subtree, or pruned subtree for short.
+///
+/// During constraints aggregation, each
+/// [`fuchsia.sysmem2/BufferCollectionTokenGroup`] will select a single child
+/// `Node` among its direct children. The rest of the children will appear to
+/// fail the logical allocation, while the selected child may succeed.
+///
+/// When more than one `BufferCollectionTokenGroup` exists in the overall
+/// logical allocation pruned subtree, the relative priority between two groups
+/// is equivalent to their ordering in a DFS pre-order iteration of the tree,
+/// with parents higher priority than children, and left children higher
+/// priority than right children.
+///
+/// When a particular child of a group is selected (whether provisionally during
+/// a constraints aggregation attempt, or as a final selection), the
+/// non-selection of other children of the group will "hide" any other groups
+/// under those non-selected children.
+///
+/// Within a logical allocation, aggregation is attempted first by provisionally
+/// selecting child 0 of the highest-priority group, and child 0 of the next
+/// highest-priority group that isn't hidden by the provisional selections so
+/// far, etc.
+///
+/// If that aggregation attempt fails, aggregation will be attempted with the
+/// ordinal 0 child of all the same groups except the lowest priority non-hidden
+/// group which will provisionally select its ordinal 1 child (and then child 2
+/// and so on). If a new lowest-priority group is un-hidden as provisional
+/// selections are updated, that newly un-hidden lowest-priority group has all
+/// its children considered in order, before changing the provisional selection
+/// in the former lowest-priority group. In terms of result, this is equivalent
+/// to systematic enumeration of all possible combinations of choices in a
+/// counting-like order updating the lowest-priority group the most often and
+/// the highest-priority group the least often. Rather than actually attempting
+/// aggregation with all the combinations, we can skip over combinations which
+/// are redundant/equivalent due to hiding without any change to the result.
+///
+/// Attempted constraint aggregations of enumerated non-equivalent combinations
+/// of choices continue in this manner until either (a) all aggregation attempts
+/// fail in which case the overall logical allocation fails, or (b) until an
+/// attempted aggregation succeeds, in which case buffer allocation (if needed;
+/// if this is the pruned subtree rooted at the overall root `Node`) is
+/// attempted once. If buffer allocation based on the first successful
+/// constraints aggregation fails, the overall logical allocation fails (there
+/// is no buffer allocation retry / re-attempt). If buffer allocation succeeds
+/// (or is not needed due to being a pruned subtree that doesn't include the
+/// root), the logical allocation succeeds.
+///
+/// If this prioritization scheme cannot reasonably work for your usage of
+/// sysmem, please don't hesitate to contact sysmem folks to discuss potentially
+/// adding a way to achieve what you need.
+///
+/// Please avoid creating a large number of `BufferCollectionTokenGroup`(s) per
+/// logical allocation, especially with large number of children overall, and
+/// especially in cases where aggregation may reasonably be expected to often
+/// fail using ordinal 0 children and possibly with later children as well.
+/// Sysmem mitigates potentially high time complexity of evaluating too many
+/// child combinations/selections across too many groups by simply failing
+/// logical allocation beyond a certain (fairly high, but not huge) max number
+/// of considered group child combinations/selections. More advanced (and more
+/// complicated) mitigation is not anticipated to be practically necessary or
+/// worth the added complexity. Please contact sysmem folks if the max limit is
+/// getting hit or if you anticipate it getting hit, to discuss potential
+/// options.
+///
+/// Prefer to use multiple [`fuchsia.sysmem2/ImageFormatConstraints`] in a
+/// single [`fuchsia.sysmem2/BufferCollectionConstraints`] when feasible (when a
+/// participant just needs to express the ability to work with more than a
+/// single [`fuchsia.images2/PixelFormat`], with sysmem choosing which
+/// `PixelFormat` to use among those supported by all participants).
+///
+/// Similar to [`fuchsia.sysmem2/BufferCollectionToken`] and
+/// [`fuchsia.sysmem2/BufferCollection`], closure of the
+/// `BufferCollectionTokenGroup` channel without sending
+/// [`fuchsia.sysmem2/Node.Release`] first will cause buffer collection failure
+/// (or subtree failure if using
+/// [`fuchsia.sysmem2/BufferCollectionToken.SetDispensable`] or
+/// [`fuchsia.sysmem2/BufferCollection.AttachToken`] and the
+/// `BufferCollectionTokenGroup` is part of a subtree under such a node that
+/// doesn't propagate failure to its parent).
+///
+/// Epitaphs are not used in this protocol.
+@available(added=19)
+open protocol BufferCollectionTokenGroup {
+    compose Node;
+
+    /// Create a child [`fuchsia.sysmem2/BufferCollectionToken`]. Only one child
+    /// (including its children) will be selected during allocation (or logical
+    /// allocation).
+    ///
+    /// Before passing the client end of this token to
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`], completion of
+    /// [`fuchsia.sysmem2/Node.Sync`] after
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup.CreateChild`] is required.
+    /// Or the client can use
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup.CreateChildrenSync`] which
+    /// essentially includes the `Sync`.
+    ///
+    /// Sending CreateChild after AllChildrenPresent is not permitted; this will
+    /// fail the group's subtree and close the connection.
+    ///
+    /// After all children have been created, send AllChildrenPresent.
+    ///
+    /// + request `token_request` The server end of the new token channel.
+    /// + request `rights_attenuation_mask` If ZX_RIGHT_SAME_RIGHTS, the created
+    ///   token allows the holder to get the same rights to buffers as the
+    ///   parent token (of the group) had. When the value isn't
+    ///   ZX_RIGHT_SAME_RIGHTS, the value is interpretted as a bitmask with 0
+    ///   bits ensuring those rights are attentuated, so 0xFFFFFFFF is a synonym
+    ///   for ZX_RIGHT_SAME_RIGHTS. The value 0 is not allowed and intentionally
+    ///   causes subtree failure.
+    flexible CreateChild(resource table {
+        /// Must be set.
+        1: token_request server_end:BufferCollectionToken;
+
+        /// If not set, the default is `ZX_RIGHT_SAME_RIGHTS`.
+        2: rights_attenuation_mask zx.Rights;
+    });
+
+    /// Create 1 or more child tokens at once, synchronously.  In contrast to
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup.CreateChild`], no
+    /// [`fuchsia.sysmem2/Node.Sync`] is required before passing the client end
+    /// of a returned token to
+    /// [`fuchsia.sysmem2/Allocator/BindSharedCollection`].
+    ///
+    /// The lower-index child tokens are higher priority (attempted sooner) than
+    /// higher-index child tokens.
+    ///
+    /// As per all child tokens, successful aggregation will choose exactly one
+    /// child among all created children (across all children created across
+    /// potentially multiple calls to
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup.CreateChild`] and
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup.CreateChildrenSync`]).
+    ///
+    /// The maximum permissible total number of children per group, and total
+    /// number of nodes in an overall tree (from the root) are capped to limits
+    /// which are not configurable via these protocols.
+    ///
+    /// Sending CreateChildrenSync after AllChildrenPresent is not permitted;
+    /// this will fail the group's subtree and close the connection.
+    ///
+    /// After all children have been created, send AllChildrenPresent.
+    ///
+    /// + request `rights_attentuation_masks` The size of the
+    ///   `rights_attentuation_masks` determines the number of created child
+    ///   tokens. The value ZX_RIGHT_SAME_RIGHTS doesn't attenuate any rights.
+    ///   The value 0xFFFFFFFF is a synonym for ZX_RIGHT_SAME_RIGHTS. For any
+    ///   other value, each 0 bit in the mask attenuates that right.
+    /// - response `tokens` The created child tokens.
+    flexible CreateChildrenSync(table {
+        1: rights_attenuation_masks vector<zx.Rights>:MAX_COUNT_CREATE_CHILDREN;
+    }) -> (resource table {
+        1: tokens vector<client_end:BufferCollectionToken>:MAX_COUNT_CREATE_CHILDREN;
+    });
+
+    /// Indicate that no more children will be created.
+    ///
+    /// After creating all children, the client should send
+    /// [`fuchsia.sysmem2/BufferCollectionTokenGroup.AllChildrenPresent`] to
+    /// inform sysmem that no more children will be created, so that sysmem can
+    /// know when it's ok to start aggregating constraints.
+    ///
+    /// Sending CreateChild after AllChildrenPresent is not permitted; this will
+    /// fail the group's subtree and close the connection.
+    ///
+    /// If [`fuchsia.sysmem2/Node.Release`] is to be sent, it should be sent
+    /// after `AllChildrenPresent`, else failure of the group's subtree will be
+    /// triggered. This is intentionally not analogous to how `Release` without
+    /// prior [`fuchsia.sysmem2/BufferCollection.SetConstraints`] doesn't cause
+    /// subtree failure.
+    flexible AllChildrenPresent();
+};

@@ -1,0 +1,811 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.wlan.softmac;
+
+using fuchsia.wlan.common;
+using fuchsia.wlan.driver;
+using fuchsia.wlan.ieee80211 as ieee80211;
+using zx;
+
+/// Describes the capabilities of a SoftMAC on a particular band.
+type WlanSoftmacBandCapability = table {
+    /// Band to which the capabilities described by this datagram apply.
+    1: band ieee80211.WlanBand;
+
+    /// Servers (i.e., drivers) should set `ht_caps` if the device supports HT
+    /// PHY mode or unset `ht_caps` if the device does not.
+    5: ht_caps ieee80211.HtCapabilities;
+
+    /// Servers (i.e., drivers) should set `vht_caps` if the device supports
+    /// VHT PHY mode or unset `vht_caps` if the device does not.
+    7: vht_caps ieee80211.VhtCapabilities;
+
+    /// Set of supported basic rates in units of 500 Kbit/s (as defined in IEEE
+    /// Std 802.11-2016, 9.4.2.3), e.g., 0x02 represents 1 Mbps. This set
+    /// represents all of the non-HT rates that the device supports for both
+    /// transmitting and receiving.
+    10: basic_rates vector<uint8>:ieee80211.MAX_SUPPORTED_BASIC_RATES;
+
+    /// Set of valid primary channels per regulatory information as determined
+    /// by the device driver during iface creation. A primary channel refers
+    /// to a channel on which APs may transmit beacon frames.
+    ///
+    /// The client must use this set to determine the efficacy of subsequent
+    /// requests to scan a subset of channels using the iface or to determine
+    /// which primary channel to use when starting an AP.
+    11: primary_channels vector<ieee80211.ChannelNumber>:ieee80211.MAX_UNIQUE_CHANNEL_NUMBERS;
+};
+
+/// High-level information describing the state of a running softmac.
+/// All fields in this response are required.
+type WlanSoftmacQueryResponse = table {
+    /// Station address.
+    1: sta_addr ieee80211.MacAddr;
+
+    /// MAC role
+    2: mac_role fuchsia.wlan.common.WlanMacRole;
+
+    /// Bitmask indicating WlanInfoPhyType values supported by the hardware.
+    @mutable
+    3: supported_phys vector<ieee80211.WlanPhyType>:fuchsia.wlan.common.MAX_SUPPORTED_PHY_TYPES;
+
+    /// Bitmask indicating enabled WlanInfoHardwareCapability values. Values defined as fuchsia.wlan.driver.WlanSoftmacHardwareCapability
+    4: hardware_capability fuchsia.wlan.driver.WlanSoftmacHardwareCapability;
+
+    /// Supported bands.
+    @mutable
+    5: band_caps vector<WlanSoftmacBandCapability>:fuchsia.wlan.common.MAX_BANDS;
+
+    /// The MAC address of the device as assigned in the factory.
+    6: factory_addr ieee80211.MacAddr;
+};
+
+
+type WlanRxInfoValid = flexible bits : uint32 {
+    PHY = 0x1;
+    DATA_RATE = 0x2;
+    CHAN_WIDTH = 0x4;
+    MCS = 0x8;
+    RSSI = 0x10;
+    SNR = 0x20;
+    // Bits 6-31 reserved
+};
+
+type WlanRxInfoFlags = flexible bits : uint32 {
+    /// The FCS for the received frame was invalid.
+    FCS_INVALID = 0x1;
+    /// Padding was added after the MAC header to align the frame body to 4 bytes.
+    FRAME_BODY_PADDING_4 = 0x2;
+    // Bits 2-31 reserved
+};
+
+type WlanRxInfo = struct {
+    /// Receive flags. These represent boolean flags as opposed to enums or value-based info which
+    /// are represented below. Values should be taken from the WLAN_RX_INFO_FLAGS_* enum.
+    rx_flags WlanRxInfoFlags;
+
+    /// Bitmask indicating which of the following fields are valid in this struct. Reserved flags
+    /// must be zero.
+    valid_fields WlanRxInfoValid;
+
+    /// The PHY format of the device at the time of the operation.
+    phy ieee80211.WlanPhyType;
+    /// The data rate of the device, measured in units of 0.5 Mb/s.
+    data_rate uint32;
+    /// The channel of the device at the time of the operation. This field must be included.
+    primary ieee80211.ChannelNumber;
+    /// The bandwidth of the channel at the time of the operation.
+    bandwidth ieee80211.ChannelBandwidth;
+    /// The secondary 80 MHz channel segment, if applicable.
+    vht_secondary_80_channel ieee80211.ChannelNumber;
+    /// The modulation and coding scheme index of the device at the time of the operation. Depends
+    /// on the PHY format and channel width.
+    mcs uint8;
+
+    /// Received Signal Strength Indicator.
+    rssi_dbm int8;
+    /// Signal-to-Noise Ratio, in 0.5 dB.
+    snr_dbh int16;
+};
+
+type WlanTxInfoFlags = flexible bits : uint32 {
+    /// Indicate this packet should be protected.
+    PROTECTED = 0x1;
+    /// For rate control: indicate an important data frame, such as EAPOL, which should be sent
+    /// _reliably_ rather than fast, and is exempt from rate probing
+    FAVOR_RELIABILITY = 0x2;
+    /// Indicate that this packet should be sent out with QoS header when possible (11n+).
+    // TODO(https://fxbug.dev/42104394): remove this when MLME supports QoS tag.
+    QOS = 0x4;
+};
+
+type WlanTxInfoValid = flexible bits : uint32 {
+    DATA_RATE = 0x1;
+    TX_VECTOR_IDX = 0x2;
+    PHY = 0x4;
+    CHANNEL_BANDWIDTH = 0x8;
+    MCS = 0x10;
+};
+
+type WlanTxInfo = struct {
+    /// Transmit flags. These represent boolean options as opposed to enums or other value-based
+    /// info which are represented below. Values should be taken from the WLAN_TX_INFO_FLAGS_* enum.
+    tx_flags uint32;
+
+    /// Bitmask indicating which of the following fields are valid in this struct. Reserved flags
+    /// must be zero. Values for fields not indicated by a flag may be chosen at the discretion of
+    /// the softmac driver.
+    valid_fields uint32;
+    // Will be sent back in wlan_tx_result_t if Minstrel is enabled for the device, indicated by
+    // WLAN_TX_INFO_VALID_TX_VECTOR_IDX.
+    tx_vector_idx uint16;
+    // The PHY format to be used to transmit this packet.
+    phy ieee80211.WlanPhyType;
+    // The channel width to be used to transmit this packet.
+    bandwidth ieee80211.ChannelBandwidth;
+    /// The modulation and coding scheme index for this packet. Depends on the PHY format and
+    /// channel width.
+    mcs uint8;
+};
+
+// TODO(b/309634989) Soft transition to use fuchsia.wlan.common.WlanProtection
+@strict_audit(bug="https://fxbug.dev/467128644", state="PENDING_REVIEW")
+type WlanProtection = strict enum : uint8 {
+    NONE = 0;
+    RX = 1;
+    TX = 2;
+    RX_TX = 3;
+};
+
+// TODO(b/309634989) Soft transition to use fuchsia.wlan.common.WlanKeyConfiguration
+type WlanKeyConfiguration = table {
+    /// Which path to protect: None, TX, RX, or TX and RX.
+    1: protection WlanProtection;
+    /// IEEE Cipher suite selector.
+    /// See IEEE Std 802.11-2016, 9.4.2.25.2, Table 9-131
+    2: cipher_oui array<uint8, 3>;
+    3: cipher_type uint8;
+    /// Whether this key is a pairwise, group or peer key.
+    4: key_type ieee80211.KeyType;
+    /// The peer MAC address for pairwise and peer keys.
+    /// For group keys this value is always the broadcast address.
+    5: peer_addr ieee80211.MacAddr;
+    /// Index for rotating keys, e.g. group keys.
+    /// This value is always 0 for key types which aren't rotating, e.g. pairwise keys.
+    6: key_idx uint8;
+    // They key's actual bytes.
+    7: key vector<uint8>:ieee80211.MAX_KEY_LEN;
+    /// Receive Sequence Counter for group keys only.
+    /// In all other cases the RSC will be 0.
+    8: rsc uint64;
+};
+
+type WlanRxPacket = struct {
+    @buffer
+    mac_frame vector<uint8>:MAX;
+    info WlanRxInfo;
+};
+
+type WlanTxPacket = struct {
+    @buffer
+    mac_frame vector<uint8>:MAX;
+    /// Additional data needed to transmit the packet.
+    /// TODO(https://fxbug.dev/42056823): This field is ignored by iwlwifi.
+    info WlanTxInfo;
+};
+
+/// Protocol containing methods common to both `WlanSoftmacIfc` and `WlanSoftmacIfcBridge`.
+///
+/// The `WlanSoftmacIfc` and `WlanSoftmacIfcBridge` protocols have common methods, as the latter
+/// generally forwards `WlanSoftmacIfc` requests received in the wlansoftmac driver
+/// to `WlanSoftmacIfcBridge` requests in the bridged driver. Composing this
+/// protocol into `WlanSoftmacIfc` and `WlanSoftmacIfcBridge` minimizes the duplication of method
+/// definitions (and associated request conversions that would be caused by such duplication).
+///
+/// **This protocol is not implemented directly by any component.** It is composed into `WlanSoftmacIfc`
+/// and `WlanSoftmacIfcBridge`.
+@available(added=HEAD)
+open protocol WlanSoftmacIfcBase {
+    /// Reports the result of an attempted transmission.
+    ///
+    /// A device driver indicates support for `ReportTxResult()` using
+    /// `fuchsia.wlan.common/DeviceExtension.report_tx_result_supported`.
+    @selector("fuchsia.wlan.softmac/WlanSoftmacIfc.ReportTxResult")
+    strict ReportTxResult(struct {
+        tx_result WlanTxResult;
+    }) -> ();
+
+    /// Reports completion of a scan associated with the unique `scan_id`. `status`
+    /// indicates whether the scan completed successfully, failed due to an error,
+    /// or was cancelled.
+    ///
+    /// Return status indicates the reason for scan completion:
+    ///   ZX_OK: All channels were scanned successfully.
+    ///   ZX_ERR_CANCELLED: The scan was terminated by a user request, either an
+    ///       explicit WlanSoftmac.CancelScan() or the initiation of an
+    ///       incompatible request (e.g. connect).
+    ///   ZX_ERR_OUT_OF_RANGE: The scan request included a prohibited channel.
+    ///       This may be due to the current country setting.
+    @selector("fuchsia.wlan.softmac/WlanSoftmacIfc.NotifyScanComplete")
+    strict NotifyScanComplete(table {
+        1: status zx.Status;
+        2: scan_id uint64;
+    }) -> ();
+};
+
+/// Protocol that transports `WlanSoftmacIfc` requests from the wlansoftmac driver to
+/// the bridged driver.
+///
+/// This protocol should always be available at HEAD since it's intended to be an in-tree only protocol.
+/// This protocol only exists because wlansoftmac cannot be implemented in Rust and must interact with
+/// the wlansoftmac-c, wlansoftmac-rust, and wlan-mlme Rust crates.
+@available(added=HEAD)
+open protocol WlanSoftmacIfcBridge {
+    compose WlanSoftmacIfcBase;
+
+    /// Stop the bridged driver.
+    ///
+    /// Calling this method causes both the server end of this protocol (`WlanSoftmacIfcBridge`)
+    /// to close and the client end of `WlanSoftmacBridge` to close. The server will not return a
+    /// response from this method until after processing all queued events.
+    ///
+    /// In practice, the wlansoftmac driver calls this method during unbind.
+    strict StopBridgedDriver() -> ();
+};
+
+/// Protocol for sending an Ethernet frame from the bridged wlansoftmac
+/// driver to the wlansoftmac driver.
+///
+/// # Experimental
+///
+/// This protocol is implemented as a foreign function interface (FFI)
+/// between the wlansoftmac driver and the bridged driver solely to improve
+/// the performance of processing data frames through the wlan-mlme library.
+closed protocol EthernetRx {
+    strict Transfer(table {
+        1: packet_address uint64;
+        2: packet_size uint64;
+    }) -> () error zx.Status;
+};
+
+/// Protocol for sending an Ethernet frame from the wlansoftmac driver to the bridged
+/// wlansoftmac driver.
+///
+/// # Experimental
+///
+/// This protocol is implemented as a foreign function interface (FFI)
+/// between the wlansoftmac driver and the bridged driver solely to improve
+/// the performance of processing data frames through the wlan-mlme library.
+///
+/// # Safety
+///
+/// The `complete_borrowed_operation` field must be a function pointer of the type
+/// void (*)(eth::BorrowedOperation<>*, zx_status_t) where the first argument
+/// is the value of `borrowed_operation` field.
+///
+/// Calling `complete_borrowed_operation` will result in calling
+/// `eth::BorrowedOperation<>::Complete()` to release ownership of the packet. This
+/// must be called exactly once. Failing to call `complete_borrowed_operation`
+/// will leak memory, and calling more than once will result in use-after-free.
+closed protocol EthernetTx {
+    strict Transfer(table {
+        1: packet_address uint64;
+        2: packet_size uint64;
+        3: async_id uint64;
+        4: borrowed_operation uint64;
+        5: complete_borrowed_operation uint64;
+    }) -> () error zx.Status;
+};
+
+/// Protocol for sending a WLAN frame from the wlansoftmac driver to the bridged
+/// wlansoftmac driver.
+///
+/// # Experimental
+///
+/// This protocol is implemented as a foreign function interface (FFI)
+/// between the wlansoftmac driver and the bridged driver solely to improve
+/// the performance of processing data frames through the wlan-mlme library.
+closed protocol WlanRx {
+    strict Transfer(table {
+        1: packet_address uint64;
+        2: packet_size uint64;
+        3: packet_info WlanRxInfo;
+        4: async_id uint64;
+        5: arena uint64;
+    }) -> ();
+};
+
+/// Protocol for sending a WLAN frame from the bridged wlansoftmac
+/// driver to the wlansoftmac driver.
+///
+/// # Experimental
+///
+/// This protocol is implemented as a foreign function interface (FFI)
+/// between the wlansoftmac driver and the bridged driver solely to improve
+/// the performance of processing data frames through the wlan-mlme library.
+closed protocol WlanTx {
+    strict Transfer(table {
+        1: packet_address uint64;
+        2: packet_size uint64;
+        3: packet_info WlanTxInfo;
+        4: async_id uint64;
+        5: arena uint64;
+    }) -> () error zx.Status;
+};
+
+@discoverable
+@transport("Driver")
+@available(added=HEAD)
+open protocol WlanSoftmacIfc {
+    compose WlanSoftmacIfcBase;
+
+    /// Forward up a packet received over the wireless medium.
+    strict Recv(struct {
+        packet WlanRxPacket;
+    }) -> ();
+};
+
+/// Argument struct to be passed as the single argument to WlanSoftmac.StartActiveScan
+type WlanSoftmacStartActiveScanRequest = table {
+    /// List of channels to scan on. An empty list of channels will cause a
+    /// scan request to immediately return ZX_ERR_INVALID_ARGS.
+    ///
+    /// Invalid channel numbers will be silently ignored. The validity of a channel
+    /// number depends on the current regulatory region, and a SoftMAC driver cannot
+    /// always determine the region setting. This is especially the case when
+    /// firmware changes the region setting dynamically.
+    1: channels vector<ieee80211.ChannelNumber>:ieee80211.MAX_UNIQUE_CHANNEL_NUMBERS;
+
+    /// List of SSIDs to scan for. For a list with a single SSID, the SSID will be placed in
+    /// the SSID element in the Probe Request frame. For a list with more than one SSID,
+    /// all SSIDs will be placed in an SSID List element in the Probe Request frame with the
+    /// first SSID in the list in the required SSID element. An empty list is the same as
+    /// specifying a list containing only the wildcard SSID.
+    2: ssids vector<ieee80211.CSsid>:ieee80211.SSID_LIST_MAX;
+
+    /// Buffer containing a MAC header (as defined in IEEE Std 802.11-2016, 9.3.3.2) to
+    /// include in each Probe Request frame.
+    @buffer
+    3: mac_header vector<uint8>:ieee80211.MAX_MGMT_FRAME_MAC_HEADER_BYTE_LEN;
+
+    /// Buffer containing IE bytes to include in each Probe Request frame.
+    ///
+    /// The IEs specified must not result in a Probe Request MMPDU that exceed the
+    /// limits defined by IEEE Std 802.11-2016, 9.2.4.7. MMPDU limit constants can
+    /// be found in ieee80211. These limits are very large and will
+    /// likely not be exceeded by specifying the most common IEs found in
+    /// Probe Request frames.
+    @buffer
+    4: ies vector<uint8>:ieee80211.MAX_VHT_MPDU_BYTE_LEN_2;
+
+    /// Minimum duration to spend on each channel during the scan.
+    5: min_channel_time zx.Duration;
+
+    /// Maximum duration to spend on each channel during the scan.
+    6: max_channel_time zx.Duration;
+
+    /// Minimum duration to spend on the home channel(s) between the dwell time on each channel
+    /// where a home channel corresponds to channels the device should otherwise be present
+    /// on while not scanning.
+    7: min_home_time zx.Duration;
+
+    /// Minimum number of Probe Request frames to transmit per channel visit during a scan.
+    /// The definition of a channel visit may differ between device drivers, but it is roughly
+    /// the interval of time spent on a specific channel during a scan.
+    ///
+    /// Sending more than one Probe Request frame on a channel may increase the probability that
+    /// it is received in a noisy environment.
+    8: min_probes_per_channel uint8;
+
+    /// Maximum number of Probe Request frames to transmit per channel visit during a scan.
+    /// The definition of a channel visit may differ between device drivers, but it is roughly
+    /// the interval of time spent on a specific channel during a scan. Specifying 0 is invalid
+    /// since at least one Probe Request frame must be transmitted for an active scan.
+    ///
+    /// Limiting the number of Probe Request frames sent on a channel reduces the time spent
+    /// transmitting frames, and thus increase the time spent receiving frames, while scanning.
+    9: max_probes_per_channel uint8;
+};
+
+const WLAN_MAC_MAX_RATES uint32 = 263; // (8 + 255)
+
+/// Argument table to be passed as the single argument to
+/// WlanSoftmac.NotifyAssociationComplete.
+/// All information here is relevant only in the context of the association with
+/// the given peer_addr.
+/// All fields in this table are required unless stated otherwise.
+type WlanAssociationConfig = table {
+    /// The MAC address of the peer with which we are now associated.
+    1: bssid ieee80211.MacAddr;
+    /// A unique identifier for this specific association. This is unique among
+    /// active associations, not necessarily historical ones.
+    2: aid uint16;
+    3: listen_interval uint16;
+    /// The channel on which we have associated with this peer.
+    4: primary ieee80211.ChannelNumber;
+
+    /// QoS capable and parameters
+    5: qos bool;
+    /// WFA WMM v1.2, 2.2.2
+    6: wmm_params fuchsia.wlan.driver.WlanWmmParameters;
+
+    /// Concatenation of SupportedRates and ExtendedSupportedRates
+    /// IEEE Std 802.11-2016, 9.4.2.3 & 9.4.2.13
+    7: rates vector<uint8>:WLAN_MAC_MAX_RATES;
+
+    /// IEEE Std 802.11-2016, 9.4.1.4
+    8: capability_info uint16;
+
+    /// IEEE Std 802.11-2016, 9.4.2.56, 57
+    /// Rx MCS Bitmask in Supported MCS Set field represents the set of MCS
+    /// the peer can receive at from this device, considering this device's Tx capability.
+    9: ht_cap ieee80211.HtCapabilities;
+    10: ht_op ieee80211.HtOperation;
+
+    /// IEEE Std 802.11-2016, 9.4.2.158, 159
+    11: vht_cap ieee80211.VhtCapabilities;
+    12: vht_op ieee80211.VhtOperation;
+    13: bandwidth ieee80211.ChannelBandwidth;
+    14: vht_secondary_80_channel ieee80211.ChannelNumber;
+};
+
+/// `WlanSoftmacBase` is a template protocol intended to be composed into
+/// `WlanSoftmacBridge` and `WlanSoftmac`. `WlanSoftmacBase` contains all method
+/// that both `WlanSoftmacBridge` and `WlanSoftmac` have in common.
+/// `WlanSoftmacBase` should not be implemented directly.
+///
+/// NOTE: All methods use a `selector` attribute to maintain their ordinal
+///       following migration from `WlanSoftmac` into this protocol. This is necessary
+///       to preserve API compatibility.
+open protocol WlanSoftmacBase {
+    /// Gets general information about the device and its supported features.
+    /// This method is safe to call even when the SoftMAC has not yet started.
+    ///
+    /// Note: The implementation of this method must not depend on a response
+    /// from an ethernet driver, otherwise there is a risk of deadlock.
+    /// The wlansoftmac driver calls this method synchronously while
+    /// serving the fuchsia.hardware.ethernet/EthernetImpl.Query method.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.Query")
+    strict Query() -> (WlanSoftmacQueryResponse) error zx.Status;
+
+    /// Gets information about the station discovery (e.g., scanning and
+    /// probing) features supported by the device. This method is safe to call
+    /// even when the SoftMAC has not yet started.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.QueryDiscoverySupport")
+    strict QueryDiscoverySupport() -> (struct {
+        resp DiscoverySupport;
+    }) error zx.Status;
+
+    /// Gets information about the MAC features supported by the device. This
+    /// method is safe to call even when the SoftMAC has not yet started.
+    ///
+    /// Note: The implementation of this method must not depend on a response
+    /// from an ethernet driver, otherwise there is a risk of deadlock.
+    /// The wlansoftmac driver calls this method synchronously while
+    /// serving the fuchsia.hardware.ethernet/EthernetImpl.Query method.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.QueryMacSublayerSupport")
+    strict QueryMacSublayerSupport() -> (struct {
+        resp fuchsia.wlan.common.MacSublayerSupport;
+    }) error zx.Status;
+
+    /// Gets information about the security features supported by the device.
+    /// This method is safe to call even when the SoftMAC has not yet started.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.QuerySecuritySupport")
+    strict QuerySecuritySupport() -> (struct {
+        resp fuchsia.wlan.common.SecuritySupport;
+    }) error zx.Status;
+
+    /// Gets information about the spectrum usage (e.g., DFS) features supported
+    /// by the device. This method is safe to call even when the SoftMAC has not
+    /// yet started.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.QuerySpectrumManagementSupport")
+    strict QuerySpectrumManagementSupport() -> (struct {
+        resp fuchsia.wlan.common.SpectrumManagementSupport;
+    }) error zx.Status;
+
+    /// Set the primary radio channel, e.g. in response to a channel switch event.
+    /// If successful, this will trigger the channel switch immediately. This may
+    /// impact the transmission of any frames that are in-flight, and might also
+    /// interfere with an ongoing scan request.
+    ///
+    /// Common errors include: \
+    ///   ZX_ERR_NOT_SUPPORTED: The device cannot switch to the requested channel.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.SetChannel")
+    strict SetChannel(table {
+        1: primary ieee80211.ChannelNumber;
+        2: bandwidth ieee80211.ChannelBandwidth;
+        3: vht_secondary_80_channel ieee80211.ChannelNumber;
+    }) -> () error zx.Status;
+
+    /// Join a specific BSS in which we will participate.
+    /// This applies regardless of if we are hosting the BSS or joining it
+    /// (indicated by the `remote` flag in `JoinBssRequest`).
+    /// If successful, the device will switch to the correct channel and perform
+    /// any internal filtering/timing operations required to join the BSS.
+    /// For client STAs, this is the first step before authenticating.
+    ///
+    /// Common errors include: \
+    ///   ZX_ERR_NOT_SUPPORTED: The device does not support the given bss config.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.JoinBss")
+    strict JoinBss(struct {
+        join_request fuchsia.wlan.driver.JoinBssRequest;
+    }) -> () error zx.Status;
+
+    /// Enables hardware Beaconing.
+    ///
+    /// This method cannot be called while beaconing is enabled and so
+    /// `DisableBeaconing` must be called prior to this method if beaconing is
+    /// enabled.
+    ///
+    /// All request fields are required.
+    ///
+    /// Common errors include:
+    ///
+    /// - `ZX_ERR_NOT_SUPPORTED`: The device does not support hardware beacons.
+    /// - `ZX_ERR_INVALID_ARGS`: The device cannot transmit the requested
+    ///                          beacon.
+    /// - `ZX_ERR_BAD_STATE`: The device is already beaconing.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.EnableBeaconing")
+    strict EnableBeaconing(table {
+        /// Beacon template. Since this is a template, some packet content can
+        /// only contain minimal valid information, because the content is later
+        /// modified by hardware, firmware, or software.
+        1: packet_template WlanTxPacket;
+
+        /// TIM offset to the start of the `packet_template` field in bytes.
+        /// This must index the first byte of the TIM IE, which is the tag ID.
+        2: tim_ele_offset uint64;
+
+        /// Beacon interval period in TU.
+        3: beacon_interval uint16;
+    }) -> () error zx.Status;
+
+    /// Disables hardware beaconing.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.DisableBeaconing")
+    strict DisableBeaconing() -> () error zx.Status;
+
+    /// Install a key for encryption when transmitting or receiving protected
+    /// frames.
+    ///
+    /// Common errors include:
+    ///   ZX_ERR_INVALID_ARGS: The given config does not specify a valid key.
+    ///   ZX_ERR_NOT_SUPPORTED: The device does not support the given cipher.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.InstallKey")
+    strict InstallKey(WlanKeyConfiguration) -> () error zx.Status;
+
+    /// Notifies the device of a successful association and configures
+    /// additional parameters necessary to participate in that association.
+    ///
+    /// # Errors
+    ///
+    /// Common errors include:
+    ///
+    /// - `ZX_ERR_BAD_STATE`: The device was not previously informed of this BSS
+    ///                       via `WlanSoftmac.JoinBss`.
+    @selector("fuchsia.wlan.softmac/WlanSoftmacBridge.NotifyAssociationComplete")
+    strict NotifyAssociationComplete(struct {
+        assoc_cfg WlanAssociationConfig;
+    }) -> () error zx.Status;
+
+    /// Notifies MAC and PHY that the peer has been de-associated.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.ClearAssociation")
+    strict ClearAssociation(table {
+        1: peer_addr ieee80211.MacAddr;
+    }) -> () error zx.Status;
+
+    /// Starts a passive scan. The server will deliver scan results
+    /// as Beacon frames using WlanSoftmacIfc.Recv(). When complete,
+    /// the server will call WlanSoftmacIfc.ScanComplete() with the
+    /// same `scan_id` returned by StartPassiveScan().
+    ///
+    /// The server indicates support for `StartPassiveScan()` using
+    /// `fuchsia.wlan.common/ScanOffloadExtension.supported`.
+    ///
+    /// Common errors include:
+    ///   ZX_ERR_INVALID_ARGS: The device is not capable of performing the
+    ///       requested scan, e.g. because an incompatible channel was requested.
+    ///   ZX_ERR_UNAVAILABLE: The device cannot currently perform scans.
+    ///   ZX_ERR_SHOULD_WAIT: Another scan is already in-progress.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.StartPassiveScan")
+    strict StartPassiveScan(table {
+        /// List of channels to scan on. An empty list of channels will cause a
+        /// scan request to immediately return ZX_ERR_INVALID_ARGS.
+        ///
+        /// Invalid channel numbers will be silently ignored. The validity of a channel
+        /// number depends on the current regulatory region, and a SoftMAC driver cannot
+        /// always determine the region setting. This is especially the case when
+        /// firmware changes the region setting dynamically.
+        ///
+        /// This is a required parameter.
+        1: channels vector<ieee80211.ChannelNumber>:ieee80211.MAX_UNIQUE_CHANNEL_NUMBERS;
+
+        /// Minimum duration to spend on each channel during the scan.
+        2: min_channel_time zx.Duration;
+
+        /// Maximum duration to spend on each channel during the scan.
+        3: max_channel_time zx.Duration;
+
+        /// Minimum duration to spend on the home channel(s) between the dwell time on
+        /// each channel where a home channel corresponds to channels the device should
+        /// otherwise be present on while not scanning.
+        4: min_home_time zx.Duration;
+    }) -> (table {
+        1: scan_id uint64;
+    }) error zx.Status;
+
+    /// Starts an active scan. The server will deliver scan results
+    /// as Beacon or Probe Response frames using WlanSoftmacIfc.Recv().
+    /// When complete, the server will call WlanSoftmacIfc.ScanComplete()
+    /// with the same `scan_id` returned by StartActiveScan().
+    ///
+    /// A device driver indicates support for `StartActiveScan()` using
+    /// `fuchsia.wlan.common/ProbeRequestOffloadExtension.supported`.
+    ///
+    /// Common errors include:
+    ///   ZX_ERR_INVALID_ARGS: The device is not capable of performing the
+    ///       requested scan, e.g. because an incompatible channel was requested.
+    ///   ZX_ERR_UNAVAILABLE: The device cannot currently perform scans.
+    ///   ZX_ERR_SHOULD_WAIT: Another scan is already in-progress.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.StartActiveScan")
+    strict StartActiveScan(WlanSoftmacStartActiveScanRequest) -> (table {
+        1: scan_id uint64;
+    }) error zx.Status;
+
+    /// Cancels the ongoing scan corresponding to `scan_id`,
+    /// where `scan_id` is an identifier returned by
+    /// `StartPassiveScan()` or `StartActiveScan()`. If cancellation succeeds,
+    /// the server will soon call WlanSoftmacIfc.ScanComplete() with the same
+    /// `scan_id`.
+    ///
+    /// A device driver indicates support for `CancelScan()` using
+    /// `fuchsia.wlan.common/ScanOffloadExtension.scan_cancel_supported`.
+    ///
+    /// Common errors include:
+    ///
+    /// - `ZX_ERR_NOT_FOUND`: `scan_id` does not match an ongoing scan.
+    /// - `ZX_ERR_NOT_SUPPORTED`: Server does not support scan cancellation.
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.CancelScan")
+    strict CancelScan(table {
+        1: scan_id uint64;
+    }) -> () error zx.Status;
+
+    /// Indicate the device of modified WiFi Multimedia (WMM) parameters for a
+    /// particular access category (AC).
+    @selector("fuchsia.wlan.softmac/WlanSoftmac.UpdateWmmParameters")
+    strict UpdateWmmParameters(table {
+        1: ac ieee80211.WlanAccessCategory;
+        2: params fuchsia.wlan.driver.WlanWmmParameters;
+    }) -> () error zx.Status;
+};
+
+// TODO(https://fxbug.dev/42077271): Merge `WlanSoftmacBridge` into `WlanSoftmac` when
+//                         FIDL supports generating multiple transports for the
+//                         same protocol or generating Rust bindings for driver-
+//                         transported protocols.
+// TODO(https://fxbug.dev/42085148): Revisit documentation about safety and when methods
+//                         can be called for clarity. See for example `Query`.
+/// `WlanSoftmacBridge` is the protocol the `wlansoftmac` driver serves
+/// to the bridged driver. This protocol **should not** be implemented
+/// by a vendor driver.
+open protocol WlanSoftmacBridge {
+    compose WlanSoftmacBase;
+
+    /// Signal to the server that the MLME for the iface is ready to send and receive
+    /// frames.
+    ///
+    /// The client provides the following arguments:
+    ///
+    ///   - `ifc_bridge`: The client end of a `WlanSoftmacIfcBridge` server which the
+    ///     `wlansoftmac` driver will use to forward `WlanSoftmacIfc` events to
+    ///     the bridged driver.
+    ///   - `ethernet_tx`: A `ethernet_tx_t*` casted to a `uint64`. The
+    ///     `ethernet_tx_t` is defined in
+    ///     `//src/connectivity/wlan/drivers/wlansoftmac/rust_driver/c-binding/bindings.h`.
+    ///   - `wlan_rx`: A `wlan_rx_t*` casted to a `uint64`. The
+    ///     `wlan_rx_t` is defined in
+    ///     `//src/connectivity/wlan/drivers/wlansoftmac/rust_driver/c-binding/bindings.h`.
+    ///
+    /// The server must copy the contents of `ethernet_tx_t` and `wlan_rx_t` before
+    /// returning from this method. The lifetimes of `ethernet_tx_t*` and `wlan_rx_t*` are only as
+    /// long as this method call, but the contents of `ethernet_tx_t` and `wlan_rx_t` will
+    /// live until the server stops the MLME.
+    ///
+    /// The server returns a server end of a `fuchsia.wlan.mlme/MLME` protocol. The SME
+    /// for the iface owns the client end. Thus, this channel is used for SME <-> MLME
+    /// communication.
+    ///
+    /// The `WlanSoftmacBridge.Start` method is different from `WlanSoftmac.Start`
+    /// for two reasons. First, Rust bindings do not exist for Driver transported
+    /// protocols, so `WlanSoftmacIfcBridge` protocol must be Zircon transported to be
+    /// usable by the bridged driver. Second, the Zircon transport adds
+    /// significant latency compared to the Driver transport. As a result, the
+    /// `ethernet_tx` and `wlan_rx` arguments provide an FFI for the wlansoftmac driver
+    /// to send Ethernet and receive WLAN packets to the bridged driver with
+    /// latency comparable or better than a Driver transported protocol.
+    ///
+    /// Except where noted, `WlanSoftmacBridge` methods must only be called after
+    /// a successful call to `WlanSoftmacBridge.Start`.
+    ///
+    /// Common errors include:
+    ///
+    ///   - `ZX_ERR_ALREADY_BOUND`: `Start` was already called on this softmac.
+    strict Start(resource struct {
+        ifc_bridge client_end:WlanSoftmacIfcBridge;
+        ethernet_tx uint64;
+        wlan_rx uint64;
+    }) -> (resource struct {
+        sme_channel zx.Handle:CHANNEL;
+    }) error zx.Status;
+
+    /// Forwards a status containing `ETHERNET_STATUS_*` flags to the
+    /// `fuchsia.hardware.ethernet/EthernetImplIfc` proxy owned by
+    /// the C++ portion of wlansoftmac.
+    ///
+    /// As documented, the value of `status` is set by bits defined in
+    /// `ETHERNET_STATUS_*` flags. However, there is only one flag named
+    /// `ETHERNET_STATUS_ONLINE` and no specification of for the meaning
+    /// of specifying no flags. In practice, `0x1` means the status is up,
+    /// and `0x0` means the status is down.
+    ///
+    /// While this method should belong in something like an
+    /// "`EthernetImplIfcBridge` protocol", it's included in the
+    /// `WlanSoftmacBridge` protocol as a convenience. The wlansoftmac driver
+    /// will eventually cease using a `fuchsia.hardware.ethernet/EthernetImplIfc`
+    /// proxy and use a `fuchsia.hardware.network.driver/NetworkDeviceIfc`
+    /// proxy instead. At that time, an equivalent of this method should be
+    /// refactored into a separate bridge.
+    strict SetEthernetStatus(struct {
+        status uint32;
+    }) -> ();
+};
+
+/// `WlanSoftmac` is an SDK versioned protocol implemented by third-party drivers.
+@discoverable
+@transport("Driver")
+open protocol WlanSoftmac {
+    /// Signal to the server that the MLME for the iface is ready to send and receive
+    /// frames.
+    ///
+    /// The client provides the following arguments:
+    ///
+    ///   - `ifc`: The client end of a `WlanSoftmaIfc` server which the
+    ///     server will use to send events to the client.
+    ///
+    /// The server returns a server end of a `fuchsia.wlan.mlme/MLME` protocol. The SME
+    /// for the iface owns the client end. Thus, this channel is used for SME <-> MLME
+    /// communication.
+    ///
+    /// Except where noted, `WlanSoftmac` methods must only be called after
+    /// a successful call to `WlanSoftmac.Start`.
+    ///
+    /// Common errors include:
+    ///
+    ///   - `ZX_ERR_ALREADY_BOUND`: `Start` was already called on this softmac.
+    strict Start(resource struct {
+        ifc client_end:WlanSoftmacIfc;
+    }) -> (resource struct {
+        sme_channel zx.Handle:CHANNEL;
+    }) error zx.Status;
+
+    /// Shut down the softmac if it is running.
+    /// Safe to call when the softmac is not running.
+    strict Stop() -> ();
+
+    /// Queue a packet for transmission. May return before a packet has actually
+    /// been transmitted. This call does not take ownership of the buffer passed in
+    /// the WlanTxPacket.
+    ///
+    /// Errors result from a failure to queue the packet for transmission.
+    /// An OK result thus only indicates that the packet was queued, *not* that
+    /// it was successfully transmitted.
+    strict QueueTx(struct {
+        packet WlanTxPacket;
+    }) -> () error zx.Status;
+
+    compose WlanSoftmacBase;
+};
+
+service Service {
+    wlan_softmac client_end:WlanSoftmac;
+};

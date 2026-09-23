@@ -1,0 +1,610 @@
+#!/usr/bin/env bash
+
+# Copyright 2016 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+function HELP {
+    echo "help:"
+    echo "-a <arch>            : arm64, riscv64, or x64"
+    echo "-c <text>            : append item to kernel commandline"
+    echo "-D <disk file|device>: specify disk file or device path on host"
+    echo "--disktype[=<type>]  : should be one of (ahci, virtio, nvme, virtio-scsi, usb), default is ahci"
+    echo "--diskfmt[=<format>] : disk format (raw, qcow2, etc), default is raw"
+    echo "-g                   : use graphical console"
+    echo "-H, --hvf            : use HVF (macOS hosts only); defaults to true if supported."
+    echo "    --no-hvf         : don't use HVF, even if supported."
+    echo "-I <interface name>  : network interface name, default is qemu."
+    echo "-k, --kvm            : use KVM (Linux hosts only); defaults to true if supported."
+    echo "    --no-kvm         : don't use KVM, even if supported."
+    echo "-m <memory in MB>    : memory size, default is ${MEMSIZE_DEFAULT}MB"
+    echo "-n                   : run with emulated nic"
+    echo "-N                   : run with emulated nic via tun/tap"
+    echo "-q <directory>       : location of qemu, defaults to looking in prebuilt/downloads/qemu/bin, then \$PATH"
+    echo "-s <number of cpus>  : number of cpus, 1 for uniprocessor, default is $SMP_DEFAULT"
+    echo "-t <binary>          : use <binary> as the QEMU->ZBI trampoline"
+    echo "-u <path>            : execute qemu startUp script, default is no script"
+    echo "-V, --virtio         : use virtio devices; defaults to true."
+    echo "    --no-virtio      : don't use virtio devices."
+    echo "-z <zbi>             : boot specified ZBI via trampoline"
+    echo "--audio[=<host_drv>] : use Intel HD Audio"
+    echo "                       <host_drv> should be one of (alsa, oss, pa, wav, none)"
+    echo "--ahci=<disk image>  : run with disk image file as raw ahci drive"
+    echo "--debugger           : Enable gdb stub and wait for connection"
+    echo "--dry-run            : do everything but start qemu"
+    echo "--gic=<version>      : use GIC 2, 3, or max supported. default is 3"
+    echo "--no-serial          : Disable writing out to the guest's serial port"
+    echo "-S <device>          : output serial port to a QEMU character device. Default is stdio."
+    echo "-M <device>          : output QEMU monitor console to a QEMU character device"
+    echo "--uefi               : Boot QEMU through UEFI. With this setting, one of -t or -D must be"
+    echo "                       supplied: if -t is supplied, then that value is assumed to be a"
+    echo "                       UEFI executable; else, the value under -D is assumbed to be a "
+    echo "                       bootable, UEFI FAT filesystem or disk image. In the second case,"
+    echo "                       if --disktype is unset, the image is specified as the contents of"
+    echo "                       a USB disk drive. -z may be passed alongside -t to specify a"
+    echo "                       ramdisk that the UEFI boot application should in turn boot;"
+    echo "                       however, no UEFI such boot shims are yet supported."
+    echo "--vnc=<display>      : use vnc based display"
+    echo "--wavfile=<file>     : When audio host_drv == wav, output to the specified WAV file"
+    echo "-h for help"
+    echo "all arguments after -- are passed to qemu directly"
+    exit 1
+}
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+readonly PREBUILT_DIR="$DIR/../../prebuilt"
+
+# Note these match the defaults in [virtual device specs](/build/images/flash/BUILD.gn;l=517)
+# and https://source.corp.google.com/fuchsia/build/sdk/virtual_device.gni
+# (//src/developer/ffx/plugins/emulator/src/vdl_files.rs).This can be overriden by the emulator
+# configs in the infra/recipe repo
+# (https://fuchsia.googlesource.com/infra/recipes/+/refs/heads/main/recipe_modules/emu/api.py).
+readonly MEMSIZE_DEFAULT=8192
+readonly SMP_DEFAULT=4
+
+# Host operating system. Will either be "Linux" or "Darwin" (macOS) on
+# supported platforms.
+HOST_OS=$(uname -s)
+readonly HOST_OS
+
+# Determine host architecture.
+case "$(uname -m)" in
+  aarch64*|arm64)
+    readonly HOST_ARCH="arm64"
+    ;;
+  x86_64)
+    readonly HOST_ARCH="x64"
+    ;;
+  *)
+    echo "unknown host architecture: $(uname -m)"
+    exit 1
+    ;;
+esac
+
+AHCI=()
+ARCH=
+AUDIO=
+AUDIO_WAVFILE="/tmp/qemu.wav"
+DEBUGGER=0
+DISKFILE=
+DISKTYPE=
+DISKFMT="raw"
+DRY_RUN=0
+GIC=3
+GRAPHICS=0
+DO_HVF=
+DO_KVM=
+MEMSIZE=$MEMSIZE_DEFAULT
+NET=0
+QEMUDIR=
+UEFI=0
+UPSCRIPT=no
+VNC=
+VIRTIO=1
+SERIAL=1
+SERIAL_DEV="stdio"
+MONITOR_DEV=
+SMP=$SMP_DEFAULT
+CMDLINE=""
+OPT_CMDLINE=""
+QEMU_KERNEL=
+QEMU_INITRD=
+QEMU_WRAPPER=()
+IFNAME="qemu"
+
+# Propagate our TERM environment variable as a kernel command line
+# argument.  This is first so that an explicit -c TERM=foo argument
+# goes into CMDLINE later and overrides this.
+if [[ -n $TERM ]]; then
+    CMDLINE+="TERM=$TERM "
+fi
+
+# QEMU looks for its own files in its current directory before looking in its
+# data directory (.../share/qemu/).  So a file in the current directory that
+# happens to match one of those internal files' names will be used instead of
+# the proper file and make things go awry.  There's no way to tell QEMU not to
+# look in the current directory first.  So to make it safe to have files by any
+# name in the current directory, we cd to / before running QEMU (on the more
+# reasonable presumption that / won't contain any files by those names).  Hence,
+# we have to convert any relative file names we're passing to QEMU to absolute.
+abspath() {
+  local path="$1"
+  case "$path" in
+      /*) echo "$path";;
+      *) echo "$PWD/$path";;
+  esac
+}
+
+# The QEMU command-line arguments to be built up below.
+ARGS=()
+
+# The running number of certain disks by type.
+AHCI_NUM=0
+VIRTIO_SCSI_NUM=0
+USB_NUM=0
+
+while getopts "a:c:D:gHI:km:nNq:s:t::u:Vz:S:M:h-:" FLAG; do
+    case $FLAG in
+        a) ARCH=$OPTARG;;
+        c) OPT_CMDLINE+="$OPTARG ";;
+        D) DISKFILE="$(abspath "$OPTARG")";;
+        g) GRAPHICS=1;;
+        H)
+            if [[ "$HOST_OS" != "Darwin" ]]; then
+                echo "error: HVF option (-H) is only supported on MacOS"
+                exit 1
+            fi
+            if [[ "$HOST_ARCH" != "${ARCH}" ]]; then
+                echo "error: HVF option (-H) is only supported on a ${ARCH} host architecture"
+                exit 1
+            fi
+            if ! sysctl -n kern.hv_support ; then
+                echo "error: HVF is not supported"
+            fi
+            DO_HVF=1
+            ;;
+        I) IFNAME=$OPTARG;;
+        k)
+            if [[ "$HOST_OS" != "Linux" ]]; then
+                echo "error: KVM option (-k) is only supported on Linux"
+                exit 1
+            fi
+            if [[ "$HOST_ARCH" != "${ARCH}" ]]; then
+                echo "error: KVM option (-k) is only supported on a ${ARCH} host architecture"
+                exit 1
+            fi
+            if [[ ! -e "/dev/kvm" ]]; then
+                echo "error: /dev/kvm not found. Virtualisation is not supported."
+                echo
+                exit 1
+            fi
+            if [[ ! -w "/dev/kvm" ]]; then
+                echo "To use KVM acceleration, adjust permissions to /dev/kvm using:"
+                echo
+                echo "sudo chmod 666 /dev/kvm"
+                exit 1
+            fi
+            DO_KVM=1
+            ;;
+        m) MEMSIZE=$OPTARG;;
+        n) NET=1;;
+        N) NET=2;;
+        q) QEMUDIR=${OPTARG}/;;
+        s) SMP=$OPTARG;;
+        t) QEMU_KERNEL="$(abspath "$OPTARG")";;
+        u) UPSCRIPT="$(abspath "$OPTARG")";;
+        V) VIRTIO=1;;
+        z) QEMU_INITRD="$(abspath "$OPTARG")";;
+        S) SERIAL_DEV=$OPTARG;;
+        M) MONITOR_DEV=$OPTARG;;
+        h) HELP;;
+        \?)
+            echo unrecognized option
+            HELP
+            ;;
+        -)
+            case $OPTARG in
+            ahci=*) AHCI+=("$(abspath "${OPTARG#*=}")");;
+            audio) AUDIO=none;;
+            audio=*) AUDIO=${OPTARG#*=};;
+            wavfile=*) AUDIO_WAVFILE="$(abspath "${OPTARG#*=}")";;
+            debugger) DEBUGGER=1;;
+            disktype=*) DISKTYPE=${OPTARG#*=};;
+            diskfmt=*) DISKFMT=${OPTARG#*=};;
+            dry-run) DRY_RUN=1;;
+            gic=*) GIC=${OPTARG#*=};;
+            no-serial) SERIAL=0;;
+            vnc=*) VNC=${OPTARG#*=};;
+            no-kvm) DO_KVM=0;;
+            kvm) DO_KVM=1;;
+            no-hvf) DO_HVF=0;;
+            hvf) DO_HVF=1;;
+            no-virtio) VIRTIO=0;;
+            virtio) VIRTIO=1;;
+            uefi) UEFI=1;;
+            *)
+                echo unrecognized long option "$OPTARG"
+                HELP
+                ;;
+            esac
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+# arch argument is non optional
+if [[ -z $ARCH ]]; then
+    echo must specify arch
+    HELP
+fi
+
+if [[ -z "$QEMU_KERNEL" ]]; then
+  if (( UEFI )); then
+    if [[ -z "$DISKFILE" ]]; then
+        echo "with --uefi, one of -t or -D must be set"
+        HELP
+    fi
+  else
+    echo "-t switch is mandatory if --uefi is unset"
+    HELP
+  fi
+
+  if [[ -n "$OPT_CMDLINE" ]]; then
+      echo "-c cannot be set without -t"
+      HELP
+  fi
+fi
+
+if (( UEFI )) && [[ -z "$QEMU_KERNEL" ]]; then
+  readonly UEFI_DISK_BOOT=1
+else
+  readonly UEFI_DISK_BOOT=0
+fi
+
+# Fall back to disk type defaults if left unspecified with a provided emulated
+# disk file.
+if [[ -n "$DISKFILE" ]] && [[ -z "$DISKTYPE" ]]; then
+  if (( VIRTIO )); then
+    DISKTYPE="virtio"
+  else
+    DISKTYPE="ahci"
+  fi
+fi
+
+# by default use the qemu binary located in the fuchsia //prebuilt
+# repo if we can find it, but allow -q to override it for people
+# who want to use their own.
+if [[ -z $QEMUDIR && -d "$PREBUILT_DIR/downloads/qemu/bin" ]]; then
+    QEMUDIR="$PREBUILT_DIR/downloads/qemu/bin/"
+fi
+
+if (( UEFI )); then
+  readonly EDK2DIR="$PREBUILT_DIR/third_party/edk2/qemu-${ARCH}"
+  case $ARCH in
+    x64)
+    readonly UEFI_FIRMWARE="${EDK2DIR}/OVMF_CODE.fd"
+    readonly UEFI_VARS="${EDK2DIR}/OVMF_VARS.fd"
+    ;;
+    arm64)
+    readonly UEFI_FIRMWARE="${EDK2DIR}/QEMU_EFI.fd"
+    readonly UEFI_VARS="${EDK2DIR}/QEMU_VARS.fd"
+    ;;
+  esac
+
+  ARGS+=("-drive" "if=pflash,format=raw,readonly=on,file=${UEFI_FIRMWARE}")
+  # The UEFI variable store. Without 'snapshot=true' this file would need to be
+  # writable and state would persist across invocations; with it, the image
+  # will be copy-on-write and state should persist across reboots.
+  ARGS+=("-drive" "if=pflash,format=raw,snapshot=true,file=${UEFI_VARS}")
+fi
+
+if [[ -n "$QEMU_KERNEL" ]]; then
+  ARGS+=("-kernel" "$QEMU_KERNEL")
+fi
+
+if [[ -n "$QEMU_INITRD" ]]; then
+  ARGS+=("-initrd" "$QEMU_INITRD")
+fi
+
+if [[ -n $DISKFILE ]]; then
+  NAME="mydisk"
+  EXTRA_ARGS=""
+  if (( UEFI_DISK_BOOT )); then
+    NAME="uefi"
+    # `bootindex=0` ensures that this is the highest priority boot option.
+    EXTRA_ARGS=",bootindex=0"
+  fi
+  ARGS+=("-drive" "if=none,format=${DISKFMT},file=${DISKFILE},id=${NAME}")
+  if [[ "${DISKTYPE}" == "virtio" ]]; then
+    DISKARG="virtio-blk-pci,drive=${NAME}"
+  elif [[ "${DISKTYPE}" == "ahci" ]]; then
+    if [[ $AHCI_NUM -eq 0 ]]; then
+        ARGS+=("-device" "ich9-ahci,id=ahci0")
+    fi
+    DISKARG="ide-hd,drive=${NAME},bus=ahci0.${AHCI_NUM}"
+    AHCI_NUM=$((AHCI_NUM + 1))
+  elif [[ "${DISKTYPE}" == "nvme" ]]; then
+    DISKARG="nvme,drive=${NAME},serial=zircon"
+  elif [[ "${DISKTYPE}" == "virtio-scsi" ]]; then
+    if [[ $VIRTIO_SCSI_NUM -eq 0 ]]; then
+        ARGS+=("-device" "virtio-scsi-pci,id=scsi0")
+    fi
+    DISKARG="scsi-hd,drive=${NAME},scsi-id=${VIRTIO_SCSI_NUM},lun=1"
+    VIRTIO_SCSI_NUM=$((VIRTIO_SCSI_NUM + 1))
+  elif [[ "${DISKTYPE}" == "usb" ]]; then
+    if [[ $USB_NUM -eq 0 ]]; then
+        ARGS+=("-device" "nec-usb-xhci,id=xhci0")
+    fi
+    DISKARG="usb-storage,bus=xhci0.0,removable=on,drive=${NAME}"
+    USB_NUM=$((USB_NUM + 1))
+  else
+    echo unrecognized disk type "${DISKTYPE}"
+    exit
+  fi
+  ARGS+=("-device" "${DISKARG}${EXTRA_ARGS}")
+fi
+
+# construct the args for qemu
+ARGS+=("-m" "$MEMSIZE")
+if [[ -n $VNC ]]; then
+    ARGS+=("-vnc" "$VNC")
+fi
+
+# Always use virtio as the rng source
+ARGS+=("-device" "virtio-rng-pci")
+
+if [[ -n "$MONITOR_DEV" ]]; then
+  ARGS+=("-monitor" "$MONITOR_DEV")
+fi
+
+ADD_SERIAL_ARG=1
+if (( !GRAPHICS )); then
+  ARGS+=("-nographic" "-vga" "none")
+
+  # -nographic implies -serial stdio and will complain if you
+  # try to set anything else pointing at stdio.
+  if [[ "$SERIAL_DEV" == "stdio" ]]; then
+    ADD_SERIAL_ARG=0
+  fi
+else
+  if [[ "$ARCH" == "x64" && $VIRTIO == 0 ]]; then
+    # Enable Bochs VBE device, which Zircon has a device for
+    ARGS+=("-vga" "std")
+  else
+    # use the virtio gpu for display
+    ARGS+=("-vga" "none")
+    ARGS+=("-device" "virtio-gpu-pci")
+  fi
+fi
+
+if (( SERIAL && ADD_SERIAL_ARG )); then
+  ARGS+=("-serial" "$SERIAL_DEV")
+fi
+
+for ahcifile in "${AHCI[@]}"; do
+  ARGS+=("-drive" "file=${ahcifile},format=raw,if=none,id=ahcidisk${AHCI_NUM}")
+  ARGS+=("-device" "ich9-ahci,id=ahci${AHCI_NUM}")
+  ARGS+=("-device" "ide-hd,drive=ahcidisk${AHCI_NUM},bus=ahci.${AHCI_NUM}")
+  AHCI_NUM=$((AHCI_NUM + 1))
+done
+
+if (( !NET )); then
+  ARGS+=("-nic" "none")
+else
+  if [[ $NET == 1 ]]; then
+    ARGS+=("-nic" "user,hostname=$IFNAME")
+  fi
+
+  if [[ $NET == 2 ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      SOCKET_VMNET_SOCKET=$(brew --prefix)/var/run/socket_vmnet
+      if [[ -S "$SOCKET_VMNET_SOCKET" ]]; then
+        QEMU_WRAPPER=("$(brew --prefix socket_vmnet)/bin/socket_vmnet_client" "$SOCKET_VMNET_SOCKET")
+        ARGS+=("-netdev" "socket,id=net0,fd=3")
+      else
+        echo "socket_vmnet socket not found: falling back to vmnet with sudo." >&2
+        # See https://gitlab.com/qemu-project/qemu/-/issues/1364.
+        QEMU_WRAPPER=(sudo)
+        ARGS+=("-netdev" "vmnet-shared,id=net0")
+      fi
+
+    else
+      TAP_IFS=$(ip tuntap show 2>/dev/null)
+      if [[ "$TAP_IFS" != *"${IFNAME}:"* ]]; then
+        echo "To use qemu with networking on Linux, configure tun/tap:"
+        echo
+        echo "sudo ip tuntap add dev $IFNAME mode tap user $USER && \\"
+        echo "sudo ip link set $IFNAME up"
+        exit 1
+      fi
+
+      # Try to detect if a firewall is active. There are only few ways to do that
+      # without being root. Unfortunately, using systemd or systemctl does not work
+      # on Debian, so use the following hack instead:
+      if (which ufw && grep -q "^ENABLED=yes" /etc/ufw/ufw.conf) >/dev/null 2>&1; then
+        echo "Active firewall detected: If this emulator is unreachable, run: fx setup-ufw"
+      fi
+      ARGS+=("-netdev" "tap,id=net0,ifname=$IFNAME,script=$UPSCRIPT,downscript=no")
+    fi
+  fi
+  HASH=$(echo "$IFNAME" | shasum)
+  SUFFIX=$(for i in {0..2}; do echo -n ":${HASH:$(( 2 * i )):2}"; done)
+  MAC="52:54:00$SUFFIX"
+  if [[ "$ARCH" == "x64" ]] && [[ $VIRTIO == 0 ]]; then
+    ARGS+=("-device" "e1000,netdev=net0,mac=$MAC")
+  else
+    # Disable iPXE romfile. OVMF (UEFI implementation) defaults to using iPXE to
+    # talk to the network device, but iPXE's driver is more than 2x slower than
+    # OVMF's own virtio-net driver.
+    ARGS+=("-device" "virtio-net-pci,romfile=,netdev=net0,vectors=8,mac=$MAC")
+  fi
+fi
+
+if [[ -n $AUDIO ]]; then
+    AUDIODEV="id=${AUDIO},driver=${AUDIO}"
+    case $AUDIO in
+        none) ;;
+        alsa) ;;
+        oss) ;;
+        pa) ;;
+        wav)
+            AUDIODEV+=",path=${AUDIO_WAVFILE}"
+            ;;
+        *)
+            echo unrecognized QEMU host audio driver \""${AUDIO}"\"
+            exit
+            ;;
+    esac
+    ARGS+=("-device" "intel-hda" "-device" "hda-duplex" "-audiodev" "${AUDIODEV}")
+fi
+
+if [[ $SMP != 1 ]]; then
+    ARGS+=("-smp" "$SMP")
+fi
+
+# start a few extra harmless virtio devices that can be ignored
+if (( VIRTIO )); then
+    ARGS+=("-device" "virtio-serial-pci")
+    ARGS+=("-device" "virtio-mouse-pci")
+    ARGS+=("-device" "virtio-keyboard-pci")
+    # Now that we enabled the virtio mouse and keyboard, we can disable
+    # the i8042 (legacy PS/2) device.
+    if [[ "$ARCH" == "x64" ]]; then
+      ARGS+=("-machine" "i8042=off")
+    fi
+fi
+
+if (( DEBUGGER )); then
+    ARGS+=("-s" "-S")
+fi
+
+# Auto-detect if KVM or HVF support exists if not explicitly specified.
+if [[ -z $DO_KVM ]]; then
+  if [[
+      $HOST_OS == "Linux" &&      # Linux only.
+      $HOST_ARCH == "${ARCH}" &&  # Host and target arch must match.
+      -w /dev/kvm                 # /dev/kvm must exist and be writable.
+  ]]; then
+    echo "Enabling KVM acceleration: use '--no-kvm' to disable." >&2
+    DO_KVM=1
+  fi
+fi
+
+if [[ -z $DO_HVF ]]; then
+  if [[
+      $HOST_OS == "Darwin" &&              # macOS only.
+      $HOST_ARCH == "${ARCH}" &&           # Host and target arch must match.
+      $(sysctl -n kern.hv_support) == "1"  # https://developer.apple.com/documentation/hypervisor
+  ]]; then
+    echo "Enabling HVF acceleration: use '--no-hvf' to disable." >&2
+    DO_HVF=1
+  fi
+fi
+
+case $ARCH in
+    arm64)
+        QEMU=${QEMUDIR}qemu-system-aarch64
+        if (( DO_KVM )); then
+          ARGS+=("-enable-kvm" "-cpu" "host")
+          GIC=host
+        elif (( DO_HVF )); then
+          ARGS+=("-machine" "accel=hvf")
+          ARGS+=("-cpu" "host")
+        else
+          # Ask for all of the features TCG emulates
+          ARGS+=("-machine" "virtualization=true")
+          ARGS+=("-cpu" "max")
+
+          # We boot arm64 TCG through a secure bootloader (that speaks Linux's
+          # boot protocol) when we can. This gives us a 'real' PSCI
+          # implementation to test against as well as a SMCCC TRNG, which QEMU
+          # does not implement itself.
+          #
+          # The firmware's two constraints are that the system must provide a
+          # GICv3 and support FEAT_RNG (which we get from `-cpu max`).
+          if [[ $GIC == 3 ]]; then
+            ARGS+=("-machine" "secure=true")
+            ARGS+=("-bios" "$PREBUILT_DIR/firmware/arm-trusted-firmware-qemu-bios/qemu_fw.bios")
+          fi
+        fi
+        # Ask for a specific virt machine version.
+        # TODO(https://fxbug.dev/42131826) add support for high PCIe aperture
+        # Can switch to plain 'virt' once this is fixed.
+        # The highmem-ecam argument functions as a workaround until then.
+        MACHINEARG="virt-9.2,highmem-ecam=off"
+        # append a gic version to the machine specifier
+        if [[ $GIC != 0 ]]; then
+            MACHINEARG+=",gic-version=${GIC}"
+        fi
+        ARGS+=("-machine" "${MACHINEARG}")
+
+        if (( !SERIAL )); then
+          CMDLINE+="kernel.serial=none "
+        fi
+        ;;
+    riscv64)
+        QEMU=${QEMUDIR}qemu-system-riscv64
+        ARGS+=("-cpu" "rv64,svpbmt=true,v=true,vext_spec=v1.0")
+        ARGS+=("-machine" "virt")
+        ARGS+=("-object" "rng-random,filename=/dev/urandom,id=rng0")
+        ARGS+=("-device" "virtio-rng-device,rng=rng0")
+        if (( !SERIAL )); then
+          CMDLINE+="kernel.serial=none "
+        fi
+        ;;
+    x64)
+        QEMU=${QEMUDIR}qemu-system-x86_64
+        # The kernel only supports the v2.1 (32-bit) SMBIOS entry point.
+        ARGS+=("-machine" "q35,smbios-entry-point-type=32")
+        ARGS+=("-device" "isa-debug-exit,iobase=0xf4,iosize=0x04")
+
+        # Override the SeaBIOS serial port to keep it from outputting
+        # a terminal reset on start.
+        ARGS+=("-fw_cfg" "name=etc/sercon-port,string=0")
+
+        if (( DO_KVM )); then
+          ARGS+=("-enable-kvm" "-cpu" "host,migratable=no,+invtsc")
+        else
+          ARGS+=("-cpu" "Skylake-Client,-check")
+        fi
+
+        if (( SERIAL )); then
+          CMDLINE+="kernel.serial=legacy "
+        else
+          CMDLINE+="kernel.serial=none "
+        fi
+        ;;
+    *)
+        echo unsupported arch
+        HELP
+        ;;
+esac
+
+# Add entropy to the kernel
+CMDLINE+="kernel.entropy-mixin=$(head -c 32 /dev/urandom | shasum -a 256 | awk '{ print $1 }') "
+
+# Don't 'reboot' the emulator if the kernel crashes
+CMDLINE+="kernel.halt-on-panic=true "
+
+# Finally, append any values received via option. We save them for last so that
+# they can override others since "last value wins".
+CMDLINE+=$OPT_CMDLINE
+
+cd /
+
+# If dry run is set, simply echo all commands run from here on out.
+if (( DRY_RUN )); then
+  RUN_CMD="echo"
+else
+  RUN_CMD="exec"
+  set -x
+fi
+
+if (( UEFI_DISK_BOOT )); then
+  $RUN_CMD "${QEMU_WRAPPER[@]}" "$QEMU" "${ARGS[@]}" "$@"
+else
+  echo "CMDLINE: $CMDLINE"
+  $RUN_CMD "${QEMU_WRAPPER[@]}" "$QEMU" "${ARGS[@]}" -append "$CMDLINE" "$@"
+fi

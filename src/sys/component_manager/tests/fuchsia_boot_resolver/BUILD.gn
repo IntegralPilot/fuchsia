@@ -1,0 +1,205 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/assembled_system.gni")
+import("//build/assembly/board_configuration.gni")
+import("//build/assembly/bootfs_files_for_assembly.gni")
+import("//build/assembly/product_assembly_configuration.gni")
+import("//build/component/config.gni")
+import("//build/components.gni")
+import("//build/components/fuchsia_package.gni")
+import("//build/info/info.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/testing/host_test_data.gni")
+
+import("//build/zircon/tools.gni")
+
+rustc_test("resolve_bootfs_package") {
+  name = "resolve-bootfs-package"
+  edition = "2024"
+
+  source_root = "src/resolve_bootfs_package.rs"
+
+  deps = [
+    ":test.checker_rust",
+    "//sdk/fidl/fuchsia.component:fuchsia.component_rust",
+    "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+    "//sdk/fidl/fuchsia.process:fuchsia.process_rust",
+    "//sdk/fidl/fuchsia.sys2:fuchsia.sys2_rust",
+    "//sdk/rust/zx",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-component",
+    "//src/lib/fuchsia-component-test",
+    "//src/lib/fuchsia-runtime",
+  ]
+
+  sources = [ "src/resolve_bootfs_package.rs" ]
+}
+if (current_toolchain == default_toolchain) {
+  board_configuration("board_config") {
+    name = "test"
+    version = "fake_version"
+    partitions_config = "//boards/partitions:default"
+  }
+
+  product_assembly_configuration("product_config") {
+    testonly = true
+    platform = {
+      build_type = "eng"
+      feature_set_level = "bootstrap"
+      storage = {
+        filesystems = {
+          image_name = "test_zbi"
+          image_mode = "no_image"
+        }
+      }
+    }
+    product = {
+    }
+
+    bootfs_packages = [ ":root_component_pkg" ]
+    bootfs_files_labels = [ ":bootfs_config" ]
+    version = build_info_version
+  }
+
+  # `assembled_system` builds a zbi for consumption by the test.
+  assembled_system("test_zbi") {
+    testonly = true
+    product_assembly_config_label = ":product_config"
+    board_config_label = ":board_config"
+    use_bringup_platform_bundles_only = true
+  }
+
+  output_file = "$target_out_dir/uncompressed_bootfs"
+
+  action("test_assembly") {
+    testonly = true
+    script = "//src/sys/component_manager/tests/fuchsia_boot_resolver/scripts/extract_bootfs_from_zbi.py"
+
+    deps = [
+      ":test_zbi",
+      zbi_tool_target,
+    ]
+
+    inputs = [
+      target_out_dir + "/test_zbi_gen/test_zbi.zbi",
+      zbi_tool_path,
+    ]
+    outputs = [ output_file ]
+
+    args = [
+      "--zbi",
+      rebase_path(zbi_tool_path, root_build_dir),
+      "--zbi-image",
+      rebase_path(target_out_dir + "/test_zbi_gen/test_zbi.zbi",
+                  root_build_dir),
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+    ]
+  }
+
+  resource("bootfs_resource") {
+    testonly = true
+    sources = [ output_file ]
+    outputs = [ "data/tests/uncompressed_bootfs" ]
+    deps = [ ":test_assembly" ]
+  }
+
+  fuchsia_test_component("resolve_bootfs_package-component") {
+    component_name = "resolve_bootfs_package"
+    manifest = "meta/resolve_bootfs_package.cml"
+    deps = [
+      ":bootfs_resource",
+      ":resolve_bootfs_package",
+    ]
+    test_type = "system"
+  }
+
+  # This module tests the property that the FuchsiaBootResolver successfully
+  # resolves components that are encoded in a meta.far. This test is fully
+  # hermetic, despite using assembled_system, as it only uses that template
+  # to generate a wellformed hermetic bootfs.
+  fuchsia_test_package("fuchsia-boot-resolver-integration-tests") {
+    test_components = [ ":resolve_bootfs_package-component" ]
+    deps = [
+      ":bootfs_resource",
+      ":component-manager-cmp",
+      ":root_component",
+    ]
+  }
+
+  bootfs_files_for_assembly("bootfs_config") {
+    testonly = true
+    deps = [ ":config" ]
+  }
+
+  component_config("config") {
+    testonly = true
+    sources = [ "config.json5" ]
+    dest = "data/component_manager_config"
+  }
+
+  fuchsia_component("component-manager-cmp") {
+    testonly = true
+    component_name = "component_manager"
+    manifest = "meta/component_manager.cml"
+    deps = [ "//src/sys/component_manager:bin_with_tracing" ]
+  }
+
+  group("tests") {
+    testonly = true
+
+    deps = []
+
+    # In debug mode, this test can cause flaky OOMs since it loads a test
+    # bootfs which is very large.
+    if (!is_debug) {
+      deps += [ ":fuchsia-boot-resolver-integration-tests" ]
+    }
+  }
+}
+
+fidl("test.checker") {
+  testonly = true
+  sources = [ "checker.test.fidl" ]
+}
+
+rustc_binary("root_component_bin") {
+  edition = "2024"
+  testonly = true
+  name = "root_component"
+  source_root = "src/root_component.rs"
+  deps = [
+    ":test.checker_rust",
+    "//sdk/fidl/fuchsia.pkg:fuchsia.pkg_rust",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-async",
+    "//src/lib/fuchsia-component",
+    "//src/lib/fuchsia-fs",
+    "//third_party/rust_crates:futures",
+  ]
+  sources = [ "src/root_component.rs" ]
+}
+
+fuchsia_component("root_component") {
+  testonly = true
+  deps = [ ":root_component_bin" ]
+  manifest = "meta/root_component.cml"
+}
+
+fuchsia_package("root_component_pkg") {
+  testonly = true
+  deps = [
+    ":root_component",
+    ":sentinel_file",
+  ]
+}
+
+resource("sentinel_file") {
+  testonly = true
+  sources = [ "bootfs_package_resolver_test_sentinel" ]
+  outputs = [ "data/bootfs_package_resolver_test_sentinel" ]
+}

@@ -1,0 +1,453 @@
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=26)
+library fuchsia.tracing.controller;
+
+using fuchsia.tracing;
+using zx;
+
+/// The maximum number of providers supported.
+const MAX_NUM_PROVIDERS uint32 = 100;
+
+/// The maximum length of an alert name.
+const MAX_ALERT_NAME_LENGTH uint32 = 14;
+
+/// aliases
+alias AlertName = string:MAX_ALERT_NAME_LENGTH;
+
+/// This covers errors from using the `Tracing` protocol (specifically
+/// trace recording errors).
+@available(added=29)
+type RecordingError = flexible enum {
+    /// Error encountered when opening the proxy to the target.
+    TARGET_PROXY_OPEN = 0;
+
+    /// This is a general error when starting a trace.
+    RECORDING_START = 1;
+
+    /// An error encountered if a trace recording has already been started
+    /// for a given Fuchsia target.
+    RECORDING_ALREADY_STARTED = 2;
+
+    /// An error encountered when attempting to stop a trace. This causes an
+    /// immediate termination of the client channel, so the user should not
+    /// attempt to run `StopRecording` again.
+    RECORDING_STOP = 3;
+
+    /// Error for when a trace file is already being written to by the tracing
+    /// service.
+    DUPLICATE_TRACE_FILE = 4;
+
+    /// When attempting to stop a trace, there were no active traces found for
+    /// the given lookup name.
+    NO_SUCH_TRACE_FILE = 5;
+
+    /// No targets were found matching the query.
+    NO_SUCH_TARGET = 6;
+
+    /// The query matched a target that is not connected to the Daemon's FIDL
+    /// channels.
+    DISCONNECTED_TARGET = 7;
+};
+
+/// An action to be preformed on this trace. Used as part of a Trigger.
+@available(added=29)
+type Action = flexible enum {
+    /// Terminates the active trace.
+    TERMINATE = 1;
+};
+
+/// A trigger is an action that is done when a certain alert has been raised in the
+/// fuchsia tracing system.
+@available(added=29)
+type Trigger = table {
+    /// The name of the alert being watched.
+    /// See fuchsia.tracing.controller.Controller.WatchAlert for more info.
+    1: alert string:MAX_ALERT_NAME_LENGTH;
+
+    /// The action to run when this alert has been witnessed.
+    2: action Action;
+};
+
+/// Covers how a trace will be run when invoking `StartRecording`.
+@available(added=29)
+type TraceOptions = table {
+    /// Determines how long a trace recording will run before terminating in
+    /// nanoseconds. This is an "at-least" duration, with the actual
+    /// runtime terminating likely a few dozen milliseconds longer.
+    ///
+    /// If this is not set, a trace will run indefinitely and must be stopped
+    /// using `StopRecording`.
+    1: duration_ns zx.Duration;
+
+    /// The triggers to run against this trace.
+    2: triggers vector<Trigger>:MAX;
+
+    /// The requested categories for the trace. These could include
+    /// groups, or nothing. These categories are expanded and the expanded
+    /// list is in the TraceConfig. This list is used to support the nice UX of
+    /// explicitly checking for events with these categories and warn the
+    /// user if the no events were captured for any of these categories.
+    3: requested_categories fuchsia.tracing.EnabledCategoryList;
+
+    /// The compression algorithm to use for the trace data.
+    @available(added=HEAD)
+    4: compression CompressionType;
+};
+
+/// The compression algorithm to use for the trace data.
+@available(added=HEAD)
+type CompressionType = flexible enum {
+    /// No compression.
+    NONE = 0;
+    /// Zstd compression.
+    ZSTD = 1;
+};
+
+/// Status of the trace session managed by SessionManager
+@available(added=29)
+type TraceStatus = table {
+
+    // 1-2: reserved
+
+    /// The total duration of the command in fractional seconds. This will not
+    /// be set if the command is supposed to run indefinitely.
+    3: duration zx.Duration;
+
+    /// The amount of time remaining before the trace terminates. This will not
+    /// be set if the command is supposed to run indefinitely.
+    4: remaining_runtime zx.Duration;
+
+    /// The original config sent to the `StartRecording` command.
+    5: config TraceConfig;
+
+    /// A list of triggers active for this trace. See [Trigger] for more info.
+    6: triggers vector<Trigger>:MAX;
+
+    /// unique id of this trace session.
+    7: task_id uint64;
+};
+
+/// The state of the tracing session.
+/// A "session" is everything between `Initialize` and `Terminate`.
+type SessionState = flexible enum {
+    /// The tracing system is ready for a new session.
+    /// There can be only one session at a time.
+    READY = 1;
+    /// A new tracing session has been initialized.
+    INITIALIZED = 2;
+    /// Tracing is in the midst of starting.
+    STARTING = 3;
+    /// Tracing has started.
+    STARTED = 4;
+    /// Tracing is in the midst of being stopped.
+    STOPPING = 5;
+    /// Tracing has fully stopped.
+    STOPPED = 6;
+    /// Tracing is in the midst of being terminated.
+    /// Once the system has completely terminated the session it goes back
+    /// to the READY state.
+    TERMINATING = 7;
+};
+
+/// The provisioner interface used to initialize a trace Session, that can
+/// then be started and stopped.
+///
+/// The provisioner is required to start a trace Session and bind the control
+/// to the client. It can also perform tasks like getting the list of registered
+/// providers and known categories, which can be performed without a existing
+/// trace Session.
+@discoverable
+open protocol Provisioner {
+    /// Requests to initialize tracing with the specified `config`.
+    ///
+    /// A bad request will terminate the connection.
+    ///
+    /// Dropping the socket connection will abort and terminate the
+    /// existing trace Session.
+    ///
+    /// The trace controller emits trace data to `output` as a sequence of
+    /// binary formatted trace records.  Traces obtained from different providers
+    /// are delimited by metadata records within the stream.
+    flexible InitializeTracing(resource struct {
+        controller server_end:Session;
+        config TraceConfig;
+        output zx.Handle:<SOCKET, zx.Rights.WRITE | zx.Rights.WAIT>;
+    });
+
+    /// Return the set of registered providers.
+    flexible GetProviders() -> (struct {
+        providers vector<ProviderInfo>:MAX_NUM_PROVIDERS;
+    });
+
+    // Gets the known categories.
+    flexible GetKnownCategories() -> (struct {
+        categories vector<fuchsia.tracing.KnownCategory>:fuchsia.tracing.MAX_NUM_KNOWN_CATEGORIES;
+    });
+};
+
+@available(added=29)
+@discoverable
+open protocol SessionManager {
+
+    /// Return the set of registered providers.
+    flexible GetProviders() -> (struct {
+        providers vector<ProviderInfo>:MAX_NUM_PROVIDERS;
+    });
+
+    /// Gets the known categories.
+    flexible GetKnownCategories() -> (struct {
+        categories vector<fuchsia.tracing.KnownCategory>:fuchsia.tracing.MAX_NUM_KNOWN_CATEGORIES;
+    });
+
+    /// Starts a Trace session.
+    flexible StartTraceSession(resource struct {
+        config TraceConfig;
+        options TraceOptions;
+    }) -> (struct {
+        task_id uint64;
+    }) error RecordingError;
+
+    /// Configure a Trace session to start when the component starts.
+    flexible StartTraceSessionOnBoot(resource struct {
+        config TraceConfig;
+        options TraceOptions;
+    }) -> () error RecordingError;
+
+    /// Ends the trace session.
+    /// If task_id is non-zero, then only the trace task with the given id is checked.
+    /// Note: Currently there is only 1 trace task active at a time, so the task_id is of
+    /// little value at this time.
+    flexible EndTraceSession(resource struct {
+        task_id uint64;
+        output zx.Handle:<SOCKET, zx.Rights.WRITE | zx.Rights.WAIT | zx.Rights.TRANSFER>;
+    }) -> (struct {
+        options TraceOptions;
+        result StopResult;
+    }) error RecordingError;
+
+    /// Aborts an ongoing trace session without saving results.
+    @available(added=31)
+    flexible AbortTraceSession(struct {
+        task_id uint64;
+    }) -> () error RecordingError;
+
+    /// Returns the status of the current trace session.
+    flexible Status() -> (TraceStatus) error RecordingError;
+};
+
+/// The session interface used by the trace tool to start/stop/terminate a trace Session.
+///
+/// The trace Session may lightly validate the structure of
+/// trace records as it copies them from trace buffers into the output.
+/// In particular, it may verify the size of each record header to ensure
+/// that the framing of trace records in the data stream is maintained.
+///
+/// The trace Session does not validate the contents of the trace records
+/// themselves.  For example, it does not try to check argument lengths in
+/// events.  This ensures that the trace format can be extended without needing
+/// to modify the trace Session.
+///
+/// The trace Session must be initialized from the provisioner. It can then be
+/// used to start/stop tracing as many times as needed. Dropping the Session
+/// will terminate tracing.
+open protocol Session {
+    /// Requests to start tracing with the specified `options`.
+    ///
+    /// If tracing has already started then the request is ignored,
+    /// except to send back an error code.
+    ///
+    /// The trace Session acknowledges the request when all
+    /// registered providers have been started or after
+    /// `TraceConfig.start_timeout_milliseconds` milliseconds.
+    /// One useful reason for the has-started acknowledgement is that the
+    /// trace program can start a program to trace knowing that all the
+    /// providers are started.
+    flexible StartTracing(StartOptions) -> () error StartError;
+
+    /// Requests to stop tracing.
+    ///
+    /// If tracing has already stopped then this does nothing.
+    /// Returning a result lets callers know when it's ok to, for example,
+    /// start tracing again.
+    flexible StopTracing(StopOptions) -> (StopResult) error StopError;
+
+    /// Returns the next alert when it arrives.
+    ///
+    /// Alerts received by the Session are queued until a WatchAlert
+    /// request is received. Alerts are sent to the caller in the order
+    /// they were received.
+    ///
+    /// WatchAlert requests are also queued until an alert is received
+    /// and the requests are serviced in the order they were received.
+    flexible WatchAlert() -> (struct {
+        alert_name AlertName;
+    });
+
+    /// Event sent when the Session state changes.
+    flexible -> OnSessionStateChange(struct {
+        state SessionState;
+    });
+
+    /// Requests to flush of all tracing buffers into the provided socket.
+    ///
+    /// Normally streaming mode only sends data once it has enough data to
+    /// require a buffer swap and data flush. This produces fewer, but larger
+    /// and bursty data transfers.
+    ///
+    /// Some clients may want more regular smaller data transfers. These clients
+    /// may instead manually invoke FlushBuffers whenever they are ready for
+    /// data.
+    @available(added=31)
+    flexible FlushBuffers() -> () error FlushError;
+};
+
+// Individual providers can be tuned with this.
+type ProviderSpec = table {
+    1: name fuchsia.tracing.ProviderName;
+    2: buffer_size_megabytes_hint uint32;
+    3: categories fuchsia.tracing.EnabledCategoryList;
+};
+
+/// Provides options for the trace.
+type TraceConfig = table {
+    /// The trace categories to record. Prefix wildcards, such as 'kernel:*' and
+    /// '*' are supported.
+    1: categories fuchsia.tracing.EnabledCategoryList;
+
+    /// Suggested size of trace buffer which each provider should receive.
+    // If table defaults were supported, this would default to 4.
+    2: buffer_size_megabytes_hint uint32;
+
+    /// Acknowledge start request after at most `start_timeout_milliseconds`.
+    // If table defaults were supported, this would default to 5000.
+    3: start_timeout_milliseconds uint64;
+
+    // If table defaults were supported, this would default to BufferingMode.ONESHOT.
+    4: buffering_mode fuchsia.tracing.BufferingMode;
+
+    /// Overrides for particular providers.
+    5: provider_specs vector<ProviderSpec>:MAX_NUM_PROVIDERS;
+
+    /// Maximum trace format version supported byt the client.
+    /// If not set, this defaults to the latest available trace format version.
+    6: version FxtVersion;
+
+    /// When true, the session will buffer the trace within the
+    /// fuchsia.tracing.controller server and only send the trace over the
+    /// output socket to the client once the trace completes.
+    ///
+    /// It is recommended that defering the trace transfer be set to true when
+    /// using streaming mode and the fuchsia.tracing.controller client is across
+    /// the host-device boundary, such as with ffx. In this, or other cases
+    /// where sending the trace data could cause exess cpu overhead, the disk
+    /// writing cost is preferrable to the cost of sending to the client.
+    ///
+    /// NOTE: defer_transfer only has effect during BufferingMode.STREAMING as
+    /// other modes don't otherwise send trace data to the client during a
+    /// trace.
+    @available(added=28)
+    7: defer_transfer bool;
+};
+
+/// Statistics data per provider collected over the course of the tracing session
+type ProviderStats = table {
+    1: name fuchsia.tracing.ProviderName;
+    2: pid zx.Koid;
+    3: buffering_mode fuchsia.tracing.BufferingMode;
+    4: buffer_wrapped_count uint32;
+    5: records_dropped uint64;
+    6: percentage_durable_buffer_used float32;
+    7: non_durable_bytes_written uint64;
+};
+
+/// Result of a terminate request.
+type StopResult = table {
+    1: provider_stats vector<ProviderStats>:MAX_NUM_PROVIDERS;
+};
+
+/// Error codes from Start operations.
+type StartError = flexible enum {
+    /// Tracing hasn't been initialized, not ready to start.
+    NOT_INITIALIZED = 1;
+    /// Tracing has already been started.
+    ALREADY_STARTED = 2;
+    /// Tracing is currently being stopped.
+    STOPPING = 3;
+    /// Tracing is currently being terminated.
+    TERMINATING = 4;
+};
+
+/// Error codes from Stop operations.
+type StopError = flexible enum {
+    /// Trace controller is unavailable. Nothing to stop.
+    NOT_INITIALIZED = 1;
+    /// Tracing has not started or is currently stoppped.
+    NOT_STARTED = 2;
+    /// Tracing aborted due to error.
+    ABORTED = 3;
+};
+
+/// Error codes from Flush operations.
+@available(added=31)
+type FlushError = flexible enum {
+    /// Trace controller is unavailable. Nothing to flush.
+    NOT_INITIALIZED = 1;
+    /// Tracing has not started or is currently stoppped.
+    NOT_STARTED = 2;
+    /// Tracing aborted due to error.
+    ABORTED = 3;
+};
+
+/// Additional options to control trace data collection.
+type StartOptions = table {
+    /// Whether and how to clear the buffer when starting data collection.
+    /// This allows, for example, multiple Start/Stop trace runs to be
+    /// collected in the same buffer.
+    ///
+    /// If the preceding `Stop()` request had `save_after_stopped=true`
+    /// then this value is overridden to CLEAR_ENTIRE_BUFFER to avoid
+    /// duplicate data being saved.
+    1: buffer_disposition fuchsia.tracing.BufferDisposition;
+
+    /// The trace categories to add to the initial set provided in
+    /// `TraceConfig`. If the combined number of categories goes over the
+    /// limit then the extra categories past the limit are discarded.
+    2: additional_categories fuchsia.tracing.EnabledCategoryList;
+};
+
+/// Additional options to control stopping of a trace.
+type StopOptions = table {
+    /// If true then write all collected data after tracing has stopped.
+    /// This is useful in situations where one wants to clear the buffer
+    /// before starting the next trace, without having to first terminate the
+    /// trace and start a new one.
+    1: write_results bool;
+};
+
+/// Result of `GetProviders`.
+type ProviderInfo = table {
+    /// The provider's ID, assigned by trace-manager.
+    1: id fuchsia.tracing.ProviderId;
+
+    /// The provider's pid.
+    2: pid zx.Koid;
+
+    /// The name of the provider.
+    3: name fuchsia.tracing.ProviderName;
+};
+
+/// Version of trace record format.
+///
+/// Default to the latest available version, which is currently 0.1.
+///
+/// More information about the format of trace records can be found here:
+/// https://fuchsia.dev/fuchsia-src/reference/tracing/trace-format
+type FxtVersion = table {
+    /// Defaults to 0.
+    1: major uint32;
+
+    /// Defaults to 1
+    2: minor uint32;
+};

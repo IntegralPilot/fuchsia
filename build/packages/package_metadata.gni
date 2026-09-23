@@ -1,0 +1,232 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/dist/generated_resource.gni")
+import("//build/group_with_inputs.gni")
+import("//build/host.gni")
+
+# Generate a list of package metadata exported from all packages in the
+# transitive closure of declared dependencies. This list is then used to form
+# a structured PackageManifestList object of format:
+# {'content': {'manifests': [<MANIFESTS FROM METADATA CRAWL>]}, 'version': '1'}
+#
+# Parameters
+#
+#   data_keys (required)
+#     [list of strings] A list of package target metadata keys to collect into a
+#     list. See gn help for data_keys for more information.
+#
+#     Well known package metadata:
+#
+#       package_names
+#
+#       snapshot_entries
+#         The snapshot entries are consumed for the production of the snapshots
+#         that feed into `fx delta` for version to version OTA size computations.
+#
+#       blob_manifests
+#         The blob manifests are aggregated by the image build process to produce
+#         manifests to publish to repositories and to produce manifests to write
+#         into blobfs images.
+#
+#       package_output_manifests
+#         The path of each output manifest for each package.
+#
+#       package_barrier
+#         Metadata barrier.
+#
+#       package_names_barrier
+#         Metadata barrier.
+#
+#   applicable_licenses (optional)
+#   data_deps (optional)
+#   data_keys (optional)
+#   deps (optional)
+#   output_conversion (optional)
+#   outputs (optional)
+#   public_deps (optional)
+#   rebase (optional)
+#   testonly (optional)
+#   visibility (optional)
+#     Same as for any GN `generated_file()` target.
+template("generate_package_metadata") {
+  _metadata_target = "${target_name}.package_metadata"
+  _metadata_output = "$target_gen_dir/${_metadata_target}"
+
+  generated_file(_metadata_target) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "data_deps",
+                             "data_keys",
+                             "deps",
+                             "output_conversion",
+                             "public_deps",
+                             "rebase",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    outputs = [ _metadata_output ]
+    walk_keys = [
+      "bazel_inputs_barrier",
+      "package_barrier",
+      "package_names_barrier",
+    ]
+  }
+
+  action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "outputs",
+                             "testonly",
+                             "visibility",
+                           ])
+    if (!defined(outputs)) {
+      outputs = [ target_gen_dir + "/" + target_name ]
+    }
+    assert(outputs == [ outputs[0] ], "'outputs' must have a single value")
+    deps = [ ":${_metadata_target}" ]
+    inputs = [ _metadata_output ]
+    script = "//build/packages/generate_package_metadata.py"
+    args = [
+      "--input",
+      rebase_path(inputs[0], root_build_dir),
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+    ]
+  }
+}
+
+# Defines package metadata.
+#
+# This metadata is collected by `generate_package_metadata`. The caller should
+# add a dep on the given target name for the metadata to take effect.
+#
+# Parameters (see `generate_package_metadata` for full definitions)
+#
+#   applicable_licenses (optional)
+#   package_name (required)
+#   snapshot_entry (required)
+#   blob_manifest (required)
+#   package_output_manifest (required)
+#   testonly (optional)
+#   visibility (optional)
+template("define_package_metadata") {
+  assert(defined(invoker.package_name), "Missing package_name")
+  assert(defined(invoker.snapshot_entry), "Missing snapshot_entry")
+  assert(defined(invoker.blob_manifest), "Missing blob_manifest")
+  assert(defined(invoker.package_output_manifest),
+         "Missing package_output_manifest")
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+    metadata = {
+      package_names = [ invoker.package_name ]
+      snapshot_entries = [ invoker.snapshot_entry ]
+      blob_manifests = [ rebase_path(invoker.blob_manifest, root_build_dir) ]
+      package_output_manifests = [ invoker.package_output_manifest ]
+    }
+  }
+}
+
+# Generate meta/package file.
+#
+# Parameters
+#
+#   applicable_licenses (optional)
+#   package_name (required)
+#   testonly
+#   visibility
+template("generate_meta_package") {
+  generated_resource(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+    contents = "{\"name\":\"${invoker.package_name}\",\"version\":\"0\"}"
+    outputs = [ "meta/package" ]
+  }
+}
+
+# Generate the `declared_subpackages` file, which will be passed to `pm build`
+# with the optional flag `-subpackages <file>`. `pm build` will parse this file
+# and generate a `meta/fuchsia.pkg/subpackages` file.
+#
+# Each subpackage entry includes either an explicit name or a path to a file
+# containing the default package name for the subpackage, and a path to the
+# subpackage's merkle.
+#
+# Parameters
+#
+#   subpackages (required)
+#   applicable_licenses (optional)
+#   testonly
+#   visibility
+template("generate_meta_subpackages") {
+  rebased_subpackages = []
+  subpackage_targets = []
+  subpackage_inputs = []
+  foreach(subpackage, invoker.subpackages) {
+    package_manifest_file =
+        get_label_info(subpackage.package, "target_out_dir") + "/" +
+        get_label_info(subpackage.package, "name") + "/package_manifest.json"
+
+    subpackage_inputs += [ package_manifest_file ]
+
+    rebased_subpackages += [
+      {
+        if (defined(subpackage.name)) {
+          name = subpackage.name
+        }
+
+        # the package_manifest.json of the subpackage
+        package_manifest_file =
+            rebase_path(package_manifest_file, root_build_dir)
+      },
+    ]
+    subpackage_targets += [ subpackage.package ]
+  }
+
+  # This group validates that the subpackage labels passed into this template
+  # are actually package-creating targets, by ensuring that the computed package
+  # manifest and merkle files above are all outputs of the labels in question.
+  group_with_inputs(target_name + ".subpackage_deps") {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+    if (!defined(visibility)) {
+      visibility = []
+    }
+    visibility += [ ":*" ]
+
+    deps = subpackage_targets
+    inputs = subpackage_inputs
+  }
+
+  generated_resource(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+    contents = rebased_subpackages
+    outputs = [ "target_subpackages.json" ]
+    output_conversion = "json"
+
+    deps = [ ":${target_name}.subpackage_deps" ]
+  }
+}

@@ -1,0 +1,295 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.update.installer;
+
+/// Monitors a single update installation attempt.
+///
+/// Clients interested in receiving progress information for an update attempt
+/// should implement this protocol and provide the client end to
+/// [`Installer.StartUpdate`] or [`Installer.MonitorUpdate`].
+closed protocol Monitor {
+    /// Receives a status update for this installation attempt.
+    ///
+    /// This request will be called for all state changes, skipping none.
+    /// However, message delivery is throttled by the rate at which the
+    /// implementation acknowledges the messages.
+    ///
+    /// The throttled delivery doesn't impact the underlying state of the
+    /// [`Installer`].  It does not wait for any acknowledgements before it
+    /// moves on to the next state in its state machine.  The [`Installer`] will
+    /// simply queue up the states for the [`Monitor`] implementor to receive.
+    ///
+    /// During states with data that changes as the updage progress, the
+    /// [`Installer`] may, at its discretion, collapse redundant information
+    /// like the fraction completed, in the event that the [`Monitor`]
+    /// implementation is not responding to the `OnState()` requests in a timely
+    /// manner.
+    ///
+    /// + request `state` The new state of the update installation attempt.
+    /// - response        The implementation is ready to receive the next
+    ///                   [`State`] from the [`Installer`].
+    strict OnState(struct {
+        state State;
+    }) -> ();
+};
+
+/// The set of states that a [`Monitor`] can receive during an update
+/// installation attempt.
+///
+/// An installation attempt ends when it enters a terminal state, denoted below
+/// as the states on the right-hand side of the diagram with no arrows leading
+/// out of them.
+///
+/// # State Machine Diagram
+///
+/// ```
+///                       +----------------+     +----------------+
+///            +----------|    prepare     |---->|  fail_prepare  |
+///            |          +----------------+     +----------------+
+///            |                  |
+///            |                  v
+///            |          +----------------+     +----------------+
+///            +----------|     stage      |---->|   fail_stage   |
+///            |          +----------------+     +----------------+
+///            |                  |
+///            |                  v
+///            |          +----------------+     +----------------+
+///            +----------|     fetch      |---->|   fail_fetch   |
+///            |          +----------------+     +----------------+
+///            |                  |
+///            |                  v
+///            |          +----------------+     +----------------+
+///            +----------|     commit     |---->|   fail_commit  |
+///            |          +----------------+     +----------------+
+///            v                  |
+///    +----------------+         |              +----------------+
+///    |    canceled    |         +------------> |    complete    |
+///    +----------------+         |              +----------------+
+///                               v
+///                       +----------------+     +----------------+
+///                       | wait_to_reboot |---->|  defer_reboot  |
+///                       +----------------+     +----------------+
+///                               |
+///                               |              +----------------+
+///                               +------------->|     reboot     |
+///                                              +----------------+
+/// ```
+type State = strict union {
+    /// Fetching required metadata to begin the update and verifying system
+    /// state.
+    ///
+    /// Next States:
+    /// * `stage` system is ready to install the update.
+    /// * `fail_prepare` on error.
+    /// * `canceled` on cancel.
+    1: prepare PrepareData;
+
+    /// Fetching and writing kernel and firmware images.
+    ///
+    /// Next States:
+    /// * `fetch`  required kernel and firmware images are written.
+    /// * `fail_stage`  on error.
+    /// * `canceled` on cancel.
+    2: stage StageData;
+
+    /// Fetching packages.
+    ///
+    /// Next States:
+    /// * `commit` packages were fetched successfully.
+    /// * `fail_fetch` on error.
+    /// * `canceled` on cancel.
+    3: fetch FetchData;
+
+    /// Prepare to switch over to the new system by writing the packages
+    /// and switching the active partition.
+    ///
+    /// Next States:
+    /// * `wait_to_reboot` if a reboot is necessary to complete the update.
+    /// * `complete` if no reboot is necessary to complete the update.
+    /// * `fail_commit` on error.
+    /// * `canceled` on cancel.
+    4: commit CommitData;
+
+    /// The system is configured to boot the updated OS on next boot, and the
+    /// installer is waiting for the trigger to reboot the system.
+    ///
+    /// Next States:
+    /// * `reboot` when the installer decides it is time to initiate the reboot.
+    /// * `defer_reboot` if the initiator specifically requests to not reboot.
+    ///
+    5: wait_to_reboot WaitToRebootData;
+
+    /// The installer has initiated a system reboot into the updated OS.
+    ///
+    /// **This is a terminal state**
+    ///
+    6: reboot RebootData;
+
+    /// The initiator specifically requested to skip the reboot, but a reboot is
+    /// still required to complete the update.
+    ///
+    /// **This is a terminal state**
+    ///
+    7: defer_reboot DeferRebootData;
+
+    /// The update is complete and no reboot was required.
+    ///
+    /// **This is a terminal state**
+    ///
+    8: complete CompleteData;
+
+    /// An error occurred while preparing the install.
+    ///
+    /// **This is a terminal state**
+    ///
+    9: fail_prepare FailPrepareData;
+
+    /// An error occurred while staging the images for the OS.
+    ///
+    /// **This is a terminal state**
+    ///
+    10: fail_stage FailStageData;
+
+    /// An error occurred while fetching the required artifacts.
+    ///
+    /// **This is a terminal state**
+    ///
+    11: fail_fetch FailFetchData;
+
+    /// An error occured while switching partitions.
+    ///
+    /// **This is a terminal state**
+    ///
+    12: fail_commit FailCommitData;
+
+    /// The update is canceled.
+    ///
+    /// **This is a terminal state**
+    ///
+    13: canceled CanceledData;
+};
+
+/// Data associated with [`State.prepare`].
+type PrepareData = table {};
+
+/// Data associated with [`State.stage`].
+type StageData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+};
+
+/// Data associated with [`State.fetch`].
+type FetchData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+};
+
+/// Data associated with [`State.commit`].
+type CommitData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+};
+
+/// Data associated with [`State.wait_to_reboot`].
+type WaitToRebootData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+};
+
+/// Data associated with [`State.reboot`].
+type RebootData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+};
+
+/// Data associated with [`State.defer_reboot`].
+type DeferRebootData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+};
+
+/// Data associated with [`State.complete`].
+type CompleteData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+};
+
+/// Data associated with [`State.fail_prepare`].
+type FailPrepareData = table {
+    1: reason PrepareFailureReason;
+};
+
+/// Data associated with [`State.fail_stage`].
+type FailStageData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+    3: reason StageFailureReason;
+};
+
+/// Data associated with [`State.fail_fetch`].
+type FailFetchData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+    3: reason FetchFailureReason;
+};
+
+/// Data associated with [`State.fail_commit`].
+type FailCommitData = table {
+    1: info UpdateInfo;
+    2: progress InstallationProgress;
+};
+
+/// Data associated with [`State.canceled`].
+type CanceledData = table {};
+
+/// Metadata for an update.  Once a field is populated during an installation
+/// attempt, the value will not change.
+type UpdateInfo = table {
+    /// The total number of bytes that may be downloaded to apply this update.
+    /// Optional, the installer may not be able to provide this value.
+    1: download_size uint64;
+};
+
+/// Current progress for an installation attempt.
+type InstallationProgress = table {
+    /// The fraction [0-1.0f] of the installation that has been completed.
+    1: fraction_completed float32;
+
+    /// The number of bytes downloaded during this installation attempt. Less
+    /// than or equal to [`UpdateInfo.download_size`] if that field is present.
+    2: bytes_downloaded uint64;
+};
+
+/// The set of values provided when an installation attempt fails on [`State.prepare`].
+type PrepareFailureReason = strict enum {
+    /// The prepare failed because of some other reason.
+    INTERNAL = 0;
+
+    /// The prepare failed because the system does not have enough space to fetch
+    /// the update package.
+    OUT_OF_SPACE = 1;
+
+    /// The prepare failed because the system cannot downgrade across a version boundary. Not all
+    /// unsupported downgrades will fail with this error -- just the ones the system can detect. For
+    /// more context, see [RFC-0071](/docs/contribute/governance/rfcs/0071_ota_backstop.md).
+    UNSUPPORTED_DOWNGRADE = 2;
+};
+
+/// The set of values provided when an installation attempt fails on [`State.stage`].
+type StageFailureReason = strict enum {
+    /// The stage failed because of some other reason.
+    INTERNAL = 0;
+
+    /// The stage failed because the system does not have enough space to fetch a package.
+    OUT_OF_SPACE = 1;
+};
+
+/// The set of values provided when an installation attempt fails on [`State.fetch`].
+type FetchFailureReason = strict enum {
+    /// The fetch failed because of some other reason.
+    INTERNAL = 0;
+
+    /// The fetch failed because the system does not have enough space to fetch a package.
+    OUT_OF_SPACE = 1;
+};

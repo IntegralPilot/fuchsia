@@ -1,0 +1,24 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_STORAGE_MINFS_RESIZEABLE_BUFFER_H_
+#define SRC_STORAGE_MINFS_RESIZEABLE_BUFFER_H_
+
+#ifdef __Fuchsia__
+#include "src/storage/lib/buffer/resizeable_vmo_buffer.h"
+#else
+#include "src/storage/minfs/resizeable_array_buffer.h"
+#endif
+
+namespace minfs {
+
+#ifdef __Fuchsia__
+using ResizeableBufferType = storage::ResizeableVmoBuffer;
+#else
+using ResizeableBufferType = ResizeableArrayBuffer;
+#endif
+
+}  // namespace minfs
+
+#endif  // SRC_STORAGE_MINFS_RESIZEABLE_BUFFER_H_

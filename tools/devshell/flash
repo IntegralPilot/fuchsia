@@ -1,0 +1,111 @@
+#!/bin/bash
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Device management
+### flash a connected device
+## usage: fx flash [-s <serial>] [--build|--no-build]
+##   --build | --no-build    Build (or not) the required dependencies
+##   -s                      Serial of device you wish to flash to (only necessary
+##                           if multiple devices in fastboot mode)
+##  --skip-verify            Skip hardware verification. This is dangerous, please be
+##                           sure the images you are flashing match the device. Only
+##                           supported with ffx
+##  --no-bootloader-reboot   Don't reboot bootloader after flashing firmware or
+##                           recovery fastboot image.
+##
+## Defaults are defined by the "incremental" feature:
+##    'fx --enable=incremental flash'  defaults to "--build"
+##    'fx --disable=incremental flash'  defaults to "--no-build"
+
+set -e
+
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/fx-flash.sh || exit $?
+fx-config-read
+fx-fail-if-main-pb-is-not-set
+
+usage() {
+    fx-command-help
+    echo "Available devices:"
+    fx-command-run host-tool fastboot devices -l
+    exit 1
+}
+
+build=false
+if is_feature_enabled "incremental"; then
+  # In incremental workflows, these defaults have changed.
+  # Keep old behavior if incremental is not enabled.
+  build=true
+fi
+serial=
+device=$(get-device-name)
+skip_verify=false
+no_bootloader_reboot=false
+while [[ $# -ge 1 ]]; do
+  case "$1" in
+  -h|--help)
+    usage
+    ;;
+  --no-build)
+    build=false
+    ;;
+  --build)
+    build=true
+    ;;
+  -s)
+    shift
+    serial="$1"
+    ;;
+  -device)
+    shift
+    device="$1"
+    ;;
+  --skip-verify)
+    skip_verify=true
+    ;;
+  --no-bootloader-reboot)
+    no_bootloader_reboot=true
+    ;;
+  *)
+    fx-error "Unknown option $1."
+    usage
+  esac
+  shift
+done
+
+get_flash_source_args=()
+if [[ "${build}" == "true" ]]; then
+  fx-info "Building/refreshing flash artifacts"
+  get_flash_source_args+=(--build)
+fi
+flash_source="$(fx-command-run get-flash-source "${get_flash_source_args[@]}")"
+
+case "${flash_source}" in
+  flash-manifest:*)
+      flash_manifest="${FUCHSIA_BUILD_DIR}"/"${flash_source#flash-manifest:}"
+      product_bundle=
+      ;;
+  product-bundle:*)
+      flash_manifest=
+      product_bundle="${FUCHSIA_BUILD_DIR}"/"${flash_source#product-bundle:}"
+      ;;
+  *)
+      fx-error "Unsupported flash source format: ${flash_source}"
+      exit 1
+esac
+
+if is-remote-workflow-device; then
+  fx-error "It is not possible to flash a device over a remote tunnel, as flashing requires a direct USB connection."
+  fx-error "Use \`fx flash-remote\` from the local side of the link in these secarios."
+  fx-error "A lightweight build on the local side is: \`fx set core.x64 && fx self-build\`"
+  echo >&2
+  fx-error "If you are not using a remote workflow, run \`fx unset-device\` to remove the remote device configuration."
+  exit 1
+fi
+
+cd "${FUCHSIA_BUILD_DIR}"
+fx-flash "${serial}" "${device}" "${flash_manifest}" "${product_bundle}" "${skip_verify}" "${no_bootloader_reboot}"

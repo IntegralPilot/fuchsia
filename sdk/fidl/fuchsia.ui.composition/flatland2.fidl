@@ -1,0 +1,485 @@
+// Copyright 2026 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.ui.composition;
+
+using fuchsia.math;
+using zx;
+using fuchsia.ui.views;
+
+/// **Zero identifiers**: zero is never a valid identifier, for any of these types; each
+/// `Create*` method rejects it. Unlike the classic API (where, e.g., [`Flatland.SetContent`]
+/// accepts id 0 to clear a Transform's content), Flatland2 never uses a zero id to express
+/// clearing; where clearing is possible, it is expressed by omitting an optional field
+/// (see [`Flatland.SetTransformContent`]).
+///
+/// A user-defined identifier for a particular layer. See [`Flatland.CreateLayer`] and
+/// [`Flatland.ReleaseLayer`] for more information.
+@available(added=HEAD)
+type LayerId = struct {
+    value uint64;
+};
+
+/// A user-defined identifier for a particular layer stack created with [`Flatland.CreateLayerStack`].
+///
+/// Zero is never a valid `LayerStackId`; the shared identifier rules documented on
+/// [`LayerId`] also apply.
+@available(added=HEAD)
+type LayerStackId = struct {
+    value uint64;
+};
+
+/// A maximum of 32 layers per stack is enough for the expected usage of these APIs.
+@available(added=HEAD)
+const MAX_STACK_LAYERS int32 = 32;
+
+/// A user-defined identifier for a particular image created with [`Flatland.CreateImage2`].
+///
+/// Zero is never a valid `ImageId`; the shared identifier rules documented on
+/// [`LayerId`] also apply.
+@available(added=HEAD)
+type ImageId = struct {
+    value uint64;
+};
+
+/// A user-defined identifier for a particular viewport created with [`Flatland.CreateViewport2`].
+///
+/// Zero is never a valid `ViewportId`; the shared identifier rules documented on
+/// [`LayerId`] also apply.
+@available(added=HEAD)
+type ViewportId = struct {
+    value uint64;
+};
+
+/// Bitset which supports all permutations of flips and rotations.  Flips (if any) are performed
+/// first, followed by rotation (if any).
+@available(added=HEAD)
+type FlipThenRotate = strict bits : uint8 {
+    /// Flip the image horizontally (across the Y-axis).
+    FLIP_H = 0x1;
+
+    /// Flip the image vertically (across the X-axis).
+    FLIP_V = 0x2;
+
+    /// Rotate the image 90 degrees clockwise.
+    ROTATE_90 = 0x4;
+};
+
+/// Selects what a Layer composites: an image, a solid color, or nothing at all.
+///
+/// `INVISIBLE` is the freshly-created state. An `INVISIBLE` layer keeps its place in any
+/// `LayerStack` which references it, but contributes nothing to the frame. Because layer
+/// properties are sticky (see [`LayerProperties`]), passing through `INVISIBLE` and back
+/// loses nothing.
+@available(added=HEAD)
+type CompositionMode = strict enum {
+    INVISIBLE = 1;
+    IMAGE = 2;
+    SOLID_COLOR = 3;
+};
+
+/// Stateful properties associated with a Layer.
+///
+/// All fields are sticky: [`SetLayerProperties`] merges the provided table into the
+/// layer's stored properties, and stored values persist across [`SetLayerImage`] calls
+/// and across composition mode changes. Fields not used by the current composition mode
+/// keep their values, and take effect again when a mode that uses them is re-entered.
+/// Nothing is cleared implicitly; [`ResetLayer`] is the only operation that forgets
+/// stored properties.
+///
+/// **Hints (Safety and Performance Semantics)**:
+/// Hints (such as [`hint_damage_rects`] and [`hint_visible_rects`]) are optional
+/// optimization details provided by the client.
+/// * **Ignorable by Design**: The implementation is free to ignore these hints. If ignored,
+///   rendering remains fully correct, though possibly less optimal.
+/// * **Correct Hints**: Yield the identical visual result but may improve performance (e.g.,
+///   by allowing composition shortcuts or partial updates).
+/// * **Incorrect Hints**: May result in rendering artifacts, stale regions, or incorrect
+///   pixels on the display, as the implementation might optimize based on false assumptions.
+@available(added=HEAD)
+type LayerProperties = table {
+    // --- Common properties which apply to both image / solid fill mode ---
+
+    /// The rectangle where the layer content will be displayed in its local coordinate space.
+    ///
+    /// For image layers, visual properties are applied in the following order:
+    /// 1. **Sample**: The region specified by `sample_rect` is extracted from the image.
+    /// 2. **Transform**: The sampled region is flipped and rotated as specified by `transform`.
+    /// 3. **Scale/Fit**: Transformed content is implicitly scaled to fit the `display_rect`.
+    ///
+    /// Hardware image scaling is requested implicitly when the dimensions of the transformed
+    /// `sample_rect` differ from the extent of the `display_rect`. Not all display hardware supports
+    /// scaling, or may have limitations.
+    ///
+    /// The dimensions of `display_rect` must account for image dimension changes caused by rotations
+    /// to avoid implicit scaling or distortion. For example, rotating a 600x300 pixel region
+    /// by 90 degrees would require specifying 300x600 dimensions here to maintain the aspect ratio.
+    ///
+    /// **Note**: This rectangle is specified in the local space of the LayerStack (or the Transform
+    /// the LayerStack is attached to). Any scaling applied by parent transforms in the Flatland scene
+    /// graph will further affect the final size on the physical display.
+    ///
+    /// Default: (0,0,0,0). The layer will not be visible until a rectangle with non-zero
+    /// width and height is set.
+    1: display_rect fuchsia.math.RectU;
+
+    /// The opacity of the layer, in the range [0..1].
+    ///
+    /// Multiplies with opacity inherited from `Transform`s above the layer's `LayerStack`
+    /// (see [`fuchsia.ui.composition/Flatland.SetOpacity`]) to give the layer's *effective
+    /// opacity*. The layer renders as if its content's own alpha (image pixels' alpha, or
+    /// `color.alpha` for a solid-color layer) were scaled by the effective opacity; since
+    /// this requires blending, a `REPLACE` layer with effective opacity below 1.0 renders
+    /// as `PREMULTIPLIED_ALPHA` (see [`blend_mode`]). A layer with effective opacity 0.0
+    /// is invisible.
+    ///
+    /// Default: 1.0 (the content's own alpha applies unmodified).
+    2: opacity float32;
+
+    /// The blend mode used to composite the layer over the content beneath it.
+    ///
+    /// `REPLACE` is honored only while the layer's effective opacity is 1.0 (see [`opacity`]);
+    /// at lower effective opacity the layer renders as `PREMULTIPLIED_ALPHA`, so that opacity
+    /// always fades the layer. To write exact sub-unity alpha values into the output (e.g.
+    /// punching a hole for an underlay), author them in the content itself (the image's own
+    /// pixels, or `color.alpha` for a solid-color layer) and leave `opacity` at 1.0.
+    ///
+    /// `STRAIGHT_ALPHA` names a content *encoding*, and is meaningful for image
+    /// content. A solid-color layer's encoding is fixed by the API (`color` is straight
+    /// RGBA regardless of `blend_mode`), so for solid-color content `STRAIGHT_ALPHA` is
+    /// accepted and composites identically to `PREMULTIPLIED_ALPHA`.
+    ///
+    /// Default: `BlendMode2.REPLACE`.
+    3: blend_mode BlendMode2;
+
+    // --- Properties which apply only to layers in solid-fill mode ---
+
+    /// The color to fill the layer with, as straight (non-premultiplied) RGBA regardless
+    /// of `blend_mode`. The compositor performs any conversion needed for rendering.
+    ///
+    /// Default: opaque white (1.0, 1.0, 1.0, 1.0).
+    4: color ColorRgba;
+
+    // --- Properties which apply only to layers in image mode ---
+
+    /// Describes the region inside the image to sample from, in unnormalized coordinates
+    /// (rect width/height match image width/height).
+    ///
+    /// Default: (0,0,0,0), which is interpreted as the entire image region.  A client can
+    /// reset to the full image by setting this field to (0,0,0,0).
+    ///
+    /// Must lie within the bounds of the bound image. This is checked during
+    /// [`fuchsia.ui.composition/Flatland.Present`], and only for layers whose
+    /// `composition_mode` is `IMAGE`, so the order of calls within a batch does not
+    /// matter: a rect and an image of matching size may be set in either order, and a
+    /// rect set while no image is bound (or while another mode is in effect) is stored
+    /// without complaint. A violation at `Present` closes the connection with
+    /// `BAD_OPERATION`.
+    5: sample_rect fuchsia.math.RectF;
+
+    /// Specifies image transform.
+    ///
+    /// Default: No transformation (identity).
+    6: transform FlipThenRotate;
+
+    /// A hint describing the region of the source image that has changed since the last frame.
+    /// Specified in the coordinate space of the source image (buffer).
+    ///
+    /// Default: Empty vector (interpreted as the entire sample rect being damaged).
+    ///
+    /// Refer to [`LayerProperties`] for the general safety and performance semantics of hints.
+    7: hint_damage_rects vector<fuchsia.math.RectU>:MAX;
+
+    /// A hint describing the visible region of the layer on the screen.
+    /// Specified in the local coordinate space of the Layer (matching `display_rect`).
+    ///
+    /// Default: Empty vector (interpreted as the entire `display_rect` being visible).
+    ///
+    /// Refer to [`LayerProperties`] for the general safety and performance semantics of hints.
+    8: hint_visible_rects vector<fuchsia.math.RectU>:MAX;
+
+    // --- Mode selection ---
+
+    /// Selects which of the property groups above is in effect; see [`CompositionMode`].
+    ///
+    /// Default: `CompositionMode.INVISIBLE`.
+    9: composition_mode CompositionMode;
+
+    // Eventually add additional fields corresponding to fields in AIDL LayerCommand:
+    // - `@nullable float[] colorTransform`
+    // - `@nullable Luts luts`
+    // - `@nullable PerFrameMetadata[] perFrameMetadata`
+    //
+    // Of these, `colorTransform` and `luts` use a try-and-validate model, where the HAL will fails
+    // by instructing the caller to fall back to `CLIENT` composition.  Because Flatland always
+    // succeeds in presenting content (even if it has to fall back to GPU composition itself), it
+    // makes no sense to add these fields until they are actually implemented.
+    //
+    // `perFrameMetadata` uses a capability-query model: the client must make an affirmative query
+    // to the HAL before using this field.
+};
+
+/// Content that can be attached to a Transform when Flatland2 is enabled.
+///
+/// This union defines the types of content that can be attached to a Transform
+/// using [`Flatland.SetTransformContent`].
+@available(added=HEAD)
+type TransformContent = strict union {
+    1: layer_stack LayerStackId;
+    2: viewport ViewportId;
+};
+
+/// A fence that will be signaled when the associated resource is ready for Scenic to use.
+/// For context-specific usage info, refer to the method the fence appears in.
+@available(added=HEAD)
+type WaitFence = strict resource union {
+    /// A basic handle (e.g., EVENT or EVENTPAIR).
+    1: basic zx.Handle;
+    /// At the time the fence is signalled, the timestamp of the
+    /// corresponding event will have been written into the counter.
+    2: timestamp zx.Handle:COUNTER;
+};
+
+/// A fence that will be signaled by Scenic when some condition becomes true.
+/// For more details, refer to the method the fence appears in.
+@available(added=HEAD)
+type SignalFence = strict resource union {
+    /// A basic handle (e.g., EVENT or EVENTPAIR).
+    1: basic zx.Handle;
+    /// Before Scenic signals the fence, it will write the timestamp of
+    /// the corresponding event into the counter.
+    2: timestamp zx.Handle:COUNTER;
+};
+
+/// This protocol is composed into the "classic" [`Flatland`] protocol, and
+/// cleans up some "warts" in the original design.
+///
+/// All methods defined in this protocol are ONLY available when Flatland2 is enabled
+/// (e.g. via [`TrustedFlatlandConfig.use_flatland2_api`]). Calling these methods
+/// when Flatland2 is not enabled will result in a channel closure.
+///
+/// Broadly speaking, the "warts" involve properties that are set on images when they shouldn't be.
+/// For example, it should be possible to display two copies of the same image side by side, with
+/// one image flipped `LEFT_RIGHT` to reflect the other.  This is impossible in the classic Flatland
+/// API, because the flip is a property of the image.  In Flatland2, the flip is a property of
+/// the layer, and the client's goal is easily achieved with two layers with the same image and
+/// different flips.
+///
+/// Certain "classic" Flatland methods are disabled/illegal when Flatland2 is enabled.
+/// Eventually these methods will be removed; Flatland2 will be the standard way to display
+/// images in Flatland.  Until then, this "opt in" approach provides clients with a convenient way
+/// to migrate to this modernized API.  The disabled methods are:
+/// - [`fuchsia.ui.composition/Flatland.CreateFilledRect`]
+/// - [`fuchsia.ui.composition/Flatland.CreateImage`]
+/// - [`fuchsia.ui.composition/Flatland.CreateViewport`]
+/// - [`fuchsia.ui.composition/Flatland.ReleaseFilledRect`]
+/// - [`fuchsia.ui.composition/Flatland.ReleaseImage`]
+/// - [`fuchsia.ui.composition/Flatland.ReleaseViewport`]
+/// - [`fuchsia.ui.composition/Flatland.SetContent`]
+/// - [`fuchsia.ui.composition/Flatland.SetImageBlendingFunction`]
+/// - [`fuchsia.ui.composition/Flatland.SetImageBlendMode`]
+/// - [`fuchsia.ui.composition/Flatland.SetImageDestinationSize`]
+/// - [`fuchsia.ui.composition/Flatland.SetImageFlip`]
+/// - [`fuchsia.ui.composition/Flatland.SetImageOpacity`]
+/// - [`fuchsia.ui.composition/Flatland.SetSolidFill`]
+/// - [`fuchsia.ui.composition/Flatland.SetImageSampleRegion`]
+/// - [`fuchsia.ui.composition/Flatland.SetViewportProperties`]
+/// - [`fuchsia.ui.composition/TrustedFlatland.ReleaseImageImmediately`]
+@available(added=HEAD)
+closed protocol Flatland2 {
+    /// A Layer is a type of `Content` that composites either a single `Image` or a solid
+    /// color. It separates visual properties (such as size, flip, opacity, and blending)
+    /// from the raw pixel data.
+    ///
+    /// Unlike typical `Content` items which represent a static visual resource, a Layer is designed
+    /// to be a dynamic container for an image sequence. Typical usage involves setting the layer's
+    /// visual properties and image metadata infrequently, and then rapidly swapping the active
+    /// `Image` (e.g. on every frame) with another image of matching metadata.
+    ///
+    /// This separation allows a single `Image` resource to be reused across multiple layers with
+    /// different visual configurations simultaneously.
+    ///
+    /// To use a Layer:
+    /// 1. Create a `Layer` using [`CreateLayer`].
+    /// 2. Set properties on the `Layer` via [`SetLayerProperties`], including the
+    ///    composition mode.
+    /// 3. For an image layer, associate an `Image` with the `Layer` via [`SetLayerImage`].
+    /// 4. Add the `Layer` to a `LayerStack` via [`SetStackLayers`].
+    /// 5. Set the `LayerStack` as the content of a node via [`SetTransformContent`].
+    ///
+    /// `layer_id` must satisfy the identifier rules documented on [`LayerId`].
+    strict CreateLayer(struct {
+        layer_id LayerId;
+    });
+
+    /// Released Layers will be garbage collected by the system once they are no longer necessary
+    /// for rendering. For Layers, this means:
+    /// - the Layer is no longer referenced by any LayerStack, and
+    /// - any pending rendering that references the Layer is complete.
+    ///
+    /// `layer_id` must refer to a valid, unreleased Layer.
+    strict ReleaseLayer(struct {
+        layer_id LayerId;
+    });
+
+    /// Associates an Image with the Layer.
+    ///
+    /// The binding is legal in any composition mode, and is sticky: it survives composition
+    /// mode changes, and is replaced only by a later [`SetLayerImage`] call (or cleared by
+    /// [`ResetLayer`]). The image is displayed only while the layer's composition mode is
+    /// `IMAGE`.
+    ///
+    /// The bound image must be large enough for the layer's stored `sample_rect`; this is
+    /// checked at [`fuchsia.ui.composition/Flatland.Present`], not here. See
+    /// [`LayerProperties.sample_rect`].
+    ///
+    /// `layer_id` must refer to a valid, unreleased Layer.
+    /// `image_id` must refer to a valid, unreleased Image.
+    /// `acquire_fence` is an optional fence that must be signaled before the image is displayed.
+    /// `release_fence` is an optional fence, signaled by Scenic when *this binding* no
+    /// longer references the image. It is per-binding, not per-image: an image bound to
+    /// several layers has one such fence per binding, and the image is safe to write only
+    /// once every one of them has signaled.
+    ///
+    /// A binding is ended by:
+    ///
+    /// - being superseded by a later [`SetLayerImage`] on the same layer
+    /// - [`ResetLayer`]
+    /// - the layer ref-count reaching zero, either via [`ReleaseLayer`] or by being released
+    ///   by a layer stack
+    /// - destruction of the session, which ends every binding it holds
+    ///
+    /// For a binding ended while the session is alive, Scenic signals at the first frame
+    /// retire after that point. Bindings that never reached the screen (e.g. one superseded
+    /// within a single batch, or one lost when several
+    /// [`fuchsia.ui.composition/Flatland.Present`] calls are squashed into a single
+    /// frame) signal at that same retire rather than immediately. The signal is
+    /// therefore conservative by at most one frame; it is never early.
+    // TODO(https://fxbug.dev/474444799): specify release-fence timing for session
+    // destruction. Audit what classic Flatland does with undelivered release fences at
+    // session death, match it, and document it in the paragraph above.
+    strict SetLayerImage(resource struct {
+        layer_id LayerId;
+        image_id ImageId;
+        acquire_fence WaitFence:optional;
+        release_fence SignalFence:optional;
+    });
+
+    /// Sets properties of the Layer.
+    ///
+    /// The provided `properties` table is merged into the layer's stored properties: fields
+    /// which are unset in `properties` retain their previously stored values. Stored
+    /// properties are sticky; see [`LayerProperties`] for the full persistence semantics.
+    ///
+    /// Values are stored as given; validation which depends on other state (notably
+    /// `sample_rect` against the bound image) happens at
+    /// [`fuchsia.ui.composition/Flatland.Present`]. See [`LayerProperties.sample_rect`].
+    ///
+    /// `layer_id` must refer to a valid, unreleased Layer.
+    strict SetLayerProperties(struct {
+        layer_id LayerId;
+        properties LayerProperties;
+    });
+
+    /// Unbinds any Image bound to the layer and clears every stored [`LayerProperties`]
+    /// field, returning the layer to its freshly-created state (composition mode
+    /// `INVISIBLE`, all properties at their documented defaults). This is the only
+    /// operation which forgets stored layer properties.
+    ///
+    /// `layer_id` must refer to a valid, unreleased Layer.
+    strict ResetLayer(struct {
+        layer_id LayerId;
+    });
+
+    /// Creates a new layer stack with the specified `stack_id`.
+    ///
+    /// `stack_id` must satisfy the identifier rules documented on [`LayerId`].
+    strict CreateLayerStack(struct {
+        stack_id LayerStackId;
+    });
+
+    /// Releases the layer stack with the specified `stack_id`.
+    strict ReleaseLayerStack(struct {
+        stack_id LayerStackId;
+    });
+
+    /// Sets the layers in the stack. The order of layers in the vector determines their Z-order,
+    /// with the first element being the back-most and the last element being the front-most.
+    ///
+    /// `stack_id` must refer to a valid, unreleased LayerStack. Each element of `layers`
+    /// must refer to a valid, unreleased Layer. Duplicate layers within `layers` are
+    /// disallowed.
+    strict SetStackLayers(struct {
+        stack_id LayerStackId;
+        layers vector<LayerId>:MAX_STACK_LAYERS;
+    });
+
+    /// Creates an Image resource.
+    ///
+    /// `image_id` must satisfy the identifier rules documented on [`LayerId`].
+    strict CreateImage2(resource struct {
+        image_id ImageId;
+        import_token BufferCollectionImportToken;
+        vmo_index uint32;
+        properties ImageProperties;
+    });
+
+    /// Released Images will be garbage collected by the system once they are no longer necessary
+    /// for rendering. For Images, this means:
+    /// - the Image is no longer bound to any Layer, and
+    /// - any pending rendering that references the Image is complete.
+    ///
+    /// The `image_id` value is freed for reuse immediately by the client (identifier uniqueness
+    /// is instantaneous).
+    ///
+    /// Note: Per-binding release fences (passed to `SetLayerImage`) are unaffected by this call.
+    /// They track the lifecycle of individual layer bindings, not the client's `image_id`.
+    ///
+    /// `image_id` must refer to a valid, unreleased Image.
+    strict ReleaseImage2(struct {
+        image_id ImageId;
+    });
+
+    /// Creates a Viewport resource.
+    ///
+    /// `viewport_id` must satisfy the identifier rules documented on [`LayerId`].
+    strict CreateViewport2(resource struct {
+        viewport_id ViewportId;
+        token fuchsia.ui.views.ViewportCreationToken;
+        properties ViewportProperties;
+        child_view_watcher server_end:ChildViewWatcher;
+    });
+
+    /// Releases a Viewport from the scene.
+    strict ReleaseViewport2(struct {
+        viewport_id ViewportId;
+    }) -> (resource struct {
+        token fuchsia.ui.views.ViewportCreationToken;
+    });
+
+    /// Sets the properties of a Viewport.
+    strict SetViewportProperties2(struct {
+        viewport_id ViewportId;
+        properties ViewportProperties;
+    });
+
+    /// Sets (or clears) the content of a Transform.
+    ///
+    /// The same content may be attached to more than one Transform; each attachment composites
+    /// that content again under its own Transform's matrix, clip, and opacity, so a single
+    /// LayerStack or Viewport can appear repeatedly in a scene without the client duplicating the
+    /// underlying resources.
+    ///
+    /// A Transform's content can be cleared by not providing the optional `content`.
+    ///
+    /// If `content` is set, it must refer to a valid, unreleased LayerStack or Viewport.
+    /// Unlike classic [`Flatland.SetContent`], a zero id does not clear the content.
+    // TODO(https://fxbug.dev/474444799): confirm the Viewport half. The LayerStack half
+    // is settled (one content handle may already be the priority child of several
+    // transforms, and the facade depends on it); multi-parenting a Viewport is expected
+    // to work for the same reason, but has not been verified and nothing pins it.
+    strict SetTransformContent(struct {
+        transform_id TransformId;
+        content TransformContent:optional;
+    });
+};

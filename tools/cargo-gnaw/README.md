@@ -1,0 +1,177 @@
+# Cargo GNaw
+**Tooling to convert Cargo.toml files into native GN rules**
+
+[![crates.io](https://img.shields.io/crates/v/cargo-gnaw.svg)](https://crates.io/crates/cargo-gnaw)
+[![license](https://img.shields.io/badge/license-BSD3.0-blue.svg)](https://github.com/google/cargo-gnaw/LICENSE)
+[![docs.rs](https://docs.rs/com/badge.svg)](https://docs.rs/crate/cargo-gnaw/)
+![cargo-gnaw](https://github.com/google/cargo-gnaw/workflows/cargo-gnaw/badge.svg)
+
+## Install
+```sh
+$ cargo install --path ~/cargo-gnaw
+```
+
+## Run
+```sh
+$ cargo gnaw --manifest-path ~/fuchsia/third_party/rust_crates/Cargo.toml -o ~/fuchsia/third_party/rust_crates/BUILD.gn
+```
+
+### Options
+* --skip-root - Skip the root package in the Cargo.toml and treat it's dependencies as the top-level targets
+* --gn-bin - Path to GN binary for formatting the output
+* --min-publish-age - Minimum age (in days) of published packages to resolve (e.g. 14)
+
+## How it works
+
+Cargo GNaw operates on vendored crates to convert them into [GN](https://gn.googlesource.com/gn/+/HEAD/docs/reference.md) rules. The resulting BUILD.gn file is expected
+to be vendored with the crates and provides targets for the GN build system to reference.
+
+All top-level crates are given an easy to use GN alias group that references the version exposed in the Cargo.toml.
+Direct dependencies of the root crate can be "lifted" to the top-level by skipping the default
+root crate.
+
+### Simple Example
+```toml
+[package]
+name = "simple"
+version = "1.0.25"
+authors = ["Benjamin Brittain <bwb@google.com>"]
+edition = "2024"
+
+[dependencies]
+```
+
+converts to:
+
+```gn
+
+group("simple") {
+  deps = [":simple-1-0-25"]
+}
+
+rust_library("simple-1-0-25") {
+  crate_name = "simple"
+  crate_root = "//tools/cargo-gnaw/src/tests/simple/src/lib.rs"
+  output_name = "simple-9ac42213326ac72d"
+
+  deps = []
+
+  rustenv = []
+  rustflags = ["--cap-lints=allow",
+               "--edition=2018",
+               "-Cmetadata=9ac42213326ac72d",
+               "-Cextra-filename=-9ac42213326ac72d"]
+}
+
+```
+
+### Build Scripts
+GNaw intentionally does not handle build.rs scripts at compilation time. Any evaluation of a build.rs script is done when the crate is vendored.
+The resulting configuration which is usually produced by the build.rs script is put into [a
+section in the source Cargo.toml](#gn-configs).
+Simple build.rs scripts (ones that only depend upon Rust's `std` library) evaluate and
+automatically provide the author with the expected configuration.
+
+### Packages vs. targets vs. crates
+The difference between a "package", "target", and a "crate" is useful knowledge when working with GNaw:
+  - A Cargo "target" corresponds to source files that can be compiled into a Rust "crate".
+  There are multiple target types, including library and binary.
+  - A Cargo "package" contains one or more "targets", and can contain at most one library target.
+
+(Paraphrased from https://doc.rust-lang.org/cargo/reference/cargo-targets.html)
+
+Many Cargo packages only contain a single library target that produces a single library crate.
+Because of this (and because of the catchiness of the term) "crate" is often used imprecisely to
+refer to any of those three items depending on the context. However, when packages contain
+multiple targets, like one or more binaries alongside the library, it becomes important to
+distinguish between these terms.
+
+## GN configs
+Some targets, including but not limited to those that use build.rs scripts, require additional
+configuration that can be specified in the Cargo.toml file. This configuration is consumed by
+GNaw, not Cargo, and used when generating GN targets.
+
+### Basic configuration
+Basic configuration for a package's library target is specified as
+`gn.package.<PackageName>.<ExactVersion>`. This configuration will be applied to the GN library
+target unconditionally (for all platforms) and can include the following arrays:
+
+* `configs` - native GN config
+* `remove_configs` - native GN configs to exclude
+* `deps` - native GN dependency
+* `env_vars` - environment variables, usually used for pretending to be Cargo
+* `features` - extra crate features to enable (converted to `--cfg=feature="..."` flags)
+* `remove_features` - crate features to exclude (converted to `--cfg=feature="..."` flags removed via `-=` in GN)
+* `rustflags` - flags to pass through to rustc
+* `remove_rustflags` - flags to remove from rustc (via `-=` in GN)
+
+#### Example
+```toml
+[gn.package.anyhow."1.0.25"]
+rustflags = [ "--cfg=backtrace" ]
+```
+
+### Platform-specific configuration
+You can also apply configuration to specific platforms only, such as when
+building for Fuchsia, when building for the Zircon kernel (`cfg(kernel)` or
+`cfg(not(kernel))`), or when targeting specific architectures.
+
+Specify platforms in the Rust cfg format (for example, `cfg(unix)`, `cfg(kernel)`,
+`cfg(all(kernel, target_arch = "x86_64"))`). You can use any of the configuration fields
+documented above (`configs`, `remove_configs`, `deps`, `env_vars`, `features`,
+`remove_features`, `rustflags`, `remove_rustflags`).
+
+#### Example
+```toml
+[gn.package.foo."1.2.3".platform."cfg(target_os = \"fuchsia\")"]
+configs = [ "//some:fuchsia_specific_config" ]
+
+[gn.package.bitflags."2.13.0".platform."cfg(kernel)"]
+remove_features = [ "std" ]
+```
+
+### Generating executables for binary targets
+GNaw also supports generating GN executable targets for Cargo binary targets. GNaw must be told
+to generate such targets; none are generated by default.
+
+Platform-independent or -dependent configuration can be specified as well, similar to above. The
+same four configuration fields (`configs`, `deps`, `env_vars`, `rustflags`) documented above are
+supported.
+
+In the example below, `my-gn-name` will become both the name of the group target to depend upon
+and the executable's output_name, so usages can assume output_name == target_name (and must since
+get_target_outputs only works within the same file).
+
+#### Example
+This example generates a group target named `my-gn-name` and an executable target that produces
+`my-gn-name` from the binary `my-cargo-target` target inside package `my-cargo-package` version
+1.2.3. Also, when building for Unix this example applies an extra GN config.
+
+```toml
+[gn.package.my-cargo-package."1.2.3".binary.my-cargo-target]
+output_name = "my-gn-name"
+rustflags = [ "--cfg=feature" ]
+
+[gn.package.my-cargo-package."1.2.3".binary.my-cargo-target.platform."cfg(unix)"]
+configs = [ "//some:unix_specific_config" ]
+```
+
+### Global configuration
+Global configuration affecting all packages can be specified in `[gn.config]`:
+
+* `min_publish_age` - Minimum age (in days) of published crates (e.g. `14`), passing `-Zmin-publish-age` and
+  `--config=registry.global-min-publish-age="<days> days"` to Cargo resolution.
+* `require_licenses` - Whether crates must have license files.
+* `add_cfgs` - Global GN configs to add to all generated targets.
+* `remove_cfgs` - Global GN configs to remove from all generated targets.
+
+#### Example
+```toml
+[gn.config]
+min_publish_age = 14
+require_licenses = true
+
+# Allow specific emergency security patch before publish cooldown:
+[gn.package.hotfix-crate."1.2.3"]
+allow_recent_publish = true
+```

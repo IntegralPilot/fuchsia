@@ -1,0 +1,93 @@
+// Copyright 2017 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_LIB_FIDL_C_WALKER_TESTS_FIDL_CODED_TYPES_H_
+#define SRC_LIB_FIDL_C_WALKER_TESTS_FIDL_CODED_TYPES_H_
+
+#include <lib/fidl/coding.h>
+#include <lib/fidl/internal.h>
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+extern const FidlCodedHandle nonnullable_handle;
+extern const FidlCodedHandle nullable_handle;
+extern const FidlCodedHandle nullable_channel_handle;
+extern const FidlCodedHandle nullable_vmo_handle;
+extern const FidlCodedHandle nonnullable_channel_handle;
+extern const FidlCodedHandle nonnullable_vmo_handle;
+
+extern const FidlCodedArray array_of_two_nonnullable_handles;
+extern const FidlCodedArray array_of_four_nonnullable_handles;
+extern const FidlCodedArray array_of_five_nullable_handles;
+extern const FidlCodedArray array_of_three_arrays_of_four_nonnullable_handles;
+extern const FidlCodedArray array_of_two_arrays_of_two_nonnullable_handles;
+
+extern const FidlCodedString unbounded_nonnullable_string;
+extern const FidlCodedString unbounded_nullable_string;
+extern const FidlCodedString bounded_32_nonnullable_string;
+extern const FidlCodedString bounded_32_nullable_string;
+extern const FidlCodedString bounded_4_nonnullable_string;
+extern const FidlCodedString bounded_4_nullable_string;
+
+extern const FidlCodedVector unbounded_nonnullable_vector_of_handles;
+extern const FidlCodedVector unbounded_nullable_vector_of_handles;
+extern const FidlCodedVector bounded_32_nonnullable_vector_of_handles;
+extern const FidlCodedVector bounded_32_nullable_vector_of_handles;
+extern const FidlCodedVector bounded_2_nonnullable_vector_of_handles;
+extern const FidlCodedVector bounded_2_nullable_vector_of_handles;
+
+extern const FidlCodedVector unbounded_nonnullable_vector_of_uint32;
+extern const FidlCodedVector unbounded_nullable_vector_of_uint32;
+extern const FidlCodedVector bounded_32_nonnullable_vector_of_uint32;
+extern const FidlCodedVector bounded_32_nullable_vector_of_uint32;
+extern const FidlCodedVector bounded_2_nonnullable_vector_of_uint32;
+extern const FidlCodedVector bounded_2_nullable_vector_of_uint32;
+
+extern const FidlCodedStruct nonnullable_handle_message_type;
+extern const FidlCodedStruct nonnullable_channel_message_type;
+extern const FidlCodedStruct multiple_nonnullable_handles_message_type;
+extern const FidlCodedStruct nullable_handle_message_type;
+extern const FidlCodedStruct multiple_nullable_handles_message_type;
+
+extern const FidlCodedStruct array_of_nonnullable_handles_message_type;
+extern const FidlCodedStruct array_of_nullable_handles_message_type;
+extern const FidlCodedStruct array_of_array_of_nonnullable_handles_message_type;
+extern const FidlCodedStruct out_of_line_array_of_nonnullable_handles_message_type;
+
+extern const FidlCodedStruct unbounded_nonnullable_string_message_type;
+extern const FidlCodedStruct unbounded_nullable_string_message_type;
+extern const FidlCodedStruct bounded_32_nonnullable_string_message_type;
+extern const FidlCodedStruct bounded_32_nullable_string_message_type;
+extern const FidlCodedStruct multiple_nonnullable_strings_message_type;
+extern const FidlCodedStruct multiple_nullable_strings_message_type;
+extern const FidlCodedStruct multiple_short_nonnullable_strings_message_type;
+extern const FidlCodedStruct multiple_short_nullable_strings_message_type;
+
+extern const FidlCodedStruct unbounded_nonnullable_vector_of_handles_message_type;
+extern const FidlCodedStruct unbounded_nullable_vector_of_handles_message_type;
+extern const FidlCodedStruct bounded_32_nonnullable_vector_of_handles_message_type;
+extern const FidlCodedStruct bounded_32_nullable_vector_of_handles_message_type;
+extern const FidlCodedStruct multiple_nonnullable_vectors_of_handles_message_type;
+extern const FidlCodedStruct multiple_nullable_vectors_of_handles_message_type;
+
+extern const FidlCodedStruct unbounded_nonnullable_vector_of_uint32_message_type;
+extern const FidlCodedStruct unbounded_nullable_vector_of_uint32_message_type;
+extern const FidlCodedStruct bounded_32_nonnullable_vector_of_uint32_message_type;
+extern const FidlCodedStruct bounded_32_nullable_vector_of_uint32_message_type;
+extern const FidlCodedStruct multiple_nonnullable_vectors_of_uint32_message_type;
+extern const FidlCodedStruct multiple_nullable_vectors_of_uint32_message_type;
+
+extern const FidlCodedStruct struct_level_0_struct;
+extern const FidlCodedStruct nested_structs_message_type;
+
+extern const FidlCodedStructPointer struct_ptr_level_0_struct_pointer;
+extern const FidlCodedStruct nested_struct_ptrs_message_type;
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif  // SRC_LIB_FIDL_C_WALKER_TESTS_FIDL_CODED_TYPES_H_

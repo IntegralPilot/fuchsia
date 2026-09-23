@@ -1,0 +1,229 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.virtualization.hardware;
+
+using fuchsia.net;
+using fuchsia.ui.input3;
+using fuchsia.ui.pointer;
+using fuchsia.virtualization;
+using zx;
+
+// The following EVENT_* constants indicate which user signal is associated with an event.
+// The value 0 is `ZX_USER_SIGNAL_0`, 1 is `ZX_USER_SIGNAL_1` etc.
+
+/// Set a flag to inspect queues on the next interrupt.
+const EVENT_SET_QUEUE uint32 = 0;
+/// Set a flag to inspect configs on the next interrupt.
+const EVENT_SET_CONFIG uint32 = 1;
+/// If a flag is set, send an interrupt to the device.
+const EVENT_SET_INTERRUPT uint32 = 2;
+
+/// Contains the details of a device trap.
+type Trap = struct {
+    /// The address of the device trap. This must be page-aligned.
+    addr uint64;
+
+    /// The size of the device trap. This must be a multiple of the page size.
+    size uint64;
+};
+
+/// Contains the basic information required to start execution of a device.
+type StartInfo = resource struct {
+    /// The trap associated with a device. It is up to the device to set this
+    /// trap during device setup.
+    trap Trap;
+
+    /// The guest associated with a device. This handle should be used to setup
+    /// device traps, and then be released before device operation begins.
+    guest zx.Handle:<GUEST, optional>;
+
+    /// The event associated with a device interrupt. This is how the device will
+    /// notify the guest of events it should process.
+    ///
+    /// The meaning of the different signals that can be raised on the event are
+    /// documented by the EVENT_* constants above.
+    event zx.Handle:EVENT;
+
+    /// The VMO used to represent guest physical memory.
+    vmo zx.Handle:VMO;
+};
+
+closed protocol VirtioDevice {
+    /// Configure a `queue` for the device. This specifies the `size` and the
+    /// guest physical addresses of the queue: `desc`, `avail`, and `used`.
+    strict ConfigureQueue(struct {
+        queue uint16;
+        size uint16;
+        desc uint64;
+        avail uint64;
+        used uint64;
+    }) -> ();
+
+    /// Notify a `queue` for the device. Primarily used for black-box testing.
+    strict NotifyQueue(struct {
+        queue uint16;
+    });
+
+    /// Ready a device. This provides the set of `negotiated_features` that the
+    /// driver and device have agreed upon.
+    strict Ready(struct {
+        negotiated_features uint32;
+    }) -> ();
+};
+
+@discoverable
+closed protocol VirtioBalloon {
+    compose VirtioDevice;
+
+    /// Start the balloon device.
+    strict Start(resource struct {
+        start_info StartInfo;
+    }) -> ();
+
+    /// Get memory statistics from the balloon device.
+    strict GetMemStats() -> (struct {
+        status zx.Status;
+        mem_stats vector<fuchsia.virtualization.MemStat>:optional;
+    });
+};
+
+@discoverable
+closed protocol VirtioBlock {
+    compose VirtioDevice;
+
+    /// Start the block device.
+    strict Start(resource struct {
+        start_info StartInfo;
+        spec fuchsia.virtualization.BlockSpec;
+    }) -> (struct {
+        capacity uint64;
+        block_size uint32;
+    });
+};
+
+@discoverable
+closed protocol VirtioConsole {
+    compose VirtioDevice;
+
+    /// Start the console device. This uses `socket` to handle input and output.
+    strict Start(resource struct {
+        start_info StartInfo;
+        socket zx.Handle:SOCKET;
+    }) -> ();
+};
+
+@discoverable
+closed protocol VirtioGpu {
+    compose VirtioDevice;
+
+    /// Start the GPU device.
+    strict Start(resource struct {
+        start_info StartInfo;
+        keyboard_listener client_end:<fuchsia.ui.input3.KeyboardListener, optional>;
+        mouse_source server_end:<fuchsia.ui.pointer.MouseSource, optional>;
+    }) -> ();
+
+    /// Called when a device's configuration is changed.
+    strict -> OnConfigChanged();
+};
+
+type InputType = strict resource union {
+    1: keyboard server_end:<fuchsia.ui.input3.KeyboardListener>;
+    2: mouse client_end:<fuchsia.ui.pointer.MouseSource>;
+};
+
+@discoverable
+closed protocol VirtioInput {
+    compose VirtioDevice;
+
+    /// Start the input device.
+    strict Start(resource struct {
+        start_info StartInfo;
+        input_type InputType;
+    }) -> ();
+};
+
+@discoverable
+closed protocol VirtioNet {
+    compose VirtioDevice;
+
+    /// Start the net device.
+    strict Start(resource struct {
+        start_info StartInfo;
+        mac_address fuchsia.net.MacAddress;
+        enable_bridge bool;
+    }) -> () error zx.Status;
+};
+
+@discoverable
+closed protocol VirtioRng {
+    compose VirtioDevice;
+
+    /// Start the RNG device.
+    strict Start(resource struct {
+        start_info StartInfo;
+    }) -> ();
+};
+
+@discoverable
+closed protocol VirtioSound {
+    compose VirtioDevice;
+
+    /// Start the sound device.
+    /// The response contains the device's expected static configuration.
+    ///
+    /// + request `start_info` basic info to start the device
+    /// + request `enable_input` whether audio input (capture) should be enabled
+    /// + request `enable_verbose_logging` whether verbose logging should be enabled
+    /// - response `features` supported features
+    /// - response `jacks` the virtio_snd_config.jacks value to advertise
+    /// - response `streams` the virtio_snd_config.streams value to advertise
+    /// - response `chmaps` the virtio_snd_config.chaps value to advertise
+    strict Start(resource struct {
+        start_info StartInfo;
+        enable_input bool;
+        enable_verbose_logging bool;
+    }) -> (struct {
+        features uint32;
+        jacks uint32;
+        streams uint32;
+        chmaps uint32;
+    });
+};
+
+@discoverable
+closed protocol VirtioVsock {
+    compose VirtioDevice;
+
+    /// Start the vsock device, setting the guest_cid to the provided value.
+    ///
+    /// Returns:
+    ///   - ZX_OK if device startup succeeded
+    ///   - ZX_ERR_INVALID_ARGS if guest_cid is a reserved value
+    ///   - Any errors returned from fuchsia.virtualization.HostVsockEndpoint::Listen
+    strict Start(resource struct {
+        start_info StartInfo;
+        guest_cid uint32;
+        listeners vector<fuchsia.virtualization.Listener>:MAX;
+    }) -> () error zx.Status;
+};
+
+@discoverable
+closed protocol VirtioMem {
+    compose VirtioDevice;
+
+    /// Start the mem device.
+    strict Start(resource struct {
+        start_info StartInfo;
+        region_addr uint64;
+        plugged_block_size uint64;
+        region_size uint64;
+    }) -> ();
+
+    /// Called when a device's configuration is changed.
+    strict -> OnConfigChanged(struct {
+        plugged_size uint64;
+    });
+};

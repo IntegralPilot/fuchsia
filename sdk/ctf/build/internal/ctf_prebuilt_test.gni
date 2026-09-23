@@ -1,0 +1,130 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/packages/prebuilt_test_manifest.gni")
+import("//sdk/ctf/build/internal/prebuilt_host_test_manifest.gni")
+
+# Creates a Fuchsia test package from a prebuilt CTF test.
+#
+# This template takes the test's manifest entry as input.
+# The manifest entry should point to the test's archive in the CTF release
+# which is "unpacked" into a collection of package  target.
+#
+# Parameters:
+#
+#   ctf_path (required)
+#     The absolute path to the extracted CTF release archive.
+#     Type: path
+#
+#   test (required)
+#     The CTF test manifest entry.
+#     For more info on the manifest entry, see ctf_test_release_archive.gni.
+#     Type: scope; derived from a JSON object.
+#
+#   deps
+#   environments
+template("ctf_prebuilt_test") {
+  assert(defined(invoker.ctf_path), "The path to the CTF archive is required")
+  assert(defined(invoker.test), "CTF test manifest entry is required")
+
+  test = invoker.test
+
+  if (!defined(test.log_settings)) {
+    test.log_settings = {
+    }
+  }
+
+  prebuilt_test_package_target = "${target_name}_prebuilt"
+  prebuilt_test_package(prebuilt_test_package_target) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "environments",
+                           ])
+    archive = "${invoker.ctf_path}/${test.archive_name}.far"
+    component_name = test.component_name
+    package = test.package_name
+    log_settings = test.log_settings
+  }
+
+  # This wrapper package just provides the test realms in a subpackage.
+  fuchsia_package_target = "${target_name}_package"
+  fuchsia_package(fuchsia_package_target) {
+    deps = [ ":$prebuilt_test_package_target" ]
+    testonly = true
+  }
+
+  # TODO(113115): We should be able to use the fuchsia_package above as
+  # $target_name. Debug why it fails and remove this group.
+  group(target_name) {
+    deps = [
+      ":$fuchsia_package_target",
+      ":$prebuilt_test_package_target",
+    ]
+    testonly = true
+  }
+}
+
+# Creates a collection of Fuchsia packages from a prebuilt CTF test manifest.
+#
+# For documentation on the manifest contents, see ctf_test_release_archive.gni.
+#
+# Parameters:
+#   ctf_path (required)
+#     The absolute path to the extracted CTF test archive.
+#     Type: path
+#
+#  disabled_tests
+#     A list of FAR archive names containing tests to skip.
+#     The archive names can be found in //prebult/cts/<version>/<platform>/cts.
+#
+#   visibility
+template("ctf_prebuilt_tests_from_manifest") {
+  assert(defined(invoker.ctf_path), "ctf_path must be defined.")
+
+  if (!defined(invoker.disabled_tests)) {
+    invoker.disabled_tests = []
+  }
+
+  tests = []
+
+  # The list of tests that are successfully disabled.
+  disabled_tests = []
+
+  foreach(test, read_file("${invoker.ctf_path}/test_manifest.json", "json")) {
+    is_disabled =
+        filter_include(invoker.disabled_tests, [ test.archive_name ]) != []
+    if (is_disabled) {
+      disabled_tests += [ test.archive_name ]
+    } else {
+      # Support the legacy 'package=' instead of 'package_name='.
+      # Delete after the F9 CTF release falls off CQ.
+      if (!defined(test.package_name)) {
+        test.package_name = test.package
+      }
+
+      tests += [ ":${test.package_name}" ]
+      ctf_prebuilt_test(test.package_name) {
+        forward_variables_from(invoker, "*")
+      }
+    }
+  }
+
+  # Check for typos or stale disabled tests.
+  unknown_tests = invoker.disabled_tests - disabled_tests
+  if (unknown_tests != []) {
+    label_no_toolchain = get_label_info(":$target_name", "label_no_toolchain")
+    print("Warning: These tests were removed from CTF at ${invoker.ctf_path}.")
+    print("Warning:   $unknown_tests")
+    print("Warning: Please delete the lines `disabled_tests=${unknown_tests}`")
+    print("Warning: from the target at $label_no_toolchain")
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker, [ "visibility" ])
+    testonly = true
+    public_deps = tests
+  }
+}

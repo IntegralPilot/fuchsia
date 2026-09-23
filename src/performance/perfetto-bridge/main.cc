@@ -1,0 +1,81 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include <fidl/fuchsia.tracing.perfetto/cpp/fidl.h>
+#include <lib/async-loop/cpp/loop.h>
+#include <lib/async-loop/default.h>
+#include <lib/async/cpp/task.h>
+#include <lib/async/dispatcher.h>
+#include <lib/component/outgoing/cpp/outgoing_directory.h>
+#include <lib/syslog/cpp/log_settings.h>
+#include <lib/syslog/cpp/macros.h>
+#include <lib/trace-provider/provider.h>
+
+#include <perfetto/ext/base/thread_task_runner.h>
+#include <perfetto/ext/tracing/ipc/service_ipc_host.h>
+#include <perfetto/tracing/platform.h>
+
+#include "consumer_adapter.h"
+#include "producer_connector_impl.h"
+
+int main(int argc, char** argv) {
+  // Set up the FIDL task runner.
+  async::Loop loop(&kAsyncLoopConfigAttachToCurrentThread);
+  async_dispatcher_t* dispatcher = loop.dispatcher();
+
+  // Set up the Perfetto environment and task runner.
+  auto platform = perfetto::Platform::GetDefaultPlatform();
+  auto perfetto_task_runner = platform->CreateTaskRunner({.name_for_debugging = "Perfetto"});
+  trace::TraceProviderWithFdio trace_provider(loop.dispatcher(), "perfetto");
+
+  // Start up the Perfetto service and IPC host.
+  perfetto::ipc::Host* producer_host_ptr = nullptr;
+  std::unique_ptr<perfetto::ServiceIPCHost> ipc_host =
+      perfetto::ServiceIPCHost::CreateInstance(perfetto_task_runner.get());
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool initialized = false;
+  perfetto_task_runner->PostTask([&initialized, &mutex, &cv, &producer_host_ptr, &ipc_host,
+                                  perfetto_task_runner = perfetto_task_runner.get()]() {
+    std::lock_guard<std::mutex> l(mutex);
+    auto producer_host = perfetto::ipc::Host::CreateInstance_Fuchsia(perfetto_task_runner);
+    producer_host_ptr = producer_host.get();
+
+    auto consumer_host = perfetto::ipc::Host::CreateInstance_Fuchsia(perfetto_task_runner);
+    FX_CHECK(ipc_host->Start(std::move(producer_host), std::move(consumer_host)))
+        << "Perfetto IPC host failed to start.";
+
+    initialized = true;
+    cv.notify_one();
+  });
+
+  std::unique_lock<std::mutex> lock(mutex);
+  cv.wait(lock, [&initialized]() { return initialized; });
+
+  // Create a single instance of ProducerConnectorImpl, to be shared across all clients.
+  ProducerConnectorImpl producer_connector_service(loop.dispatcher(), perfetto_task_runner.get(),
+                                                   producer_host_ptr);
+
+  // Instantiate an in-process consumer client.
+  ConsumerAdapter consumer(ipc_host->service(), &trace_provider, perfetto_task_runner.get());
+
+  // Expose the FIDL server.
+  component::OutgoingDirectory outgoing = component::OutgoingDirectory(dispatcher);
+  zx::result result = outgoing.AddUnmanagedProtocol<fuchsia_tracing_perfetto::ProducerConnector>(
+      [dispatcher, service = &producer_connector_service](
+          fidl::ServerEnd<fuchsia_tracing_perfetto::ProducerConnector> server_end) {
+        fidl::BindServer(dispatcher, std::move(server_end), service,
+                         [](ProducerConnectorImpl*, fidl::UnbindInfo,
+                            fidl::ServerEnd<fuchsia_tracing_perfetto::ProducerConnector>) {
+                           // No per-connection state is maintained; no clean up is required.
+                         });
+      });
+  FX_CHECK(result.is_ok()) << "Failed to expose ProducerConnector protocol: "
+                           << result.status_string();
+
+  result = outgoing.ServeFromStartupInfo();
+  FX_CHECK(result.is_ok()) << "Failed to serve outgoing directory: " << result.status_string();
+
+  return loop.Run() == ZX_OK;
+}

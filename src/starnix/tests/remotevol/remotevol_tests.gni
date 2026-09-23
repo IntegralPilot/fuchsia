@@ -1,0 +1,116 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+
+# Defines a fuchsia_test_package for remotevol tests.
+#
+# Parameters
+#   use_inline_encryption (optional)
+#     If true, the test will use a debian container with `inlinecrypt` mount options.
+#     Default: false
+#   kernel_base_manifest (required)
+#     Path to the base kernel manifest to build the test package.
+#   test_specs (optional)
+#     The test_specs gets forwarded as-is.
+template("remotevol_test_package") {
+  _use_inline_encryption = false
+  if (defined(invoker.use_inline_encryption)) {
+    _use_inline_encryption = invoker.use_inline_encryption
+  }
+
+  assert(defined(invoker.kernel_base_manifest),
+         "kernel_base_manifest must be defined")
+  _kernel_base_manifest = invoker.kernel_base_manifest
+
+  # Generate a debian container shard with or without inline encryption that
+  # will be used to build the kernel component manifest.
+  _debian_container_shard_label = "${target_name}_debian_container_shard"
+  _debian_container_shard_file =
+      "${target_gen_dir}/${target_name}_debian_container.shard.cml"
+  _debian_container_component_name = "debian_container_with_user_volume"
+  if (_use_inline_encryption) {
+    _debian_container_component_name =
+        "debian_container_with_user_volume_inline_encrypted"
+  }
+  generated_file(_debian_container_shard_label) {
+    outputs = [ _debian_container_shard_file ]
+    output_conversion = "json"
+    contents = {
+      children = [
+        {
+          name = "debian_container"
+          url = "debian#meta/${_debian_container_component_name}.cm"
+          environment = "#starnix_kernel_env"
+        },
+      ]
+    }
+  }
+
+  # Generate the kernel_with_container manifest
+  _kernel_manifest_label = "${target_name}_kernel_with_container.cml"
+  _kernel_manifest_file =
+      "${target_gen_dir}/${target_name}_kernel_with_container.cml"
+  generated_file(_kernel_manifest_label) {
+    outputs = [ _kernel_manifest_file ]
+    output_conversion = "json"
+    contents = {
+      include = [
+        rebase_path(_kernel_base_manifest, root_build_dir),
+        rebase_path(_debian_container_shard_file, root_build_dir),
+      ]
+    }
+    deps = [ ":${_debian_container_shard_label}" ]
+  }
+
+  _kernel_component_target = "${target_name}_kernel_with_container"
+  fuchsia_component(_kernel_component_target) {
+    testonly = true
+    manifest = _kernel_manifest_file
+
+    # remotevol tests expects this component name
+    component_name = "kernel_with_container"
+    deps = [ ":${_kernel_manifest_label}" ]
+  }
+
+  fuchsia_test_package(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "use_inline_encryption",
+                             "kernel_base_manifest",
+                             "test_specs",
+                           ])
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [ ":${_kernel_component_target}" ]
+  }
+}
+
+# Defines a group of remotevol test packages to run with and without inline
+# encryption.
+#
+# Parameters
+#   kernel_base_manifest (required)
+#     Path to the base kernel manifest to build the test packages.
+template("remotevol_tests_group") {
+  remotevol_test_package("${target_name}_no_inline_encryption") {
+    forward_variables_from(invoker, "*")
+    use_inline_encryption = false
+  }
+
+  remotevol_test_package("${target_name}_with_inline_encryption") {
+    forward_variables_from(invoker, "*")
+    use_inline_encryption = true
+  }
+
+  group(target_name) {
+    testonly = true
+    deps = [
+      ":${target_name}_no_inline_encryption",
+      ":${target_name}_with_inline_encryption",
+    ]
+  }
+}

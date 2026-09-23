@@ -1,0 +1,369 @@
+# Copyright 2019 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/compiler_config.gni")
+import("//build/cpp/library_headers.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//zircon/kernel/kernel_rust_mod.gni")
+
+# These set the ABI contract between C++ and assembly code.
+# This is kept consistent between the kernel proper and phys
+# so (pure PIC) code should be callable from the kernel proper.
+compiler_config("abi") {
+  compiler_configs = [
+    ":integer-register-abi",
+    ":thread-pointer-abi",
+    ":stack-pointer-abi",
+  ]
+
+  # These are not part of the ABI contract per se, but they're part of the
+  # "expected resilience of generated code" contract that should be uniform
+  # across all the privileged code.
+  compiler_configs += [ "//build/config/x64:harden_sls" ]
+  configs = [
+    ":retpoline",
+    ":skylake_jcc",
+  ]
+}
+
+# Don't use any FP / vector registers in kernel code.  They usually still
+# hold the user-mode values while running in kernel mode.
+compiler_config("integer-register-abi") {
+  cflags = [ "-msoft-float" ]
+  if (!is_gcc) {
+    cflags_c = [
+      "-Xclang",
+      "-target-feature",
+      "-Xclang",
+      "+soft-float",
+    ]
+    cflags_cc = cflags_c
+  }
+  rust_target_features = [ "+soft-float" ]
+  if (toolchain_environment == "kernel") {
+    rust_target_edits = [
+      {
+        key = "rustc-abi"
+        action = "set"
+        value = "softfloat"
+      },
+    ]
+  }
+
+  disabled_features = [
+    "mmx",
+    "sse",
+    "sse2",
+    "sse3",
+    "ssse3",
+    "sse4.1",
+    "sse4.2",
+    "avx",
+    "avx2",
+  ]
+
+  foreach(feature, disabled_features) {
+    cflags += [ "-mno-$feature" ]
+    rust_target_features += [ "-$feature" ]
+  }
+
+  if (is_gcc) {
+    cflags += [
+      # Optimization: Since FPU is disabled, do not pass flag in %rax to
+      # varargs routines that floating point args are in use.
+      "-mskip-rax-setup",
+    ]
+  }
+
+  # None of these actually matter in ldflags even for LTO, and the Clang driver
+  # complains about some as unused at link time.
+  asmflags = cflags
+}
+
+# Use the right thread-pointer ABI for the kernel (%gs.base, not %fs.base).
+# This affects `__builtin_thread_pointer()`; would affect ELF TLS if it were
+# used; and affects the ABI implicitly used by stack-protector and safe-stack.
+compiler_config("thread-pointer-abi") {
+  # Clang needs -mcmodel=kernel to tell it to use the right safe-stack ABI for
+  # the kernel.  It doesn't have any other effects that matter when using -fPIE
+  # as we do; it's not useful to us at all in GCC and doesn't exist for x86-32.
+  if (toolchain_environment != "kernel.phys32" && !is_gcc) {
+    c_family_flags = [ "-mcmodel=kernel" ]
+  }
+  if (toolchain_environment == "kernel") {
+    rust_target_edits = [
+      {
+        key = "code-model"
+        action = "set"
+        value = "kernel"
+      },
+    ]
+  } else {
+    rustflags = [ "-Ccode-model=kernel" ]
+  }
+}
+
+# This tells the compiler not to use any space below the current stack pointer,
+# because in supervisor mode an exception frame could be pushed there by
+# hardware at any time.
+compiler_config("stack-pointer-abi") {
+  c_family_flags = [ "-mno-red-zone" ]
+  if (toolchain_environment == "kernel") {
+    rust_target_edits = [
+      {
+        key = "disable-redzone"
+        action = "set"
+        value = true
+      },
+    ]
+  } else {
+    rustflags = [ "-Cno-redzone" ]
+  }
+}
+
+config("retpoline") {
+  visibility = [ ":*" ]
+  if (is_gcc) {
+    cflags = [
+      "-mindirect-branch=thunk-inline",
+      "-mindirect-branch-register",
+    ]
+  } else {
+    cflags = [ "-mretpoline" ]
+    rustflags = [ "-Zretpoline" ]
+    if (toolchain_environment == "kernel") {
+      # The kernel proper uses its own optimized thunks, but phys and
+      # multiboot can just use the compiler's safe default thunks.
+      cflags += [ "-mretpoline-external-thunk" ]
+      rustflags += [ "-Zretpoline-external-thunk" ]
+    }
+  }
+  defines = [ "KERNEL_RETPOLINE=1" ]
+}
+
+# Mitigate errata in Intel Skylake family of CPUs that cause control transfer
+# instructions to
+# execute incorrectly when they end at or cross 32-byte boundaries. (https://fxbug.dev/42120593)
+config("skylake_jcc") {
+  visibility = [ ":*" ]
+  defines = [ "X64_KERNEL_JCC_WORKAROUND" ]
+  configs = [ "//build/config/x64:mitigate_skylake_jcc" ]
+}
+
+# This is used pervasively throughout the kernel on x86.
+config("kernel") {
+  defines = [ "ARCH_X86" ]
+
+  # For #include <arch/foo.h>.
+  include_dirs = [ "include" ]
+
+  # TODO(digit): Once the dependencies below have been migrated to the Fuchsia
+  # build, only use configs to add the include paths.
+  include_dirs += [
+    # <arch/aspace.h> has #include <bitmap/rle-bitmap.h>
+    "//zircon/system/ulib/bitmap/include",
+
+    # <arch/aspace.h> has #include <arch/x86/page_tables/constants.h>.
+    "page_tables/include",
+
+    # <arch/x86/page_tables/page_tables.h> has #include <hwreg/bitfields.h>.
+    "//zircon/system/ulib/hwreg/include",
+
+    # <hwreg/mmio.h> has #include <lib//mmio-ptr/mmio-ptr.h>.
+    "//zircon/system/ulib/mmio-ptr/include",
+
+    # <arch/x86/page_tables/page_tables.h> has #include
+    # <page_tables/x86/constants.h>.
+    "//zircon/system/ulib/page_tables/include",
+
+    # <arch/x86/idle_states.h> has #include <ktl/atomic.h>.
+    "//zircon/kernel/lib/ktl/include",
+
+    # <arch/x86.h> has #include <lib/arch/intrin.h>.
+    "//zircon/kernel/lib/arch/x86/include",
+  ]
+}
+
+source_set("x86") {
+  sources = [
+    "acpi.S",
+    "amd.cc",
+    "arch.cc",
+    "asm.S",
+    "bootstrap16.cc",
+    "cache.cc",
+    "crashlog.cc",
+    "debugger.cc",
+    "descriptor.cc",
+    "exceptions.S",
+    "exceptions_c.cc",
+    "feature.cc",
+    "gdt.S",
+    "handoff.cc",
+    "hwp.cc",
+    "idle_states.cc",
+    "idt.cc",
+    "intel.cc",
+    "ioport.cc",
+    "mexec.S",
+    "mmu.cc",
+    "mmu_mem_types.cc",
+    "mp.cc",
+    "msr.cc",
+    "msr_bench.cc",
+    "ops.S",
+    "registers.cc",
+    "restricted.cc",
+    "smp.cc",
+    "spinlock.cc",
+    "start.S",
+    "start16.S",
+    "thread.cc",
+    "timer_freq.cc",
+    "uspace_entry.S",
+  ]
+  deps = [
+    ":syscall",
+    "cpuid",
+    "retpoline",
+    "user-copy",
+    "//sdk/lib/fit",
+    "//zircon/kernel/dev/hw_rng",
+    "//zircon/kernel/dev/iommu/stub",
+    "//zircon/kernel/lib/arch",
+    "//zircon/kernel/lib/backtrace",
+    "//zircon/kernel/lib/boot-options",
+    "//zircon/kernel/lib/code-patching:headers",
+    "//zircon/kernel/lib/console",
+    "//zircon/kernel/lib/counters",
+    "//zircon/kernel/lib/crashlog",
+    "//zircon/kernel/lib/debuglog",
+    "//zircon/kernel/lib/fbl",
+    "//zircon/kernel/lib/init",
+    "//zircon/kernel/lib/instrumentation",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/ktrace",
+    "//zircon/kernel/lib/page",
+    "//zircon/kernel/lib/perfmon",
+    "//zircon/kernel/lib/root_resource_filter",
+    "//zircon/kernel/lib/topology",
+    "//zircon/kernel/object",
+    "//zircon/kernel/phys:handoff",
+    "//zircon/kernel/platform:headers",
+    "//zircon/kernel/platform/pc",
+    "//zircon/system/ulib/bitmap",
+    "//zircon/system/ulib/pretty",
+  ]
+  public_deps = [ ":headers" ]
+}
+
+library_headers("headers") {
+  headers = []
+  public_deps = [
+    # <arch/x86/system_topology.h> has #include <arch/x86/cpuid.h>.
+    "//zircon/kernel/arch/x86/cpuid:headers",
+
+    # <arch/x86/apic.h has #include <dev/interrupt.h>.
+    # <arch/x86/apic.h> has #include <dev/interrupt.h>.
+    "//zircon/kernel/dev/interrupt:headers",
+
+    # <arch/x86/hypervisor.h> has #include <hypervisor/aspace.h>.
+    "//zircon/kernel/hypervisor:headers",
+
+    # <arch/x86/hypervisor.h> has #include <lib/id_allocator.h>.
+    "//zircon/kernel/lib/id_allocator:headers",
+
+    # <arch/x86/bootstrap16.h> has #include <lib/page/size.h>
+    # <arch/x86/pv.h> has #include <lib/page/size.h>
+    # <arch/aspace.h> has #include <lib/page/size.h>
+    "//zircon/kernel/lib/page:headers",
+
+    # <arch/aspace.h> has #include <bitmap/rle-bitmap.h>.
+    # <arch/x86/ioport.h> has #include <bitmap/rle-bitmap.h>.
+    "//zircon/system/ulib/bitmap:headers",
+
+    # <arch/aspace.h> uses various fbl things
+    "//zircon/system/ulib/fbl:headers",
+
+    # <arch/x86/idle_states.h> has #include <ktl/atomic.h>.
+    "//zircon/kernel/lib/ktl:headers",
+
+    # <arch/x86.h> has #include <lib/arch/intrin.h>.
+    "//zircon/kernel/lib/arch:headers",
+  ]
+}
+
+source_set("syscall") {
+  sources = [ "syscall.S" ]
+  deps = [
+    "//zircon/kernel/lib/code-patching:headers",
+    "//zircon/kernel/lib/syscalls",
+  ]
+}
+
+kernel_rust_mod("arch-x86-rs") {
+  output_name = "arch_x86"
+  source_root = "src/mod.rs"
+  sources = [
+    "src/apic.rs",
+    "src/fake_msr_access.rs",
+    "src/feature.rs",
+    "src/interrupts.rs",
+    "src/ioapic.rs",
+    "src/lapic.rs",
+    "src/mod.rs",
+    "src/platform_access.rs",
+    "src/pv.rs",
+    "src/registers.rs",
+    "src/suspend.rs",
+    "src/system_topology.rs",
+    "src/x86.rs",
+  ]
+  deps = [
+    "//sdk/rust/zbi",
+    "//sdk/rust/zx-status",
+    "//sdk/rust/zx-types",
+    "//src/lib/kalloc",
+    "//src/lib/kprint",
+    "//src/lib/ksync",
+    "//src/lib/lazy_init:lazy_init_rs",
+    "//src/lib/regio",
+    "//src/lib/zr",
+    "//third_party/rust_crates:pin-init",
+    "//zircon/kernel/arch:arch-types-bindings",
+    "//zircon/kernel/lib/acpi_lite/rust:acpi_lite",
+    "//zircon/kernel/lib/arch:arch-rs",
+    "//zircon/kernel/lib/debug",
+    "//zircon/kernel/lib/page:page-rs",
+    "//zircon/system/ulib/fbl/rust:fbl",
+  ]
+  test_deps = [ "//zircon/kernel/lib/unittest:unittest-rs" ]
+}
+
+source_set("tests") {
+  testonly = true
+  sources = [
+    "hwp_tests.cc",
+    "idle_states_test.cc",
+    "mmu_tests.cc",
+    "platform_tests.cc",
+  ]
+  deps = [
+    ":headers",
+    "cpuid:kernel-tests",
+    "//zircon/kernel/lib/arch/testing",
+    "//zircon/kernel/lib/boot-options",
+    "//zircon/kernel/lib/console:headers",
+    "//zircon/kernel/lib/page",
+    "//zircon/kernel/lib/topology:headers",
+    "//zircon/kernel/lib/unittest",
+  ]
+}
+
+group("kernel-tests") {
+  testonly = true
+  deps = [ ":tests" ]
+}

@@ -1,0 +1,101 @@
+#!/bin/bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Other
+### Create a pair of changes that will be submitted atomically. It will modify
+### the commit in fuchsia.git and vendor/google, and make them depend on each
+### other.
+
+## usage: fx atomic-commit [--no-upload]
+
+set -o errexit
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh
+fx-config-read
+
+function update_footer() {
+    local repo_dir=$1
+    local dependency_id=$2
+    local upload=$3
+    (
+        cd "${repo_dir}" || exit 1
+        local message=$(git log -1 --pretty=%B)
+        local new_footer="""Depends-on: ${dependency_id}
+Change-Id:"""
+
+        local modified_message=${message/"Change-Id:"/${new_footer}}
+        git commit --amend -m "${modified_message}"
+        if [[ "${upload}" == "true" ]]; then
+            git push origin
+        fi
+    )
+}
+
+function print_usage_guidance() {
+    echo
+    echo "To create atomic-commit, make sure your changes are on the top of"
+    echo "commit stacks in both fuchsia and vendor/google."
+    echo
+    echo "--- Current top commit in fuchsia.git ---"
+    echo
+    echo $(cd $FUCHSIA_DIR && git log -1 --pretty=medium)
+    echo
+    echo "--- Current top commit in vendor/google ---"
+    echo
+    echo $(cd ${FUCHSIA_DIR}/vendor/google && git log -1 --pretty=medium)
+    echo
+    read -p "Does this look correct to you?[y|n]" value
+
+    if [[ "${value}" != "y" && "${value}" != "Y" ]]; then
+        exit
+    fi
+}
+
+function print_tip() {
+    local upload=$1
+    echo
+    echo "Your changes are raised."
+    if [[ "${upload}" == "true" ]]; then
+        echo "Please enable Auto-Submit on both CLs to enable atomic-commit."
+    else
+        echo "Changes were not uploaded (--no-upload)."
+        echo "You will need to manually push them to enable atomic-commit."
+    fi
+    echo
+}
+
+main() {
+    local upload="true"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-upload)
+                upload="false"
+                ;;
+            *)
+                echo "Unknown option: $1"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    print_usage_guidance
+
+    local change_id_fuchsia=$(
+        cd "${FUCHSIA_DIR}"
+        git log -1 | grep "Change-Id" | sed "s/Change-Id://g" | xargs
+    )
+    local change_id_vendor_google=$(
+        cd "${FUCHSIA_DIR}/vendor/google"
+        git log -1 | grep "Change-Id" | sed "s/Change-Id://g" | xargs
+    )
+
+    update_footer "${FUCHSIA_DIR}/vendor/google" "fuchsia:${change_id_fuchsia}" "${upload}"
+    update_footer "${FUCHSIA_DIR}" "turquoise-internal:${change_id_vendor_google}" "${upload}"
+
+    print_tip "${upload}"
+}
+
+main "$@"

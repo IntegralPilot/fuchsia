@@ -1,0 +1,393 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_inputs.gni")
+import("//build/compiled_action.gni")
+import("//build/zbi/zbi.gni")
+
+# Creates the assembly Board configuration file, and it's main Hardware Support
+# Bundle, which respectively provide information about the board and components
+# and drivers which are to be included by assembly when assembling a product for
+# this board.
+#
+# NOTE: This template DOES NOT use GN metadata, all labels for packages must be
+# the actual target that creates the package.
+#
+# Parameters
+#
+#  Board
+#
+#  name (optional)
+#    [string] The name of the board, defaults to '$target_name'
+#
+#  hardware_info (optional)
+#    [scope]  Data provided via the 'fuchsia.hwinfo.Board' protocol.  Fields:
+#      - name [string] - The board name to provide via hwinfo, if different from
+#                        the name in build info (provided above).  Must be 32
+#                        bytes or less.
+#      - vendor_id [u32] - Must be provided with 'product_id'.  Used to add a
+#                          platform_id item to the ZBI.
+#      - product_id [u32] - Must be provided with 'vendor_id'.  Used to add a
+#                           platform_id item to the ZBI.
+#      - revision [u32] - Must be provided with 'product_id' and 'vendor_id'.
+#                         Used to add a board_info item to the ZBI.
+#
+#  provided_features (optional)
+#    [list, strings] A list of strings which are named features, capabilities,
+#    or requirements that are used by assembly to include optional portions of
+#    the platform, or to indicate that the board provides (or its drivers
+#    provide).
+#
+#    Examples:
+#      - `fuchsia::network_require_netstack3` - netstack3 (implemented in Rust)
+#        must be used on this board, and not netstack2 (implemented in Go).
+#
+#      - `fuchsia::wlan_softmac` - used to tell assembly that this board uses a
+#        "soft MAC" wifi driver.
+#
+#      - `fuchsia::wlan_fullmac` - used to tell assembly that this board uses a
+#        wifi driver that implements the full MAC itself.
+#
+#    The list if valid strings is currently an unstable API between boards and
+#    assembly and can change at any time.
+#
+#  partitions_config (required)
+#    [GN label] Label of the generated_partitions_config() to add to the board.
+#
+#  input_bundles (optional)
+#    [list; GN Labels] The GN labels of the Board Input Bundles for this board.
+#    Each must be the label of a board_input_bundle() target.  If the target
+#    isn't a board_input_bundle() target, it will cause an error such as:
+#      "no dependency provides the input <target_name>/board_input_bundle.json"
+#
+#  board_input_bundle_sets (optional; default=[])
+#    [list; GN labels] The GN labels of board_input_bundle_set()s which may
+#    provide BIBs to include. board_input_bundle_names lists which BIBs from
+#    the sets to include.
+#
+#  filesystems (optional)
+#    [scope] A GN scope that describes configuration to use for various
+#    different filesystems in order to use them with this board.  This doesn't
+#    trigger the creation of these filesystems, but rather is board-specific
+#    information that's needed to correctly create those filesystems when they
+#    are requested by the product.
+#
+#    NOTE:  This template converts GN paths for vbmeta keys into the correctly
+#    rebased form automatically.
+#
+#  devicetree (optional)
+#    [GN Label] The GN label of the devicetree binary for this board. This
+#    should be a devicetree() target.
+#
+#  zbi_extra_items (optional)
+#    [list; GN Labels] The GN labels of ZBI containers to be included in this
+#    in this board. The ZBI containers provide additional items to be incorporated
+#    that are specific to the board.
+#
+#  trusted_app_guids (optional)
+#    [list; strings of valid GUIDs] The GUIDs of optee Trusted Applications
+#    coordinated tee_manager and which tee_manager should expose. Specifying
+#    anything in this list will cause tee_manager to be included in the core
+#    realm and have the protocols specified routed to the /core/trusted_apps
+#    realm.
+#
+#  version (optional)
+#    [string] String representing the release version for this board config.
+#    Either this field or "version_file" must be set.
+#
+#  version_file (optional)
+#    [string] Path to a file containing the release version for this config.
+#    Either this field or "version" must be set.
+#
+#  release_info_name (optional)
+#    [string] Name to use to reference this artifact in MOS.
+#    When this arg is absent, the name defaults to the board_name.
+#
+#  Outputs
+#    A directory structure and manifest
+#
+#   manifest path:
+#     $target_out_dir/$target_name/board_configuration.json
+#
+#     or if the defaults are overridden:
+#     $bundle_dir/$name/board_configuration.json
+#
+# GN usual meanings
+#  testonly, visibility
+#
+template("board_configuration") {
+  assert(defined(invoker.partitions_config), "partitions_config is required")
+
+  bundles_dir = target_out_dir
+
+  board_name = target_name
+  if (defined(invoker.name)) {
+    board_name = invoker.name
+  }
+
+  labels = {
+    main_target = target_name
+
+    # Outputs
+    bazel_inputs = "${target_name}.bazel_input"
+
+    # Intermediate Files
+    base_info = "${target_name}.base_info"
+
+    # Internal manifest of the ZBI items being incoorporated by assembly.
+    zbi_extra_items = "${target_name}.zbi_extra_items"
+  }
+
+  files = {
+    # Outputs
+
+    # The directory where the board configuration file is written to.  This is
+    # named for the target, not the name of the board, if the name is being
+    # overridden.
+    #
+    # This allows other templates to compute the path to the main configuration
+    # file based on just the label.
+    board_config_dir = "${bundles_dir}/${target_name}"
+    board_config_file = "${board_config_dir}/board_configuration.json"
+
+    board_config_file_intermediate =
+        "${bundles_dir}/${target_name}_board_configuration.json"
+
+    # The directory of input bundles
+    input_bundle_dirs = []
+
+    # The directories of the board input bundle sets.
+    board_input_bundle_set_dirs = []
+
+    partitions_config =
+        get_label_info(invoker.partitions_config, "target_out_dir") + "/" +
+        get_label_info(invoker.partitions_config, "name")
+
+    zbi_extra_items = "${bundles_dir}/${labels.zbi_extra_items}.zbi"
+  }
+
+  if (defined(invoker.input_bundles)) {
+    _input_bundle_names = []
+    foreach(input_bundle, invoker.input_bundles) {
+      _input_bundle_name = get_label_info(input_bundle, "name")
+      assert(
+          _input_bundle_names == _input_bundle_names + [ _input_bundle_name ] -
+                                     [ _input_bundle_name ],
+          "All input bundle targets must have unique 'name' portions of their label.")
+      _input_bundle_names += [ _input_bundle_name ]
+
+      _input_bundle_input_dir = get_label_info(input_bundle, "target_out_dir") +
+                                "/" + _input_bundle_name
+      files.input_bundle_dirs += [ _input_bundle_input_dir ]
+    }
+  }
+
+  if (defined(invoker.board_input_bundle_sets)) {
+    foreach(set, invoker.board_input_bundle_sets) {
+      _set_name = get_label_info(set, "name")
+      _set_dir = get_label_info(set, "target_out_dir") + "/" + _set_name
+      files.board_input_bundle_set_dirs += [ _set_dir ]
+    }
+  }
+
+  _filesystems = {
+  }
+  if (defined(invoker.filesystems)) {
+    _filesystems = invoker.filesystems
+  }
+  if (defined(_filesystems.vbmeta)) {
+    _vbmeta = _filesystems.vbmeta
+    if (defined(_vbmeta.key)) {
+      _vbmeta.key = rebase_path(_vbmeta.key, root_build_dir)
+    }
+    if (defined(_vbmeta.key_metadata)) {
+      _vbmeta.key_metadata = rebase_path(_vbmeta.key_metadata, root_build_dir)
+    }
+    _filesystems.vbmeta = {
+    }
+    _filesystems.vbmeta = _vbmeta
+  }
+  has_zbi_extra_items =
+      defined(invoker.zbi_extra_items) && invoker.zbi_extra_items != []
+  if (has_zbi_extra_items) {
+    zbi(labels.zbi_extra_items) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":*" ]
+
+      # Must not be a bootable ZBI.
+      cpu = ""
+      output_dir = bundles_dir
+      deps = invoker.zbi_extra_items
+    }
+  }
+
+  release_info_name = board_name
+  if (defined(invoker.release_info_name)) {
+    release_info_name = invoker.release_info_name
+  }
+
+  base_info_contents = {
+    forward_variables_from(invoker,
+                           [
+                             "provided_features",
+                             "kernel",
+                             "platform",
+                             "tee_trusted_app_guids",
+                           ])
+    name = board_name
+    arch = target_cpu
+
+    if (defined(invoker.hardware_info)) {
+      hardware_info = invoker.hardware_info
+
+      if (defined(hardware_info.vendor_id) ||
+          defined(hardware_info.product_id) ||
+          defined(hardware_info.revision)) {
+        assert(
+            defined(hardware_info.vendor_id) &&
+                defined(hardware_info.product_id) &&
+                defined(hardware_info.revision),
+            "If any of 'vendor_id', 'product_id' or 'revision' are set, then all are required")
+      }
+    }
+
+    if (defined(_filesystems)) {
+      filesystems = _filesystems
+    }
+
+    if (defined(invoker.devicetree)) {
+      devicetree = rebase_path(
+              get_label_info(invoker.devicetree, "target_out_dir") + "/" +
+                  get_label_info(invoker.devicetree, "name") + ".dtb",
+              root_build_dir)
+    }
+
+    release_info = {
+      info = {
+        name = release_info_name
+        repository = "intermediate_repository"
+        version = "intermediate_version"
+      }
+      bib_sets = []
+    }
+
+    if (has_zbi_extra_items) {
+      zbi_extra_items = rebase_path(files.zbi_extra_items, root_build_dir)
+    }
+  }
+
+  generated_file(labels.base_info) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":${labels.main_target}" ]
+    outputs = [ files.board_config_file_intermediate ]
+    output_conversion = "json"
+    contents = base_info_contents
+  }
+
+  compiled_action(labels.main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    # The contents of these folders are dynamic, and managed entirely by this
+    # action.  Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    hermetic_action_ignored_prefixes =
+        [
+          files.board_config_dir,
+          files.partitions_config,
+        ] + files.input_bundle_dirs + files.board_input_bundle_set_dirs
+
+    tool = "//build/assembly/tools/assembly_config"
+    tool_output_name = "assembly_config"
+    inputs = []
+    outputs = [ files.board_config_file ]
+    depfile = "${target_out_dir}/${target_name}.d"
+
+    args = [
+      "generate",
+      "board",
+      "--config",
+      rebase_path(files.board_config_file_intermediate, root_build_dir),
+      "--repo",
+      "fuchsia",
+      "--partitions-config",
+      rebase_path(files.partitions_config, root_build_dir),
+      "--output",
+      rebase_path(files.board_config_dir, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+    foreach(board_input_bundle, files.input_bundle_dirs) {
+      args += [
+        "--board-input-bundles",
+        rebase_path(board_input_bundle, root_build_dir),
+      ]
+    }
+    foreach(board_input_bundle_set, files.board_input_bundle_set_dirs) {
+      args += [
+        "--board-input-bundle-sets",
+        rebase_path(board_input_bundle_set, root_build_dir),
+      ]
+    }
+
+    assert(
+        defined(invoker.version) || defined(invoker.version_file),
+        "board_configuration(\"target_name\") must define `version` or `version_file`")
+    if (defined(invoker.version) && invoker.version != "") {
+      args += [
+        "--version",
+        invoker.version,
+      ]
+    }
+    if (defined(invoker.version_file) && invoker.version_file != "") {
+      inputs += [ invoker.version_file ]
+      args += [
+        "--version-file",
+        invoker.version_file,
+      ]
+    }
+
+    public_deps = [
+      ":${labels.base_info}",
+      invoker.partitions_config,
+    ]
+    deps = []
+    if (defined(invoker.input_bundles)) {
+      deps += invoker.input_bundles
+    }
+    if (defined(invoker.board_input_bundle_sets)) {
+      deps += invoker.board_input_bundle_sets
+    }
+    if (defined(invoker.devicetree)) {
+      deps += [ invoker.devicetree ]
+    }
+    if (has_zbi_extra_items) {
+      deps += [ ":${labels.zbi_extra_items}" ]
+    }
+
+    metadata = {
+      board_input_bundle_sets_barrier = []
+      board_configs = [
+        {
+          label =
+              get_label_info(":${labels.main_target}", "label_with_toolchain")
+          name = board_name
+          cipd_name = board_name
+          outdir = rebase_path(files.board_config_dir, root_build_dir)
+        },
+      ]
+    }
+  }
+
+  # Make board configuration and hardware support bundle available to Bazel
+  bazel_input_directory(labels.bazel_inputs) {
+    forward_variables_from(invoker, [ "testonly" ])
+    generator = ":${labels.main_target}"
+    output_directory = files.board_config_dir
+  }
+}

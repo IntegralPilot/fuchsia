@@ -1,0 +1,195 @@
+// Copyright 2017 The Fuchsia Authors
+//
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT
+
+#include <lib/unittest/unittest.h>
+#include <platform.h>
+
+#include <kernel/semaphore.h>
+#include <lockdep/lockdep.h>
+
+using lockdep::Guard;
+
+static bool smoke_test() {
+  BEGIN_TEST;
+
+  {
+    Semaphore sema;
+    ASSERT_EQ(0, sema.count());
+    ASSERT_EQ(0u, sema.num_waiters());
+  }
+
+  {
+    Semaphore sema(0);
+    ASSERT_EQ(0, sema.count());
+    ASSERT_EQ(0u, sema.num_waiters());
+  }
+
+  {
+    Semaphore sema(5);
+    ASSERT_EQ(5, sema.count());
+    ASSERT_EQ(0u, sema.num_waiters());
+  }
+
+  {
+    Semaphore sema(-2);
+    ASSERT_EQ(-2, sema.count());
+    ASSERT_EQ(0u, sema.num_waiters());
+  }
+
+  {
+    constexpr int64_t kPostCount = 10;
+    Semaphore sema;
+
+    for (int64_t i = 0; i < kPostCount; ++i) {
+      ASSERT_EQ(i, sema.count());
+      ASSERT_EQ(0u, sema.num_waiters());
+
+      sema.Post();
+
+      ASSERT_EQ(i + 1, sema.count());
+      ASSERT_EQ(0u, sema.num_waiters());
+    }
+
+    for (int64_t i = 0; i < kPostCount; ++i) {
+      ASSERT_EQ(kPostCount - i, sema.count());
+      ASSERT_EQ(0u, sema.num_waiters());
+
+      ASSERT_EQ(ZX_OK, sema.Wait(Deadline::infinite()));
+
+      ASSERT_EQ(kPostCount - i - 1, sema.count());
+      ASSERT_EQ(0u, sema.num_waiters());
+    }
+  }
+
+  END_TEST;
+}
+
+static bool timeout_test() {
+  BEGIN_TEST;
+
+  auto dealine = Deadline::after_mono(ZX_USEC(10));
+
+  Semaphore sema;
+  ASSERT_EQ(0, sema.count());
+  ASSERT_EQ(0u, sema.num_waiters());
+  ASSERT_EQ(ZX_ERR_TIMED_OUT, sema.Wait(dealine));
+  ASSERT_GE(0, sema.count());
+  ASSERT_EQ(0u, sema.num_waiters());
+
+  END_TEST;
+}
+
+static bool thread_is_blocked(const Thread* t) {
+  SingleChainLockGuard guard{IrqSaveOption, t->get_lock(),
+                             CLT_TAG("thread_is_blocked (semaphore tests)")};
+  return (t->state() == THREAD_BLOCKED);
+}
+
+enum class Signal { kPost, kPostQueue, kKill, kSuspend };
+
+template <Signal signal, Interruptible interruptible>
+static bool signal_test() {
+  BEGIN_TEST;
+
+  Semaphore sema;
+
+  ASSERT_EQ(0, sema.count());
+  ASSERT_EQ(0u, sema.num_waiters());
+
+  auto wait_sema_thread = [](void* arg) -> int {
+    auto sema = reinterpret_cast<Semaphore*>(arg);
+    zx_status_t status;
+    if constexpr (interruptible == Interruptible::Yes) {
+      status = sema->Wait(Deadline::infinite());
+    } else {
+      status = sema->Wait();
+    }
+    return static_cast<int>(status);
+  };
+  auto thread = Thread::Create("test semaphore", wait_sema_thread, &sema, DEFAULT_PRIORITY);
+
+  ASSERT(nullptr != thread);
+  thread->Resume();
+
+  while (thread_is_blocked(thread) == false) {
+    Thread::Current::SleepRelative(ZX_MSEC(1));
+  }
+
+  ASSERT_EQ(-1, sema.count());
+  ASSERT_EQ(1u, sema.num_waiters());
+
+  int expected_error;
+  int64_t expected_count;
+  switch (signal) {
+    case Signal::kPost:
+      sema.Post();
+      expected_error = ZX_OK;
+      expected_count = 0;
+      break;
+
+    case Signal::kPostQueue: {
+      OwnedWaitQueue queue;
+      sema.Post(&queue);
+      queue.ResetOwnerIfNoWaiters();
+      expected_error = ZX_OK;
+      expected_count = 0;
+      break;
+    }
+
+    case Signal::kKill:
+      thread->Kill();
+      if constexpr (interruptible == Interruptible::Yes) {
+        expected_error = ZX_ERR_INTERNAL_INTR_KILLED;
+        expected_count = -1;
+      } else {
+        sema.Post();
+        expected_error = ZX_OK;
+        expected_count = 0;
+      }
+      break;
+
+    case Signal::kSuspend:
+      thread->Suspend();
+      if constexpr (interruptible == Interruptible::Yes) {
+        expected_error = ZX_ERR_INTERNAL_INTR_RETRY;
+        expected_count = -1;
+      } else {
+        sema.Post();
+        expected_error = ZX_OK;
+        expected_count = 0;
+      }
+      break;
+  }
+
+  int retcode = ZX_OK;
+  thread->Join(&retcode, ZX_TIME_INFINITE);
+  ASSERT_EQ(expected_error, retcode);
+  ASSERT_EQ(expected_count, sema.count());
+  ASSERT_EQ(0u, sema.num_waiters());
+
+  END_TEST;
+}
+
+template <Signal signal>
+static bool interruptible_signal_test() {
+  return signal_test<signal, Interruptible::Yes>();
+}
+
+template <Signal signal>
+static bool uninterruptible_signal_test() {
+  return signal_test<signal, Interruptible::No>();
+}
+
+UNITTEST_START_TESTCASE(semaphore_tests)
+UNITTEST("smoke_test", smoke_test)
+UNITTEST("timeout_test", timeout_test)
+UNITTEST("post_signal_test", interruptible_signal_test<Signal::kPost>)
+UNITTEST("post_queue_signal_test", interruptible_signal_test<Signal::kPostQueue>)
+UNITTEST("kill_signal_test", interruptible_signal_test<Signal::kKill>)
+UNITTEST("suspend_signal_test", interruptible_signal_test<Signal::kSuspend>)
+UNITTEST("kill_uninterruptible_signal_test", uninterruptible_signal_test<Signal::kKill>)
+UNITTEST("suspend_uninterruptible_signal_test", uninterruptible_signal_test<Signal::kSuspend>)
+UNITTEST_END_TESTCASE(semaphore_tests, "semaphore", "Semaphore tests")

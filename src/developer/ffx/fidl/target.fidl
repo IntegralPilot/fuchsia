@@ -1,0 +1,396 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.developer.ffx;
+using fuchsia.net;
+using fuchsia.buildinfo;
+using fuchsia.developer.remotecontrol as rc;
+
+type TargetIp = struct {
+    ip fuchsia.net.IpAddress;
+    scope_id uint32;
+};
+
+type TargetIpPort = struct {
+    ip fuchsia.net.IpAddress;
+    scope_id uint32;
+    port uint16;
+};
+
+type TargetVSockNamespace = strict enum {
+    VSOCK = 0;
+    USB = 1;
+};
+
+type TargetVSockCtx = struct {
+    cid uint32;
+    namespace TargetVSockNamespace;
+};
+
+// TODO(awdavies): Add serial number.
+type TargetIpAddrInfo = strict union {
+    1: ip TargetIp;
+    2: ip_port TargetIpPort;
+};
+
+// TODO(awdavies): Add serial number.
+type TargetAddrInfo = strict union {
+    1: ip TargetIp;
+    2: ip_port TargetIpPort;
+    3: vsock TargetVSockCtx;
+};
+
+// TODO(awdavies): Add more target states once they're more well defined.
+type TargetState = strict enum {
+    UNKNOWN = 1;
+    DISCONNECTED = 2;
+    PRODUCT = 3;
+    FASTBOOT = 4;
+    ZEDBOOT = 5;
+};
+
+/// Address of the ssh host address from the perspective of the target.
+type SshHostAddrInfo = struct {
+    address string:256;
+};
+
+/// Current known state of the remote control
+type RemoteControlState = strict enum {
+    UP = 1;
+    DOWN = 2;
+    UNKNOWN = 3;
+};
+
+/// Interface fastboot is connected over.
+type FastbootInterface = strict enum {
+    USB = 0;
+    UDP = 1;
+    TCP = 2;
+};
+
+alias CompatibilityInfo = rc.CompatibilityInfo;
+alias CompatibilityState = rc.CompatibilityState;
+
+type TargetInfo = table {
+    1: nodename string:rc.NODE_NAME_MAX;
+    2: addresses vector<TargetAddrInfo>:256;
+    3: age_ms uint64;
+    4: rcs_state RemoteControlState;
+    5: target_state TargetState;
+    // Contains the string used for the product in `fx set`, for example
+    // `fx set core.x64` would make this value "core".
+    6: product_config string:fuchsia.buildinfo.MAX_STRING_LENGTH;
+    // Contains the string used for the board in `fx set`, for example
+    // `fx set core.x64` would make this value "x64".
+    7: board_config string:fuchsia.buildinfo.MAX_STRING_LENGTH;
+    8: serial_number string:256;
+    /// ssh_address is the preferred address to use to connect to the
+    /// device over SSH, and will include a port number if a custom SSH
+    /// port number has been set.
+    9: ssh_address TargetIpAddrInfo;
+    10: fastboot_interface FastbootInterface;
+    /// The address of the ssh host as seen by the target.
+    11: ssh_host_address SshHostAddrInfo;
+    /// Compatibility status between host tools and target.
+    12: compatibility rc.CompatibilityInfo;
+    /// Whether the target was added manually.
+    13: is_manual bool;
+};
+
+type TargetRebootError = strict enum {
+    /// Cannot reboot from fastboot to recovery.
+    FASTBOOT_TO_RECOVERY = 1;
+    /// There was an Overnet communication issue with the target.
+    TARGET_COMMUNICATION = 2;
+    /// There was a Fastboot protocol communication issue with the
+    /// target.
+    FASTBOOT_COMMUNICATION = 3;
+    /// No netsvc address was found for the target when attempting
+    /// to reboot from Zedboot.
+    NETSVC_ADDRESS_NOT_FOUND = 4;
+    /// Error when running a function through netsvc protocol.
+    NETSVC_COMMUNICATION = 5;
+};
+
+type TargetRebootState = strict enum {
+    PRODUCT = 1;
+    BOOTLOADER = 2;
+    RECOVERY = 3;
+};
+
+/// An iterator for which the client handles calls to the `Next` function. When
+/// a client calls `ListTargets` in the `TargetCollection` protocol, the targets
+/// will be sent to the client via the `Next` function, with acknowledgements
+/// sent via the responder to handle backpressure.
+///
+/// When there are no more targets to be sent to the client, an empty vector
+/// will be sent as the last call to `Next`.
+closed protocol TargetCollectionReader {
+    strict Next(struct {
+        entry vector<TargetInfo>:MAX;
+    }) -> ();
+};
+
+/// A query for a Fuchsia target device. If empty when supplied to a method, will be
+/// interpreted as requesting the first target to be seen on the network, or ALL
+/// targets that have been seen on the network.
+type TargetQuery = table {
+    /// A string matcher is something that can match either the:
+    /// - Target nodename
+    /// - Target IP (any that have been seen).
+    /// - Serial number
+    ///
+    /// IPv6 and IPv4 addresses are both acceptable queries. If the address being
+    /// queried is ipv6 and includes a port number, the address (and
+    /// scope id if present) must be enclosed in square brackets. Scope and port
+    /// number are both optional, but may be present.
+    ///
+    /// If a port number is specified, it will match only with targets with
+    /// that same port number (with no port set on the target being treated as
+    /// the default ssh port, 22).
+    ///
+    /// Specifying 0 for the port will match specifically with hosts with
+    /// no port specified.
+    1: string_matcher string:255;
+};
+
+type OpenTargetError = strict enum {
+    /// When querying for a target, an ambiguous query was received (one that
+    /// matched multiple targets).
+    QUERY_AMBIGUOUS = 1;
+    /// No targets were able to match the query after waiting.
+    TARGET_NOT_FOUND = 2;
+    /// When resolving the target, the discovery of potentially matching
+    /// targets failed.
+    FAILED_DISCOVERY = 3;
+};
+
+type TargetConnectionError = strict enum {
+    /// Permission was denied (from the public SSH key to the target).
+    PERMISSION_DENIED = 1;
+    /// SSH refused connection to the target.
+    CONNECTION_REFUSED = 2;
+    /// Hostname could not be resolved.
+    UNKNOWN_NAME_OR_SERVICE = 3;
+    /// Timed out trying to communicate with the target.
+    TIMEOUT = 4;
+    /// SSH Key verification could not proceed (usually a known_hosts issue).
+    KEY_VERIFICATION_FAILURE = 5;
+    /// There was no route to the specified host through SSH.
+    NO_ROUTE_TO_HOST = 6;
+    /// SSH could not reach the specified address.
+    NETWORK_UNREACHABLE = 7;
+    /// The address given was invalid for the target (likely containing a
+    /// scope-ID that does not exist).
+    INVALID_ARGUMENT = 8;
+    /// An as-yet unseen error was encountered preventing connection to the
+    /// device (user will need to check the logs).
+    UNKNOWN_ERROR = 9;
+    /// There was an error communicating via FIDL to the device. This happens
+    /// after a connection has been established.
+    FIDL_COMMUNICATION_ERROR = 10;
+    /// An error was encountered while trying to knock a service in RCS. This
+    /// means that RCS was unable to connect to a service in order to verify a
+    /// FIDL channel can be established.
+    RCS_CONNECTION_ERROR = 11;
+    /// On attempting to 'knock' a service connection, the service dropped the
+    /// channel prematurely, closing the connection.
+    FAILED_TO_KNOCK_SERVICE = 12;
+    /// Daemon's ABI does not match the target's.
+    TARGET_INCOMPATIBLE = 13;
+    /// The connection was closed by the remote host (unique from `connection
+    /// refused`).
+    CONNECTION_CLOSED_BY_REMOTE_HOST = 14;
+};
+
+// TODO(https://fxbug.dev/42176602): Migrate the method specifc error enums to use
+// this type instead.
+type TargetError = strict enum {
+    /// The specified address does not exist within the target.
+    ADDRESS_NOT_FOUND = 1;
+};
+
+/// Configuration options for adding a manual target.
+type AddTargetConfig = table {
+    /// Attempts to verify connection.
+    1: verify_connection bool;
+};
+
+type AddTargetError = table {
+    /// An error with the target connection.
+    1: connection_error TargetConnectionError;
+
+    /// Ancillary information about how the connection failed.
+    /// Example: if there's an ABI mismatch, the specific mismatch is reported
+    /// here.
+    2: connection_error_logs vector<string:MAX>:MAX;
+};
+
+/// Defines the responses from the `AddTarget` method of the [TargetCollection]
+/// protocol. This is to assist in reporting structured errors to the client.
+closed protocol AddTargetResponder {
+    /// Called when `AddTarget()` succeeds.
+    strict Success();
+
+    /// Called when `AddTarget()` fails.
+    strict Error(struct {
+        err AddTargetError;
+    });
+};
+
+/// A protocol defining a collection of Fuchsia targets. This is used to inspect
+/// and interact with fuchsia targets that the daemon has discovered.
+@discoverable
+closed protocol TargetCollection {
+    /// Sends a list of all active targets in the collection. An active target
+    /// is one that has responded over the network recently.
+    ///
+    /// An optional query string can be passed that will limit results to only
+    /// targets whose metadata matches. Matching is limited to string
+    /// matches via the target's nodename, serial number, or IP address.
+    ///
+    /// The client receives updates by handling calls to `Next` in the
+    /// `TargetCollectionReader` protocol.
+    strict ListTargets(resource struct {
+        query TargetQuery;
+        reader client_end:TargetCollectionReader;
+    });
+
+    /// Opens a target handle given the query matches exactly one
+    /// target. If a target does not yet exist in the cache that matches the
+    /// query, then this will hang until one is found. It is the caller's
+    /// responsibility to time out if this call takes too long.
+    strict OpenTarget(resource struct {
+        query TargetQuery;
+        target_handle server_end:Target;
+    }) -> () error OpenTargetError;
+
+    /// Manually adds a target that cannot be discovered via mDNS. This target
+    /// will be retained indefinitely, including across daemon restarts.
+    ///
+    /// If `verify_connection` is passed as true in the config, this will wait
+    /// until it is possible to establish a remote control service connection
+    /// to the target, or else will return an error detailing what went wrong
+    /// communicating with the Fuchsia device.
+    ///
+    /// Note: the client will be responsible for timing out against this method,
+    /// as it will run for as long as the FIDL connection remains open. If the
+    /// channel is closed prematurely, then the manually added target will be
+    /// removed.
+    ///
+    /// If the channel to this call is dropped before the result is returned,
+    /// it is possible to leak a persistent manual target, so later on the
+    /// caller may need to invoke `RemoveTarget`.
+    ///
+    /// If `verify_connection` is passed as `false`, this function will return
+    /// immediately, ignoring possible connection issues with the target.
+    strict AddTarget(resource struct {
+        ip TargetAddrInfo;
+        config AddTargetConfig;
+        add_target_responder client_end:AddTargetResponder;
+    });
+
+    /// Manually remove a target from the target list.
+    ///
+    /// If the target_id doesn't match a device name, the daaemon will attempt
+    /// to interpret it as an IP.
+    strict RemoveTarget(struct {
+        target_id string:rc.NODE_NAME_MAX;
+    }) -> (struct {
+        removed bool;
+    });
+};
+
+/// This is a handle to a target received from the target collection.
+/// Not to be confused with the `TargetControl` protocol. This is exclusively
+/// for use with the target collection service.
+@discoverable
+closed protocol Target {
+    /// Returns:
+    /// * As much information identifying the target as is currently available.
+    strict Identity() -> (struct {
+        target_info TargetInfo;
+    });
+
+    /// Gets the target SSH host pipe error logs for this target.
+    ///
+    /// Returns:
+    /// * SSH host pipe error logs for the target. If there aren't any, will
+    /// return an empty string.
+    strict GetSshLogs() -> (struct {
+        entry string:MAX;
+    });
+
+    /// Waits for an SSH address to become available on the target.
+    ///
+    /// Returns:
+    /// * The first cached address viable for SSH. If there isn't one, will
+    ///   wait until there is. It is the client's responsibility to handle
+    ///   potential timeouts.
+    strict GetSshAddress() -> (struct {
+        address TargetIpAddrInfo;
+    });
+
+    /// Sets the preferred SSH address.
+    ///
+    /// If successful, then all subsequent interactions with the `Target` over
+    /// SSH will leverage the provided `ip`. That is, any existing connection to
+    /// target is severed and a new connection is established using the provided
+    /// `ip`. Note that the specified address is not persisted across daemon
+    /// version changes or restarts.
+    ///
+    /// This method is primarily useful in testing scenarios where a particular
+    /// network interface should be used (e.g. other interfaces may be disabled
+    /// during testing).
+    ///
+    /// Returns:
+    /// * An error if the `ip` does not exist within the target. Otherwise,
+    ///   nothing on success.
+    strict SetPreferredSshAddress(struct {
+        ip TargetIp;
+    }) -> () error TargetError;
+
+    /// Clears an address that was previously configured using
+    /// `SetPreferredSshAddress`.
+    ///
+    /// Any existing connection to the target is severed and a new connection is
+    /// established. The newly selected address is chosen using the standard
+    /// address selection logic.
+    ///
+    /// Returns:
+    /// * Nothing on success.
+    strict ClearPreferredSshAddress() -> ();
+
+    /// Opens a connection to the RemoteControlService for a given
+    /// target. If the target is not in a state that allows opening up the
+    /// remote control, will wait until it is. It is the client's responsibilty
+    /// to handle potential timeouts here otherwise it will wait indefinitely.
+    ///
+    /// Returns:
+    /// * Empty struct on success.
+    ///
+    /// Errors:
+    /// * See [TargetError] for failure states.
+    strict OpenRemoteControl(resource struct {
+        remote_control server_end:rc.RemoteControl;
+    }) -> () error TargetConnectionError;
+
+    /// Reboots the target to the desired state.
+    ///
+    /// Returns:
+    /// * Empty struct on success.
+    ///
+    /// Errors:
+    /// * See [TargetRebootError] for failure states.
+    strict Reboot(struct {
+        state TargetRebootState;
+    }) -> () error TargetRebootError;
+
+    /// Tells the daemon to disconnect from the target.
+    /// This is useful when the client knows any connection to the target
+    /// is stale, e.g. during a reboot test.
+    ///
+    /// Returns:
+    /// * Nothing on success.
+    strict Disconnect() -> ();
+};

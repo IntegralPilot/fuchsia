@@ -1,0 +1,141 @@
+#!/bin/bash
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test expected behavior of 'fx add-test' and 'fx add-host-test'
+
+BT_FILE_DEPS=(
+    "scripts/fx"
+    "tools/devshell/lib/vars.sh"
+    "tools/devshell/lib/is_invoked_by_agent.sh"
+    "tools/devshell/lib/agents.txt"
+    "tools/devshell/lib/fx-cmd-locator.sh"
+    "tools/devshell/lib/fx-optional-features.sh"
+    "tools/devshell/lib/platform.sh"
+    "tools/devshell/lib/generate-ssh-config.sh"
+    "tools/devshell/contrib/add-test"
+    "tools/devshell/contrib/add-host-test"
+)
+
+BT_MOCKED_TOOLS=(
+    "build/regenerator"
+)
+
+declare fx
+
+BT_SET_UP() {
+    source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+    fx="$(btf::setup_fx)"
+    FUCHSIA_DIR="${BT_TEMP_DIR}"
+    # Default mock regenerator to succeed
+    cat > "${FUCHSIA_DIR}/build/regenerator.mock_side_effects" <<EOF
+exit 0
+EOF
+}
+
+# Test that `fx add-test` appends to target_labels by default
+TEST_fx-add-test-default() {
+    local args_gn="${FUCHSIA_DIR}/out/default/args.gn"
+    echo "# initial args" > "${args_gn}"
+
+    BT_EXPECT "${fx}" add-test //src/sys:foo //src/sys:bar
+
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" 'target_labels += \["//src/sys:foo"\]'
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" 'target_labels += \["//src/sys:bar"\]'
+}
+
+# Test that `fx add-test --target-list` specifies a custom target list
+TEST_fx-add-test-target-list-flag() {
+    local args_gn="${FUCHSIA_DIR}/out/default/args.gn"
+    echo "# initial args" > "${args_gn}"
+
+    BT_EXPECT "${fx}" add-test --target-list host_labels //src/host:foo //src/host:bar
+
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" 'host_labels += \["//src/host:foo"\]'
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" 'host_labels += \["//src/host:bar"\]'
+    BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${args_gn}" "target_labels"
+    BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${args_gn}" "target-list"
+}
+
+# Test that `fx add-host-test` appends to host_labels
+TEST_fx-add-host-test() {
+    local args_gn="${FUCHSIA_DIR}/out/default/args.gn"
+    echo "# initial args" > "${args_gn}"
+
+    BT_EXPECT "${fx}" add-host-test //src/host:test1 //src/host:test2
+
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" 'host_labels += \["//src/host:test1"\]'
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" 'host_labels += \["//src/host:test2"\]'
+    BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${args_gn}" "target-list"
+    BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${args_gn}" "target_labels"
+}
+
+# Test that `fx add-test` ignores the --with argument
+TEST_fx-add-test-skips-with() {
+    local args_gn="${FUCHSIA_DIR}/out/default/args.gn"
+    echo "# initial args" > "${args_gn}"
+
+    BT_EXPECT "${fx}" add-test --with //src/sys:foo
+
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" 'target_labels += \["//src/sys:foo"\]'
+    BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${args_gn}" "with"
+}
+
+# Helper to configure the mock regenerator to fail on its first run and succeed thereafter.
+setup_mock_regenerator_fail_once() {
+    local marker="$1"
+    rm -f "${FUCHSIA_DIR}/${marker}"
+    cat > "${FUCHSIA_DIR}/build/regenerator.mock_side_effects" <<EOF
+if [[ -f "${FUCHSIA_DIR}/${marker}" ]]; then
+    exit 0
+else
+    touch "${FUCHSIA_DIR}/${marker}"
+    exit 1
+fi
+EOF
+}
+
+# Test that `fx add-test` restores args.gn and exits with failure on gen failure
+TEST_fx-add-test-reverts-on-gen-failure() {
+    local args_gn="${FUCHSIA_DIR}/out/default/args.gn"
+    echo "# pristine args" > "${args_gn}"
+
+    setup_mock_regenerator_fail_once ".add_test_failed_once"
+
+    BT_EXPECT_FAIL "${fx}" add-test //invalid:target
+
+    # args.gn should be restored to pristine state
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" "# pristine args"
+    BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${args_gn}" "//invalid:target"
+}
+
+# Test that `fx add-host-test` restores args.gn and exits with failure on gen failure
+TEST_fx-add-host-test-reverts-on-gen-failure() {
+    local args_gn="${FUCHSIA_DIR}/out/default/args.gn"
+    echo "# pristine args" > "${args_gn}"
+
+    setup_mock_regenerator_fail_once ".add_host_test_failed_once"
+
+    BT_EXPECT_FAIL "${fx}" add-host-test //invalid:target
+
+    # args.gn should be restored to pristine state
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${args_gn}" "# pristine args"
+    BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${args_gn}" "//invalid:target"
+}
+
+# Test error handling when too few arguments are given
+TEST_fx-add-test-too-few-args() {
+    local out="${BT_TEMP_DIR}/_fx_add_test_output"
+
+    BT_EXPECT_FAIL "${fx}" add-test >"$out" 2>&1
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "$out" "ERROR: Too few arguments. At least one label is required."
+
+    BT_EXPECT_FAIL "${fx}" add-test --target-list >"$out" 2>&1
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "$out" "ERROR: Missing argument for --target-list"
+
+    BT_EXPECT_FAIL "${fx}" add-test --target-list host_labels >"$out" 2>&1
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "$out" "ERROR: Too few arguments. At least one label is required."
+}
+
+BT_RUN_TESTS "$@"

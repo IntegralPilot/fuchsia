@@ -1,0 +1,543 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/dist/distribution_manifest_generated_file.gni")
+import("//build/dist/resource.gni")
+import("//build/python/python_action.gni")
+import("//tools/cmc/build/cmc.gni")
+import("//tools/cmc/build/cml.gni")
+
+# Which tool(s) to use in this process are conditional based on this being a
+# sub-build or normal build.  Sub-builds use prebuilt binaries, whereas the
+# normal build depends on the actual build targets.
+#
+# This logic is taken from `compiled_action()`, and is similar to the logic
+# there, although slightly simplified because we know we will not be opt'ing
+# out of the use of prebuilt tools.
+_cmc_label = "//tools/cmc:cmc.actual(${host_toolchain})"
+_cmc_output_dir =
+    get_label_info("//tools/cmc:cmc.actual(${host_toolchain})", "root_out_dir")
+_cmc_executable = "${_cmc_output_dir}/cmc"
+
+if (host_tools_base_path_override != "") {
+  # Use a prebuilt version of the host tool. Assume the tool is already
+  # built so do not add any dependency to the target.
+  _cmc_executable_rebased = host_tools_base_path_override + "/" +
+                            rebase_path(_cmc_executable, root_build_dir)
+  _cmc_executable =
+      "//" + rebase_path(_cmc_executable_rebased, "//", root_build_dir)
+
+  _tools_cmc = {
+    input = _cmc_executable
+    rebased = _cmc_executable_rebased
+  }
+} else {
+  # Use the compilation dep for the tool
+  _tools_cmc = {
+    dep = _cmc_label
+    input = _cmc_executable
+    rebased = rebase_path(_cmc_executable, root_build_dir)
+  }
+}
+
+# Defines a Fuchsia component's manifest.
+# See: https://fuchsia.dev/fuchsia-src/development/components/build
+#
+# Parameters
+#
+#   manifest (required)
+#     The component manifest.
+#     Type: path
+#
+#   component_name (optional)
+#     The name of the component.
+#     Type: string
+#     Default: target_name
+#
+#   required_offers (optional)
+#     Check that all children and collections are offered each protocol listed.
+#     Type: list of strings
+#
+#   required_uses (optional)
+#     Check that all children and collections use each protocol listed.
+#     Type: list of strings
+#
+#   restricted_features (optional)
+#     The set of restricted CML features to allow.
+#     The set of features is allowlisted here: //tools/cmc/build/restricted_features/BUILD.gn
+#     where each feature name is represented by a group of the same name.
+#     Type: list of strings
+#     Default: []
+#
+#   experimental_force_runner (optional)
+#     Set the --experimental-force-runner flag to the given value.
+#     This flag is experimental and may be removed without warning.
+#     Type: string
+#
+#   data_deps
+#   deps
+#   testonly
+#   visibility
+template("fuchsia_component_manifest") {
+  if (current_toolchain == default_toolchain) {
+    assert(
+        defined(invoker.manifest),
+        "A `manifest` argument was missing when calling fuchsia_component_manifest($target_name)")
+
+    component_name = target_name
+    if (defined(invoker.component_name)) {
+      component_name = invoker.component_name
+    }
+
+    # Handle different manifest versions
+    manifest_extension = get_path_info(invoker.manifest, "extension")
+    if (manifest_extension != "cml") {
+      assert(
+          false,
+          "Unknown manifest format for \"${invoker.manifest}\", must be \".cml\"")
+    }
+    manifest_name = "$component_name.cm"
+    manifest_resource_target = "${target_name}_manifest_resource"
+
+    # Process the manifest
+    cm(target_name) {
+      output_name = "$manifest_extension/$target_name/$manifest_name"
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "deps",
+                               "manifest",
+                               "required_offers",
+                               "required_uses",
+                               "restricted_features",
+                               "testonly",
+                               "visibility",
+                               "experimental_force_runner",
+                             ])
+
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += [ ":$manifest_resource_target" ]
+
+      # NOTE: must be kept in sync with path in fuchsia_structured_config.gni
+      config_values_package_path = "meta/$component_name.cvf"
+
+      metadata = {
+        if (defined(invoker.metadata)) {
+          forward_variables_from(invoker.metadata, "*")
+        }
+
+        component_manifest_path = [ manifest ]
+        component_manifest_path_barrier = []
+      }
+    }
+
+    # Add the manifest
+    resource(manifest_resource_target) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "data_deps",
+                               "testonly",
+                             ])
+      sources = get_target_outputs(":${invoker.target_name}")
+      outputs = [ "meta/$manifest_name" ]
+      visibility = [ ":*" ]
+    }
+  } else {
+    group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "visibility",
+                             ])
+      deps = [ ":$target_name($default_toolchain)" ]
+    }
+    not_needed(invoker, "*")
+  }
+}
+
+# Defines a Fuchsia component.
+# See: https://fuchsia.dev/fuchsia-src/development/components/build
+#
+# A component is defined by a component manifest.
+# Component manifests typically reference files in the package that they are
+# distributed in. Therefore a component can also have dependencies on
+# `resource()`, such that any package that depends on the component will
+# also include that resource.
+#
+# A component is launched by a URL.
+# See: https://fuchsia.dev/fuchsia-src/glossary#component_url
+#
+# A component's URL is a function of the name of a package that includes it,
+# and the path within that package to the component's manifest. For instance if
+# you defined the following:
+# ```
+# executable("my_program") {
+#   ...
+# }
+#
+# fuchsia_component("my-component") {
+#   manifest = "manifest.cml"
+#   deps = [ ":my_program" ]
+# }
+#
+# fuchsia_package("my-package") {
+#   deps = [ ":my-component" ]
+# }
+# ```
+# The component above will have the following launch URL:
+# `fuchsia-pkg://fuchsia.com/my-package#meta/my-component.cm`
+#
+# Since the component depends on the executable target, the binary produced by
+# the executable will be packaged with the manifest. Therefore the manifest
+# author can reference the path `bin/my_program`.
+#
+# Components may depend on any number of `resource()` targets to ensure that
+# any `fuchsia_package()` that includes them will include the same resources.
+#
+# ```
+# resource("my_file") {
+#   sources = [ "my_file.txt" ]
+#   outputs = [ "data/{{source_file_part}}" ]
+# }
+#
+# fuchsia_component("my-component") {
+#   deps = [ ":my_file" ]
+#   ...
+# }
+# ```
+#
+# The component defined above will be able to read my_file.txt under the path
+# "/pkg/data/my_file.txt" in its sandbox.
+#
+# Parameters
+#
+#   manifest (must specify either manifest or cm_label)
+#     The component manifest.
+#     Type: path
+#
+#   cm_label (must specify either manifest or cm_label)
+#     Use label of a fuchsia_component_manifest target instead of supplying the manifest source.
+#     Type: string, GN label e.g. `:my-manifest`
+#
+#   component_name (optional)
+#     The name of the component.
+#     Type: string
+#     Default: target_name
+#
+#   check_includes (optional)
+#     Check against expect_includes() in deps.
+#     Warning: Do not disable this unless there is a good, documented reason.
+#     Type: boolean
+#     Default: true
+#
+#   check_references (optional)
+#     Check component manifest references (e.g. "program.binary") against
+#     package manifest.
+#     Type: boolean
+#     Default: true
+#
+#   restricted_features (optional)
+#     The set of restricted CML features to allow.
+#     The set of features is allowlisted here: //tools/cmc/build/restricted_features/BUILD.gn
+#     where each feature name is represented by a group of the same name.
+#     Type: list of strings
+#     Default: []
+#
+#   experimental_force_runner (optional)
+#     Set the --experimental-force-runner flag to the given value.
+#     This flag is experimental and may be removed without warning.
+#     Type: string
+#
+#   manifest_deps (optional)
+#     Dependencies for the component's manifest, in case it is generated by another target.
+#     Type: list of targets
+#
+#   data_deps
+#   deps
+#   testonly
+#   visibility
+template("fuchsia_component") {
+  forwarded = [
+    "applicable_licenses",
+    "data_deps",
+    "deps",
+    "component_name",
+    "manifest",
+    "metadata",
+    "restricted_features",
+    "testonly",
+    "visibility",
+    "experimental_force_runner",
+  ]
+  if (current_toolchain == default_toolchain) {
+    main_target = target_name
+
+    _manifest_defined = defined(invoker.manifest)
+    _cm_label_defined = defined(invoker.cm_label)
+    assert(
+        (_manifest_defined && !_cm_label_defined) ||
+            (!_manifest_defined && _cm_label_defined),
+        "Exactly one of `manifest` or `cm_label` argument must be specified when calling fuchsia_component($target_name)")
+    if (defined(invoker.manifest)) {
+      # Compile the manifest from source
+      cm_target = "${target_name}_manifest_compile"
+      fuchsia_component_manifest(cm_target) {
+        forward_variables_from(invoker, forwarded)
+        if (defined(metadata) && defined(metadata.test_components)) {
+          # empty it out so that same entry is not produced two times when
+          # walking the metadata
+          metadata.test_components = []
+        }
+        if (!defined(component_name)) {
+          component_name = invoker.target_name
+        }
+        if (defined(invoker.manifest_deps)) {
+          if (!defined(deps)) {
+            deps = []
+          }
+          deps += invoker.manifest_deps
+        }
+      }
+      cm_label = ":$cm_target"
+    } else {
+      cm_label = invoker.cm_label
+      not_needed(invoker, forwarded)
+    }
+
+    # Get the compiled manifest path
+    _manifest_outputs = get_target_outputs(cm_label)
+
+    # Assert that there is only one output file from the cm_label action
+    assert(_manifest_outputs == [ _manifest_outputs[0] ],
+           "fuchsia_component_manifest() should only ever have 1 output file")
+
+    # And then use that for the CM path
+    _compiled_manifest = _manifest_outputs[0]
+
+    _output_compiled_manifest =
+        "$target_out_dir/${target_name}_component_manifest/" +
+        get_path_info(_compiled_manifest, "file")
+
+    # Check that the manifest includes shards for component dependencies
+    check_includes = true
+    if (defined(invoker.check_includes)) {
+      check_includes = invoker.check_includes
+    }
+
+    # Check that the files the manifest references are dependencies of the
+    # component itself (and therefore will be included in the same package
+    # as it will be)
+    check_references = true
+    if (defined(invoker.check_references)) {
+      check_references = invoker.check_references
+    }
+
+    if (check_includes) {
+      # When checking includes, the source cml file for the component is
+      # required (to check for includes), so generate a file that contains
+      # the path to the source manifest.
+      #
+      # TODO:  When invoker.manifest is specified instead of invoker.cm_label,
+      #        skip this and provide it directly
+      #
+      _find_manifest_target = "${target_name}.find_manifest"
+      _find_manifest_file = "${target_out_dir}/${_find_manifest_target}.json"
+      generated_file(_find_manifest_target) {
+        forward_variables_from(invoker,
+                               [
+                                 "applicable_licenses",
+                                 "testonly",
+                               ])
+        visibility = [ ":${main_target}" ]
+        outputs = [ _find_manifest_file ]
+        data_keys = [ "component_manifest_path" ]
+        walk_keys = [ "component_manifest_path_barrier" ]
+        rebase = root_build_dir
+        output_conversion = "json"
+        deps = [ cm_label ]
+      }
+
+      _expected_includes_target = "${target_name}.expected_includes"
+      _expected_includes_file = "${target_out_dir}/${_expected_includes_target}"
+      generated_file(_expected_includes_target) {
+        forward_variables_from(invoker,
+                               [
+                                 "applicable_licenses",
+                                 "deps",
+                                 "testonly",
+                               ])
+        visibility = [ ":${main_target}" ]
+        outputs = [ _expected_includes_file ]
+        data_keys = [ "cmc_expected_includes_cml" ]
+        walk_keys = [ "expect_includes_barrier" ]
+      }
+    }
+
+    if (check_references) {
+      # When checking the component references, we need a distribution manifest
+      # of all distributable files that the component depends on, which the
+      # script will convert into a 'fini' manifest (also called a package
+      # creation manifest) and pass to the 'cmc' tool to verify that all the
+      # required binaries are present.
+
+      # The distribution manifest
+      _component_dist_target = "${target_name}.dist"
+      _component_dist_manifest = "${target_out_dir}/${target_name}.dist"
+      distribution_manifest_generated_file(_component_dist_target) {
+        forward_variables_from(invoker,
+                               [
+                                 "applicable_licenses",
+                                 "deps",
+                                 "testonly",
+                               ])
+        if (!defined(deps)) {
+          deps = []
+        }
+        deps += [ cm_label ]
+        visibility = [ ":${main_target}" ]
+        outputs = [ _component_dist_manifest ]
+      }
+
+      # The fini file that will be generated from the manifest
+      _component_fini_manifest = "${target_out_dir}/${target_name}.manifest"
+    }
+
+    if (!(check_includes || check_references)) {
+      not_needed([ "main_target" ])
+    }
+
+    python_action(target_name) {
+      mnemonic = "COMPONENT"
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "deps",
+                               "public_deps",
+                               "visibility",
+                             ])
+      binary_label = "//build/components:component_creation_wrapper"
+
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += [ cm_label ]
+
+      inputs = [
+        # The compiled manifest itself
+        _compiled_manifest,
+      ]
+
+      outputs = [
+        # The final output destination for the manifest
+        _output_compiled_manifest,
+      ]
+
+      # As the sole output is a compiled manifest, it can't leak output dir
+      # paths
+      check_for_output_dir_leaks = false
+
+      args = [
+        "--label",
+        get_label_info(":${target_name}", "label_no_toolchain"),
+        "--compiled-manifest",
+        rebase_path(_compiled_manifest, root_build_dir),
+        "--output",
+        rebase_path(outputs[0], root_build_dir),
+      ]
+      depfile = "${target_out_dir}/${target_name}.d"
+
+      # Both of these need CMC
+      if (check_includes || check_references) {
+        if (defined(_tools_cmc.dep)) {
+          deps += [ _tools_cmc.dep ]
+        }
+        inputs += [ _tools_cmc.input ]
+        args += [
+          "--cmc",
+          _tools_cmc.rebased,
+          "--depfile",
+          rebase_path(depfile, root_build_dir),
+        ]
+      } else {
+        print("Not validated: " +
+              get_label_info(":${target_name}", "label_no_toolchain"))
+      }
+
+      # If cml includes checking is enabled, add the above-generated files that
+      # are needed for that to the set of deps/inputs, and their arguments, so
+      # that the script can find the source cml file, as well as the list of
+      # expected includes that all the libraries used by the component's binary
+      # need the component manifest to include (directly or transitively).
+      if (check_includes) {
+        deps += [
+          ":${_expected_includes_target}",
+          ":${_find_manifest_target}",
+        ]
+        inputs += [
+          _find_manifest_file,
+          _expected_includes_file,
+        ]
+        args += [
+                  # The source cml file's location
+                  "--manifest-path-file",
+                  rebase_path(_find_manifest_file, root_build_dir),
+
+                  # The list of includes that are expected to be included in the
+                  # above cml file.
+                  "--expected-includes",
+                  rebase_path(_expected_includes_file, root_build_dir),
+                ] + cmc_include_paths
+      }
+
+      # If component reference checkign is enabled, add the above-generated
+      # file that contains all the distributable files that the component
+      # depends on.  All files referenced in the component need to be in this
+      # list.
+      if (check_references) {
+        # The above-generated distribution manifest
+        deps += [ ":${_component_dist_target}" ]
+        inputs += [ _component_dist_manifest ]
+
+        args += [
+          "--check-references-dist-manifest",
+          rebase_path(_component_dist_manifest, root_build_dir),
+          "--check-references-fini-manifest",
+          rebase_path(_component_fini_manifest, root_build_dir),
+        ]
+      }
+
+      metadata = {
+        if (defined(invoker.metadata)) {
+          forward_variables_from(invoker.metadata, "*")
+        }
+
+        test_component_manifest_program_barrier = []
+        test_component_manifest_barrier = []
+
+        # no need to parse any more deps. Will make the build little bit faster.
+        test_components_barrier = []
+
+        # Don't collect expected includes via transitive deps of components
+        expect_includes_barrier = []
+      }
+    }
+  } else {
+    group(target_name) {
+      forward_variables_from(invoker, [ "testonly" ])
+      deps = [ ":$target_name($default_toolchain)" ]
+    }
+    not_needed(invoker,
+               forwarded + [
+                     "check_includes",
+                     "check_references",
+                     "cm_label",
+                     "manifest_deps",
+                   ])
+  }
+}

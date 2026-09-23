@@ -1,0 +1,205 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "src/ui/scenic/lib/input/mouse_source_base.h"
+
+#include <lib/async/cpp/time.h>
+#include <lib/syslog/cpp/macros.h>
+#include <lib/trace/event.h>
+
+namespace scenic_impl::input {
+
+using fuchsia_ui_pointer::MouseEvent;
+
+MouseEvent MouseSourceBase::NewMouseEvent(const InternalMouseEvent& event) {
+  MouseEvent new_event;
+  new_event.timestamp(event.timestamp);
+  new_event.trace_flow_id(TRACE_NONCE());
+  new_event.pointer_sample(MouseSourceBase::NewPointerSample(event));
+  return new_event;
+}
+
+void MouseSourceBase::AddDeviceInfoToEvent(MouseEvent& out_event, const InternalMouseEvent& event) {
+  fuchsia_ui_pointer::MouseDeviceInfo device_info;
+  device_info.id(event.device_id);
+  if (event.scroll_v.has_value()) {
+    const auto& [unit, exponent, range, _] = event.scroll_v.value();
+    FX_DCHECK(range[0] < range[1]);
+    device_info.scroll_v_range(fuchsia_input_report::Axis{{
+        .range = fuchsia_input_report::Range{{.min = range[0], .max = range[1]}},
+        .unit = fuchsia_input_report::Unit{{
+            .type = static_cast<fuchsia_input_report::UnitType>(unit),
+            .exponent = exponent,
+        }},
+    }});
+  }
+  if (event.scroll_h.has_value()) {
+    const auto& [unit, exponent, range, _] = event.scroll_h.value();
+    FX_DCHECK(range[0] < range[1]);
+    device_info.scroll_h_range(fuchsia_input_report::Axis{{
+        .range = fuchsia_input_report::Range{{.min = range[0], .max = range[1]}},
+        .unit = fuchsia_input_report::Unit{{
+            .type = static_cast<fuchsia_input_report::UnitType>(unit),
+            .exponent = exponent,
+        }},
+    }});
+  }
+  if (!event.buttons.identifiers.empty()) {
+    FX_DCHECK(event.buttons.identifiers.size() <= fuchsia_input_report::kMouseMaxNumButtons);
+    device_info.buttons(event.buttons.identifiers);
+  }
+  out_event.device_info(std::move(device_info));
+}
+
+void MouseSourceBase::AddStreamInfoToEvent(MouseEvent& out_event, const InternalMouseEvent& event,
+                                           bool view_entered) {
+  out_event.stream_info(fuchsia_ui_pointer::MouseEventStreamInfo{{
+      .device_id = event.device_id,
+      .status = view_entered ? fuchsia_ui_pointer::MouseViewStatus::kEntered
+                             : fuchsia_ui_pointer::MouseViewStatus::kExited,
+  }});
+}
+
+void MouseSourceBase::AddViewParametersToEvent(MouseEvent& out_event, const Viewport& viewport,
+                                               const view_tree::BoundingBox& view_bounds) {
+  out_event.view_parameters(fuchsia_ui_pointer::ViewParameters{{
+      .view = fuchsia_ui_pointer::Rectangle{{.min = view_bounds.min, .max = view_bounds.max}},
+      .viewport = fuchsia_ui_pointer::Rectangle{{
+          .min = {viewport.extents.min[0], viewport.extents.min[1]},
+          .max = {viewport.extents.max[0], viewport.extents.max[1]},
+      }},
+      .viewport_to_view_transform = viewport.receiver_from_viewport_transform.value(),
+  }});
+}
+
+MouseEvent MouseSourceBase::NewViewExitEvent(const InternalMouseEvent& event) {
+  MouseEvent new_event;
+  new_event.timestamp(event.timestamp);
+  new_event.trace_flow_id(TRACE_NONCE());
+  new_event.stream_info(fuchsia_ui_pointer::MouseEventStreamInfo{{
+      .device_id = event.device_id,
+      .status = fuchsia_ui_pointer::MouseViewStatus::kExited,
+  }});
+  return new_event;
+}
+
+void MouseSourceBase::WatchBase(fit::function<void(std::vector<MouseEvent>)> callback) {
+  TRACE_DURATION("input", "MouseSourceBase::Watch");
+  if (pending_callback_ != nullptr) {
+    FX_LOGS(ERROR) << "Called Watch() without waiting for previous callback to return.";
+    close_channel_(ZX_ERR_BAD_STATE);
+    return;
+  }
+
+  pending_callback_ = std::move(callback);
+  SendPendingIfWaiting();
+}
+
+fuchsia_ui_pointer::MousePointerSample MouseSourceBase::NewPointerSample(
+    const InternalMouseEvent& event) {
+  fuchsia_ui_pointer::MousePointerSample pointer;
+  pointer.device_id(event.device_id);
+
+  pointer.position_in_viewport(
+      std::array<float, 2>{event.position_in_viewport[0], event.position_in_viewport[1]});
+  pointer.relative_motion(std::array<float, 2>{event.relative_motion[0], event.relative_motion[1]});
+
+  if (event.scroll_v.has_value() && event.scroll_v->scroll_value.has_value()) {
+    pointer.scroll_v(event.scroll_v->scroll_value.value());
+  }
+  if (event.scroll_h.has_value() && event.scroll_h->scroll_value.has_value()) {
+    pointer.scroll_h(event.scroll_h->scroll_value.value());
+  }
+  if (event.scroll_v_physical_pixel.has_value()) {
+    pointer.scroll_v_physical_pixel(event.scroll_v_physical_pixel.value());
+  }
+  if (event.scroll_h_physical_pixel.has_value()) {
+    pointer.scroll_h_physical_pixel(event.scroll_h_physical_pixel.value());
+  }
+  if (event.is_precision_scroll.has_value()) {
+    pointer.is_precision_scroll(event.is_precision_scroll.value());
+  }
+
+  FX_DCHECK(event.buttons.pressed.size() <= fuchsia_input_report::kMouseMaxNumButtons);
+  if (!event.buttons.pressed.empty()) {
+    pointer.pressed_buttons(event.buttons.pressed);
+  }
+
+  return pointer;
+}
+
+void MouseSourceBase::UpdateStream(const StreamId stream_id, InternalMouseEvent event,
+                                   const view_tree::BoundingBox view_bounds, const bool view_exit) {
+  if (view_exit) {
+    const auto erased = tracked_streams_.erase(stream_id);
+    FX_DCHECK(erased == 1) << "First event of a stream can't have MouseViewStatus::EXITED";
+    if (erased == 1) {
+      fuchsia_ui_pointer::MouseEvent exit_event = NewViewExitEvent(event);
+      if (event.wake_lease) {
+        exit_event.wake_lease(std::move(event.wake_lease));
+      }
+      PushEvent(std::move(exit_event));
+    }
+    return;
+  }
+
+  auto out_event = NewMouseEvent(event);
+  if (!tracked_streams_.contains(stream_id)) {
+    tracked_streams_.emplace(stream_id);
+    AddStreamInfoToEvent(out_event, event, /*view_entered*/ true);
+  }
+
+  if (!tracked_devices_.contains(event.device_id)) {
+    tracked_devices_.emplace(event.device_id);
+    AddDeviceInfoToEvent(out_event, event);
+  }
+
+  // Add ViewParameters to the message if the viewport or view bounds have changed (which is
+  // always true for the first message).
+  if (current_viewport_ != event.viewport || current_view_bounds_ != view_bounds ||
+      is_first_event_) {
+    is_first_event_ = false;
+    current_viewport_ = event.viewport;
+    current_view_bounds_ = view_bounds;
+    AddViewParametersToEvent(out_event, current_viewport_, current_view_bounds_);
+  }
+
+  if (event.wake_lease) {
+    out_event.wake_lease(std::move(event.wake_lease));
+  }
+
+  PushEvent(std::move(out_event));
+}
+
+void MouseSourceBase::PushEvent(fuchsia_ui_pointer::MouseEvent event) {
+  pending_events_.push(std::move(event));
+  SendPendingIfWaiting();
+}
+
+void MouseSourceBase::SendPendingIfWaiting() {
+  if (!pending_callback_ || pending_events_.empty()) {
+    return;
+  }
+
+  std::vector<MouseEvent> events;
+  for (size_t i = 0; !pending_events_.empty() && i < fuchsia_ui_pointer::kMouseMaxEvent; ++i) {
+    auto event = std::move(pending_events_.front());
+    if (event.trace_flow_id().has_value()) {
+      TRACE_FLOW_BEGIN("input", "dispatch_event_to_client", event.trace_flow_id().value());
+    }
+
+    pending_events_.pop();
+    events.emplace_back(std::move(event));
+  }
+  FX_DCHECK(!events.empty());
+  FX_DCHECK(events.size() <= fuchsia_ui_pointer::kMouseMaxEvent);
+
+  // Move the callback onto the stack and reset the member variable before calling it.
+  // This is to allow the |pending_callback_| member variable to be reset from within the callback.
+  auto pending_callback = std::move(pending_callback_);
+  pending_callback_ = nullptr;
+  pending_callback(std::move(events));
+}
+
+}  // namespace scenic_impl::input

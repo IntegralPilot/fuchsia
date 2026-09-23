@@ -1,0 +1,144 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/fidl/toolchain.gni")
+
+# Declares a Measure Tape.
+#
+# This target generates a measuring tape for one or multiple target types.
+#
+# Parameters
+#
+#   target_binding (required)
+#     The binding for which to create the measure tape. Both `hlcpp` and `rust`
+#     are supported.
+#
+#   fidls (required)
+#     A list of GN depedencies. All those depedencies must be `fidl` targets.
+#
+#   target_types (required)
+#     A list of fully qualified FIDL types for which to generate a measuring
+#     tape.
+template("measure_tape") {
+  assert(defined(invoker.target_binding))
+  assert(defined(invoker.fidls))
+  assert(defined(invoker.target_types))
+
+  # targets
+  name = target_name
+  fidl_targets = invoker.fidls
+  gen_target_name = "${target_name}_gen"
+
+  out_cc = "${target_gen_dir}/measure_tape/hlcpp/${target_name}.cc"
+  out_h = "${target_gen_dir}/measure_tape/hlcpp/${target_name}.h"
+  out_rs_root = "${target_gen_dir}/${target_name}/rust"
+  out_rs = "${out_rs_root}/src/lib.rs"
+
+  # arguments for code generation tool
+  gen_args = [
+    "--target-binding",
+    invoker.target_binding,
+    "--out-cc",
+    rebase_path(out_cc, root_build_dir),
+    "--out-h",
+    rebase_path(out_h, root_build_dir),
+    "--out-rs",
+    rebase_path(out_rs, root_build_dir),
+    "--h-include-path",
+    "measure_tape/hlcpp/${target_name}.h",
+  ]
+  foreach(target_type, invoker.target_types) {
+    gen_args += [
+      "--target-types",
+      target_type,
+    ]
+  }
+  foreach(fidl, invoker.fidls) {
+    fidl_target =
+        get_label_info(fidl, "label_no_toolchain") + "($fidl_toolchain)"
+    json_file = get_label_info(fidl_target, "target_gen_dir") + "/" +
+                get_label_info(fidl_target, "name") + ".fidl.json"
+    gen_args += [
+      "--json",
+      rebase_path(json_file, root_build_dir),
+    ]
+  }
+
+  if (invoker.target_binding == "hlcpp") {
+    config_target_name = "${target_name}_config"
+
+    # source set configuration to support `#include <...>`
+    config(config_target_name) {
+      include_dirs = [ target_gen_dir ]
+    }
+
+    # source set consisting of the two generated files
+    source_set(name) {
+      forward_variables_from(invoker,
+                             [
+                               "defines",
+                               "testonly",
+                               "visibility",
+                             ])
+      sources = [
+        out_cc,
+        out_h,
+      ]
+      deps = [ ":$gen_target_name" ]
+      public_deps = []
+      foreach(fidl_target, fidl_targets) {
+        label = get_label_info(fidl_target, "label_no_toolchain")
+        public_deps += [ "${label}_hlcpp" ]
+      }
+      public_configs = [ ":$config_target_name" ]
+    }
+
+    generated_outputs = [
+      out_cc,
+      out_h,
+    ]
+  } else if (invoker.target_binding == "rust") {
+    import("//build/rust/rustc_library.gni")
+
+    rustc_library(name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      edition = "2024"
+      deps = [
+        "//sdk/rust/zx-types",
+        "//src/lib/fidl/rust/fidl",
+      ]
+      foreach(fidl_target, fidl_targets) {
+        label = get_label_info(fidl_target, "label_no_toolchain")
+        deps += [ "${label}_rust" ]
+      }
+      non_rust_deps = [ ":$gen_target_name" ]
+      source_root = out_rs
+      sources = [ out_rs ]
+      disable_clippy = true
+      disable_rustdoc = true
+    }
+
+    generated_outputs = [ out_rs ]
+  }
+
+  # code generation
+  compiled_action(gen_target_name) {
+    tool = "//tools/fidl/measure-tape/src:measure-tape"
+    tool_output_name = "measure-tape"
+
+    args = gen_args
+    outputs = generated_outputs
+    deps = []
+    foreach(fidl_target, fidl_targets) {
+      label = get_label_info(fidl_target, "label_no_toolchain")
+      deps += [ "${label}($fidl_toolchain)" ]
+    }
+    forward_variables_from(invoker, [ "testonly" ])
+  }
+}

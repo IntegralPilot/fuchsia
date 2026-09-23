@@ -1,0 +1,201 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.bluetooth;
+
+using zx;
+
+type ScoCodingFormat = flexible enum : uint8 {
+    CVSD = 1;
+    MSBC = 2;
+};
+
+type ScoEncoding = flexible enum : uint8 {
+    BITS_8 = 1;
+    BITS_16 = 2;
+};
+
+type ScoSampleRate = flexible enum : uint8 {
+    KHZ_8 = 1;
+    KHZ_16 = 2;
+};
+
+const EVENT_MAX uint64 = 257;
+const COMMAND_MAX uint64 = 258;
+const ACL_PACKET_MAX uint64 = 65539;
+const ISO_PACKET_MAX uint64 = 16387;
+const SCO_PACKET_MAX uint64 = 258;
+
+/// Packet received by the host from the controller.
+type ReceivedPacket = flexible union {
+    1: event vector<byte>:EVENT_MAX;
+    2: acl vector<byte>:ACL_PACKET_MAX;
+    3: iso vector<byte>:ISO_PACKET_MAX;
+};
+
+/// Packet sent by the host to the controller.
+type SentPacket = flexible union {
+    1: command vector<byte>:COMMAND_MAX;
+    2: acl vector<byte>:ACL_PACKET_MAX;
+    3: iso vector<byte>:ISO_PACKET_MAX;
+};
+
+type ScoPacket = struct {
+    packet vector<byte>:SCO_PACKET_MAX;
+};
+
+type SnoopPacket = flexible union {
+    1: event vector<byte>:EVENT_MAX;
+    2: command vector<byte>:COMMAND_MAX;
+    3: acl vector<byte>:ACL_PACKET_MAX;
+    4: sco vector<byte>:SCO_PACKET_MAX;
+    5: iso vector<byte>:ISO_PACKET_MAX;
+};
+
+@strict_audit(bug="https://fxbug.dev/467127725", state="PENDING_REVIEW")
+type PacketDirection = strict enum {
+    HOST_TO_CONTROLLER = 1;
+    CONTROLLER_TO_HOST = 2;
+};
+
+open protocol ScoConnection {
+    /// More than one Send can be pending simultaneously.
+    /// Prefer to limit the number of pending calls to avoid overflow.
+    /// A maximum of 10 pending calls is suggested.
+    flexible Send(ScoPacket) -> ();
+
+    /// More than one packet event can be sent before acknowledged. Each packet must be
+    /// acknowledged with `AckReceive`. Servers should limit the number of pending acknowledgements
+    /// to avoid channel overflow. A maximum of 10 unacked packets is recommended.
+    flexible -> OnReceive(ScoPacket);
+    flexible AckReceive();
+
+    /// The server will close the protocol when `Stop` is received. This is useful for
+    /// synchronization (e.g. before configuring another `ScoConnection`).
+    flexible Stop();
+};
+
+open protocol Snoop {
+    /// A packet has been transmitted/received. Some number of packets can be observed before the
+    /// server stalls. The server is allowed to drop packets if the client takes too long to
+    /// acknowledge packets.
+    flexible -> OnObservePacket(table {
+        /// Monotonically increasing packet count. Used for flow control in conjunction with
+        /// `OnAcknowledgePackets`.
+        1: sequence uint64;
+        2: direction PacketDirection;
+        3: packet SnoopPacket;
+    });
+
+    /// Acknowledge packets have been received up to `sequence`.
+    flexible AcknowledgePackets(struct {
+        sequence uint64;
+    });
+
+    /// Sent by the server once after `AcknowledgePackets` is received if packets were dropped since
+    /// the last `OnObservePacket`.
+    flexible -> OnDroppedPackets(table {
+        1: sent uint32;
+        2: received uint32;
+    });
+};
+
+open protocol HciTransport {
+    /// More than one Send can be pending simultaneously.
+    /// Prefer to limit the number of pending calls to avoid overflow.
+    /// A maximum of 10 pending calls is suggested.
+    /// If an event or SCO packet is received by the server, the server should close the protocol.
+    flexible Send(SentPacket) -> ();
+
+    /// More than one packet event can be sent before acknowledged. Each packet must be
+    /// acknowledged with `AckReceive`. Servers should limit the number of pending acknowledgements
+    /// to avoid channel overflow. A maximum of 10 unacked packets is recommended. If a command or
+    /// SCO packet is received by the client, the client should close the protocol.
+    flexible -> OnReceive(ReceivedPacket);
+    flexible AckReceive();
+
+    /// Establish a SCO connection. Only 1 SCO connection can be configured at a time.
+    flexible ConfigureSco(resource table {
+        /// Required.
+        1: coding_format ScoCodingFormat;
+        /// Required.
+        2: encoding ScoEncoding;
+        /// Required.
+        3: sample_rate ScoSampleRate;
+        /// Required.
+        4: connection server_end:ScoConnection;
+    });
+};
+
+@available(removed=NEXT, note="use HciTransport instead")
+open protocol Hci {
+    /// Open the two-way HCI command channel for sending HCI commands and
+    /// receiving event packets.  Returns ZX_ERR_ALREADY_BOUND if the channel
+    /// is already open.
+    flexible OpenCommandChannel(resource struct {
+        channel zx.Handle:CHANNEL;
+    }) -> () error zx.Status;
+
+    /// Open the two-way HCI ACL data channel.
+    /// Returns ZX_ERR_ALREADY_BOUND if the channel is already open.
+    flexible OpenAclDataChannel(resource struct {
+        channel zx.Handle:CHANNEL;
+    }) -> () error zx.Status;
+
+    // TODO(b/315877895): Define a new protocol to hold SCO API calls.
+    /// Opens a SCO channel on the provided handle. The zircon channel is
+    /// closed in the event of an error opening the hci channel or if the hci
+    /// channel is already associated with a handle to another zircon channel.
+    /// Returns ZX_ERR_NOT_SUPPORTED if SCO is not supported by the current vendor or transport
+    /// driver.
+    /// Returns ZX_ERR_ALREADY_BOUND if the channel is already open.
+    flexible OpenScoDataChannel(resource struct {
+        channel zx.Handle:CHANNEL;
+    }) -> () error zx.Status;
+
+    /// Configure the HCI for a SCO connection with the indicated parameters.
+    /// This must be called before sending/receiving data on the SCO channel.
+    /// Returns ZX_ERR_NOT_SUPPORTED if SCO is not supported by the current vendor or transport
+    /// driver.
+    flexible ConfigureSco(struct {
+        coding_format ScoCodingFormat;
+        encoding ScoEncoding;
+        sample_rate ScoSampleRate;
+    }) -> () error zx.Status;
+
+    /// Releases resources held by an active SCO connection. Must be called
+    /// when a SCO connection is closed.
+    /// Returns ZX_ERR_NOT_SUPPORTED if SCO is not supported by the current vendor or transport
+    /// driver.
+    flexible ResetSco() -> () error zx.Status;
+
+    /// Opens a channel on the provided handle for sending and receiving isochronous data packets.
+    /// The zircon channel is closed in the event of an error opening the hci channel or if the hci
+    /// channel is already associated with a handle to another zircon channel.
+    /// Returns ZX_ERR_NOT_SUPPORTED if ISO is not supported by the current vendor or transport
+    /// driver.
+    /// Returns ZX_ERR_ALREADY_BOUND if the channel is already open.
+    flexible OpenIsoDataChannel(resource struct {
+        channel zx.Handle:CHANNEL;
+    }) -> () error zx.Status;
+
+    /// Open an output-only channel for monitoring HCI traffic.
+    /// The format of each message is: [1-octet flags] [n-octet payload]
+    /// The flags octet is a bitfield with the following values defined:
+    ///  - 0x00: The payload represents a command packet sent from the host to the
+    ///          controller.
+    ///  - 0x01: The payload represents an event packet sent by the controller.
+    /// Returns ZX_ERR_ALREADY_BOUND if the channel is already open.
+    flexible OpenSnoopChannel(resource struct {
+        channel zx.Handle:CHANNEL;
+    }) -> () error zx.Status;
+};
+
+/// Wrap the protocol in a service that will be exposed to the child driver.
+service HciService {
+    @available(removed=NEXT, note="use hci_transport instead")
+    hci client_end:Hci;
+
+    hci_transport client_end:HciTransport;
+    snoop client_end:Snoop;
+};

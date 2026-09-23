@@ -1,0 +1,250 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/rust/rustc_library.gni")
+import("config.gni")  # icu_flavors, icu_fixup_deps
+
+set_defaults("icu_rustc_library") {
+  configs = default_common_binary_configs
+}
+
+# An ICU-aware rustc_library.
+#
+# Args:
+#
+#   - icu_deps: list(label): the target labels that need to be fixed up for
+#     ICU product assembly.  Otherwise the same as deps.
+#   - icu_non_rust_deps: list(label): Same as above, but for non_rust_deps.
+#   - icu_test_deps: list(label): Same as above, but for test_deps.
+#   - icu_data_deps: list(label): Same as above, but for data_deps.
+#   - All other args are forwarded verbatim from the invoker.
+#
+# Refer to icu_source_set.gni for detailed comments on some constructs below,
+# the ideas of which are commonly reused in all icu_* templates.
+template("icu_rustc_library") {
+  _name = target_name
+  if (defined(invoker.crate_name)) {
+    _name = invoker.crate_name
+  } else if (defined(invoker.name)) {
+    _name = invoker.name
+  }
+  foreach(icu_flavor, icu_flavors) {
+    _icu_target_name =
+        "${target_name}.icu_${icu_flavor.name}_${icu_flavor.commit_id}"
+    rustc_library(_icu_target_name) {
+      # All flavored crates must have the same name as the unflavored crate.
+      # However, their output files will have flavored names.
+      # The `rustc_library` template uses the `name` parameter to achieve this.
+      name = _name
+      configs = []
+      configs = invoker.configs
+      if (defined(invoker.test_configs)) {
+        test_configs = invoker.test_configs
+      }
+
+      # Since the library names are also crate names, we must place each
+      # flavored library in a separate directory, but with the same base name.
+      output_dir =
+          "${target_out_dir}/icu_rustc_library_flavored.${_icu_target_name}"
+
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "crate_name",  # Consumed to set `name` above.
+                               "icu_data_deps",
+                               "icu_deps",
+                               "icu_non_rust_deps",
+                               "icu_public_deps",
+                               "icu_test_deps",
+                               "target_name",  # Workaround for
+                                               # https://fxbug.dev/42083609.
+                               "testonly",
+                               "visibility",
+                               "with_unit_tests",
+                             ])
+      forward_variables_from(invoker,
+                             [
+                               "visibility",
+                               "testonly",
+                             ])
+
+      # We don't need tests for flavored libraries.
+      with_unit_tests = false
+
+      _flavored_icu_deps = [
+        get_label_info("//third_party/icu/${icu_flavor.name}:icu",
+                       "label_with_toolchain"),
+        get_label_info("//third_party/icu/${icu_flavor.name}:icudata",
+                       "label_with_toolchain"),
+      ]
+      not_needed([
+                   "icu_flavor",
+                   "_flavored_icu_deps",
+
+                   # Because with_unit_tests = false
+                   "test_deps",
+                 ])
+
+      if (!defined(deps)) {
+        deps = []
+      }
+      _icu_deps = []
+      if (defined(invoker.icu_deps)) {
+        _icu_deps = invoker.icu_deps
+      }
+
+      # For icu_rustc_libraries defined for third-party Rust crates, redirect
+      # ICU rust crates defined in their `deps` to `icu_deps`. This is to get
+      # around the limitation that cargo-gnaw doesn't support `icu_deps` in
+      # GN annotations, so we can't generate `icu_deps` fields.
+      if (get_label_info(":${target_name}", "dir") ==
+          "//third_party/rust_crates") {
+        _deps_to_remove = []
+        foreach(dep, deps) {
+          _is_rust_icu = string_replace(dep, "rust_icu_", "") != dep
+          if (_is_rust_icu) {
+            _deps_to_remove += [ dep ]
+            _icu_deps += [ dep ]
+          }
+        }
+        deps -= _deps_to_remove
+      }
+
+      foreach(icu_dep, _icu_deps) {
+        _relabel = get_label_info(icu_dep, "label_no_toolchain")
+        deps += [ "${_relabel}.icu_${icu_flavor.name}_${icu_flavor.commit_id}(${current_toolchain})" ]
+      }
+
+      if (defined(invoker.icu_public_deps)) {
+        if (!defined(public_deps)) {
+          public_deps = []
+        }
+
+        public_deps_to_remove = invoker.icu_public_deps
+        foreach(icu_dep, invoker.icu_public_deps) {
+          _relabel = get_label_info(icu_dep, "label_no_toolchain")
+          public_deps_to_remove += [ _relabel ]
+          public_deps += [ "${_relabel}.icu_${icu_flavor.name}_${icu_flavor.commit_id}(${current_toolchain})" ]
+        }
+        public_deps += public_deps_to_remove
+        public_deps -= public_deps_to_remove
+      }
+
+      if (defined(invoker.icu_test_deps)) {
+        if (!defined(test_deps)) {
+          test_deps = []
+        }
+
+        foreach(icu_dep, invoker.icu_test_deps) {
+          _relabel = get_label_info(icu_dep, "label_no_toolchain")
+          test_deps += [ "${_relabel}.icu_${icu_flavor.name}_${icu_flavor.commit_id}(${current_toolchain})" ]
+        }
+      }
+
+      if (defined(invoker.icu_data_deps)) {
+        if (!defined(data_deps)) {
+          data_deps = []
+        }
+
+        data_deps_to_remove = invoker.icu_data_deps
+        foreach(icu_dep, invoker.icu_data_deps) {
+          _relabel = get_label_info(icu_dep, "label_no_toolchain")
+          data_deps += [ _relabel ]
+          data_deps += [ "${_relabel}.icu_${icu_flavor.name}_${icu_flavor.commit_id}(${current_toolchain})" ]
+        }
+        data_deps += data_deps_to_remove
+        data_deps -= data_deps_to_remove
+      }
+
+      if (defined(configs)) {
+        configs += [
+          "//src/lib/icu:version",
+          "//src/lib/icu:version_${icu_flavor.name}",
+        ]
+        configs -= [ "//src/lib/icu:version" ]
+      }
+
+      if (!defined(non_rust_deps)) {
+        non_rust_deps = []
+      }
+      non_rust_deps += icu_fixup_deps + _flavored_icu_deps
+      non_rust_deps -= icu_fixup_deps
+
+      if (defined(invoker.icu_non_rust_deps)) {
+        non_rust_deps_to_remove = invoker.icu_non_rust_deps
+        foreach(icu_dep, invoker.icu_non_rust_deps) {
+          _relabel = get_label_info(icu_dep, "label_no_toolchain")
+          non_rust_deps_to_remove += [ _relabel ]
+          non_rust_deps += [ "${_relabel}.icu_${icu_flavor.name}_${icu_flavor.commit_id}(${current_toolchain})" ]
+        }
+        non_rust_deps += non_rust_deps_to_remove
+        non_rust_deps -= non_rust_deps_to_remove
+      }
+    }
+  }
+
+  rustc_library(target_name) {
+    configs = []
+    configs = invoker.configs
+    if (defined(invoker.test_configs)) {
+      test_configs = invoker.test_configs
+    }
+
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "visibility",
+                             "testonly",
+                             "icu_deps",
+                             "icu_public_deps",
+                             "icu_non_rust_deps",
+                             "icu_test_deps",
+                             "icu_data_deps",
+                           ])
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "testonly",
+                           ])
+
+    output_dir = "${target_out_dir}/icu_rust_library_unflavored"
+
+    # See icu_rustc_binary.gni for detailed comments.
+    if (defined(invoker.icu_deps)) {
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += invoker.icu_deps
+    }
+
+    if (defined(invoker.icu_public_deps)) {
+      if (!defined(public_deps)) {
+        public_deps = []
+      }
+      public_deps += invoker.icu_public_deps
+    }
+
+    if (defined(invoker.icu_test_deps)) {
+      if (!defined(test_deps)) {
+        test_deps = []
+      }
+      test_deps += invoker.icu_test_deps
+    }
+
+    if (defined(invoker.icu_data_deps)) {
+      if (!defined(data_deps)) {
+        data_deps = []
+      }
+      data_deps += invoker.icu_data_deps
+    }
+
+    if (!defined(non_rust_deps)) {
+      non_rust_deps = []
+    }
+    non_rust_deps += icu_fixup_deps_no_testonly
+    if (defined(invoker.icu_non_rust_deps)) {
+      non_rust_deps += invoker.icu_non_rust_deps
+    }
+  }
+}

@@ -1,0 +1,1047 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/assembly_input_bundle.gni")
+import("//build/assembly/developer_overrides.gni")
+import("//build/assembly/emulator_support_aib.gni")
+import("//build/assembly/hermetic_inputs_for_image_assembly.gni")
+import("//build/assembly/kernel_aib.gni")
+import("//build/bazel/bazel_inputs.gni")
+import("//build/board.gni")
+import("//build/python/python_action.gni")
+import("//build/zircon/tools.gni")
+import("//bundles/assembly/platform_aibs.gni")
+import("//src/developer/ffx/build/ffx_action.gni")
+
+# Assembles a Fuchsia system.
+#
+# Metadata parameters:
+#
+#   generate_image_metadata (optional, default=true)
+#     [boolean] if true, assembled_system() will generate the appropiate image
+#     metadata for the assembly output. This metadata will make the image
+#     discoverable by users of the "images" build api module, as long as
+#     the image is part of the dependency graph defined by the //:images.
+#
+#   image_metadata_overrides (optional)
+#     [scope] Per-image overrides for the associated image metadata. Used for
+#     compliance among customers that depend on legacy fields as they were
+#     previously (quasi-)standardized. Any override that is supplied for an
+#     image not assembled is ignored. The scope contains the following:
+#
+#       [scope] zbi, zbi_signed, vbmeta, minfs, blobfs, fvm, fvm_sparse,
+#       fvm_fastboot (optional)
+#         An arbitrary scope of additional metadata to record for the
+#         associated image.
+#
+#   metadata (optional)
+#     [scope] Usual GN meaning, passed to the image assembly target created by
+#     the template.
+#
+#   include_assembly_inputs (optional; default=false)
+#     [bool] Whether to declare the assembly inputs metadata.
+#
+# Production code assertions:
+#
+#   testonly (optional)
+#     [bool] Usual GN meanings.
+#
+# Product Assembly parameters:
+#
+#   board_config_label (required if board_config is not used)
+#     [label] The board_configuration() target to use as the board to assemble the
+#     product for.
+#
+#   product_assembly_config_label (optional)
+#     [label] A label for the product assembly config, should be a
+#     `product_assembly_configuration` target. This is required if
+#      legacy_bundle_only=false.
+#
+#   enable_example_aib (optional; default=false)
+#     [boolean] If true, allow the use of the example / testing AIB by this
+#     assembly.  This is only for use by tests of assembly.
+#
+#   kernel_zbi (optional)
+#     [label] Label of the zircon kernel to use. This label complies with
+#     `kernel_aib_input` metadata protocol, see `Metadata Protocol` below.
+#     The default value is most likely the correct one.  This should only be
+#     overridden in special circumstances.
+#
+#   qemu_kernel (optional; default: null)
+#     [label] Label of a custom boot shim for kernel tests
+#
+#   assembly_mode (optional; default: null)
+#     [string] The mode to run product assembly in. Valid values are:
+#     "test-ramdisk", "test-zbi", and "test-no-platform".
+#
+# Image Assembly parameters:
+#
+#   assembly_include_account_in_fvm (optional; default: false)
+#     [bool] Whether to include an account partition in the FVM image.
+#
+#   ramdisk_in_zbi (optional)
+#     [bool] Whether the FVM or Fxfs image should be embedded into the ZBI as a ramdisk.
+#
+#
+# Outputs:
+#
+#   These arguments help inform GN what to put in `outputs = []`.
+#   These do not actually cause the images to get generated.
+#   `product_assembly_config_label` is the config that declares what images to
+#   generate.
+#
+#   image_name (optional; default: target_name)
+#     [string] The filename to give the ZBIs and VBMetas.
+#
+#   namespace (optional; default: image_name)
+#     [string] A namespace to use for naming all the outputs and generated files.
+#
+#   generate_signed_zbi (optional; default: false)
+#     [bool] Whether a signed zbi will be generated.
+#
+#   generate_vbmeta (optional; default: false)
+#     [bool] Whether a vbmeta will be generated.
+#
+#   generate_fvm (optional; default: false)
+#     [bool] Whether a fvm will be generated
+#
+#   generate_fvm_fastboot (optional; default: false)
+#     [bool] Whether a fastboot fvm will be generated.
+#
+#   generate_fvm_nand (optional; default: false)
+#     [bool] Whether a nand fvm will be generated.
+#
+#   generate_fxfs (optional; default: false)
+#     [bool] Whether a fxfs image will be generated.
+#     Exclusive with generate_fvm and generate_fvm_*.
+#
+#
+# Optional copy() for the images:
+#
+#   output_dir (optional; default: target_out_dir)
+#     [string] The output directory into which the final system ZBI is written.
+#
+#   output_name (optional; default: <target_name>.zbi)
+#     [string] The name of the final system ZBI file.
+#
+# Metadata Protocol:
+#
+#    kernel_aib_input: Performing a metadata walk with `kernel_aib_input` as data key
+#    and `kernel_aib_input_barrier` as walk key MUST yield exactly one entry. The entry
+#    contains a `zbi` member which is the relative path from `$root_build_dir`
+#    to the kernel's ZBI.
+#
+#    emulator_support_aib: Performing a metadata walk with `emulator_support_aib_input`
+#    as data key and `emulator_support_aib_input_barrier` as walk key must yield exactly
+#    one entry. The entry contains a `path` which is the relative path to `$root_build_dir`
+#    of the `qemu_kernel` to used instead of the `qemu_kernel` provided by the default
+#    `emualtor_support` AIB.
+#
+template("assembled_system") {
+  assert(current_toolchain == default_toolchain,
+         "Assembly can only be performed in the default toolchain.")
+
+  _image_name = target_name
+  if (defined(invoker.image_name)) {
+    _image_name = invoker.image_name
+  }
+
+  _namespace = _image_name
+  if (defined(invoker.namespace)) {
+    _namespace = invoker.namespace
+  }
+
+  _generate_fvm = false
+  if (defined(invoker.generate_fvm)) {
+    _generate_fvm = invoker.generate_fvm
+  }
+  _generate_fxfs = false
+  if (defined(invoker.generate_fxfs)) {
+    _generate_fxfs = invoker.generate_fxfs
+  }
+  assert(!_generate_fvm || !_generate_fxfs,
+         "Only one of Fxfs and FVM can host blobs")
+
+  _supports_blobs = _generate_fvm || _generate_fxfs
+
+  assert(defined(invoker.product_assembly_config_label),
+         "Need to define product_assembly_config_label")
+
+  # This is necessary in order to _run_ assembly, but some of the builders have
+  # configurations that don't define any board, yet also end up with targets
+  # that are defined, but unbuilt, which depend on assembly.  So we skip the
+  # assert in that situation, and try to make this template tolerant of being
+  # processed in a case where a board isn't defined, but we know that it will
+  # fail at build time.
+  if (has_board) {
+    assert(defined(invoker.board_config_label) &&
+               invoker.board_config_label != false,
+           "'board_config_label' must be defined.")
+  }
+
+  _generate_image_metadata = true
+  if (defined(invoker.generate_image_metadata)) {
+    _generate_image_metadata = invoker.generate_image_metadata
+  }
+
+  _generate_vbmeta = false
+  if (defined(invoker.generate_vbmeta)) {
+    _generate_vbmeta = invoker.generate_vbmeta
+  }
+
+  ramdisk_in_zbi = false
+  if (defined(invoker.ramdisk_in_zbi) && invoker.ramdisk_in_zbi) {
+    assert(
+        _supports_blobs,
+        "The 'ramdisk_in_zbi' mode is only needed when generating either an fvm or fxfs image.")
+    ramdisk_in_zbi = true
+  }
+
+  # The sparse fvm image is not needed when building the ramdisk into the zbi
+  _generate_fvm_sparse = _generate_fvm
+  if (ramdisk_in_zbi) {
+    _generate_fvm_sparse = false
+  }
+
+  _generate_fvm_fastboot = false
+  if (defined(invoker.generate_fvm_fastboot)) {
+    _generate_fvm_fastboot = invoker.generate_fvm_fastboot
+  }
+  _generate_fvm_nand = false
+  if (defined(invoker.generate_fvm_nand)) {
+    _generate_fvm_nand = invoker.generate_fvm_nand
+  }
+
+  if (_generate_fvm_fastboot || _generate_fvm_nand) {
+    assert(_generate_fvm,
+           "The 'generate_fvm_*' options require 'generate_fvm' to be true")
+  }
+
+  # These shouldn't be set when ramdisk_in_zbi is set
+  if (ramdisk_in_zbi) {
+    assert(
+        !_generate_fvm_fastboot && !_generate_fvm_nand,
+        "The 'generate_fvm_*'' options cannot be used whem 'ramdisk_in_zbi' is true.")
+  }
+
+  forward_variables_from(invoker, [ "image_metadata_overrides" ])
+  if (defined(image_metadata_overrides)) {
+    _generate_signed_zbi = defined(invoker.zbi_signing_script)
+    if (defined(invoker.generate_signed_zbi)) {
+      _generate_signed_zbi = invoker.generate_signed_zbi
+    }
+    if (!_generate_signed_zbi) {
+      assert(
+          !defined(image_metadata_overrides.zbi_signed),
+          "No signed ZBI will be built: no metadata override should be provided")
+    }
+    if (!_generate_vbmeta) {
+      assert(!defined(image_metadata_overrides.vbmeta),
+             "No VBMeta will be built: no metadata override should be provided")
+    }
+    if (!_generate_fvm) {
+      error_msg =
+          "No FVMs will be built: no metadata override should be provided"
+      assert(!defined(image_metadata_overrides.fvm), error_msg)
+      assert(!defined(image_metadata_overrides.fvm_sparse), error_msg)
+      assert(!defined(image_metadata_overrides.fvm_fastboot), error_msg)
+      not_needed([ "error_msg" ])
+    } else {
+      if (!_generate_fvm_sparse) {
+        assert(
+            !defined(image_metadata_overrides.fvm_sparse),
+            "No Sparse FVM will be built: no metadata override should be provided")
+      }
+      if (!_generate_fvm_fastboot) {
+        assert(
+            !defined(image_metadata_overrides.fvm_fastboot),
+            "No Fastboot FVM will be built: no metadata override should be provided")
+      }
+    }
+    if (!_generate_fxfs) {
+      assert(
+          !defined(image_metadata_overrides.fxfs),
+          "No Fxfs image will be built: no metadata override should be provided")
+    }
+  }
+
+  fvm_tool_target = "//src/storage/bin/fvm($host_toolchain)"
+  fvm_tool_path = get_label_info(fvm_tool_target, "root_out_dir")
+  fvm_tool_path += "/fvm"
+
+  # Internal labels used for Image Assembly.
+
+  _use_bringup_aibs_only = false
+  if (defined(invoker.use_bringup_platform_bundles_only)) {
+    if (invoker.use_bringup_platform_bundles_only) {
+      _use_bringup_aibs_only = true
+    }
+  }
+
+  labels = {
+    image_assembly_inputs = "${_namespace}.image_assembly_inputs"
+    product_assembler = "${_namespace}.product_assembler"
+    image_assembler = "${_namespace}.image_assembler"
+    copy_vbmeta = "${_namespace}.copy_vbmeta"
+    copy_zbi = "${_namespace}.copy_zbi"
+    copy_zbi_signed = "${_namespace}.copy_zbi_signed"
+    copy_zbi_manifest = "${_namespace}.copy_zbi_manifest"
+    copy_images = "${_namespace}.copy_images"
+    assembly_generated_packages = "${_namespace}.assembly_generated_packages"
+    compare_command_logs = "${_namespace}.compare_command_logs"
+    compare_images_manifests = "${_namespace}.compare_images_manifests"
+    developer_overrides_list = "${_namespace}.developer_overrides_list"
+
+    # *_platform_aib_labels come from //bundles/assembly/platform_aibs.gni
+
+    if (_use_bringup_aibs_only) {
+      # Use only the bringup bundles when that's explicitly set.
+      platform_artifacts = "//bundles/assembly:bringup"
+    } else {
+      platform_artifacts = "//bundles/assembly:platform"
+    }
+
+    # This is defined here to save against needing to check against
+    # invoker.board_config_label being false elsewhere in this template.  It can
+    # just be checked for having been defined.
+    if (defined(invoker.board_config_label) &&
+        invoker.board_config_label != false) {
+      board_config_label = invoker.board_config_label
+    }
+
+    if (defined(invoker.kernel_zbi)) {
+      custom_kernel_aib = "${_namespace}.custom_kernel_aib"
+    }
+
+    if (defined(invoker.qemu_kernel)) {
+      custom_boot_shim_aib = "${_namespace}.custom_boot_shim_aib"
+    }
+  }
+
+  if (defined(invoker.assembly_mode)) {
+    assert(invoker.assembly_mode == "test-ramdisk" ||
+           invoker.assembly_mode == "test-zbi" ||
+           invoker.assembly_mode == "test-no-platform")
+  }
+
+  # Intermediate files produced for Image Assembly.
+
+  files = {
+    outdir = "${target_out_dir}/${_namespace}"
+    gendir = "${outdir}_gen"
+    product_assembly_gen = "${outdir}_product_assembly_gen"
+
+    product_assembly_config_dir =
+        get_label_info(invoker.product_assembly_config_label,
+                       "target_out_dir") + "/" +
+        get_label_info(invoker.product_assembly_config_label, "name") +
+        "/product_assembly_config"
+    product_assembly_config =
+        product_assembly_config_dir + "/product_configuration.json"
+
+    image_assembly_inputs =
+        "$target_out_dir/${_namespace}.image_assembly_inputs"
+
+    # 'files.board_config' will not be defined if it these don't exist.  That's
+    # ok, and is checked for when constructing the product assembly action.
+    # Assembly will fail without it, but this template is still being invoked in
+    # configurations that don't define a board.
+    if (defined(labels.board_config_label)) {
+      board_config_dir =
+          get_label_info(labels.board_config_label, "target_out_dir") + "/" +
+          get_label_info(labels.board_config_label, "name")
+      board_config = "${board_config_dir}/board_configuration.json"
+    }
+
+    # This file is created implicitly by ffx assembly product, so this is the
+    # path that it's expected to be found at, not the path that it's to be
+    # written to.
+    regenerated_image_assembly_config = "${gendir}/image_assembly.json"
+
+    bootfs_files = "${gendir}/bootfs_files.list"
+    additional_boot_args = "${gendir}/additional_boot_args.txt"
+    zbi = "${gendir}/${_image_name}.zbi"
+    zbi_signed = "${zbi}.signed"
+    zbi_unsigned = "${zbi}.unsigned"
+    vbmeta = "${gendir}/${_image_name}.vbmeta"
+
+    if (_generate_fvm || _generate_fvm_fastboot || _generate_fvm_nand) {
+      blobfs = "${gendir}/blob.blk"
+    }
+    if (_generate_fvm) {
+      fvm = "${gendir}/fvm.blk"
+    }
+    if (_generate_fvm_sparse) {
+      fvm_sparse = "${gendir}/fvm.sparse.blk"
+    }
+    if (_generate_fvm_fastboot || _generate_fvm_nand) {
+      fvm_fastboot = "${gendir}/fvm.fastboot.blk"
+    }
+    if (_generate_fvm_nand) {
+      fvm_fastboot_tmp = "${gendir}/fvm.fastboot.tmp.blk"
+    }
+    if (_generate_fxfs) {
+      fxfs_sparse = "${gendir}/fxfs.sparse.blk"
+    }
+
+    base_package = "${gendir}/meta.far"
+    base_package_manifest = "${gendir}/system_image/package_manifest.json"
+    base_package_merkle = "${gendir}/base.merkle"
+
+    zbi_manifest = "${gendir}/zbi.json"
+    blobfs_manifest = "${gendir}/blob.manifest"
+    blobs_json = "${gendir}/blobs.json"
+    bootfs_packages = "${gendir}/data/bootfs_packages"
+    static_packages = "${gendir}/system_image/data/static_packages"
+    anchored_packages = "${gendir}/system_image/data/anchored_packages.json"
+    cache_packages = "${gendir}/system_image/data/cache_packages.json"
+    base_meta_package = "${gendir}/system_image/meta/package"
+    base_pkg_abi_revision =
+        "${gendir}/system_image/meta/fuchsia.abi/abi-revision"
+    assembly_manifest = "${outdir}/assembled_system.json"
+    config_data_manifest = "${gendir}/config_data/package_manifest.json"
+    image_command_log = "${gendir}/command_log.json"
+    developer_overrides_list = "${gendir}/developer_overrides_list.json"
+
+    # The directory in which all the platform AIBs can be found
+    platform_artifacts =
+        get_label_info(labels.platform_artifacts, "target_out_dir") + "/" +
+        get_label_info(labels.platform_artifacts, "name") +
+        "/platform_artifacts"
+
+    # The platform_artifacts.json file generated by labels.platform_artifacts
+    platform_artifacts_json = platform_artifacts + "/platform_artifacts.json"
+
+    if (defined(labels.custom_kernel_aib)) {
+      custom_kernel_aib = "${gendir}/custom_kernel_aib"
+      custom_kernel_aib_manifest = "${custom_kernel_aib}/assembly_config.json"
+    }
+
+    if (defined(labels.custom_boot_shim_aib)) {
+      custom_boot_shim_aib = "${gendir}/custom_boot_shim_aib"
+      custom_boot_shim_aib_manifest =
+          "${custom_boot_shim_aib}/assembly_config.json"
+    }
+  }
+
+  #######
+  # Build the images using the Image Assembler.
+  #
+
+  developer_overrides_list(labels.developer_overrides_list) {
+    assembly_target = ":$target_name"
+    outputs = [ files.developer_overrides_list ]
+  }
+
+  # Create the AIB for a custom kernel zbi, if one was provided.
+  if (defined(labels.custom_kernel_aib)) {
+    kernel_assembly_input_bundle(labels.custom_kernel_aib) {
+      forward_variables_from(invoker,
+                             [
+                               "kernel_zbi",
+                               "testonly",
+                             ])
+      bundles_dir = files.gendir
+      bundle_name = "custom_kernel_aib"
+    }
+  }
+
+  # Create the AIB for a custom boot shim, if one was provided.
+  if (defined(labels.custom_boot_shim_aib)) {
+    emulator_support_assembly_input_bundle(labels.custom_boot_shim_aib) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "qemu_kernel",
+                             ])
+      bundles_dir = files.gendir
+      bundle_name = "custom_boot_shim_aib"
+    }
+  }
+
+  # Run product assembly.
+  ffx_action(labels.product_assembler) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    if (!defined(deps)) {
+      deps = []
+    }
+
+    # This will not be resolved except by moving to Bazel.
+    hermetic_deps = false
+
+    # The contents of these folders are dynamic, and managed entirely by this
+    # action.  Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    hermetic_action_ignored_prefixes = [ files.platform_artifacts ]
+
+    ffx_tool = "//src/developer/ffx/plugins/assembly:ffx_assembly_tool"
+    ffx_tool_output_name = "ffx-assembly"
+
+    args = []
+
+    if (defined(invoker.enable_example_aib) && invoker.enable_example_aib) {
+      args += [
+        "--config",
+        "assembly_example_enabled=true",
+      ]
+    }
+
+    args += [
+      "assembly",
+      "product",
+      "--product",
+      rebase_path(files.product_assembly_config_dir, root_build_dir),
+    ]
+
+    args += [
+      "--input-bundles-dir",
+      rebase_path(files.platform_artifacts, root_build_dir),
+      "--gendir",
+      rebase_path(files.product_assembly_gen, root_build_dir),
+      "--outdir",
+      rebase_path(files.gendir, root_build_dir),
+    ]
+
+    deps += [ invoker.product_assembly_config_label ]
+
+    # Propagate the platform artifacts dependency up the chain.
+    public_deps = [ labels.platform_artifacts ]
+
+    inputs = [
+      files.product_assembly_config,
+      files.platform_artifacts_json,
+    ]
+
+    if (defined(files.board_config)) {
+      args += [
+        "--board-config",
+        rebase_path(files.board_config_dir, root_build_dir),
+      ]
+      inputs += [ files.board_config ]
+    }
+    if (defined(labels.board_config_label)) {
+      deps += [ labels.board_config_label ]
+    }
+
+    if (defined(labels.custom_kernel_aib)) {
+      args += [
+        "--custom-kernel-aib",
+        rebase_path(files.custom_kernel_aib_manifest, root_build_dir),
+      ]
+      deps += [ ":${labels.custom_kernel_aib}" ]
+      inputs += [ files.custom_kernel_aib_manifest ]
+    }
+
+    if (defined(labels.custom_boot_shim_aib)) {
+      args += [
+        "--custom-boot-shim-aib",
+        rebase_path(files.custom_boot_shim_aib_manifest, root_build_dir),
+      ]
+      deps += [ ":${labels.custom_boot_shim_aib}" ]
+      inputs += [ files.custom_boot_shim_aib_manifest ]
+    }
+
+    if (defined(invoker.assembly_mode)) {
+      args += [
+        "--mode",
+        invoker.assembly_mode,
+      ]
+    }
+
+    outputs = [ files.regenerated_image_assembly_config ]
+
+    # If there aren't blobs, there won't be a config-data package, and so it
+    # won't be created by product assembly.
+    if (_supports_blobs) {
+      outputs += [ files.config_data_manifest ]
+    }
+
+    metadata = {
+      assembly_input_archives_barrier = []
+    }
+
+    # Pass along any developer overrides enabled for this target.
+    _overrides = get_target_outputs(":${labels.developer_overrides_list}")
+    _overrides_split = string_split(_overrides[0], ".")
+    if (_overrides_split[len(_overrides_split) - 1] != "empty") {
+      args += [
+        "--developer-overrides",
+        rebase_path(_overrides[0], root_build_dir),
+      ]
+      inputs += _overrides
+    }
+    deps += [ ":${labels.developer_overrides_list}" ]
+  }
+
+  hermetic_inputs_for_image_assembly(labels.image_assembly_inputs) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = [ ":${labels.product_assembler}" ]
+
+    image_assembly_config = files.regenerated_image_assembly_config
+    output = files.image_assembly_inputs
+  }
+
+  ffx_action(labels.image_assembler) {
+    check_for_output_dir_leaks = false
+
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    hermetic_inputs_target = ":${labels.image_assembly_inputs}"
+    hermetic_inputs_file = files.image_assembly_inputs
+
+    # The contents of these folders are dynamic, and managed entirely by this
+    # action.  Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    hermetic_action_ignored_prefixes = [
+      files.outdir,
+      files.platform_artifacts,
+    ]
+
+    ffx_tool = "//src/developer/ffx/plugins/assembly:ffx_assembly_tool"
+    ffx_tool_output_name = "ffx-assembly"
+
+    args = [
+      "assembly",
+      "create-system",
+      "--platform",
+      rebase_path(files.platform_artifacts, root_build_dir),
+      "--image-assembly-config",
+      rebase_path(files.regenerated_image_assembly_config, root_build_dir),
+      "--gendir",
+      rebase_path(files.gendir, root_build_dir),
+      "--outdir",
+      rebase_path(files.outdir, root_build_dir),
+    ]
+
+    if (defined(invoker.assembly_include_account_in_fvm) &&
+        invoker.assembly_include_account_in_fvm) {
+      args += [ "--include-account" ]
+    }
+
+    if (defined(invoker.assembly_mode)) {
+      args += [
+        "--mode",
+        invoker.assembly_mode,
+      ]
+    }
+
+    deps = []
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+
+    # Make the outputs of the product_assember available to dependent targets.
+    public_deps = [ ":${labels.product_assembler}" ]
+
+    inputs = [ files.regenerated_image_assembly_config ]
+    if (defined(invoker.inputs)) {
+      inputs += invoker.inputs
+    }
+
+    # Tools used by create-system.
+    deps += [
+      blobfs_tool_target,
+      fvm_tool_target,
+      zbi_tool_target,
+    ]
+    inputs += [
+      blobfs_tool_path,
+      fvm_tool_path,
+      zbi_tool_path,
+    ]
+
+    outputs = [
+      files.image_command_log,
+      files.assembly_manifest,
+    ]
+
+    _generate_signed_zbi = defined(invoker.zbi_signing_script)
+    if (defined(invoker.generate_signed_zbi)) {
+      _generate_signed_zbi = invoker.generate_signed_zbi
+    }
+
+    is_mode_test_ramdisk = defined(invoker.assembly_mode) &&
+                           invoker.assembly_mode == "test-ramdisk"
+    if (is_mode_test_ramdisk) {
+      assert(
+          !_generate_signed_zbi,
+          "\"test-ramdisk\" mode is incompatible with `zbi_signing_script` and `generate_signed_zbi` specifications")
+    } else {
+      outputs += [
+        files.bootfs_files,
+        files.additional_boot_args,
+        files.zbi,
+        files.zbi_manifest,
+        files.bootfs_packages,
+      ]
+    }
+
+    if (_generate_signed_zbi) {
+      outputs += [
+        files.zbi_signed,
+        files.zbi_unsigned,
+      ]
+    }
+
+    if (_generate_vbmeta) {
+      outputs += [ files.vbmeta ]
+    }
+
+    # Base package dependencies and outputs, if this configuration uses them.
+    if (_supports_blobs) {
+      deps += [
+        blobfs_tool_target,
+        fvm_tool_target,
+      ]
+
+      inputs += [
+        blobfs_tool_path,
+        fvm_tool_path,
+      ]
+
+      outputs += [
+        # In the gendir.
+        files.base_package,
+        files.base_package_manifest,
+        files.base_package_merkle,
+        files.blobfs_manifest,
+        files.blobs_json,
+        files.static_packages,
+        files.cache_packages,
+        files.base_meta_package,
+        files.base_pkg_abi_revision,
+      ]
+      if (_generate_fvm) {
+        outputs += [
+          files.fvm,
+          files.blobfs,
+        ]
+      }
+      if (_generate_fvm_sparse) {
+        outputs += [ files.fvm_sparse ]
+      }
+      if (_generate_fvm_fastboot || _generate_fvm_nand) {
+        outputs += [ files.fvm_fastboot ]
+      }
+      if (_generate_fvm_nand) {
+        outputs += [ files.fvm_fastboot_tmp ]
+      }
+      if (_generate_fxfs) {
+        outputs += [ files.fxfs_sparse ]
+      }
+    }
+
+    metadata = {
+      # We insert these barriers to prevent the dependencies of these images
+      # from leaking into images "higher up" in the dependency chain.
+      package_barrier = []
+      config_package_barrier = []
+      distribution_entries_barrier = []
+      images = []
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+
+      if (_generate_image_metadata) {
+        _image_overrides = {
+          zbi = {
+          }
+          zbi_signed = {
+          }
+          vbmeta = {
+          }
+          blobfs = {
+          }
+          fvm = {
+          }
+          fvm_sparse = {
+          }
+          fvm_fastboot = {
+          }
+          fxfs = {
+          }
+          fxfs_sparse = {
+          }
+
+          if (defined(image_metadata_overrides)) {
+            forward_variables_from(image_metadata_overrides, "*")
+          }
+        }
+      }
+
+      if (_generate_image_metadata) {
+        # (Mostly) common fields across all image metadata.
+        _common_metadata = {
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          cpu = current_cpu
+        }
+
+        images += [
+          # ZBI
+          {
+            name = _namespace
+            type = "zbi"
+
+            forward_variables_from(_common_metadata, "*")
+            if (defined(invoker.output_dir)) {
+              label =
+                  get_label_info(":${labels.copy_zbi}", "label_with_toolchain")
+              path = rebase_path("${invoker.output_dir}/" +
+                                     get_path_info(files.zbi, "file"),
+                                 root_build_dir)
+            } else {
+              path = rebase_path(files.zbi, root_build_dir)
+            }
+            forward_variables_from(_image_overrides["zbi"], "*")
+          },
+        ]
+        if (_generate_fvm) {
+          images += [
+            # BlobFS
+            {
+              name = "${_namespace}.blob"
+              path = rebase_path(files.blobfs, root_build_dir)
+              type = "blk"
+              forward_variables_from(_common_metadata, "*")
+              forward_variables_from(_image_overrides["blobfs"], "*")
+            },
+
+            # FVM
+            {
+              name = "${_namespace}.fvm"
+              path = rebase_path(files.fvm, root_build_dir)
+              type = "blk"
+              forward_variables_from(_common_metadata, "*")
+              forward_variables_from(_image_overrides["fvm"], "*")
+            },
+          ]
+
+          if (_generate_fvm_sparse) {
+            images += [
+              # Sparse FVM
+              {
+                name = "${_namespace}.fvm_sparse"
+                path = rebase_path(files.fvm_sparse, root_build_dir)
+                type = "blk"
+                forward_variables_from(_common_metadata, "*")
+                forward_variables_from(_image_overrides["fvm_sparse"], "*")
+              },
+            ]
+          }
+        } else if (_generate_fxfs) {
+          images += [
+            {
+              name = "${_namespace}.fxfs_sparse"
+              path = rebase_path(files.fxfs_sparse, root_build_dir)
+              type = "blk"
+              forward_variables_from(_common_metadata, "*")
+              forward_variables_from(_image_overrides["fxfs_sparse"], "*")
+            },
+          ]
+        }
+
+        # Optionally add the signed images.
+        if (_generate_signed_zbi) {
+          images += [
+            {
+              name = _namespace
+              type = "zbi.signed"
+
+              forward_variables_from(_common_metadata, "*")
+              if (defined(invoker.output_dir)) {
+                label = get_label_info(":${labels.copy_zbi_signed}",
+                                       "label_with_toolchain")
+                path = rebase_path("${invoker.output_dir}/" +
+                                       get_path_info(files.zbi, "file"),
+                                   root_build_dir)
+              } else {
+                path = rebase_path(files.zbi, root_build_dir)
+              }
+              forward_variables_from(_image_overrides["zbi_signed"], "*")
+            },
+          ]
+        }
+
+        # Optionally add the vbmeta image.
+        if (_generate_vbmeta) {
+          images += [
+            {
+              name = _namespace
+              type = "vbmeta"
+              forward_variables_from(_common_metadata, "*")
+              if (defined(invoker.output_dir)) {
+                label = get_label_info(":${labels.copy_vbmeta}",
+                                       "label_with_toolchain")
+                path = rebase_path("${invoker.output_dir}/" +
+                                       get_path_info(files.vbmeta, "file"),
+                                   root_build_dir)
+              } else {
+                path = rebase_path(files.vbmeta, root_build_dir)
+              }
+              forward_variables_from(_image_overrides["vbmeta"], "*")
+            },
+          ]
+        }
+
+        # Optionally include the fastboot FVM.
+        if (_generate_fvm_fastboot || _generate_fvm_nand) {
+          images += [
+            {
+              name = "${_namespace}.fvm_fastboot"
+              path = rebase_path(files.fvm_fastboot, root_build_dir)
+              type = "blk"
+              forward_variables_from(_common_metadata, "*")
+              forward_variables_from(_image_overrides["fvm_fastboot"], "*")
+            },
+          ]
+        }
+      }
+    }
+  }
+
+  #######
+  # Optionally, copy the resulting ZBI to the specified directory.
+  #
+
+  if (defined(invoker.output_dir)) {
+    assert(
+        invoker.output_dir != target_out_dir,
+        "The specified output directory must be different from the default target_out_dir")
+
+    # The output name is the same as the original file by default.
+    # Otherwise, it takes the output_name, and strips any extension.
+    output_name = "${_image_name}"
+    if (defined(invoker.output_name)) {
+      parts = string_split(invoker.output_name, ".")
+      output_name = parts[0]
+    }
+
+    copy(labels.copy_zbi) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      sources = [ files.zbi ]
+      outputs = [ "${invoker.output_dir}/${output_name}.zbi" ]
+      deps = [ ":${labels.image_assembler}" ]
+    }
+
+    copy(labels.copy_zbi_manifest) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      sources = [ files.zbi_manifest ]
+      outputs = [ "${invoker.output_dir}/${output_name}.zbi.json" ]
+      deps = [ ":${labels.image_assembler}" ]
+    }
+
+    _generate_signed_zbi = defined(invoker.zbi_signing_script)
+    if (defined(invoker.generate_signed_zbi)) {
+      _generate_signed_zbi = invoker.generate_signed_zbi
+    }
+    if (_generate_signed_zbi) {
+      copy(labels.copy_zbi_signed) {
+        forward_variables_from(invoker,
+                               [
+                                 "testonly",
+                                 "visibility",
+                               ])
+        sources = [ files.zbi ]
+        outputs = [ "${invoker.output_dir}/${output_name}.zbi.signed" ]
+        deps = [ ":${labels.image_assembler}" ]
+      }
+    }
+
+    if (_generate_vbmeta) {
+      copy(labels.copy_vbmeta) {
+        forward_variables_from(invoker,
+                               [
+                                 "testonly",
+                                 "visibility",
+                               ])
+        sources = [ files.vbmeta ]
+        outputs = [ "${invoker.output_dir}/${output_name}.vbmeta" ]
+        deps = [ ":${labels.image_assembler}" ]
+      }
+    }
+
+    group(labels.copy_images) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      public_deps = [
+        ":${labels.copy_zbi_manifest}",
+        ":${labels.copy_zbi}",
+      ]
+      if (_generate_signed_zbi) {
+        public_deps += [ ":${labels.copy_zbi_signed}" ]
+      }
+      if (_generate_vbmeta) {
+        public_deps += [ ":${labels.copy_vbmeta}" ]
+      }
+    }
+  }
+
+  #######
+  # Check the golden files.
+  #
+  # TODO(https://fxbug.dev/42052091): These checks are no longer a part of
+  # `assembled_system()`. Remove `not_needed(...)` once all build configurations
+  # no longer specify scrutiny verifier configuration.
+
+  not_needed(invoker,
+             [
+               "cmdline_goldens",
+               "bootfs_goldens",
+               "static_pkgs_goldens",
+               "route_sources_config",
+             ])
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    # public_deps is used, so that the outputs of these dependencies are
+    # available to external targets.
+    public_deps = [ ":${labels.image_assembler}" ]
+    if (defined(invoker.output_dir)) {
+      public_deps += [ ":${labels.copy_images}" ]
+    }
+
+    metadata = {
+      # Assembly does not emit information about the packages that it includes
+      # via metadata, but via its own output files.
+      distribution_entries_barrier = []
+      package_barrier = []
+      assembly_package_barrier = []
+      test_component_manifest_barrier = []
+      test_component_manifest_program_barrier = []
+
+      assembly_inputs_barrier = []
+    }
+  }
+}

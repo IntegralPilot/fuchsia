@@ -1,0 +1,186 @@
+#!/bin/bash
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Software delivery
+### perform a system OTA on a connected device
+
+## usage: fx ota [--help] [--build|--no-build] [--serve] [--packageless|--no-packageless]
+##
+##   --build | --no-build               Build (or not) the 'updates' target before initiating OTA.
+##   --serve                            Spawn 'fx serve' for the duration of the OTA if not already running.
+##   --packageless | --no-packageless   Use (or not) a packageless update (direct blob fetching).
+##                                      Defaults to '--packageless'.
+##   --help                             Print out this message.
+##
+## Ask the connected Fuchsia device to do an OTA.
+## Depending on the flags, this command will attempt to build the necessary
+## dependencies ('fx build updates') before requesting the OTA.
+##
+## The default for --build is defined by the "incremental" feature:
+##    'fx --enable=incremental ota'  defaults to '--build'
+##    'fx --disable=incremental ota'  defaults to '--no-build'
+##
+## A package server needs to be running and this command will fail if it is not.
+
+set -e
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/updates.sh || exit $?
+fx-config-read
+fx-fail-if-main-pb-is-not-set
+
+function needs-update {
+  local targets_path="${FUCHSIA_BUILD_DIR}/amber-files/repository/targets.json"
+  local base_package="system_image/0"
+  local jq_filter=".signed.targets[\"${base_package}\"].custom.merkle"
+  local base_package_merkle
+
+  if [ ! -e "${targets_path}" ]; then
+    fx-error "TUF targets metadata '${targets_path}' does not exist."
+    fx-error "You may need to run 'fx build' to create it."
+    return 1
+  fi
+
+  if ! base_package_merkle=$(fx-command-run jq -e -r "$jq_filter" "$targets_path"); then
+    fx-error "TUF targets metadata does not contain the package '${base_package}'".
+    fx-error "You may need to run 'fx build' to create it."
+    return 1
+  fi
+
+  if [[ "${base_package_merkle}" == "" || "${base_package_merkle}" == "null" ]]; then
+    fx-error "Invalid merkle for TUF targets entry for 'system_image/0'."
+    fx-error "Merkle must be a non-empty string, not '${base_package_merkle}'."
+    return 1
+  fi
+
+  [[ $(fx-command-run shell 'read ver < /system/meta;echo $ver') != "${base_package_merkle}" ]]
+}
+
+function main {
+  local build=false
+  local serve=false
+  local packageless=true
+  local build_targets=("//build/images/updates")
+  if is_feature_enabled "incremental"; then
+    # In incremental workflows, these defaults have changed.
+    # Keep old behavior if incremental is not enabled.
+    build=true
+  fi
+  while (( $# )); do
+    case "$1" in
+      --help)
+        fx-command-help
+        exit 0
+        ;;
+      --no-build)
+        build=false
+        ;;
+      --build)
+        build=true
+        ;;
+      --serve)
+        serve=true
+        ;;
+      --packageless)
+        packageless=true
+        ;;
+      --no-packageless)
+        packageless=false
+        ;;
+      *)
+       fx-error 'Invalid syntax'
+       fx-command-help
+       exit 1
+    esac
+    shift
+  done
+
+  local started_serve=false
+  if $packageless; then
+    if $serve; then
+      fx-info "--serve is not needed in packageless OTAs, a temporary server is always started by ffx."
+    fi
+  elif $serve; then
+    # TODO(https://fxbug.dev/504722186): Implement temporary server in `ffx target update`.
+    if ! check-for-package-server >/dev/null 2>&1; then
+      fx-info "Package server not running. Starting 'fx serve'..."
+      local server_name="fx-ota-serve-$(date +%Y-%m-%dt%H-%M-%S)"
+      fx-command-run serve --background --name "${server_name}" || return 1
+      started_serve=true
+      trap "fx-info \"Stopping package server...\"; fx-command-run ffx repository server stop ${server_name} || true" EXIT
+
+      # Wait for it to be ready
+      local tries=10
+      while ! check-for-package-server >/dev/null 2>&1; do
+        if ((tries-- == 0)); then
+          fx-error "Package server failed to start in time."
+          return 1
+        fi
+        sleep 1
+      done
+    fi
+  else
+    check-for-package-server || return 1
+  fi
+
+  local total_start_time=$(date +%s)
+
+  if $build; then
+    fx-info "$(date '+%Y-%m-%d %H:%M:%S') Starting build/refresh of ${build_targets[@]}..."
+    local build_start_time=$(date +%s)
+
+    fx-command-run build "${build_targets[@]}" || return 1
+
+    local build_end_time=$(date +%s)
+    local build_duration=$((build_end_time - build_start_time))
+    fx-info "$(date '+%Y-%m-%d %H:%M:%S') Build completed in ${build_duration} seconds."
+  fi
+
+  local ota_args=("--reboot" "false")
+  if $packageless; then
+    ota_args+=("--product-bundle" "--packageless")
+  fi
+
+  fx-info "$(date '+%Y-%m-%d %H:%M:%S') Starting OTA..."
+  local ota_start_time=$(date +%s)
+
+  fx-command-run ffx target update force-install "${ota_args[@]}"
+
+  local ota_end_time=$(date +%s)
+  local ota_duration=$((ota_end_time - ota_start_time))
+
+  # Assuming ffx prints its own byte counts in its progress bar, this measures the wall clock time.
+  fx-info "$(date '+%Y-%m-%d %H:%M:%S') OTA sequence completed in ${ota_duration} seconds."
+
+  fx-command-run ffx target reboot --reason system-update
+
+  fx-info "$(date '+%Y-%m-%d %H:%M:%S') Waiting for device to reboot..."
+  local wait_start_time=$(date +%s)
+  fx-command-run wait
+  local wait_end_time=$(date +%s)
+  local wait_duration=$((wait_end_time - wait_start_time))
+
+  fx-info "$(date '+%Y-%m-%d %H:%M:%S') Device rebooted in ${wait_duration} seconds."
+  fx-info "$(date '+%Y-%m-%d %H:%M:%S') Waiting for update to be committed..."
+
+  local commit_start_time=$(date +%s)
+  fx-command-run shell update wait-for-commit
+  local commit_end_time=$(date +%s)
+  local commit_duration=$((commit_end_time - commit_start_time))
+
+  fx-info "$(date '+%Y-%m-%d %H:%M:%S') Committed in ${commit_duration} seconds."
+
+  if needs-update; then
+    fx-error "After update, system appears still out of date. OTA may have failed. Run 'fx log' for details."
+    fx-error "Also ensure your firewall rules are up to date (e.g. fx setup-ufw)"
+    return 1
+  fi
+
+  local total_end_time=$(date +%s)
+  local total_duration=$((total_end_time - total_start_time))
+  fx-info "$(date '+%Y-%m-%d %H:%M:%S') Total OTA process took ${total_duration} seconds."
+}
+
+main "$@"

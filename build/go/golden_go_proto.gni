@@ -1,0 +1,145 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/testing/golden_files.gni")
+import("//third_party/protobuf/proto_library.gni")
+
+# Used internally by golden_go_proto() to verify that a generated .pb.go
+# file matches a golden reference. This is similar to the golden_files()
+# template, except that it will intentionally ignore the version numbers
+# for protoc, protoc-gen-go and protoc-gen-go-grpc embedded in the files
+# to make it easier to roll new versions of the sources or the compiler
+# and plugins.
+#
+# Arguments are:
+#
+#   candidate (required)
+#     Path to the candidate version of the file. This is typically generated
+#     by another target that would be listed in deps.
+#
+#   golden (required)
+#     Path to reference file to compare with candidate one.
+#
+#   deps
+#     Usual GN meaning.
+#
+template("_golden_go_proto_file") {
+  assert(defined(invoker.golden), "golden is a required parameter")
+  assert(defined(invoker.candidate), "candidate is a required parameter")
+
+  action(target_name) {
+    forward_variables_from(invoker, "*")
+
+    script = "//build/go/verify_golden_go_proto_file.py"
+
+    stamp_file = "$target_gen_dir/$target_name.verified"
+
+    inputs = [
+      candidate,
+      golden,
+    ]
+
+    outputs = [ stamp_file ]
+
+    args = [
+      "--golden",
+      rebase_path(golden, root_build_dir),
+      "--candidate",
+      rebase_path(candidate, root_build_dir),
+      "--stamp",
+      rebase_path(stamp_file, root_build_dir),
+      "--fuchsia-dir",
+      rebase_path("//", root_build_dir),
+    ]
+
+    if (update_goldens) {
+      args += [ "--update" ]
+    }
+  }
+}
+
+# Compiles a protocol buffer for Go and defines it as a golden checked-in file
+# in the source tree.
+#
+# Parameters (all delegate to proto_library)
+#
+#   generate_descriptor_set (optional, default false)
+#       Generate a descriptor set file.
+#
+#   generate_go_grpc (optional, default false)
+#       Generate a gRPC protobuf stub.
+#
+#   import_protobuf_full (optional)
+#       Allows .proto files to import .proto files from protobuf_full, without
+#       adding a dependency on all the C++ code in that library.
+template("golden_go_proto") {
+  _generate_go_grpc =
+      defined(invoker.generate_go_grpc) && invoker.generate_go_grpc
+  _proto_name = "${target_name}_proto"
+  if (_generate_go_grpc) {
+    _proto_name += "_grpc"
+  }
+
+  proto_library(_proto_name) {
+    forward_variables_from(invoker,
+                           [
+                             "generate_descriptor_set",
+                             "import_protobuf_full",
+                             "sources",
+                             "import_dirs",
+                           ])
+    generate_cc = false
+    if (_generate_go_grpc) {
+      generate_go_grpc = true
+    } else {
+      generate_go = true
+    }
+    generate_python = false
+  }
+
+  _here = rebase_path(".", "//")
+  _proto_dir = "${root_gen_dir}/go-proto-gen/src/${_here}"
+  _goldens = []
+  foreach(source, invoker.sources) {
+    _name = get_path_info(source, "name")
+    if (_generate_go_grpc) {
+      _name += "_grpc"
+    }
+    _dir = rebase_path(get_path_info(source, "dir"), ".")
+
+    _output = "${_name}.pb.go"
+    _golden_name = "${_name}_pb_go_diff"
+    _golden_go_proto_file(_golden_name) {
+      golden = "${_dir}/${_output}"
+      candidate = "${_proto_dir}/${golden}"
+      deps = [ ":${_proto_name}" ]
+    }
+    _goldens += [ ":${_golden_name}" ]
+  }
+
+  if (defined(invoker.generate_descriptor_set) &&
+      invoker.generate_descriptor_set) {
+    _target_name = target_name
+    if (_generate_go_grpc) {
+      _target_name += "_grpc"
+    }
+    _golden_name = "${_target_name}_desc_pb_diff"
+    golden_files(_golden_name) {
+      binary = true
+      comparisons = [
+        {
+          golden = "${_dir}/${_target_name}.desc.pb"
+          candidate = "${target_out_dir}/${_proto_name}.desc.pb"
+        },
+      ]
+      deps = [ ":${_proto_name}" ]
+    }
+
+    _goldens += [ ":${_golden_name}" ]
+  }
+
+  group(target_name) {
+    public_deps = [ ":${_proto_name}" ] + _goldens
+  }
+}

@@ -1,0 +1,129 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+load("@fuchsia_build_info//:args.bzl", "idk_buildable_api_levels", "idk_buildable_cpus")
+load("@rules_python//python:py_binary.bzl", "py_binary")
+load(":rules.bzl", "compare_bazel_sdk_contents", "generate_bazel_sdk", "generate_merged_idk", "validate_idk")
+
+package(default_applicable_licenses = ["//:license"])
+
+# A script used to convert an IDK export directory into a Fuchsia Bazel SDK directory.
+#
+# Example usage with `bazel run`:
+#
+# ```
+# # Build IDK export directory
+# fx build sdk:final_fuchsia_idk.exported
+#
+# # Build the Fuchsia Bazel SDK directory. Absolute paths are required
+# # because `bazel run` scripts are launched from the Bazel execroot, not
+# # the current directory.
+# fx bazel run //build/bazel/bazel_sdk:idk_to_bazel_sdk -- \
+#    --input-idk $(pwd)/out/default/sdk/exported/fuchsia_idk \
+#    --output-sdk /tmp/fuchsia_sdk \
+#    --buildifier $(pwd)/prebuilt/third_party/buildifier/linux-x64/buildifier \
+#
+# # Run test suite to verify its content.
+# build/bazel_sdk/tests/scripts/bazel_test.py \
+#    --fuchsia_sdk_dir /tmp/fuchsia_sdk
+# ```
+py_binary(
+    name = "idk_to_bazel_sdk",
+    srcs = ["idk_to_bazel_sdk.py"],
+    data = [
+        # NOTE: Making this file a py_library() does not work because Bazel will
+        # resolve the symlink (to the .bzl file) then complain that the real file
+        # does not end in .py. Fortunately, just adding it here as a data dependency
+        # is enough to make it available in the runfile directory. But this requires
+        # idk_to_bazel_sdk.py to use sys.path.insert(...) to modify its search path
+        # before the import.
+        "generate_sdk_build_rules.py",
+
+        # The set of template files that are used by the script at runtime.
+        "@rules_fuchsia//fuchsia/workspace/sdk_templates:templates",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "compare_bazel_sdks",
+    srcs = ["compare_bazel_sdks.py"],
+    main = "compare_bazel_sdks.py",
+)
+
+# Generates the final merged Fuchsia IDK from one or more IDK collection builds.
+generate_merged_idk(
+    name = "final_fuchsia_idk",
+
+    # Support all CPU architectures and API levels.
+    buildable_api_levels = idk_buildable_api_levels,
+    buildable_cpus = idk_buildable_cpus,
+
+    # LINT.IfChange
+    collection_name = "fuchsia_collection",
+    # LINT.ThenChange(//sdk/BUILD.gn)
+
+    # LINT.IfChange
+    ninja_root_build_dir = "fuchsia_build_generated/ninja_root_build_dir",
+    # LINT.ThenChange(//build/bazel/scripts/workspace_utils.py)
+)
+
+# Generates a Bazel SDK from an IDK collection built by Ninja. This is only used
+# in the comparison test below.
+generate_bazel_sdk(
+    name = "ninja_based_in_tree_sdk_for_test",
+    testonly = True,
+    # The GN target is actually a group wrapping a collection, but that is
+    # sufficient because an IDK is essentially merged collections. The
+    # association between the GN target and the collection's output directory is
+    # made by the "ninja_generated_in_tree_idk_for_test.bazel_input" GN target.
+    idk_export_dir = "@gn_targets//sdk:bazel_in_tree_idk",
+)
+
+# validate_idk() only looks at the meta.json files, which are generated from
+# in_tree_collection.json at regenerator time. Thus, using the hash file, which
+# refers to in_tree_collection.json, is sufficient to detect changes to the
+# files being validated. A different solution would be required if other files
+# were to be validated.
+validate_idk(
+    name = "validate_in_tree_idk",
+    idk_directory = "fuchsia_build_generated/ninja_root_build_dir/regenerator_outputs/fuchsia_in_tree_idk",
+    # LINT.IfChange
+    idk_directory_hash = "//:fuchsia_build_generated/fuchsia_in_tree_idk.hash",
+    # LINT.ThenChange(//build/bazel/scripts/workspace_utils.py)
+)
+
+# A target used to force the creation of the @fuchsia_sdk repository,
+# by creating a symlink to @fuchsia_sdk//:BUILD.bazel. See the comments
+# for the GN //build/bazel/bazel_sdk:in_tree_fuchsia_sdk target for
+# details. This target triggers the building of @fuchsia_sdk but is not involved
+# in building it. That happens in a fuchsia_sdk_repository() rule in
+# //build/bazel/toplevel.WORKSPACE.bzlmod.
+genrule(
+    name = "in_tree_fuchsia_sdk",
+    srcs = [
+        "@fuchsia_sdk//:BUILD.bazel",
+
+        # Ensure the IDK has be validated before use. This cannot be done when
+        # the IDK is generated, which is during `fx gen`.
+        ":validate_in_tree_idk",
+    ],
+    outs = ["fuchsia_sdk.stamp"],
+    cmd = "ln -sf $$(realpath $(location @fuchsia_sdk//:BUILD.bazel)) \"$@\"",
+
+    # This must be local, otherwise the repository might be created
+    # only in a remote sandbox!
+    tags = ["local"],
+)
+
+# Compare the content of the @fuchsia_sdk with the SDK generated
+# from the Ninja-generated in-tree IDK. Success means that
+# using the fuchsia_sdk_repository() function either at build time or
+# in a repository rule works in exactly the same way, as expected.
+compare_bazel_sdk_contents(
+    name = "verify_fuchsia_sdk_repository",
+    testonly = True,
+    first_sdk = "@fuchsia_sdk//:WORKSPACE.bazel",
+    second_sdk = ":ninja_based_in_tree_sdk_for_test",
+)

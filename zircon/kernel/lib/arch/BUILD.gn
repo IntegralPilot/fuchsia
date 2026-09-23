@@ -1,0 +1,182 @@
+# Copyright 2020 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/zircon/standard.gni")
+import("//build/cpp/library_headers.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/zircon/zircon_cpu.gni")
+import("//zircon/system/ulib/hwreg/hwreg_asm_header.gni")
+
+supported_cpus = standard_fuchsia_cpus + [ "arm" ]
+
+group("headers") {
+  # The per-CPU subdirectory is a separate library target but it shares (and
+  # overrides) the <lib/arch/...> header name space and users of this library
+  # need never realize it's distinct.  When building for a machine with no
+  # per-CPU subdirectory available, the rest of the library can still be used.
+  # The "host" subdirectory is a stub stand-in for a per-CPU subdirectory that
+  # provides no-op implementations of a few headers so they can be used
+  # unconditionally in various places.
+  if (supported_cpus + [ current_cpu ] - [ current_cpu ] == supported_cpus) {
+    assert(!is_fuchsia)
+    public_deps = [ "host" ]
+  } else {
+    public_deps = [ "$zircon_cpu:headers" ]
+  }
+  public_deps += [ ":gen-asm" ]
+
+  # This comes after the arch-specific one so arch-specific headers
+  # take precedence (and can use `#include_next`).
+  public_deps += [ ":common-headers" ]
+}
+
+library_headers("common-headers") {
+  visibility = [ ":*" ]
+
+  headers = []
+  public_deps = [
+    # <lib/arch/x86/cpuid.h> has #include <hwreg/bitfields.h>.
+    "//zircon/system/ulib/hwreg:headers",
+  ]
+
+  if (is_kernel) {
+    # <lib/arch/arm64/paging-traits.h> has #include <fbl/bits.h>
+    # <lib/arch/riscv64/paging-traits.h> has #include <fbl/bits.h>
+    # <lib/arch/x86/paging-traits.h> has #include <fbl/bits.h>
+    public_deps += [ "//zircon/system/ulib/fbl:headers" ]
+  } else {
+    public_deps += [ "//zircon/system/ulib/fbl" ]
+  }
+}
+
+static_library("arch") {
+  public_deps = [ ":headers" ]
+
+  complete_static_lib = true
+
+  sources = [
+    "cpuid.cc",
+    "riscv64-features.cc",
+  ]
+
+  if (is_fuchsia || is_kernel) {
+    deps = [ zircon_cpu ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":arch-rs_test($host_toolchain)",
+    "test:tests",
+  ]
+}
+
+group("kernel-tests") {
+  testonly = true
+}
+
+group("phys-tests") {
+  testonly = true
+}
+
+group("boot_tests") {
+  testonly = true
+}
+
+asm_headers = [
+  {
+    arch = "arm64"
+    name = "feature"
+  },
+  {
+    arch = "arm64"
+    name = "system"
+  },
+  {
+    arch = "riscv64"
+    name = "system"
+  },
+  {
+    arch = "x86"
+    name = "msr"
+  },
+  {
+    arch = "x86"
+    name = "cpuid"
+  },
+]
+gen_asm_deps = []
+foreach(header, asm_headers) {
+  gen_asm_deps += [ ":gen-${header.arch}-${header.name}-asm" ]
+  hwreg_asm_header("gen-${header.arch}-${header.name}-asm") {
+    visibility = [ ":*" ]
+    output_name = "lib/arch/${header.arch}/${header.name}-asm.h"
+    defines = [ "LIB_ARCH_PRINTERS" ]
+    sources = [ "$target_name.cc" ]
+    deps = [ ":arch" ]
+  }
+}
+
+group("gen-asm") {
+  visibility = [ ":*" ]
+
+  # These would be circular dependencies on the host, since that's where
+  # the generator programs are built and they need the library's headers.
+  # Since these headers are meant to be used by assembly code, they should
+  # not be needed by any host-compatible code.
+  if (!is_host) {
+    public_deps = gen_asm_deps
+  }
+}
+
+rustc_library("arch-rs") {
+  name = "libarch"
+  edition = "2024"
+
+  # Since the crate name is already "lib"-prefixed.
+  output_prefix_override = true
+
+  sources = [
+    "src/arm64/cache.rs",
+    "src/arm64/debug.rs",
+    "src/arm64/feature.rs",
+    "src/arm64/memory.rs",
+    "src/arm64/mod.rs",
+    "src/arm64/system.rs",
+    "src/lib.rs",
+    "src/riscv64/feature.rs",
+    "src/riscv64/mod.rs",
+    "src/riscv64/paging.rs",
+    "src/riscv64/system.rs",
+    "src/x86/apic_id.rs",
+    "src/x86/bug.rs",
+    "src/x86/cache.rs",
+    "src/x86/cpuid.rs",
+    "src/x86/extension.rs",
+    "src/x86/feature.rs",
+    "src/x86/intrin.rs",
+    "src/x86/mod.rs",
+    "src/x86/speculation.rs",
+    "src/x86/system.rs",
+  ]
+
+  deps = [
+    "//src/lib/bitrs",
+
+    # TODO(https://fxbug.dev/525077555): Make this implicit through bitrs once
+    # https://github.com/google/zerocopy/pull/3544 lands in-tree.
+    "//third_party/rust_crates:zerocopy",
+  ]
+
+  if (is_host) {
+    test_deps = [ "//src/lib/regio:regio-testing" ]
+    non_test_deps = [ "//src/lib/regio" ]
+    with_unit_tests = true
+  } else {
+    deps += [ "//src/lib/regio" ]
+  }
+}

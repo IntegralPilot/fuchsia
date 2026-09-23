@@ -1,0 +1,244 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+//
+/// Defines the protocols used to sample UTC time using time synchronization
+/// protocols such as NTP or Roughtime.
+///
+/// New time protocols may be added to the system by implementing the server
+/// side of one or more of these protocols. The Timekeeper component acts as
+/// the client and uses produced samples to update the system time.
+///
+/// Implementing PushSource lets the server decide when to produce samples and
+/// implies that the time source will stay running between samples. Implementing
+/// PullSource places Timekeeper in control of when to produce samples and lets
+/// the time source be stopped between samples.
+///
+/// UTC time is distributed by the system. Clients that need to obtain UTC time
+/// should use the standard libraries provided by their runtime.
+@available(added=HEAD)
+library fuchsia.time.external;
+
+using zx;
+using fuchsia.inspect;
+
+/// A protocol which defines common methods for all time sources. Should not be
+/// implemented directly.
+closed protocol TimeSource {
+    /// Notifies the time source of changes to global properties of the device
+    /// that it may use to increase accuracy of time measurements.
+    strict UpdateDeviceProperties(struct {
+        properties Properties;
+    });
+};
+
+/// A protocol for time sources that produce time samples on demand.
+@discoverable
+closed protocol PullSource {
+    compose TimeSource;
+    /// Produce a new time sample.
+    ///
+    /// The server may consider the supplied urgency and will potentially
+    /// produce a sample more quickly but with lower accuracy when a request
+    /// is marked urgent.
+    ///
+    /// The server will return an error for permanent errors but will block
+    /// on conditions that are not known to be permanent (e.g. network not
+    /// connected).
+    ///
+    /// The server will return a RATE_LIMITED error if the client should wait
+    /// before requesting another sample. In this case the client may call
+    /// `NextPossibleSampleTime` to determine when the time source will be
+    /// willing to produce another sample.
+    strict Sample(struct {
+        urgency Urgency;
+    }) -> (struct {
+        sample TimeSample;
+    }) error Error;
+
+    /// Returns the monotonic time at which the PullSource is willing to produce
+    /// another sample. If the PullSource is not rate limited it will return a
+    /// time less than or equal to current monotonic time.
+    strict NextPossibleSampleTime() -> (struct {
+        next_possible_time zx.Time;
+    });
+
+    /// Notifies the time source that it is about to be shut down.
+    ///
+    /// The time source should escrow its Inspect data to allow it to be
+    /// retrieved after the component has stopped.
+    strict Shutdown() -> (resource struct {
+        escrow_token fuchsia.inspect.EscrowToken;
+    }) error EscrowError;
+};
+
+/// A protocol for time sources that produce time samples on a schedule that it
+/// dictates. A PushSource does not report errors to clients as it is
+/// responsible for handling them internally. Instead, a PushSource reports a
+/// general health indication through the `WatchHealth` method to reflect
+/// whether or not it expects to successfully produce time samples.
+@discoverable
+closed protocol PushSource {
+    compose TimeSource;
+    /// Watch for new time samples from the time source. This method is a
+    /// hanging get and returns the latest time sample if one is available and
+    /// has not already been returned to the client. If no such sample is
+    /// available, the method will hang until one is produced and return it
+    /// then.
+    ///
+    /// Note that it is entirely at the discretion of the PushSource
+    /// implementation when to produce a sample; a call to WatchSample does
+    /// not necessarily trigger sample collection.
+    ///
+    /// In the case a client sends a second WatchSample request while another
+    /// request is active, the channel is closed with a ZX_ERR_BAD_STATE
+    /// epitaph.
+    strict WatchSample() -> (struct {
+        sample TimeSample;
+    });
+
+    /// Watch for changes in the status of the time source.
+    ///
+    /// This method is a hanging get that returns when the status changes from
+    /// the last status reported to the client.
+    ///
+    /// In the case a client sends a second WatchStatus request while another
+    /// request is active, the channel is closed with a ZX_ERR_BAD_STATE
+    /// epitaph.
+    strict WatchStatus() -> (struct {
+        status Status;
+    });
+};
+
+/// A correspondence pair that describes a UTC and the reference clock readings
+/// at the measurement instant.
+type TimeSample = table {
+    /// The UTC time sample.  The value of this instant is a value on the UTC
+    /// timeline. However, the field is not type safe, as there is no UTC
+    /// specific type on the zx level.
+    1: utc zx.Time;
+    /// The monotonic time at which the sample was most valid. Must always be
+    /// provided.
+    /// DEPRECATED. Use `reference` below instead.
+    2: monotonic zx.Time;
+    /// The standard deviation representing the error distribution of the UTC
+    /// measurement. Must always be provided.
+    3: standard_deviation zx.Duration;
+    /// The timestamp on the reference timeline at which the sample was most
+    /// valid. Must always be provided.  The reference timeline is tracking
+    /// the rate of change of proper time [1].  So, for example, Fuchsia's boot
+    /// timeline will generate the appropriate reference instant.
+    ///
+    /// [1]: https://en.wikipedia.org/wiki/Proper_time
+    4: reference zx.InstantBoot;
+};
+
+/// Enum of urgencies used when requesting a sample from a PullSource. The time
+/// source may use this information to balance the need to produce a response
+/// quickly against the desire to produce an accurate sample.
+type Urgency = flexible enum {
+    /// The client is blocked until the requested sample is received. For
+    /// example, the sample may be required to start a clock for the first time.
+    HIGH = 1;
+    /// The client will receive a significant benefit from the requested sample.
+    /// For example, the sample may be required to set the error bound on a
+    /// clock that is running with unknown accuracy.
+    MEDIUM = 2;
+    /// The client can wait as long as needed to receive a high-quality sample.
+    /// For example, the sample may be required for a periodic update on a clock
+    /// that is already running within an acceptable error bound.
+    LOW = 3;
+};
+
+/// Enum of states a PushSource may be in.
+type Status = strict enum {
+    /// The time source is performing setup steps or waiting for dependencies
+    /// such as network to become available.
+    INITIALIZING = 0;
+    /// The time source is healthy and expects to produce time samples.
+    OK = 1;
+    /// The time source does not expect to produce time samples for reasons that
+    /// cannot be classified as one of the more specific statuses.
+    UNKNOWN_UNHEALTHY = 2;
+    /// The time source is unable to produce time samples due to network
+    /// availability issues.
+    NETWORK = 3;
+    /// The time source is unable to produce time samples due to hardware
+    /// issues.
+    HARDWARE = 4;
+    /// The time source is unable to produce time samples due to errors specific
+    /// to the implemented time protocol.
+    PROTOCOL = 5;
+    /// The time source is unable to produce time samples due to local resource
+    /// errors such as IO, FIDL, or memory allocation.
+    RESOURCE = 6;
+};
+
+/// Enum of reasons why producing a time sample failed.
+type Error = strict enum {
+    /// An error occurred that cannot be classified as one of the more specific
+    /// error statuses.
+    UNKNOWN = 1;
+    /// An internal error occurred. This usually indicates a bug in the
+    /// component implementation.
+    INTERNAL = 2;
+    /// A local resource error occurred such as IO, FIDL, or memory allocation
+    /// failure.
+    RESOURCE = 3;
+    /// A network error occurred.
+    NETWORK = 4;
+    /// Some hardware that the time source depends on failed.
+    HARDWARE = 5;
+    /// A retriable error specific to the implemented time protocol occurred,
+    /// such as a malformed response from a remote server.
+    PROTOCOL = 6;
+    /// Sampling failed in a nonretriable way. Examples include failed
+    /// authentication, or a missing configuration.
+    PROTOCOL_UNRECOVERABLE = 7;
+    /// The request was made too soon and the client should wait before making
+    /// another request.
+    RATE_LIMITED = 8;
+};
+
+/// Errors returned by `Shutdown`.
+type EscrowError = strict enum {
+    /// The call to `fuchsia.inspect.InspectSink.FrozenEscrow` failed.
+    ESCROW_INSPECT_FAILED = 9;
+    /// The time source does not have an Inspect controller to escrow.
+    ESCROW_NO_INSPECT_CONTROLLER = 10;
+};
+
+/// Device global properties a time source may use to help it sample time.
+type Properties = table {};
+
+/// Report UTC reference adjustment.
+///
+/// Allows components to request corrections to the reported UTC time.  Very few
+/// components should be expected to have access to this capability.
+@discoverable
+closed protocol Adjust {
+    /// Requests that the callee changes its UTC time estimate.
+    ///
+    /// Reports the caller's desired correspondence between the boot timeline,
+    /// and the UTC timeline.
+    ///
+    /// The caller is required to provide both reference points so that any
+    /// FIDL round-trip delays do not affect the callee's interpretation of
+    /// the caller's intentions.  For example, were the callee to use its own
+    /// `boot_reference` value instead of a caller-provided one, long wall time
+    /// delays between the caller's and the callee's sampling of `boot_reference`
+    /// would introduce a skew.  While this is unlikely to happen on a device to
+    /// a meaningful extent, we established that this is the correct way to
+    /// transmit such information.
+    ///
+    /// To wit, we have observed delays in test environments. This is likely
+    /// because test environments run on emulators in shared-resource
+    /// settings, where unusually long delays are relatively common.
+    strict ReportBootToUtcMapping(struct {
+        /// A time instant on the boot timeline, for which the caller is reporting
+        /// a presumed UTC reference instant.
+        boot_reference zx.InstantBoot;
+        /// The time instant on the UTC timeline, corresponding to `boot_reference`.
+        utc_reference zx.Time;
+    }) -> () error Error;
+};

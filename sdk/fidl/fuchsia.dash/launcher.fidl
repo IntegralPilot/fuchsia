@@ -1,0 +1,183 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=16)
+library fuchsia.dash;
+
+using zx;
+using fuchsia.hardware.pty;
+using fuchsia.url;
+
+/// Maximum number of URLs allowed to be sent to the launcher.
+const MAX_URLS uint64 = 20;
+
+/// Standard errors for the Launcher protocol
+@strict_audit(bug="https://fxbug.dev/467128325", state="PENDING_REVIEW")
+type LauncherError = strict enum {
+    /// Launcher encountered an unspecified error
+    INTERNAL = 1;
+    /// Moniker could not be parsed by launcher
+    BAD_MONIKER = 2;
+    /// No instance was found matching the moniker
+    INSTANCE_NOT_FOUND = 3;
+    /// Error occurred using fuchsia.sys2.RealmQuery
+    REALM_QUERY = 4;
+    /// Error occurred using fuchsia.process.Launcher
+    PROCESS_LAUNCHER = 5;
+    /// Error loading dash binary
+    DASH_BINARY = 6;
+    /// Error occurred involving the PTY
+    PTY = 7;
+    /// Instance is not in a resolved state, so there is nothing to explore
+    INSTANCE_NOT_RESOLVED = 8;
+    /// Error occurred using fuchsia.pkg.PackageResolver
+    PACKAGE_RESOLVER = 9;
+    /// Error resolving tools package
+    TOOLS_CANNOT_RESOLVE = 10;
+    /// URL could not be parsed by launcher
+    BAD_URL = 11;
+    /// Error reading a binary from a tools package
+    TOOLS_BINARY_READ = 12;
+    /// A binary name was repeated
+    NON_UNIQUE_BINARY_NAME = 13;
+    /// Error occurred using fuchsia.process.Resolver
+    PROCESS_RESOLVER = 14;
+    /// Error occurred using fuchsia.kernel.VmexResource
+    VMEX_RESOURCE = 15;
+    /// Error resolving the package that is to be explored.
+    RESOLVE_TARGET_PACKAGE = 16;
+};
+
+/// The namespace layout to create for the dash process.
+@strict_audit(bug="https://fxbug.dev/467128325", state="PENDING_REVIEW")
+type DashNamespaceLayout = strict enum {
+    /// All instance directories are nested under subdirectories.
+    /// e.g - namespace is under /ns, outgoing dir is under /out, etc.
+    NEST_ALL_INSTANCE_DIRS = 1;
+    /// The instance namespace is the root of the dash shell.
+    /// Several ELF binaries and libraries in Fuchsia assume that directories like
+    /// `svc` and `dev` will be at the root. As a result, this layout should be
+    /// more compatible than nesting for running Fuchsia ELF binaries in the shell.
+    INSTANCE_NAMESPACE_IS_ROOT = 2;
+};
+
+/// The package resolvers available for resolving package URLs with the `fuchsia-pkg` scheme.
+@available(added=20)
+type FuchsiaPkgResolver = flexible enum : uint32 {
+    /// Resolves base packages from blobfs.
+    BASE = 1;
+    /// Resolves base, cache, or universe packages from blobfs and any configured remote
+    /// repositories.
+    FULL = 2;
+};
+
+@discoverable
+closed protocol Launcher {
+    /// Launch a dash process scoped to the component with the given moniker, forwarding the given
+    /// stdio PTY.
+    strict ExploreComponentOverPty(resource struct {
+        /// The moniker of the component that dash should be scoped to
+        moniker string:MAX;
+        /// The PTY device that should be forwarded to the dash process
+        pty client_end:fuchsia.hardware.pty.Device;
+        /// A list of package URLs whose directories will also be loaded into the dash namespace.
+        /// The path preference is determined by the order of this vector.
+        tool_urls vector<fuchsia.url.Url>:<MAX_URLS>;
+        /// An optional inline command to run
+        command string:<MAX, optional>;
+        /// The namespace layout to create for the dash process
+        ns_layout DashNamespaceLayout;
+    }) -> () error LauncherError;
+
+    /// Launch a dash process scoped to the component with the given moniker, forwarding the given
+    /// stdio socket.
+    ///
+    /// The dash launcher will implicitly create a PTY and transfer bytes between the PTY and
+    /// the socket.
+    strict ExploreComponentOverSocket(resource struct {
+        /// The moniker of the component that dash should be scoped to
+        moniker string:MAX;
+        /// The raw socket to connect to the dash process
+        socket zx.Handle:SOCKET;
+        /// A list of package URLs whose directories will also be loaded into the dash namespace.
+        /// The path preference is determined by the order of this vector.
+        tool_urls vector<fuchsia.url.Url>:<MAX_URLS>;
+        /// An optional inline command to run
+        command string:<MAX, optional>;
+        /// The namespace layout to create for the dash process
+        ns_layout DashNamespaceLayout;
+    }) -> () error LauncherError;
+
+    /// Launch a dash process with the indicated [sub]package loaded into the namespace at /pkg,
+    /// forwarding the given stdio socket.
+    ///
+    /// The dash launcher will implicitly create a PTY and transfer bytes between the PTY and
+    /// the socket.
+    ///
+    /// Always uses [`fuchsia.dash/FuchsiaPkgResolver.FULL`] to resolve package URLs with scheme
+    /// "fuchsia-pkg".
+    /// Use [`fuchsia.dash/Launcher.ExplorePackageOverSocket2`] instead to pick which resolver to
+    /// use with "fuchsia-pkg" URLs.
+    @available(
+            deprecated=20,
+            note="use ExplorePackageOverSocket2 which has a FuchsiaPkgResolver parameter instead of defaulting to the Full resolver")
+    strict ExplorePackageOverSocket(resource struct {
+        /// The absolute package URL to resolve.
+        /// If `subpackages` is empty the resolved package directory will be loaded into the dash
+        /// namespace at `/pkg`.
+        /// If `subpackages` is not empty, the package directory of the final subpackage of `url`
+        /// will be loaded into the namespace at `/pkg`.
+        url string:MAX;
+        /// The chain of subpackages, if any, of `url` to resolve, in resolution order.
+        /// If `subpackages` is not empty, the package directory of the final subpackage will be
+        /// loaded into the dash namespace at `/pkg`.
+        subpackages vector<string:MAX>:MAX;
+        /// The raw socket to connect to the dash process
+        socket zx.Handle:SOCKET;
+        /// A list of package URLs whose directories will also be loaded into the dash namespace.
+        /// The path preference is determined by the order of this vector.
+        tool_urls vector<fuchsia.url.Url>:<MAX_URLS>;
+        /// An optional inline command to run.
+        command string:<MAX, optional>;
+    }) -> () error LauncherError;
+
+    /// Launch a dash process with the indicated [sub]package loaded into the namespace at /pkg,
+    /// forwarding the given stdio socket.
+    ///
+    /// The dash launcher will implicitly create a PTY and transfer bytes between the PTY and
+    /// the socket.
+    @available(added=20)
+    strict ExplorePackageOverSocket2(resource struct {
+        /// The package resolver to use when resolving package URLs (both `url` and `tool_urls`)
+        /// that have the `fuchsia-pkg` scheme.
+        fuchsia_pkg_resolver FuchsiaPkgResolver;
+
+        /// The absolute package URL to resolve.
+        /// If `subpackages` is empty the resolved package directory will be loaded into the dash
+        /// namespace at `/pkg`.
+        /// If `subpackages` is not empty, the package directory of the final subpackage of `url`
+        /// will be loaded into the namespace at `/pkg`.
+        url string:MAX;
+
+        /// The chain of subpackages, if any, of `url` to resolve, in resolution order.
+        /// If `subpackages` is not empty, the package directory of the final subpackage will be
+        /// loaded into the dash namespace at `/pkg`.
+        subpackages vector<string:MAX>:MAX;
+
+        /// The raw socket to connect to the dash process
+        socket zx.Handle:SOCKET;
+
+        /// A list of package URLs whose directories will also be loaded into the dash namespace.
+        /// The path preference is determined by the order of this vector.
+        tool_urls vector<fuchsia.url.Url>:<MAX_URLS>;
+
+        /// An optional inline command to run.
+        command string:<MAX, optional>;
+    }) -> () error LauncherError;
+
+    /// This event fires when a shell has terminated.
+    strict -> OnTerminated(struct {
+        /// The process exit code of the shell.
+        return_code int32;
+    });
+};

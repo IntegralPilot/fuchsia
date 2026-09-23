@@ -1,0 +1,196 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.network;
+
+using zx;
+
+/// The maximum number of status samples that can be buffered by a
+/// [`StatusWatcher`].
+@available(added=HEAD)
+const MAX_STATUS_BUFFER uint32 = 50;
+
+/// The maximum number of ports attached to a device at a given time.
+@available(added=HEAD)
+const MAX_PORTS uint8 = 32;
+
+/// The base identifier of a port within a device. Always less than
+/// [`MAX_PORTS`].
+@available(added=HEAD)
+alias BasePortId = uint8;
+
+/// A device port identifier.
+@available(added=HEAD)
+type PortId = struct {
+    /// The base identifier for the port.
+    ///
+    /// Generally identifies a port instance in hardware.
+    base BasePortId;
+    /// An implementation-defined identifier that is guaranteed to change on
+    /// every instantiation of the identified port.
+    salt uint8;
+};
+
+/// Network port class.
+///
+/// *Note*: Device implementers are encouraged to propose additions to this
+/// enumeration to avoid using ill-fitting variants if there's not a good match
+/// available.
+@available(added=22)
+type PortClass = flexible enum : uint16 {
+    ETHERNET = 1;
+    WLAN_CLIENT = 2;
+    PPP = 3;
+    BRIDGE = 4;
+    WLAN_AP = 5;
+    VIRTUAL = 6;
+    LOWPAN = 7;
+};
+
+/// Port status bits, reported in [`PortStatus.flags`].
+@available(added=HEAD)
+type StatusFlags = strict bits : uint32 {
+    /// Port is online, i.e., data path is open and any ongoing sessions may
+    /// send and receive frames.
+    ONLINE = 0x01;
+};
+
+/// Dynamic port information.
+@available(added=HEAD)
+type PortStatus = table {
+    /// Port status flags.
+    1: flags StatusFlags;
+    /// Maximum transmit unit for this port, in bytes.
+    ///
+    /// The reported MTU is the size of an entire frame, including any header
+    /// and trailer bytes for whatever protocols this port supports.
+    2: mtu uint32;
+};
+
+/// Provides a way to receive updates on port status changes.
+@available(added=HEAD)
+closed protocol StatusWatcher {
+    /// `WatchStatus` blocks until the port's status has changed.
+    ///
+    /// The first call to `WatchStatus` returns immediately with the current
+    /// port status, subsequent calls complete when the port status differs from
+    /// the last one that was returned through this `StatusWatcher`.
+    ///
+    /// If `StatusWatcher` was created with a buffer value larger than 1,
+    /// `WatchStatus` may return a queued status change, depending on how many
+    /// status changed happened since the last call to `WatchStatus`.
+    ///
+    /// - response `device_status` the most recent port status.
+    strict WatchStatus() -> (struct {
+        port_status PortStatus;
+    });
+};
+
+/// Port base info.
+@available(added=HEAD)
+type PortBaseInfo = table {
+    /// Port's class. Required.
+    1: port_class PortClass;
+    /// Supported rx frame types on this port. Required.
+    ///
+    /// Clients may open sessions subscribing to a subset of `rx_types` frame
+    /// types on this port.
+    2: rx_types vector<FrameType>:MAX_FRAME_TYPES;
+    /// Supported tx frame types on this port. Required.
+    ///
+    /// Frames destined to this port whose frame type is not in `tx_types` are
+    /// returned with an error.
+    ///
+    /// Some network devices may need to perform partial frame parsing and
+    /// serialization and, for that reason, `tx_types` is a vector of
+    /// [`FrameTypeSupport`] which includes specific features per frame type.
+    /// For example, a device that supports Ethernet frames but needs to convert
+    /// the Ethernet header may only support standard Ethernet II frames, and
+    /// not any "raw" Ethernet frame.
+    3: tx_types vector<FrameTypeSupport>:MAX_FRAME_TYPES;
+};
+
+/// Logical port information.
+@available(added=HEAD)
+type PortInfo = table {
+    /// Port's identifier. Required.
+    1: id PortId;
+    // Port base info. Required.
+    2: base_info PortBaseInfo;
+};
+
+/// A logical port belonging to a [`Device`].
+@available(added=HEAD)
+closed protocol Port {
+    /// Obtain information about port.
+    ///
+    /// - response `info` port information.
+    strict GetInfo() -> (struct {
+        info PortInfo;
+    });
+    /// Obtain the operating port status.
+    ///
+    /// - response `status` snapshot of port's current status.
+    strict GetStatus() -> (struct {
+        status PortStatus;
+    });
+    /// Connects to a [`StatusWatcher`] to observe port status changes.
+    ///
+    /// + request `watcher` handle to the status watcher.
+    /// + request `buffer` the number of status changes that the client requests
+    /// to be stored by `StatusWatcher`. Values are capped at
+    /// [`MAX_STATUS_BUFFER`]. A value of 0 or 1 causes the `StatusWatcher` to
+    /// not keep any buffers on status changed. Clients that need to observe all
+    /// changes to status (as opposed to only the current state) are encouraged
+    /// to set a buffer value larger than 1, so that all edges can be observed.
+    /// If `StatusWatcher`'s internal queue is filled and new status changes
+    /// occur, the oldest samples will be dropped to make room for new ones.
+    strict GetStatusWatcher(resource struct {
+        watcher server_end:StatusWatcher;
+        buffer uint32;
+    });
+    /// Connects to a [`MacAddressing`] associated with the port.
+    ///
+    /// + request `mac` mac handle. Closed with `ZX_ERR_NOT_SUPPORTED` if this
+    /// port does not support mac addressing.
+    strict GetMac(resource struct {
+        mac server_end:MacAddressing;
+    });
+    /// Connects to the [`Device`] this port belongs to.
+    ///
+    /// + request `device` grants access to the parent device.
+    strict GetDevice(resource struct {
+        device server_end:Device;
+    });
+    /// Establishes a new connection to this port.
+    ///
+    /// + request `port` the server end for the new connection.
+    strict Clone(resource struct {
+        port server_end:Port;
+    });
+    /// Retrieves a snapshot of traffic counters on this port.
+    strict GetCounters() -> (table {
+        /// The total number of ingress frames on this port.
+        1: rx_frames uint64;
+        /// The total number of ingress bytes on this port.
+        2: rx_bytes uint64;
+        /// The total number of egress frames on this port.
+        3: tx_frames uint64;
+        /// The total number of egress bytes on this port.
+        4: tx_bytes uint64;
+    });
+    /// Grants access to [`Diagnostics`] for this port.
+    ///
+    /// + request `diagnostics` grants access to diagnostics information.
+    strict GetDiagnostics(resource struct {
+        diagnostics server_end:Diagnostics;
+    });
+    /// Retrieves a unique event handle that is always associated only with
+    /// this port.
+    ///
+    /// This event may be used to uniquely identify a specific port instance
+    /// across different APIs in the system.
+    strict GetIdentity() -> (resource struct {
+        event zx.Handle:<EVENT, zx.Rights.TRANSFER | zx.Rights.DUPLICATE>;
+    });
+};

@@ -1,0 +1,296 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.hrtimer;
+
+using zx;
+using fuchsia.power.system;
+
+/// Maximum count of timers supported by this protocol, arbitrary.
+const MAX_COUNT_TIMERS uint32 = 64;
+
+/// Maximum count of resolutions supported by a given timer, arbitrary.
+const MAX_COUNT_RESOLUTIONS uint32 = 64;
+
+/// Errors that this driver may return.
+type DriverError = flexible enum {
+    /// The driver encountered an otherwise unspecified error while performing the operation.
+    INTERNAL_ERROR = 1;
+
+    /// The operation is not implemented, supported, or enabled.
+    NOT_SUPPORTED = 2;
+
+    /// An argument is invalid.
+    INVALID_ARGS = 3;
+
+    /// The operation failed because the current state of the driver does not allow it, or a
+    /// precondition of the operation is not satisfied.
+    BAD_STATE = 4;
+
+    /// The in-progress operation has been canceled.
+    CANCELED = 5;
+};
+
+/// Amount of time for one tick of a timer.
+type Resolution = flexible union {
+    /// The resolution specified for one tick.
+    1: duration zx.Duration;
+};
+
+/// Properties for a specific timer abstracted by the driver.
+type TimerProperties = table {
+    /// Unique identifier for this timer.
+    ///
+    /// The `id` is stable for a given timer, i.e. it does not change across different clients
+    /// or different connections from the same client.
+    ///
+    /// Required.
+    1: id uint64;
+
+    /// Retrieves the resolutions supported by this timer.
+    ///
+    /// Required.
+    2: supported_resolutions vector<Resolution>:MAX_COUNT_RESOLUTIONS;
+
+    /// Range in ticks.
+    ///
+    /// This is the maximum amount of time that can be set in terms of ticks when a timer is
+    /// started. The maximum range in actual time (e.g. nanoseconds) depends on the resolution used.
+    ///
+    /// NOTE: The value reported here does not need to be identical to what
+    /// the hardware actually supports. The driver MAY provide the support for
+    /// the reported `max_ticks` that is greater than the largest value of ticks
+    /// that can be put into the device's hardware register. The driver supports
+    /// a greater value of `max_ticks` by re-programming the hardware counter multiple times
+    /// with its maximum supported interval, with an interrupt generated after
+    /// each re-programming. If you want as few re-programmings (and interrupts)
+    /// to happen as possible, as may be the case when using the hrtimer in a power-aware
+    /// context, select the coarsest available resolution from [supported_resolutions].
+    /// This will ensure the longest possible wall-clock time passes without a re-program.
+    ///
+    /// Required.
+    3: max_ticks uint64;
+
+    // Someday we should re-evaluate the use of these bools to tell the user
+    // what method(s) are supported. They already do that by returning
+    // kNotSupported.
+
+    /// If true then the `SetEvent` method is supported, if false or not present it is not
+    /// supported.
+    ///
+    /// Optional.
+    @available(deprecated=HEAD, note="Drivers should report this as `false`")
+    4: supports_event bool;
+
+    /// If true then the `StartAndWait` and `StartAndWait2` methods are supported, if false or
+    /// not present these methods are not supported.
+    ///
+    /// Optional.
+    5: supports_wait bool;
+
+    /// If true, then the `TimerRead` and `ClockRead` methods are supported, if
+    /// false or not present, these methods are not supported.
+    ///
+    /// Optional.
+    6: supports_read bool;
+};
+
+/// Driver properties.
+type Properties = resource table {
+    /// Retrieves the supported timers properties.
+    ///
+    /// Optional.
+    1: timers_properties vector<TimerProperties>:MAX_COUNT_TIMERS;
+
+    /// The driver's node token.
+    ///
+    /// If the driver provides this value, the caller can use it to request
+    /// additional information about the driver.
+    ///
+    /// Optional. The driver may not have a token to give.
+    2: driver_node_token zx.Handle:EVENT;
+};
+
+/// A driver providing high resolution timers support.
+/// This API is intended for timers that are provided by hardware separate from the CPU
+/// For instance this driver may abstract hardware provided by an SoC.
+@discoverable
+open protocol Device {
+    /// Start the timer `id` to expire after `ticks`.
+    ///
+    /// If `ticks` is 0 then the timer will expire in 0 ticks (immediately).
+    /// If the timer `id` was already started, then the previous `Start` is canceled and the driver
+    /// will restart the timer. Note that this may race with the expiration of the previous timer,
+    /// for instance the notification process may be already started and a new `Start` call won't
+    /// be able to stop a notification that is already in flight.
+    /// If the specified `id` is invalid, then this call will return `INVALID_ARGS`.
+    /// If the specified `resolution` is not supported per the `resolutions` provided by
+    /// `GetProperties`, then this call will return `INVALID_ARGS`.
+    /// If the specified `ticks` is beyond the range supported for the timer as provided by
+    /// `GetProperties`, then this call will return `INVALID_ARGS`.
+    /// If the driver encounters an internal error, then this call will return `INTERNAL_ERROR`.
+    ///
+    @available(
+            deprecated=HEAD,
+            note="This API method is racy when combined with `SetEvent`.  Use `StartAndWait2` instead.")
+    flexible Start(struct {
+        id uint64;
+        resolution Resolution;
+        ticks uint64;
+    }) -> () error DriverError;
+
+    /// Read the current timer's set or timeout value.
+    ///
+    /// The returned ticks are in time-units relative to the given resolution.
+    /// Use `GetProperties()` to determine the available resolution(s).
+    ///
+    /// Errors:
+    ///   BAD_STATE: no readable timer currently exists.
+    ///   INVALID_ARGS: `id` or `resolution` are invalid or unsupported values.
+    ///   NOT_SUPPORTED: if `supports_read` is false, or the method is otherwise
+    ///     not implemented.
+    ///   INTERNAL_ERROR: internal runtime error.
+    flexible ReadTimer(struct {
+        id uint64;
+        resolution Resolution;
+    }) -> (struct {
+        ticks uint64;
+    }) error DriverError;
+
+    /// Read the current timer's clock value.
+    ///
+    /// The returned ticks are in time-units relative to the given resolution.
+    /// Use `GetProperties()` to determine the available resolution(s).
+    ///
+    /// Errors:
+    ///   BAD_STATE: no clock is currently running.
+    ///   INVALID_ARGS: `id` or `resolution` are invalid or unsupported values.
+    ///   NOT_SUPPORTED: if `supports_read` is false, or the method is otherwise
+    ///     not implemented.
+    ///   INTERNAL_ERROR: internal runtime error.
+    flexible ReadClock(struct {
+        id uint64;
+        resolution Resolution;
+    }) -> (struct {
+        ticks uint64;
+    }) error DriverError;
+
+    /// Stops the timer `id`.
+    ///
+    /// Note that this may race with the expiration of the timer, for instance notification via
+    /// an event set with `SetEvent` may be already in flight.
+    /// If the specified `id` is invalid, then this call will return `INVALID_ARGS`.
+    /// If the driver encounters an internal error, then this call will return `INTERNAL_ERROR`.
+    flexible Stop(struct {
+        id uint64;
+    }) -> () error DriverError;
+
+    /// Get the current time in ticks left in timer `id` until expiration.
+    ///
+    /// If the specified `id` is invalid, then this call will return `INVALID_ARGS`.
+    flexible GetTicksLeft(struct {
+        id uint64;
+    }) -> (struct {
+        ticks uint64;
+    }) error DriverError;
+
+    /// Sets a Zircon Event to be notified of the timer expiration.
+    ///
+    /// The timer expiration will be notified via the ZX_EVENT_SIGNALED signal.
+    /// The client is responsible for clearing the ZX_EVENT_SIGNALED signal.
+    /// Any previously event set for the specific `id` is replaced. Note that this may race with
+    /// the event signaling from the expiration of a timer already started.
+    /// To guarantee that an event is delivered upon timer expiration, this method must be
+    /// called before calling `Start`.
+    ///
+    /// If the specified `id` is invalid, then this call will return `INVALID_ARGS`.
+    /// If this method is not supported for the given `id`, then this call will return
+    /// `NOT_SUPPORTED`.
+    /// If the driver encounters an internal error, then this call will return `INTERNAL_ERROR`.
+    @available(deprecated=HEAD, note="Use `StartAndWait2` instead.")
+    flexible SetEvent(resource struct {
+        id uint64;
+        event zx.Handle:EVENT;
+    }) -> () error DriverError;
+
+    /// Start the timer `id` to expire after `ticks` and waits until the timer expires with
+    /// support for preventing suspension via the Power Framework.
+    ///
+    /// The driver will signal the `setup_event` event once the timer has been setup using the
+    /// ZX_EVENT_SIGNALED signal. This allows a client to know that it is safe to allow the
+    /// system to suspend. The client is responsible for clearing this event.
+    ///
+    /// The driver will not respond to this call (hang) until the timer has triggered.
+    /// Calling `Stop` on the timer will abort this call and return `CANCELED`. Note that this
+    /// may race with the expiration of the timer.
+    ///
+    /// A driver supporting this call must be able to get a lease on a power element that keeps
+    /// the system from suspending. This lease is returned to the client via the `keep_alive`
+    /// LeaseToken channel field. When `keep_alive` is closed, then the driver lease keeping the
+    /// system from suspending will be dropped. Hence, to guarantee that the system is not
+    /// suspended by the Power Framework a client must either keep this `keep_alive` token for
+    /// as long as the system needs to not suspend, or a client must get its own lease from the
+    /// Power Framework to prevent suspension before it drops `keep_alive`.
+    ///
+    /// If the specified `id` is invalid, then this call will return `INVALID_ARGS`.
+    /// If this method is not supported for the given `id`, then this call will return
+    /// `NOT_SUPPORTED`.
+    /// If the driver does not have a `keep_alive` token to provide to the client, then this
+    /// call will return `BAD_STATE`.
+    /// If the driver encounters an internal error, then this call will return `INTERNAL_ERROR`.
+    flexible StartAndWait(resource struct {
+        id uint64;
+        resolution Resolution;
+        ticks uint64;
+        setup_event zx.Handle:EVENT;
+    }) -> (resource struct {
+        keep_alive fuchsia.power.system.LeaseToken;
+    }) error DriverError;
+
+    /// Start timer `id` and wait for it to expire after `ticks` ticks.
+    ///
+    /// The driver will not respond to this call (hang) until the timer has triggered.
+    /// Calling `Stop` on the timer will abort this call and return `CANCELED`. Note that this
+    /// may race with the expiration of the timer.
+    ///
+    /// This method keeps the system awake (prevents suspension) while the timer is setup using the
+    /// mandatory passed-in `setup_keep_alive` `LeaseToken`.
+    /// When the timer expires this method returns a second `expiration_keep_alive`
+    /// `LeaseToken` to prevent suspension at the time of expiration.
+    /// These keep alive wake lease tokens are provided by the Power Framework's System Activity
+    /// Governor. A driver supporting this call must be able to get `expiration_keep_alive` from
+    /// System Activity Governor.
+    ///
+    /// When `expiration_keep_alive` is closed, then this driver created wake lease keeping the
+    /// system from suspending at the time of the timer expiration is dropped. Hence, to guarantee
+    /// that the system is not suspended by the Power Framework a client must either keep this
+    /// `expiration_keep_alive` for as long as the system needs to stay awake, or a client must
+    /// get its own wake lease from the Power Framework before it drops `expiration_keep_alive` to
+    /// prevent suspension.
+    ///
+    /// Errors:
+    ///
+    /// * INVALID_ARGS: The specified `id` is invalid.
+    /// * NOT_SUPPORTED: This method is not supported for the given `id`.
+    /// * BAD_STATE: The driver is in a bad state, for instance it does not have an
+    ///   `expiration_keep_alive` token to provide to the client.
+    /// * INTERNAL_ERROR: The driver encountered an internal error.
+    flexible StartAndWait2(resource struct {
+        id uint64;
+        resolution Resolution;
+        ticks uint64;
+        setup_keep_alive fuchsia.power.system.LeaseToken;
+    }) -> (resource struct {
+        expiration_keep_alive fuchsia.power.system.LeaseToken;
+    }) error DriverError;
+
+    /// Get driver properties.
+    flexible GetProperties() -> (resource struct {
+        properties Properties;
+    });
+};
+
+service Service {
+    device client_end:Device;
+};

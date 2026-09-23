@@ -1,0 +1,169 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.media.drm;
+
+using fuchsia.media;
+using fuchsia.mem;
+
+// Common initialization data formats. These are defined as strings rather than
+// enums so as to not limit the types a ContentDecryptionModule may support.
+const LICENSE_INIT_DATA_TYPE_CENC LicenseInitDataType = "cenc";
+const LICENSE_INIT_DATA_TYPE_KEYIDS LicenseInitDataType = "keyids";
+const LICENSE_INIT_DATA_TYPE_WEBM LicenseInitDataType = "webm";
+const LICENSE_INIT_DATA_TYPE_HLS LicenseInitDataType = "hls";
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type LicenseSessionType = strict enum {
+    /// A session for which the license, keys, and record of the session are not
+    /// persisted.
+    TEMPORARY = 1;
+    /// A session for which the license, keys, and record of the session will be
+    /// persisted for offline use and can subsequently be loaded using
+    /// LoadSession().
+    PERSISTENT_LICENSE = 2;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type LicenseMessageType = strict enum {
+    REQUEST = 1;
+    RENEWAL = 2;
+    RELEASE = 3;
+};
+
+type LicenseInitData = struct {
+    /// The type is a string that indicates the format of the accompanying init
+    /// data. Common types include "cenc", "keyids", "webm", and "hls". CDMs may
+    /// also define their own.
+    type LicenseInitDataType;
+    data vector<uint8>:MAX;
+};
+
+/// A message originating from the [`LicenseSession`] that the caller must route
+/// to the license server.
+type LicenseMessage = resource struct {
+    type LicenseMessageType;
+    message fuchsia.mem.Buffer;
+};
+
+/// A message originating from the license server that the caller must provide
+/// to the [`LicenseSession`] via `ProcessLicenseServerMessage`.
+type LicenseServerMessage = resource struct {
+    message fuchsia.mem.Buffer;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type KeyStatus = strict enum {
+    /// The key is currently usable for decryption.
+    USABLE = 0;
+    /// The Key is no longer usable for decryption because it has expired.
+    EXPIRED = 1;
+    /// The Key is no longer usable for decryption, but is still known to the
+    /// CDM.
+    RELEASED = 2;
+    /// The Key has output restrictions that cannot currently be met and may be
+    /// unusable for decryption.
+    OUTPUT_RESTRICTED = 3;
+    /// The Key has output restrictions that cannot currently be met. The Key
+    /// may be usable for decryption with lower quality content.
+    OUTPUT_DOWNSCALED = 4;
+    /// The Key is not yet known or usable for decryption.
+    STATUS_PENDING = 5;
+    /// The Key is not usable for decryption because of an internal error.
+    INTERNAL_ERROR = 6;
+};
+
+type KeyState = table {
+    1: key_id fuchsia.media.KeyId;
+    2: status KeyStatus;
+};
+
+/// A protocol for exchanging messages pertaining to the establishment of a
+/// media license and the encryption keys associated with it.
+///
+/// If the client closes the `LicenseSession`, any derived Decryptors will also
+/// be closed as the encryption keys will no longer be maintained.
+closed protocol LicenseSession {
+    /// Indicates that the [`LicenseSession`] has successfully initialized.
+    ///
+    /// This is always the first message sent by the `LicenseSession`.
+    strict -> OnReady();
+
+    /// Generates a license request for a session based on the `init_data`.
+    ///
+    /// When the [`LicenseMessage`] has been created, the
+    /// `OnLicenseMessageGenerated` event will be triggered with the message to
+    /// be sent to the license server.
+    ///
+    /// + request `init_data` container-specific data that is used to generate a
+    ///   [`LicenseMessageType.REQUEST`] `LicenseMessage`.
+    /// * error an [`Error`] indicating the reason for failure.
+    strict GenerateLicenseRequest(struct {
+        init_data LicenseInitData;
+    }) -> () error Error;
+
+    /// Initiates the release process for the license session.
+    ///
+    /// This will cause the [`LicenseSession`] to destroy the license and/or
+    /// keys associated with the session. If the session is temporary, the
+    /// session will send the reply for this request once the license has been
+    /// destroyed and then close the `LicenseSession` channel. If the session is
+    /// persistent, the session will send the reply for this request once the
+    /// license has been destroyed and then it will generate a license release
+    /// type [`LicenseMessage`] through the `OnLicenseMessageGenerated` event.
+    /// The client must route that message to the license server and the
+    /// server's response to `ProcessLicenseServerMessage`. Once the
+    /// `LicenseSession` has received the license server's reply, it will close
+    /// the `LicenseSession` channel.
+    ///
+    /// * error an [`Error`] indicating the reason for failure.
+    strict GenerateLicenseRelease() -> () error Error;
+
+    /// Updates the [`LicenseSession`] with a message from the license server.
+    ///
+    /// All responses from license requests, renewals, and releases should be
+    /// routed to the `LicenseSession` through this method.
+    ///
+    /// + request `response` a message from the license server to update the
+    ///   state of the `LicenseSession`.
+    /// * error an [`Error`] indicating the reason for failure.
+    strict ProcessLicenseResponse(resource struct {
+        response LicenseServerMessage;
+    }) -> () error Error;
+
+    /// Creates a Decryptor [`fuchsia.media/StreamProcessor`] to be used to
+    /// decrypt content.
+    ///
+    /// This `decryptor` would be restricted to only having access to the
+    /// keys maintained by this [`LicenseSession`].
+    ///
+    /// + request `params` the parameters with which to create the `decryptor`.
+    /// + request `decryptor` the server endpoint of the
+    ///   `fuchsia.media/StreamProcessor`.
+    strict CreateDecryptor(resource struct {
+        params DecryptorParams;
+        decryptor server_end:fuchsia.media.StreamProcessor;
+    });
+
+    /// Provides a [`LicenseMessage`] that should be sent to the license server.
+    ///
+    /// The client is responsible for transporting this message to the license
+    /// server.
+    ///
+    /// - response `request` a message from the `LicenseSession` that the client
+    ///   should send to the license server.
+    strict -> OnLicenseMessageGenerated(resource struct {
+        request LicenseMessage;
+    });
+
+    /// Provides updated key state information.
+    ///
+    /// Some examples on when this might occur would be on license creation,
+    /// expiration, renewal, or load of a persistent license session.
+    ///
+    /// - response `key_states` a list of the key_ids and their related
+    ///   [`KeyStatusCode`]s
+    strict -> OnKeyStatesChanged(struct {
+        key_states vector<KeyState>:MAX;
+    });
+};

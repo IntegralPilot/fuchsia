@@ -1,0 +1,15 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef LIB_DRIVER_DEVICETREE_VISITORS_DRIVERS_I2C_CONTROLLERS_I2C_BUS_VISITOR_TEST_DTS_I2C_H_
+#define LIB_DRIVER_DEVICETREE_VISITORS_DRIVERS_I2C_CONTROLLERS_I2C_BUS_VISITOR_TEST_DTS_I2C_H_
+
+#define I2C_ADDRESS1 0xc
+#define I2C_ADDRESS2 0x1e
+#define I2C_ADDRESS3 0x2b
+#define I2C_ADDRESS4 0x3a
+#define I2C_ADDRESS5 0x30
+#define I2C_ADDRESS6 0x38
+
+#endif  // LIB_DRIVER_DEVICETREE_VISITORS_DRIVERS_I2C_CONTROLLERS_I2C_BUS_VISITOR_TEST_DTS_I2C_H_

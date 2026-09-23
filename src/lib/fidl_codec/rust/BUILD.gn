@@ -1,0 +1,125 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/fidl/fidl.gni")
+import("//build/rust/rustc_library.gni")
+import("//src/tests/fidl/conformance_suite/gidl-conformance-suite.gni")
+import("//tools/fidl/gidl/gidl.gni")
+
+conformance_test_source = "$target_gen_dir/src/conformance_test.rs"
+conformance_test_fidl_json = "$root_build_dir/fidling/gen/src/tests/fidl/conformance_suite/conformance_fidl.fidl.json"
+
+gidl("generate_conformance_test") {
+  type = "conformance"
+  language = "rust_codec"
+  inputs = conformance_suite_gidl_files
+  fidl = conformance_suite_fidl_target
+  output = conformance_test_source
+}
+
+rustc_test("fidl_codec_rust_conformance_tests_bin") {
+  output_name = "fidl_codec_rust_conformance_tests"
+  edition = "2024"
+  source_root = conformance_test_source
+  deps = [
+    ":fidl_codec",
+    "//sdk/rust/zx-status",
+    "//sdk/rust/zx-types",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fidl/rust/gidl_util",
+    "//third_party/rust_crates:assert_matches",
+  ]
+  rustenv = [ "CONFORMANCE_JSON_PATH=" +
+              rebase_path(conformance_test_fidl_json, "$target_gen_dir/src") ]
+  non_rust_deps = [
+    ":generate_conformance_test",
+    conformance_suite_fidl_target + "($fidl_toolchain)",
+  ]
+  sources = [ conformance_test_source ]
+  inputs = [ conformance_test_fidl_json ]
+  if (is_host) {
+    # We can't run tests in threads because they assert that handles are closed,
+    # which is racy when other threads are creating handles. See the comment on
+    # get_handle_info_valid in ./gidl_util/src/lib.rs for more details. We only
+    # need this on host because the test runner framework uses processes.
+    args = [ "--test-threads=1" ]
+  }
+}
+
+fuchsia_unittest_package("fidl_codec_rust_conformance_tests") {
+  deps = [ ":fidl_codec_rust_conformance_tests_bin" ]
+}
+
+template("fidl_codec_lib") {
+  _common = {
+    with_unit_tests = true
+    edition = "2024"
+
+    sources = [
+      "src/decode.rs",
+      "src/encode.rs",
+      "src/error.rs",
+      "src/handle.rs",
+      "src/lib.rs",
+      "src/library.rs",
+      "src/transaction.rs",
+      "src/util.rs",
+      "src/value.rs",
+    ]
+
+    deps = [
+      "//sdk/rust/fidl-data-zx",
+      "//src/lib/fidl/rust_constants",
+      "//third_party/rust_crates:bitflags",
+      "//third_party/rust_crates:nom",
+      "//third_party/rust_crates:serde",
+      "//third_party/rust_crates:serde_derive",
+      "//third_party/rust_crates:serde_json",
+      "//third_party/rust_crates:thiserror",
+    ]
+  }
+  rustc_library(target_name) {
+    forward_variables_from(_common, "*")
+
+    assert(defined(invoker.flavor))
+    flavor = invoker.flavor
+    features = [ flavor ]
+
+    if (flavor == "classic") {
+      deps += [ "//src/lib/fidl/rust/fidl" ]
+      sources += [ "src/handle/classic.rs" ]
+    } else if (flavor == "fdomain") {
+      deps += [
+        "//src/lib/fdomain/client",
+        "//src/lib/fidl/rust/fidl",
+      ]
+      sources += [ "src/handle/fdomain.rs" ]
+    } else if (flavor == "pure") {
+      sources += [ "src/handle/pure.rs" ]
+    }
+  }
+}
+
+fidl_codec_lib("fidl_codec") {
+  flavor = "classic"
+}
+
+fidl_codec_lib("fidl_codec_fdomain") {
+  flavor = "fdomain"
+}
+
+fidl_codec_lib("fidl_codec_pure") {
+  flavor = "pure"
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":fidl_codec_fdomain_test",
+    ":fidl_codec_rust_conformance_tests",
+    ":fidl_codec_rust_conformance_tests_bin($host_toolchain)",
+    ":fidl_codec_test",
+  ]
+}

@@ -1,0 +1,758 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.wlan.mlme;
+
+using fuchsia.wlan.common as common;
+using fuchsia.wlan.ieee80211 as ieee80211;
+using fuchsia.wlan.internal as internal;
+using fuchsia.wlan.stats;
+using zx;
+
+// Stub types for communicating between the wlan service and the MLME drivers. Based on the 802.11
+// MLME SAP interface (IEEE Std 802.11-2016 section 6.3).
+
+// TODO(https://fxbug.dev/42094963): restore the commented out enum aliases
+
+// MLME-SETKEYS.request (IEEE Std 802.11-2016 6.3.19.1)
+
+type KeyType = strict enum {
+    GROUP = 1;
+    PAIRWISE = 2;
+    PEER_KEY = 3;
+    IGTK = 4;
+};
+
+type SetKeyDescriptor = struct {
+    // Specs specify a bit string, we use byte array.
+    key vector<uint8>:MAX;
+    key_id uint16;
+    key_type KeyType;
+    address ieee80211.MacAddr;
+    rsc uint64;
+    cipher_suite_oui array<uint8, 3>;
+    cipher_suite_type ieee80211.CipherSuiteType;
+};
+
+type SetKeysRequest = struct {
+    keylist vector<SetKeyDescriptor>:MAX;
+};
+
+// MLME-SCAN.request (IEEE Std 802.11-2016 6.3.3.2)
+
+type ScanTypes = strict enum {
+    ACTIVE = 1;
+    PASSIVE = 2;
+    //LAST = PASSIVE;
+};
+
+const MAX_SSIDS_PER_SCAN_REQUEST uint32 = 32;
+
+type ScanRequest = struct {
+    txn_id uint64;
+    scan_type ScanTypes;
+    /// List of channels to scan on. An empty list of channels will cause a
+    /// scan request to immediately return a ScanEnd with code INVALID_ARGS.
+    ///
+    /// Invalid channel numbers will be silently ignored. The validity of a channel
+    /// number depends on the current regulatory region, and MLME does not control
+    /// or know this setting.
+    channel_list vector<ieee80211.ChannelNumber>:ieee80211.MAX_UNIQUE_CHANNEL_NUMBERS;
+    /// List of SSIDs to scan for. An empty list of ssids is the same as specifying
+    /// a list containing only the wildcard SSID.
+    ///
+    /// There is no limit on the number of SSIDs specified. A large number of
+    /// SSIDs may result in extended scan times because of hardware limitations on
+    /// the number of SSIDs permitted per scan request and the technical limitation
+    /// in IEEE 802.11-2016 that limits the number of SSIDs in a single Probe Request
+    /// frame to ieee80211.SSID_LIST_MAX SSIDs.
+    ssid_list vector<ieee80211.Ssid>:MAX;
+    probe_delay uint32; // in TimeUnits
+    // TODO(https://fxbug.dev/42171328): A TimeUnit is generally limited to 2 octets, but this field
+    // is 4 octets wide.
+    min_channel_time uint32; // in TimeUnits
+    max_channel_time uint32; // in TimeUnits
+};
+
+// MLME-SCAN.confirm (IEEE Std 802.11-2016 6.3.3.3)
+
+// LINT.IfChange
+
+/// WFA WMM v1.2, 2.2.2 Table 5
+/// Length of the WMM Parameter Element body. This does not include IE and vendor IE headers,
+/// and only includes the QoS Info, reserved, and AC parameters fields.
+const WMM_PARAM_LEN uint8 = 18;
+
+// LINT.ThenChange(//sdk/banjo/fuchsia.hardware.wlan.fullmac/wlanif.banjo)
+
+/// WFA WMM v1.2, 2.2.1
+alias QosInfo = uint8;
+
+type WmmParameter = struct {
+    bytes array<uint8, WMM_PARAM_LEN>;
+};
+
+type ScanResultCode = strict enum {
+    SUCCESS = 0;
+    NOT_SUPPORTED = 1;
+    INVALID_ARGS = 2;
+    INTERNAL_ERROR = 3;
+    SHOULD_WAIT = 4;
+    CANCELED_BY_DRIVER_OR_FIRMWARE = 5;
+};
+
+type ScanResult = struct {
+    txn_id uint64;
+    // Time of the scan result relative to when the system was powered on.
+    // See https://fuchsia.dev/fuchsia-src/concepts/time/language_support#monotonic_time
+    timestamp_nanos zx.Time;
+    bss ieee80211.BssDescription;
+};
+
+type ScanEnd = struct {
+    txn_id uint64;
+    code ScanResultCode;
+};
+
+type ConnectRequest = struct {
+    selected_bss ieee80211.BssDescription;
+    connect_failure_timeout uint32;
+
+    /// Additional parameters specific to the authentication exchange.
+    auth_type AuthenticationTypes;
+    // sae_password is ignored except when SAE_DRIVER_AUTH is enabled and the
+    // auth_type is SAE.
+    sae_password vector<uint8>:MAX;
+    /// WEP key used in the authentication exchange. Only included for WEP security type.
+    wep_key box<SetKeyDescriptor>;
+
+    /// Additional parameters specific to the association exchange.
+    security_ie vector<uint8>:ieee80211.WLAN_IE_MAX_LEN;
+    /// OWE public key used for Diffie Hellman exchange during association.
+    /// Only included for OWE security type.
+    owe_public_key box<internal.OwePublicKey>;
+};
+
+type ConnectConfirm = struct {
+    peer_sta_address ieee80211.MacAddr;
+    result_code ieee80211.StatusCode;
+
+    // These fields are only valid if the result is success.
+    association_id uint16;
+    association_ies vector<uint8>:MAX;
+};
+
+type ReconnectRequest = struct {
+    peer_sta_address ieee80211.MacAddr;
+};
+
+type RoamRequest = struct {
+    selected_bss ieee80211.BssDescription;
+};
+
+/// Result of an SME-initiated roam attempt.
+type RoamConfirm = struct {
+    selected_bssid ieee80211.MacAddr;
+
+    status_code ieee80211.StatusCode;
+
+    /// Whether the original BSS association has been maintained through the roam attempt.
+    /// A successful roam always incurs disassociation from the original BSS, so if `status_code` is
+    /// success then this field must be set to false; a roam failure typically incurs disassociation
+    /// from the original BSS, but may not in some cases (e.g. in some Fast BSS Transition scenarios).
+    original_association_maintained bool;
+
+    /// Whether the client is authenticated with the target BSS. If `status_code` is success, then
+    /// this field must be set to true; if the roam attempt failed, this field may be true or false.
+    /// This allows higher layers to decide how to clean up connection state after a failed roam
+    /// attempt.
+    target_bss_authenticated bool;
+
+    // These fields are only valid if the result is success.
+    association_id uint16;
+    association_ies vector<uint8>:MAX;
+};
+
+/// In-progress fullmac-initiated roam attempt details.
+type RoamStartIndication = struct {
+    selected_bssid ieee80211.MacAddr;
+    selected_bss ieee80211.BssDescription;
+
+    /// Whether the original BSS association has been maintained at the start of a roam attempt.
+    /// 802.11 dictates that a STA can only be associated with a single BSS, so a roam attempt
+    /// typically incurs disassociation at the start of the roam attempt. However, 802.11 also
+    /// provides a mechanism (i.e. Fast BSS Transition) that allows a device to maintain
+    /// association with the original BSS while establishing authentication with the target BSS, in
+    /// order to avoid losing the original association if authentication with the target BSS fails.
+    original_association_maintained bool;
+};
+
+/// Result of a fullmac-initiated roam attempt.
+type RoamResultIndication = struct {
+    selected_bssid ieee80211.MacAddr;
+
+    status_code ieee80211.StatusCode;
+
+    /// Whether the original BSS association has been maintained through the roam attempt.
+    /// A successful roam always incurs disassociation from the original BSS, so if `status_code` is
+    /// success then this field must be set to false; a roam failure typically incurs disassociation
+    /// from the original BSS, but may not in some cases (e.g. in some Fast BSS Transition scenarios).
+    original_association_maintained bool;
+
+    /// Whether the client is authenticated with the target BSS. If `status_code` is success, then
+    /// this field must be set to true; if the roam attempt failed, this field may be true or false.
+    /// This allows higher layers to decide how to clean up connection state after a failed roam
+    /// attempt.
+    target_bss_authenticated bool;
+
+    // These fields are only valid if the result is success.
+    association_id uint16;
+    association_ies vector<uint8>:MAX;
+};
+
+type AuthenticationTypes = strict enum {
+    OPEN_SYSTEM = 1;
+    SHARED_KEY = 2;
+    FAST_BSS_TRANSITION = 3;
+    SAE = 4;
+    //LAST = SAE;
+};
+
+// MLME-AUTHENTICATE.indication (IEEE Std 802.11-2016, 6.3.5.4)
+
+type AuthenticateIndication = struct {
+    peer_sta_address ieee80211.MacAddr;
+    auth_type AuthenticationTypes;
+
+    // etc
+};
+
+// MLME-AUTHENTICATE.response (IEEE Std 802.11-2016, 6.3.5.5)
+
+type AuthenticateResultCode = strict enum {
+    SUCCESS = 0;
+    REFUSED = 1;
+    ANTI_CLOGGING_TOKEN_REQUIRED = 2;
+    FINITE_CYCLIC_GROUP_NOT_SUPPORTED = 3;
+    AUTHENTICATION_REJECTED = 4;
+    AUTH_FAILURE_TIMEOUT = 5;
+};
+
+type AuthenticateResponse = struct {
+    peer_sta_address ieee80211.MacAddr;
+    result_code AuthenticateResultCode;
+
+    // etc
+};
+
+// MLME-DEAUTHENTICATE.request (IEEE Std 802.11-2016, 6.3.6.2)
+
+type DeauthenticateRequest = struct {
+    peer_sta_address ieee80211.MacAddr;
+    reason_code ieee80211.ReasonCode;
+    // VendorSpecificInfo
+};
+
+// MLME-DEAUTHENTICATE.confirm (IEEE Std 802.11-2016, 6.3.6.3)
+
+type DeauthenticateConfirm = struct {
+    peer_sta_address ieee80211.MacAddr;
+};
+
+// MLME-DEAUTHENTICATE.indication (IEEE Std 802.11-2016, 6.3.6.4)
+
+type DeauthenticateIndication = struct {
+    peer_sta_address ieee80211.MacAddr;
+    reason_code ieee80211.ReasonCode;
+    /// locally_initiated is true if deauth is initiated from the device,
+    /// and is false if it's initiated remotely (e.g. due to deauth frame)
+    locally_initiated bool;
+    // VendorSpecificInfo
+};
+
+// MLME-ASSOCIATE.indication (IEEE Std 802.11-2016, 6.3.7.4)
+
+type AssociateIndication = struct {
+    peer_sta_address ieee80211.MacAddr;
+    capability_info ieee80211.CapabilityInfo;
+    listen_interval uint16;
+    ssid ieee80211.Ssid:optional;
+    rates vector<uint8>:internal.MAX_ASSOC_BASIC_RATES;
+    // BSSMembershipSelectorSet
+    rsne vector<uint8>:<ieee80211.WLAN_IE_MAX_LEN, optional>;
+
+    // etc
+};
+
+// MLME-ASSOCIATE.response (IEEE Std 802.11-2016, 6.3.7.5)
+
+type AssociateResultCode = strict enum {
+    SUCCESS = 0;
+    REFUSED_REASON_UNSPECIFIED = 1;
+    REFUSED_NOT_AUTHENTICATED = 2;
+    REFUSED_CAPABILITIES_MISMATCH = 3;
+    REFUSED_EXTERNAL_REASON = 4;
+    REFUSED_AP_OUT_OF_MEMORY = 5;
+    REFUSED_BASIC_RATES_MISMATCH = 6;
+    REJECTED_EMERGENCY_SERVICES_NOT_SUPPORTED = 7;
+    REFUSED_TEMPORARILY = 8;
+};
+
+type AssociateResponse = struct {
+    peer_sta_address ieee80211.MacAddr;
+    result_code AssociateResultCode;
+
+    association_id uint16;
+
+    // This is not part of the MLME SAP, but we need this to set the association context state in
+    // the MLME.
+    capability_info ieee80211.CapabilityInfo;
+
+    // This combines both the BSSBasicRateSet and the OperationalRateSet, as the MLME will split
+    // them up.
+    rates vector<uint8>:internal.MAX_ASSOC_BASIC_RATES;
+
+    // etc
+};
+
+// MLME-DISASSOCIATE.request (IEEE Std 802.11-2016, 6.3.9.1)
+
+type DisassociateRequest = struct {
+    peer_sta_address ieee80211.MacAddr;
+    reason_code ieee80211.ReasonCode;
+    // VendorSpecificInfo
+};
+
+// MLME-DISASSOCIATE.confirm (IEEE Std 802.11-2016, 6.3.9.2)
+
+type DisassociateConfirm = struct {
+    status int32;
+};
+
+// MLME-DISASSOCIATE.indication (IEEE Std 802.11-2016, 6.3.9.3)
+
+type DisassociateIndication = struct {
+    peer_sta_address ieee80211.MacAddr;
+    reason_code ieee80211.ReasonCode;
+    /// locally_initiated is true if diassoc is initiated from the device,
+    /// and is false if it's initiated remotely (e.g. due to disassoc frame)
+    locally_initiated bool;
+    // VendorSpecificInfo
+};
+
+// MLME-RESET.request (IEEE Std 802.11-2016, 6.3.10.2)
+
+type ResetRequest = struct {
+    sta_address ieee80211.MacAddr;
+    set_default_mib bool;
+};
+
+// MLME-START.request (IEEE Std 802.11-2016, 6.3.11.2)
+
+// See dot11CountryString of IEEE Std 802.11-2016, Annex C
+const countryEnvironAll uint8 = 32; // an ASCII ' ' character
+const countryEnvironOutdoor uint8 = 79; // an ASCII 'O' character
+const countryEnvironIndoor uint8 = 73; // an ASCII 'I' character
+const countryEnvironNonCountry uint8 = 88; // an ASCII 'X' character
+
+// Information derived from Country Element, IEEE Std 802.11-2016, 9.4.2.9.
+type Country = struct {
+    alpha2 array<uint8, internal.COUNTRY_CODE_LEN>; // ISO 3116-1
+
+    // countryEnviron constant from above
+    // or Operating Class Table number from IEEE Std 802.11-2016 Annex D.
+    suffix uint8;
+};
+
+type StartRequest = struct {
+    ssid ieee80211.Ssid;
+    bss_type ieee80211.BssType;
+    beacon_period uint16; // in TU
+    dtim_period uint8;
+
+    // PHY parameter sets
+    primary ieee80211.ChannelNumber;
+
+    // Capability information.
+    capability_info ieee80211.CapabilityInfo;
+
+    // This combines both the BSSBasicRateSet and the OperationalRateSet, as the MLME will split
+    // them up.
+    rates vector<uint8>:internal.MAX_ASSOC_BASIC_RATES;
+
+    // TODO(porce): Conditionally present. See IEEE Std 802.11-2016, 10.2, 11.8, 11.10.
+    // See also dot11MultiDomainCapabilityActivated.
+    country Country;
+
+    mesh_id vector<uint8>:ieee80211.MAX_MESH_ID_BYTE_LEN;
+
+    // TODO(hahnr): Add additional elements.
+
+    // Although MLME-START.request is used to start a BSS, IEEE does not include an RSNE in this
+    // primitive. However, IEEE doesn't define any other primitive to configure the RSN after its
+    // BSS was started. The RSNE must be available when the BSS is started, and thus, this is the
+    // right place to transfer the RSNE to the MLME.
+    rsne vector<uint8>:<ieee80211.WLAN_IE_MAX_LEN, optional>;
+
+    // Combined with what MLME knows about the device capabilities,
+    // following parameters determine what to be advertised to the peer
+    // (in Beacons/ProbeResponse/AssociationResponse). Effectively this way replaces the following
+    // fields originally defined in MLME-START.request.
+    // TODO(https://fxbug.dev/42104290): Replace phy and cbw with full-fledged parameters below.
+    // - Capability Information
+    // - HT Capabilities
+    // - HT Operation
+    // - VHT Capabilities
+    // - VHT Operation
+    // - Extended Capabilities
+    phy ieee80211.WlanPhyType;
+    bandwidth ieee80211.ChannelBandwidth;
+};
+
+// MLME-START.confirm (IEEE Std 802.11-2016, 6.3.11.3)
+
+type StartResultCode = strict enum {
+    SUCCESS = 0;
+    BSS_ALREADY_STARTED_OR_JOINED = 1;
+    RESET_REQUIRED_BEFORE_START = 2;
+    NOT_SUPPORTED = 3;
+    INTERNAL_ERROR = 4;
+};
+
+type StartConfirm = struct {
+    result_code StartResultCode;
+};
+
+// MLME-STOP.request (IEEE Std 802.11-2016, 6.3.12.2)
+
+type StopRequest = struct {
+    ssid ieee80211.Ssid;
+};
+
+type StopResultCode = strict enum {
+    SUCCESS = 0;
+    BSS_ALREADY_STOPPED = 1;
+    INTERNAL_ERROR = 2;
+};
+
+type StopConfirm = struct {
+    result_code StopResultCode;
+};
+
+// MLME-DELETEKEYS.request (IEEE Std 802.11-2016 6.3.20.1)
+
+type DeleteKeyDescriptor = struct {
+    key_id uint16;
+    key_type KeyType;
+    address ieee80211.MacAddr;
+};
+
+type DeleteKeysRequest = struct {
+    keylist vector<DeleteKeyDescriptor>;
+};
+
+// MLME-EAPOL.request (IEEE Std 802.11-2016 6.3.22.1)
+
+type EapolRequest = struct {
+    src_addr ieee80211.MacAddr;
+    dst_addr ieee80211.MacAddr;
+    data vector<uint8>:MAX;
+};
+
+// MLME-EAPOL.confirm (IEEE Std 802.11-2016 6.3.22.2)
+
+type EapolResultCode = strict enum {
+    SUCCESS = 0;
+    TRANSMISSION_FAILURE = 1;
+    //LAST = TRANSMISSION_FAILURE;
+};
+
+type EapolConfirm = struct {
+    result_code EapolResultCode;
+    /// This value corresponds to the dst_addr in the EapolRequest we're confirming.
+    /// IEEE 802.11-2016 does not include this field, but we need it to disambiguate
+    /// if multiple EAPoL handshakes are ongoing.
+    dst_addr ieee80211.MacAddr;
+};
+
+// Because these methods rely on an external entity to provide a response, events are used instead
+// of return values.
+closed protocol MLME {
+    // We deviate from the spec for scanning in order to support incremental
+    // scan results easily. We could stay closer to 802.11ai, but the protocol
+    // that is described there is more difficult to implement correctly.
+
+    // Initiate a scan transaction. The caller is responsible for filling
+    // the `txn_id` field in `req` with a unique number that will be used
+    // to identify the transaction.
+    //
+    // Zero or more `OnScanResult` events with a matching `txn_id` will be sent
+    // in response.
+    //
+    // At the end on the transaction, whether it is successful or not,
+    // a `OnScanEnd` event with a matching `txn_id` is guaranteed to be sent
+    // in response (unless the channel is closed first).
+    //
+    // After `OnScanEnd`, no further events with the same `txn_id` shall be sent.
+    strict StartScan(struct {
+        req ScanRequest;
+    });
+
+    // An incremental scan result containing information about a single BSS.
+    // Only one event per unique BSSID per transaction will be sent.
+    strict -> OnScanResult(struct {
+        result ScanResult;
+    });
+
+    // An event that signals the end of a scan transaction.
+    strict -> OnScanEnd(struct {
+        end ScanEnd;
+    });
+
+    /// Starts scheduled scanning.
+    strict StartScheduledScan(struct {
+        txn_id uint64;
+        req common.ScheduledScanRequest;
+    }) -> () error zx.Status;
+
+    /// Stops scheduled scanning.
+    strict StopScheduledScan(struct {
+        txn_id uint64;
+    }) -> () error zx.Status;
+
+    /// Returns the transaction IDs of any currently active scheduled scans.
+    strict GetScheduledScanEnabled() -> (struct {
+        active_txn_ids vector<uint64>:MAX;
+    }) error zx.Status;
+
+    /// Indicates that an individual scan within the scheduled scan plan has been completed
+    /// and all results have been sent for that individual scan.
+    strict -> OnScheduledScanMatchesAvailable(struct {
+        txn_id uint64;
+    });
+
+    /// Indicates that scheduled scanning has been stopped by the firmware.
+    strict -> OnScheduledScanStoppedByFirmware(struct {
+        txn_id uint64;
+    });
+
+    strict ConnectReq(struct {
+        req ConnectRequest;
+    });
+    strict -> ConnectConf(struct {
+        resp ConnectConfirm;
+    });
+    strict ReconnectReq(struct {
+        req ReconnectRequest;
+    });
+
+    /// Initiate a roam attempt (SME-initiated).
+    strict RoamReq(struct {
+        req RoamRequest;
+    });
+
+    /// Receive the result of an SME-initiated roam attempt.
+    strict -> RoamConf(struct {
+        conf RoamConfirm;
+    });
+
+    /// Receive notification that a fullmac-initiated roam attempt is in-progress.
+    strict -> RoamStartInd(struct {
+        ind RoamStartIndication;
+    });
+
+    /// Receive the result of a fullmac-initiated roam attempt.
+    strict -> RoamResultInd(struct {
+        ind RoamResultIndication;
+    });
+
+    strict -> AuthenticateInd(struct {
+        ind AuthenticateIndication;
+    });
+    strict AuthenticateResp(struct {
+        resp AuthenticateResponse;
+    });
+
+    strict DeauthenticateReq(struct {
+        req DeauthenticateRequest;
+    });
+    strict -> DeauthenticateConf(struct {
+        resp DeauthenticateConfirm;
+    });
+
+    strict -> DeauthenticateInd(struct {
+        ind DeauthenticateIndication;
+    });
+
+    strict -> AssociateInd(struct {
+        ind AssociateIndication;
+    });
+    strict AssociateResp(struct {
+        resp AssociateResponse;
+    });
+
+    strict DisassociateReq(struct {
+        req DisassociateRequest;
+    });
+    strict -> DisassociateConf(struct {
+        resp DisassociateConfirm;
+    });
+
+    strict -> DisassociateInd(struct {
+        ind DisassociateIndication;
+    });
+
+    strict ResetReq(struct {
+        req ResetRequest;
+    });
+
+    strict StartReq(struct {
+        req StartRequest;
+    });
+    strict -> StartConf(struct {
+        resp StartConfirm;
+    });
+
+    strict StopReq(struct {
+        req StopRequest;
+    });
+    strict -> StopConf(struct {
+        resp StopConfirm;
+    });
+
+    strict SetKeysReq(struct {
+        req SetKeysRequest;
+    });
+    strict -> SetKeysConf(struct {
+        conf SetKeysConfirm;
+    });
+
+    strict DeleteKeysReq(struct {
+        req DeleteKeysRequest;
+    });
+
+    strict EapolReq(struct {
+        req EapolRequest;
+    });
+    strict -> EapolConf(struct {
+        resp EapolConfirm;
+    });
+
+    // The following are extensions to the 802.11 MLME SAP interface.
+
+    strict -> SignalReport(struct {
+        ind internal.SignalReportIndication;
+    });
+
+    strict -> EapolInd(struct {
+        ind EapolIndication;
+    });
+    strict SetControlledPort(struct {
+        req SetControlledPortRequest;
+    });
+
+    strict QueryDeviceInfo() -> (struct {
+        info DeviceInfo;
+    });
+
+    strict QueryTelemetrySupport() -> (struct {
+        resp fuchsia.wlan.stats.TelemetrySupport;
+    }) error zx.Status;
+
+    strict GetIfaceStats() -> (struct {
+        resp GetIfaceStatsResponse;
+    });
+    strict GetIfaceHistogramStats() -> (struct {
+        resp GetIfaceHistogramStatsResponse;
+    });
+    strict GetSignalReport() -> (struct {
+        resp fuchsia.wlan.stats.SignalReport;
+    }) error zx.Status;
+
+    strict ListMinstrelPeers() -> (struct {
+        resp MinstrelListResponse;
+    });
+    strict GetMinstrelStats(struct {
+        req MinstrelStatsRequest;
+    }) -> (struct {
+        resp MinstrelStatsResponse;
+    });
+
+    strict StartCaptureFrames(struct {
+        req StartCaptureFramesRequest;
+    }) -> (struct {
+        resp StartCaptureFramesResponse;
+    });
+    strict StopCaptureFrames();
+    strict -> RelayCapturedFrame(struct {
+        result CapturedFrameResult;
+    });
+
+    strict -> OnChannelSwitched(struct {
+        info internal.ChannelSwitchInfo;
+    });
+
+    strict -> OnPmkAvailable(struct {
+        info PmkInfo;
+    });
+
+    /// MLME notification that SME will handle SAE authentication.
+    strict -> OnSaeHandshakeInd(struct {
+        ind SaeHandshakeIndication;
+    });
+    /// Notifies that SAE authentication is completed.
+    strict SaeHandshakeResp(struct {
+        resp SaeHandshakeResponse;
+    });
+    /// Transmits SAE frame (if SME is managing SAE authentication).
+    strict SaeFrameTx(struct {
+        frame SaeFrame;
+    });
+    /// Receives SAE frame (if SME is managing SAE authentication).
+    strict -> OnSaeFrameRx(struct {
+        frame SaeFrame;
+    });
+
+    strict WmmStatusReq();
+    strict -> OnWmmStatusResp(struct {
+        status int32;
+        resp internal.WmmStatusResponse;
+    });
+
+    // For SoftMAC drivers only. Let SME inform MLME about the capability negotiation outcome.
+    // TODO(https://fxbug.dev/42119326): If we are able to intersect the capabilities with beacon before associating,
+    // remove this function and the capabilities from AssociateConfirm and use AssociateRequest.
+    strict FinalizeAssociationReq(struct {
+        negotiated_capabilities NegotiatedCapabilities;
+    });
+
+    // Sets the MAC address of the client interface. To reset the MAC address to the default/factory
+    // value, retrieve the `factory_addr` from `QueryDeviceInfo` and pass it here.
+    strict SetMacAddress(struct {
+        mac_addr ieee80211.MacAddr;
+    }) -> () error zx.Status;
+
+    // APF (Android Packet Filter) functionality
+    strict InstallApfPacketFilter(struct {
+        program vector<uint8>:MAX;
+    }) -> () error zx.Status;
+    strict ReadApfPacketFilterData() -> (struct {
+        memory vector<uint8>:MAX;
+    }) error zx.Status;
+    strict SetApfPacketFilterEnabled(struct {
+        enabled bool;
+    }) -> () error zx.Status;
+    strict GetApfPacketFilterEnabled() -> (struct {
+        enabled bool;
+    }) error zx.Status;
+};
+
+// Temporary interface for bridging between the devhost-owned channel model and
+// the driver-owned channel model of connection management.
+/// This protocol is used to connect to the interface's underlying MLME.
+closed protocol Connector {
+    strict Connect(resource struct {
+        request server_end:MLME;
+    });
+};

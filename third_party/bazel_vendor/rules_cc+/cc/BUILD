@@ -1,0 +1,231 @@
+# Copyright 2019 The Bazel Authors. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("//cc/toolchains:cc_toolchain_alias.bzl", "cc_toolchain_alias")
+load(":starlark_doc_extract_helper.bzl", "starlark_doc_extract_helper")
+
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])  # Apache 2.0
+
+filegroup(
+    name = "all_files_for_testing",
+    srcs = glob(["**"]) + [
+        "//cc/private/rules_impl:srcs",
+        "//cc/private/toolchain:srcs",
+    ],
+)
+
+exports_files([
+    "defs.bzl",
+    "action_names.bzl",
+    "system_library.bzl",
+    "cc_binary.bzl",
+    "cc_import.bzl",
+    "cc_library.bzl",
+    "cc_shared_library.bzl",
+    "cc_static_library.bzl",
+    "cc_test.bzl",
+    "objc_import.bzl",
+    "objc_library.bzl",
+])
+
+# The toolchain type used to distinguish cc toolchains.
+alias(
+    name = "toolchain_type",
+    actual = "@bazel_tools//tools/cpp:toolchain_type",
+)
+
+filegroup(
+    name = "action_names_test_files",
+    testonly = True,
+    srcs = [
+        "BUILD",
+        "action_names.bzl",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "bzl_srcs",
+    srcs = glob([
+        "**/*.bzl",
+    ]) + [
+        "//cc/private:bzl_srcs",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "srcs",
+    testonly = 1,
+    srcs = glob([
+        "**/*.bzl",
+        "**/BUILD",
+    ]) + [
+        "//cc/common:srcs",
+        "//cc/private:srcs",
+        "//cc/toolchains:srcs",
+        "@bazel_skylib//:test_deps",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# TODO(aiuto): Find a way to strip this rule from the distribution tarball.
+filegroup(
+    name = "distribution",
+    srcs = glob([
+        "**",
+    ]),
+    visibility = [
+        "//distro:__pkg__",
+    ],
+)
+
+bzl_library(
+    name = "find_cc_toolchain_bzl",
+    srcs = [
+        "find_cc_toolchain.bzl",
+        "use_cc_toolchain.bzl",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cc/common",
+    ],
+)
+
+bzl_library(
+    name = "action_names_bzl",
+    srcs = ["action_names.bzl"],
+    visibility = ["//visibility:public"],
+)
+
+bzl_library(
+    name = "cc_toolchain_config_lib_bzl",
+    srcs = ["cc_toolchain_config_lib.bzl"],
+    visibility = ["//cc:__subpackages__"],
+)
+
+bzl_library(
+    name = "repositories_bzl",
+    srcs = ["repositories.bzl"],
+    visibility = ["//visibility:private"],
+    deps = [
+        "//cc/common",
+        "//cc/private/toolchain:cc_configure_bzl",
+    ],
+)
+
+bzl_library(
+    name = "defs_bzl",
+    srcs = ["defs.bzl"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":build_settings_bzl",
+        ":core_rules",
+        "//cc/common",
+        "//cc/common:cc_helper_bzl",
+        "//cc/private/rules_impl:failing_cc_proto_library_bzl",
+        "//cc/toolchains:toolchain_rules",
+    ],
+)
+
+bzl_library(
+    name = "cc_postmark_bzl",
+    srcs = [
+        "cc_postmark.bzl",
+        "cc_postmark_initializers.bzl",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+bzl_library(
+    name = "build_settings_bzl",
+    srcs = ["build_settings.bzl"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@bazel_skylib//rules:common_settings",
+    ],
+)
+
+bool_flag(
+    name = "incompatible_disallow_sdk_frameworks_attributes",
+    build_setting_default = False,
+    scope = "universal",
+    visibility = ["//visibility:public"],
+)
+
+bool_flag(
+    name = "incompatible_strip_executable_safely",
+    build_setting_default = False,
+    scope = "universal",
+    visibility = ["//visibility:public"],
+)
+
+bool_flag(
+    name = "incompatible_objc_alwayslink_by_default",
+    build_setting_default = False,
+    scope = "universal",
+    visibility = ["//visibility:public"],
+)
+
+bool_flag(
+    name = "incompatible_builtin_objc_strip_action",
+    build_setting_default = True,
+    scope = "universal",
+    visibility = ["//visibility:public"],
+)
+
+bzl_library(
+    name = "core_rules",
+    srcs = [
+        "cc_binary.bzl",
+        "cc_import.bzl",
+        "cc_library.bzl",
+        "cc_shared_library.bzl",
+        "cc_static_library.bzl",
+        "cc_test.bzl",
+        "objc_import.bzl",
+        "objc_library.bzl",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":build_settings_bzl",
+        ":cc_postmark_bzl",
+        "//cc/toolchains:toolchain_rules",
+        "@cc_compatibility_proxy//:proxy_bzl",
+    ],
+)
+
+cc_toolchain_alias(name = "current_cc_toolchain")
+
+# Use alias, because it doesn't build on Bazel 6.
+alias(
+    name = "optional_current_cc_toolchain",
+    actual = "//cc/private/bazel7:optional_current_cc_toolchain",
+)
+
+cc_libc_top_alias(name = "current_libc_top")
+
+# unused target to test that we have the right bzl_library graph
+starlark_doc_extract_helper(
+    name = "defs_doc_extract",
+    src = "defs.bzl",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":defs_bzl",
+    ],
+)

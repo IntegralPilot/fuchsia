@@ -1,0 +1,192 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "ProtocolDefinition" -}}
+{{- $protocol := . }}
+
+const (
+{{- range $method := $protocol.Methods }}
+	{{ $method.OrdinalName }} uint64 = {{ $method.Ordinal | printf "%#x" }}
+{{- end }}
+)
+
+type {{ $protocol.ProxyName }} _bindings.{{ $protocol.ProxyType }}
+{{ range $method := $protocol.Methods }}
+{{ range $comment := $method.DocComments }}
+//{{ $comment }}
+{{- end }}
+{{- if not $method.IsStrict }}
+{{- if $method.IsEvent }}
+// WARNING: flexible event {{ $protocol.Name}}.{{ $method.Name }} is treated as strict in Go!
+{{- else }}
+// WARNING: flexible method {{ $protocol.Name}}.{{ $method.Name }} is treated as strict in Go!
+{{- end }}
+{{- end }}
+func (p *{{ $.ProxyName }}) {{ if $method.IsEvent -}}
+		{{ $method.EventExpectName }}
+	{{- else -}}
+		{{ $method.Name }}
+	{{- end -}}
+	{{- if $method.Request -}}
+	(ctx_ _bindings.Context, {{ $method.Request.NamesAndTypes }})
+	{{- else -}}
+	(ctx_ _bindings.Context)
+	{{- end -}}
+	{{- if $method.HasResponse -}}
+	{{- if $method.Response }} ({{ $method.Response.Types }}, error)
+	{{- else }} error{{ end -}}
+	{{- else }} error{{ end }} {
+
+	{{- if $method.HasRequest }}
+	{{- if $method.Request }}
+	req_ := &{{ $method.Request.Construct }}
+	{{- else }}
+	var req_ _bindings.Message
+	{{- end }}
+	{{- end }}
+	{{- if $method.HasResponse }}
+	{{- if $method.Response }}
+	resp_ := &{{ $method.Response.Name }}{}
+	{{- else }}
+	var resp_ _bindings.Message
+	{{- end }}
+	{{- end }}
+	{{- if $method.HasRequest }}
+		{{- if $method.HasResponse }}
+	err_ := ((*_bindings.{{ $protocol.ProxyType }})(p)).Call({{ $method.OrdinalName }}, req_, resp_)
+		{{- else }}
+	err_ := ((*_bindings.{{ $protocol.ProxyType }})(p)).Send({{ $method.OrdinalName }}, req_)
+		{{- end }}
+	{{- else }}
+		{{- if $method.HasResponse }}
+	err_ := ((*_bindings.{{ $protocol.ProxyType }})(p)).Recv({{ $method.OrdinalName }}, resp_)
+		{{- else }}
+	err_ := nil
+		{{- end }}
+	{{- end }}
+	{{- if $method.HasResponse }}
+	{{- if $method.Response }}
+	return {{ call $method.Response.Destructure "(*resp_)" }}, err_
+	{{- else }}
+	return err_
+	{{- end }}
+	{{- else }}
+	return err_
+	{{- end }}
+}
+{{- end }}
+
+{{ range $comment := .DocComments }}
+//{{ $comment }}
+{{- end }}
+type {{ $protocol.Name }} interface {
+{{- range $method := $protocol.Methods }}
+	{{- range $comment := $method.DocComments }}
+	//{{ $comment }}
+	{{- end }}
+	{{- if $method.HasRequest }}
+	{{- if not $method.IsStrict }}
+	// WARNING: method is marked flexible in protocol, but treated as strict by these bindings!
+	{{- end }}
+	{{- if $method.Request }}
+	{{ $method.Name }}(ctx_ _bindings.Context, {{ $method.Request.NamesAndTypes }})
+	{{- else }}
+	{{ $method.Name }}(ctx_ _bindings.Context)
+	{{- end }}
+	{{- if $method.HasResponse -}}
+	{{- if $method.Response }} ({{ $method.Response.Types }}, error)
+	{{- else }} error{{ end -}}
+	{{- else }} error{{ end }}
+	{{- end }}
+{{- end }}
+}
+
+{{- if eq $protocol.ProxyType "ChannelProxy" }}
+type {{ $protocol.RequestName }} _bindings.InterfaceRequest
+
+func New{{ $protocol.RequestName }}() ({{ $protocol.RequestName }}, *{{ $protocol.ProxyName }}, error) {
+	req, cli, err := _bindings.NewInterfaceRequest()
+	return {{ $protocol.RequestName }}(req), (*{{ $protocol.ProxyName }})(cli), err
+}
+
+{{- if $protocol.ProtocolNameString }}
+// Implements ServiceRequest.
+func (_ {{ $protocol.RequestName }}) Name() string {
+	return {{ $protocol.ProtocolNameString }}
+}
+func (c {{ $protocol.RequestName }}) ToChannel() _zx.Channel {
+	return c.Channel
+}
+
+const {{ $protocol.ProtocolNameConstant }} = {{ $protocol.ProtocolNameString }}
+{{- end }}
+{{- end }}
+
+type {{ $protocol.StubName }} struct {
+	Impl {{ $protocol.Name }}
+}
+
+func (s_ *{{ $protocol.StubName }}) Dispatch(args_ _bindings.DispatchArgs) (_bindings.Message, bool, error) {
+	switch args_.Ordinal {
+	{{- range $method := $protocol.Methods }}
+	{{- if not $method.IsEvent }}
+	case {{ $method.OrdinalName }}:
+		{{- if $method.HasRequest }}
+		{{- if $method.Request }}
+		in_ := &{{ $method.Request.Name }}{}
+		marshalerCtx, ok := _bindings.GetMarshalerContext(args_.Ctx)
+		if !ok {
+			return nil, false, _bindings.ErrMissingMarshalerContext
+		}
+		if err_ := _bindings.Unmarshal(marshalerCtx, args_.Bytes, args_.HandleInfos, in_); err_ != nil {
+			return nil, false, err_
+		}
+		{{- end }}
+		{{- end }}
+		{{ if $method.Response }}{{- $method.Response.Names -}}, {{- end -}}
+		{{- if $method.Request -}}
+		err_ := s_.Impl.{{ $method.Name }}(args_.Ctx, {{ call $method.Request.Destructure "(*in_)" -}})
+		{{- else -}}
+		err_ := s_.Impl.{{ $method.Name }}(args_.Ctx)
+		{{- end -}}
+		{{- if $method.HasResponse }}
+		{{- if $method.Response }}
+		out_ := &{{ $method.Response.Construct }}
+		return out_, true, err_
+		{{- else }}
+		return nil, true, err_
+		{{- end }}
+		{{- else }}
+		return nil, false, err_
+		{{- end }}
+	{{- end }}
+	{{- end }}
+	}
+	return nil, false, _bindings.ErrUnknownOrdinal
+}
+
+type {{ $protocol.EventProxyName }} _bindings.{{ $protocol.ProxyType }}
+{{ range $method := $protocol.Methods }}
+{{- if $method.IsEvent }}
+func (p *{{ $protocol.EventProxyName }}) {{ $method.Name }}(
+	{{- if $method.Response -}}
+	{{- $method.Response.NamesAndTypes -}}
+	{{- end -}}
+	) error {
+
+	{{- if $method.HasResponse }}
+	{{- if $method.Response }}
+	event_ := &{{ $method.Response.Construct }}
+	{{- else }}
+	var event_ _bindings.Message
+	{{- end }}
+	{{- end }}
+	return ((*_bindings.{{ $protocol.ProxyType }})(p)).Send({{ $method.OrdinalName }}, event_)
+}
+{{- end }}
+{{- end }}
+
+{{ end -}}

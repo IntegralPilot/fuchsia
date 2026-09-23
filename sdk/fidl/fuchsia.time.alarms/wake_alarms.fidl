@@ -1,0 +1,275 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// See the top level API summary in `overview.fidl`.
+library fuchsia.time.alarms;
+
+using zx;
+using fuchsia.power.system;
+
+/// A unique identifier for an alarm.
+///
+/// This alias is used to identify alarms within a single `WakeAlarms`
+/// connection. It is the client's responsibility to ensure that the IDs are
+/// unique for all active alarms.
+alias AlarmId = string:128;
+
+/// A timestamp denoting an instant on the UTC timeline.
+@available(added=29)
+type InstantUtc = struct {
+    /// `timestamp_utc` is the number of nanoseconds since the start of the Unix
+    /// epoch, relative to the UTC timezone.
+    ///
+    /// Fuchsia FIDL library `zx` does not have a core type that denotes this
+    /// (in contrast to say `zx.Time`), so we use a custom type to try and make
+    /// it harder to provide a timestamp set on the wrong timeline.
+    ///
+    /// ## Usage note
+    ///
+    /// Timestamps that reference the UTC timeline are unusual. This is because
+    /// the UTC timeline is actively adjusted to match the external notion of
+    /// accurate UTC time, and can change the rate, or can even "jump" both
+    /// forwards or backwards. Adjusting the notion of the UTC time manually
+    /// can pull in or push out deadlines tied to this timeline.
+    ///
+    /// This is why it is always recommended to use the UTC timeline only to
+    /// denote instants on the UTC timeline, and not use it to measure
+    /// durations.
+    timestamp_utc zx.Time;
+};
+
+/// Provides a mechanism for scheduling platform-wide wake alarms.
+///
+/// An alarm is a promise made by the system to the caller of the API to notify
+/// the caller that *at least* the requested amount of time has expired. The
+/// alarm may fire later than the requested amount of time at the discretion of
+/// the server implementing this API.
+///
+/// When this notification happens, we say that the wake alarm has "fired".
+///
+/// A "wake" alarm firing also ensures that the system comes back from a reduced
+/// power state if needed, so that it can notify the caller.
+///
+/// The general shape of a wake alarm API has three parts:
+/// * A specification of when a wake alarm is supposed to fire,
+/// * A way to notify the caller of an alarm that fired, and
+/// * A way to keep the system awake until both the caller and the callee have
+///   completed work associated with the alarm.
+@discoverable
+open protocol WakeAlarms {
+    /// Sets a wake alarm with the provided parameters, and waits for the alarm
+    /// to fire.
+    ///
+    /// The caller may request multiple alarms concurrently. Re-requesting
+    /// an alarm that has the same `alarm_id` as an already scheduled alarm
+    /// causes that scheduled alarm to be canceled before the new alarm is
+    /// scheduled.
+    ///
+    /// ## Return value
+    ///
+    /// * `keep_alive`: A handle that prevents the system from suspending as
+    ///   long as it is held.
+    ///
+    /// The call to `SetAndWait` returns when the alarm fires, an error occurs,
+    /// or the alarm is canceled. This return style is required for some
+    /// clients, such as Starnix, which rely on FIDL response tallying to guide
+    /// their power management strategy.
+    ///
+    /// As an example, under Starnix, a response to this request will cause a
+    /// Starnix container to be unsuspended ("woken up"). This is a critical
+    /// behavior for suspend correctness under Starnix. Using the [Notifier]
+    /// approach would side-step this mechanism and result in incorrect wake
+    /// behavior under Starnix.
+    ///
+    /// ## Protocol Errors
+    ///
+    /// * `DROPPED`: The alarm was canceled by a call to `Cancel`.
+    /// * `UNSPECIFIED`: A new failure mode has been observed that has not
+    ///   yet been assigned an error code. This indicates that the API
+    ///   version may need to be updated.
+    /// * `INTERNAL` is a server-side bug: an internal fallible call (which is
+    ///   expected to be unlikely to fail) has failed somehow. Please report this
+    ///   for investigation.
+    /// * [INVALID_ARGS]: a parameter provided by the user is not valid, such
+    ///   as an empty `alarm_id`.
+    SetAndWait(@generated_name("SetAndWaitArgs") resource struct {
+        /// The deadline at which the timer is supposed to fire. This
+        /// corresponds to a time instant on the boot timeline.
+        deadline zx.InstantBoot;
+
+        /// Optional mode that allows the API to support a number of use cases.
+        mode SetMode;
+
+        /// A unique identifier for the alarm.
+        ///
+        /// A unique value of `AlarmId` must be picked for each unique alarm
+        /// within a single FIDL connection's scope.
+        ///
+        /// Supplying an `alarm_id` for an already scheduled alarm reschedules
+        /// that alarm.
+        alarm_id AlarmId;
+    }) -> (resource struct {
+        /// Used by the caller to ensure a minimum time slice for useful work,
+        /// before the system may suspend again.
+        keep_alive fuchsia.power.system.LeaseToken;
+    }) error WakeAlarmsError;
+
+    /// Cancels the alarm specified by `alarm_id`.
+    ///
+    /// Providing an `alarm_id` for an alarm that is not scheduled is a no-op.
+    Cancel(struct {
+        /// The unique identifier of the alarm to cancel.
+        ///
+        /// The alarm identified by `alarm_id` is canceled, and will no
+        /// longer be expected to fire. The respective `SetAndWait` will
+        /// return `WakeAlarmsError.DROPPED`.
+        ///
+        /// A race condition is possible where the alarm fires while
+        /// the `Cancel` call is being processed, or even slightly later.
+        /// The caller must handle such an event gracefully.
+        alarm_id AlarmId;
+    });
+
+    /// Sets a wake alarm with the provided parameters.
+    ///
+    /// The caller may request multiple alarms concurrently. Re-requesting
+    /// an alarm that has the same `alarm_id` as an already scheduled alarm
+    /// causes that scheduled alarm to be canceled before the same alarm
+    /// is scheduled again.
+    ///
+    /// ## Return value
+    ///
+    /// This method will return when the alarm is scheduled.
+    ///
+    /// ## Protocol Errors
+    ///
+    /// * [UNSPECIFIED] you are observing a new failure mode which has not
+    ///   been assigned an error code yet. Expect this failure mode to be
+    ///   assigned a more specific error code in future versions of this API.
+    ///   This is not a bug, but an indication that you may need to update the
+    ///   API version.
+    /// * [INTERNAL] is a bug: an internal fallible call (which is expected
+    ///   to be unlikely to fail) has failed somehow. Please report this for
+    ///   investigation.
+    /// * [INVALID_ARGS]: a parameter provided by the user is not valid, such
+    ///   as an empty `alarm_id`.
+    Set(@generated_name("SetArgs") resource struct {
+        /// Notifier to call when the alarm fires. When the server_end to
+        /// this channel is dropped, the alarm will be canceled.
+        notifier client_end:Notifier;
+
+        /// The deadline at which the timer is supposed to fire. This
+        /// corresponds to a time instant on the boot timeline.
+        deadline zx.InstantBoot;
+
+        /// Optional mode that allows the API to support a number of use cases.
+        mode SetMode;
+
+        /// Set to a nonempty value to identify the alarm. A unique value
+        /// of [AlarmId] must be picked per each unique alarm within a
+        /// single FIDL connection's scope.
+        ///
+        /// Supplying an alarm_id for an already scheduled alarm reschedules
+        /// that alarm.
+        alarm_id AlarmId;
+    }) -> () error WakeAlarmsError;
+
+    /// Similar to [SetAndWait], except the alarm is scheduled on the UTC
+    /// timeline.
+    ///
+    /// Refer to [SetAndWait] documentation for the functionality details, and
+    /// especially see the section "Return value" for the return value
+    /// subtleties.
+    @available(added=29)
+    SetAndWaitUtc(@generated_name("SetAndWaitUtcArgs") resource struct {
+        /// The deadline at which the timer is supposed to fire. This
+        /// corresponds to a time instant on the UTC timeline.
+        deadline InstantUtc;
+
+        /// Optional mode that allows the API to support a number of use cases.
+        mode SetMode;
+
+        /// A unique identifier for the alarm.
+        ///
+        /// A unique value of `AlarmId` must be picked for each unique alarm
+        /// within a single FIDL connection's scope.
+        ///
+        /// Supplying an `alarm_id` for an already scheduled alarm reschedules
+        /// that alarm.
+        alarm_id AlarmId;
+    }) -> (resource struct {
+        /// Used by the caller to ensure a minimum time slice for useful work,
+        /// before the system may suspend again.
+        keep_alive fuchsia.power.system.LeaseToken;
+    }) error WakeAlarmsError;
+};
+
+/// [Notifier] is used to notify when a wake alarm fires.
+///
+/// A client-end channel of this protocol will be provided to the implementor of
+/// [WakeAlarms.Set].
+///
+/// Dropping the server-end will cancel all alarms scheduled with [WakeAlarms.Set]
+/// associated with this server instance.
+@discoverable
+open protocol Notifier {
+    /// Notifies when an alarm previously set by [WakeAlarms.Set] fires.
+    Notify(resource struct {
+        /// Identifier of the alarm that fired.
+        alarm_id AlarmId;
+
+        /// Used to ensure a minimum time slice for useful work, before the
+        /// system may suspend again.
+        keep_alive fuchsia.power.system.LeaseToken;
+    });
+
+    /// Notifies when an alarm previously set by [WakeAlarms.Set] is unable to
+    /// fire due to an error.
+    NotifyError(resource struct {
+        /// Identifier of the alarm that fired.
+        alarm_id AlarmId;
+
+        /// Error preventing the alarm from firing.
+        error WakeAlarmsError;
+    });
+};
+
+/// A mode of notification for when an alarm has been scheduled.
+type SetMode = flexible resource union {
+    /// This lease is dropped as immediately after the alarm is scheduled
+    /// (or an error occurs during scheduling), thus guaranteeing that the
+    /// alarm is scheduled before the system is suspended.
+    1: keep_alive fuchsia.power.system.LeaseToken;
+
+    /// The callee signals this event (with ZX_EVENT_SIGNALED) once the alarm
+    /// is scheduled. This indicates that the caller can drop any pending wake
+    /// leases related to this call.
+    2: notify_setup_done zx.Handle:EVENT;
+};
+
+/// Describes the error codes that can be returned from `WakeAlarms` API calls.
+type WakeAlarmsError = flexible enum {
+    /// A new failure mode has been observed that has not yet been assigned an
+    /// error code.
+    ///
+    /// This indicates that the API version may need to be updated.
+    UNSPECIFIED = 1;
+    /// The alarm was canceled or rescheduled by the API user.
+    DROPPED = 2;
+    /// The server end encountered an error internal to its code, which should
+    /// not ever happen in normal operation. Receiving this error means that the
+    /// server end of the connection has a bug that must be fixed.
+    INTERNAL = 3;
+    /// A parameter provided by the user is incorrect. For example, providing
+    /// an empty value for `alarm_id`.
+    @available(added=29)
+    INVALID_ARGS = 4;
+    /// The driver connection was cut off. The wake alarms service can not
+    /// recover.
+    @available(added=30)
+    DRIVER_CONNECTION = 5;
+    /// The driver reported an internal error. This is a driver bug most likely.
+    @available(added=30)
+    DRIVER = 6;
+};

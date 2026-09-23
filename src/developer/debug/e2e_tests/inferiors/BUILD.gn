@@ -1,0 +1,215 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/rust/rustc_binary.gni")
+import("//src/starnix/build/starnix_linux_executable.gni")
+import("//src/starnix/kernel/starnix.gni")
+import("//src/starnix/tests/starnix_test_subpackages.gni")
+
+# Declare an inferior with a default manifest.
+template("inferior") {
+  _target_name = target_name
+  _target_bin = target_name + "_bin"
+  _target_manifest = target_name + "_manifest"
+
+  _type = "executable"
+  if (defined(invoker.type)) {
+    _type = invoker.type
+  }
+
+  target(_type, _target_bin) {
+    output_name = _target_name
+    forward_variables_from(invoker, "*")
+  }
+
+  generated_file(_target_manifest) {
+    outputs = [ "$target_gen_dir/$_target_manifest.cml" ]
+    output_conversion = "json"
+    contents = {
+      include = [ "syslog/client.shard.cml" ]
+      program = {
+        runner = "elf"
+        binary = "bin/$_target_name"
+      }
+    }
+  }
+
+  fuchsia_component(_target_name) {
+    manifest = "$target_gen_dir/$_target_manifest.cml"
+    deps = [
+      ":$_target_bin",
+      ":$_target_manifest",
+    ]
+  }
+}
+
+inferior("step_plt") {
+  sources = [ "step_plt.cc" ]
+  cflags = [ "-finline-functions" ]  # inline std::make_shared.
+}
+
+inferior("wait_for_debugger") {
+  sources = [ "wait_for_debugger.cc" ]
+  deps = [ "//src/lib/debug" ]
+}
+
+inferior("inlined_crasher") {
+  sources = [ "inlined_crasher.cc" ]
+}
+
+inferior("bitfield") {
+  sources = [ "bitfield.cc" ]
+}
+
+inferior("loop") {
+  sources = [ "loop.cc" ]
+
+  # Ensure std::ostream << doesn't get inlined.
+  cflags = [ "-fno-inline-functions" ]
+}
+
+inferior("async_rust") {
+  type = "rustc_binary"
+  edition = "2024"
+  sources = [ "async_rust.rs" ]
+  source_root = "async_rust.rs"
+  deps = [
+    "//src/lib/fuchsia-async",
+    "//third_party/rust_crates:futures",
+  ]
+}
+
+inferior("async_rust_multithreaded") {
+  type = "rustc_binary"
+  edition = "2024"
+  sources = [ "async_rust_multithreaded.rs" ]
+  source_root = "async_rust_multithreaded.rs"
+  deps = [ "//src/lib/fuchsia-async" ]
+}
+
+inferior("simplified_templates") {
+  sources = [ "simplified_templates.cc" ]
+  deps = [ "//src/lib/debug" ]
+
+  # Never optimize this since we are relying on the variables to be present.
+  cflags = [
+    "-gsimple-template-names",
+    "-fno-inline-functions",
+  ]
+}
+
+inferior("template_functions") {
+  sources = [ "template_functions.cc" ]
+  deps = [ "//src/lib/debug" ]
+}
+
+inferior("cpp_functions") {
+  sources = [ "cpp_functions.cc" ]
+
+  cflags = [ "-fno-inline-functions" ]
+}
+
+inferior("pretty_types") {
+  sources = [ "pretty_types.cc" ]
+
+  # TODO(https://fxbug.dev/42180987): workaround for toolchain issues, see bug
+  deps = [ "//build/config/fuchsia:uses-outline-atomics-fxbug98632" ]
+}
+
+# Creates some types that are linked in to the pretty_types_rust binary below to
+# make sure the expression evaluation doesn't fail when types shadow member
+# variable names.
+static_library("rust_pretty_types_lib") {
+  visibility = [ ":*" ]
+  sources = [
+    "rust_pretty_types_lib.cc",
+    "rust_pretty_types_lib.h",
+  ]
+}
+
+inferior("pretty_types_rust") {
+  type = "rustc_binary"
+  edition = "2024"
+  sources = [ "pretty_types.rs" ]
+  source_root = "pretty_types.rs"
+
+  non_rust_deps = [ ":rust_pretty_types_lib" ]
+}
+
+inferior("rust_functions") {
+  type = "rustc_binary"
+  edition = "2024"
+  sources = [ "rust_functions.rs" ]
+  source_root = "rust_functions.rs"
+}
+
+## Starnix
+
+starnix_linux_executable("starnix_proc_bin") {
+  output_name = "starnix_proc"
+  sources = [ "starnix_proc.cc" ]
+}
+
+starnix_linux_executable("starnix_proc_exception_bin") {
+  output_name = "starnix_proc_exception"
+  sources = [ "starnix_proc_exception.cc" ]
+}
+
+starnix_linux_arch32_executable("starnix_proc_exception32_bin") {
+  output_name = "starnix_proc_exception32"
+  sources = [ "starnix_proc_exception32.cc" ]
+  cflags = [
+    # Ensure .ARM.exidx is generated. Without this, the section exists but only
+    # contains a single "CantUnwind" entry, which is not useful for us.
+    "-funwind-tables",
+  ]
+}
+
+fuchsia_component("starnix_proc") {
+  manifest = "starnix_proc.cml"
+  deps = [ ":starnix_proc_bin" ]
+}
+
+fuchsia_component("starnix_proc_exception") {
+  manifest = "starnix_proc_exception.cml"
+  deps = [ ":starnix_proc_exception_bin" ]
+}
+
+fuchsia_component("starnix_proc_exception32") {
+  manifest = "starnix_proc_exception32.cml"
+  deps = [ ":starnix_proc_exception32_bin" ]
+}
+
+fuchsia_package("zxdb_e2e_inferiors") {
+  testonly = true
+  deps = [
+    ":async_rust",
+    ":async_rust_multithreaded",
+    ":bitfield",
+    ":cpp_functions",
+    ":inlined_crasher",
+    ":loop",
+    ":pretty_types",
+    ":pretty_types_rust",
+    ":rust_functions",
+    ":simplified_templates",
+    ":step_plt",
+    ":template_functions",
+    ":wait_for_debugger",
+  ]
+
+  # Starnix
+  deps += [
+    ":starnix_proc",
+    ":starnix_proc_exception",
+  ]
+
+  if (target_linux_arch32_toolchain != "") {
+    deps += [ ":starnix_proc_exception32" ]
+  }
+
+  subpackages = starnix_test_subpackages +
+                [ "//src/starnix/containers/debian:debian_package" ]
+}

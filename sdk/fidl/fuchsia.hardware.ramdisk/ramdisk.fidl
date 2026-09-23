@@ -1,0 +1,145 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.ramdisk;
+
+using fuchsia.io;
+using fuchsia.storage.block;
+using zx;
+
+/// The protocol for interacting with a instance of a ramdisk.
+@discoverable
+closed protocol Ramdisk {
+    /// Sets any of the `RAMDISK_FLAG_*` flags.
+    strict SetFlags(struct {
+        flags @generated_name("RamdiskFlag") strict bits : uint32 {
+            /// Identifies if requests which are sent ot the ramdisk while it is
+            /// considered "asleep" should be processed when the ramdisk wakes
+            /// up. If this flag is not set, those requests are failed
+            /// immediately.
+            RESUME_ON_WAKE = 0x00000001;
+
+            /// If set, blocks written after the last flush are filled with an
+            /// indeterminate value when waking after sleeping.
+            DISCARD_NOT_FLUSHED_ON_WAKE = 0x00000002;
+
+            /// If set, blocks written after the last flush are filled at
+            /// random rather than all blocks.  This can be used to simulate
+            /// out-of-order writes.
+            DISCARD_RANDOM = 0x00000004;
+        };
+    }) -> ();
+
+    /// Wakes a ramdisk, if it was sleeping.
+    ///
+    /// Resets the block counts being stored by the ramdisk.
+    strict Wake() -> ();
+
+    /// Causes the ramdisk to sleep after `count` blocks are written successfully.
+    /// After `count` blocks are written, requests either wait for the ramdisk to
+    /// be awoken (if RESUME_ON_WAKE has been set), or begin failing immediately.
+    ///
+    /// Resets the block counts being stored by the ramdisk.
+    strict SleepAfter(struct {
+        count uint64;
+    }) -> ();
+
+    /// Returns the number of write requests since the last call to either
+    /// "SleepAfter" or "Wake".
+    strict GetBlockCounts() -> (struct {
+        /// Counters for the number of write requests since the last call to either
+        /// "SleepAfter" or "Wake". All units are in individual blocks.
+        counts @generated_name("BlockWriteCounts") struct {
+            received uint64;
+            successful uint64;
+            failed uint64;
+        };
+    });
+};
+
+// TODO(smklein): Deduplicate GUID declarations with other FIDL interfaces.
+
+/// Matches the value of ZBI_PARTITION_GUID_LEN.
+const GUID_LEN uint32 = 16;
+
+/// An array of bytes interpreted as a GUID. Wrapped in a struct to
+/// allow optional GUIDs.
+type Guid = struct {
+    value array<uint8, GUID_LEN>;
+};
+
+const MAX_NAME_LENGTH uint32 = 32;
+
+closed protocol RamdiskController {
+    /// Initializes a new Ramdisk instance with the provided block size and block count.
+    /// Takes an optional `type_guid`, which may be queried from the ramdisk instance.
+    strict Create(struct {
+        block_size uint64;
+        block_count uint64;
+        type_guid box<Guid>;
+    }) -> (struct {
+        name string:<MAX_NAME_LENGTH, optional>;
+    }) error zx.Status;
+
+    /// Initializes a new Ramdisk instance from a VMO. Uses a block size of `PAGE_SIZE`,
+    /// and derives the block count from the size of the VMO.
+    strict CreateFromVmo(resource struct {
+        vmo zx.Handle:VMO;
+    }) -> (struct {
+        name string:<MAX_NAME_LENGTH, optional>;
+    }) error zx.Status;
+
+    /// Same as CreateFromVmo, but with the given `block_size` and optional `type_guid`. If
+    /// `block_size` is zero, `PAGE_SIZE` will be used as `block_size`.
+    strict CreateFromVmoWithParams(resource struct {
+        vmo zx.Handle:VMO;
+        block_size uint64;
+        type_guid box<Guid>;
+    }) -> (struct {
+        name string:<MAX_NAME_LENGTH, optional>;
+    }) error zx.Status;
+};
+
+/// Options for creating a ram-disk.  Some combinations are invalid and will
+/// result in ZX_ERR_INVALID_ARGS.
+type Options = resource table {
+    /// If unspecified, the system page size is used.
+    1: block_size uint32;
+
+    /// If unspecified, will be deduced from `vmo`.
+    2: block_count uint64;
+
+    /// Optional type GUID returned in the fuchsia.hardware.block.partition.Partition protocol.
+    3: type_guid Guid;
+
+    /// If unspecified, a VMO will be created, in which case `block_count` must be specified.
+    4: vmo zx.Handle:VMO;
+
+    /// If true, expose fuchsia.hardware.block.volume.Service for the ramdisk.
+    5: publish bool;
+
+    /// If unspecified, there is no maximum.
+    6: max_transfer_blocks uint32;
+
+    /// If unspecified, a default set of flags is used.
+    7: device_flags fuchsia.storage.block.DeviceFlag;
+};
+
+open protocol Controller {
+    /// Initializes a new Ramdisk instance with the specified options.  Returns an outgoing
+    /// directory for the ramdisk which will export the Ramdisk and
+    /// fuchsia.hardware.block.volume.Volume protocols.
+    strict Create(Options) -> (resource struct {
+        // The outgoing directory for the ram disk.
+        outgoing client_end:fuchsia.io.Directory;
+
+        // The ramdisk will be destroyed when this is dropped.
+        lifeline zx.Handle:EVENTPAIR;
+    }) error zx.Status;
+};
+
+/// The v2 ramdisk driver will expose this service.
+service Service {
+    controller client_end:Controller;
+};

@@ -1,0 +1,314 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.audio.device;
+
+using fuchsia.audio;
+using fuchsia.hardware.audio;
+using fuchsia.hardware.audio.signalprocessing;
+using zx;
+
+
+/// A `ControlCreator` interface creates `Control` instances. Each `Control` binds
+/// to a single device. A device can only be bound to one `Control` at any time.
+@discoverable
+open protocol ControlCreator {
+    /// Create a `Control` for the specified device.
+    flexible Create(resource table {
+        /// The token id for the device to be controlled.
+        ///
+        /// Required.
+        1: token_id TokenId;
+
+        /// The server_end of the `Control` to be created.
+        ///
+        /// Required.
+        2: control_server server_end:Control;
+    }) -> (table {}) error ControlCreatorError;
+};
+
+/// Errors returned by `ControlCreator/Create`.
+type ControlCreatorError = flexible enum {
+    /// The required `token_id` is missing.
+    INVALID_TOKEN_ID = 1;
+
+    /// The required `control_server` is missing.
+    INVALID_CONTROL = 2;
+
+    /// No device with `token_id` was found. Either this token has never been
+    /// used, or the device with `token_id` has been removed.
+    DEVICE_NOT_FOUND = 3;
+
+    /// The device with `token_id` encountered an error and cannot be controlled.
+    DEVICE_ERROR = 4;
+
+    /// A `Control` associated with `token_id` already exists. This device is
+    /// already being actively controlled.
+    ALREADY_ALLOCATED = 5;
+};
+
+/// A `Control` instance is used to change the settings or state of an audio
+/// device. It also creates the ring buffer used to pass audio data between
+/// client and device. Each `Control` is associated with an initialized audio
+/// device; conversely each device is associated with either zero or one
+/// `Control` at any time.
+open protocol Control {
+    /// Change the processing topology (via `SetTopology`) or the state of a
+    /// single processing node (via `SetElementState`).
+    compose fuchsia.hardware.audio.signalprocessing.SignalProcessing;
+
+    /// Create the ring buffer used to pass audio to/from this device. If the device is
+    /// Composite, then the targeted RING_BUFFER element must be identified by `element_id`.
+    ///
+    /// Should only be called for Composite devices.
+    flexible CreateRingBuffer(resource table {
+        /// The ID for an element of type `RING_BUFFER`.
+        ///
+        /// Required.
+        1: element_id ElementId;
+
+        /// Additional requirements about the actual ring buffer being created.
+        ///
+        /// Required.
+        2: options RingBufferOptions;
+
+        /// The server_end of the `RingBuffer` to be created.
+        ///
+        /// Required.
+        3: ring_buffer_server server_end:RingBuffer;
+    }) -> (resource table {
+        /// Properties about the ring buffer and active audio stream as created.
+        1: properties RingBufferProperties;
+
+        /// An object that represents the audio stream and ring memory itself.
+        /// Note: ring-buffer VMO memory ranges must be cache-invalidated before
+        /// each read, and cache-flushed after each write.
+        2: ring_buffer fuchsia.audio.RingBuffer;
+    }) error ControlCreateRingBufferError;
+
+    /// Set the wire format for the digital interconnect associated with this element.
+    /// Creates a packet stream on the specified element.
+    flexible CreatePacketStream(resource table {
+        /// The element ID for an `ENDPOINT` of type `PACKET_STREAM`.
+        ///
+        /// Required.
+        1: element_id ElementId;
+
+        /// Additional configuration options for the packet stream being created.
+        ///
+        /// Required.
+        2: options PacketStreamOptions;
+
+        /// The server_end of the `PacketStream` control protocol.
+        /// The client keeps the client_end to control the stream (Start/Stop/etc).
+        ///
+        /// Required.
+        3: packet_stream_server server_end:PacketStream;
+    }) -> (resource table {
+        /// Properties of the created packet stream.
+        1: properties PacketStreamProperties;
+    }) error ControlCreatePacketStreamError;
+
+    /// Set the wire format for the digital interconnect connected to this Codec endpoint.
+    /// This method returns information related to the format that was set, including delay values.
+    /// If the device is Composite, then the targeted DAI_INTERCONNECT element must be identified
+    /// by `element_id`.
+    ///
+    /// Should only be called for Codec and Composite devices.
+    flexible SetDaiFormat(table {
+        /// The ID for an element of type `DAI_INTERCONNECT`.
+        ///
+        /// Required for Composite; ignored for Codec.
+        1: element_id ElementId;
+
+        2: dai_format fuchsia.hardware.audio.DaiFormat;
+    }) -> (table {
+        1: state fuchsia.hardware.audio.CodecFormatInfo;
+    }) error ControlSetDaiFormatError;
+
+    /// Start the Codec hardware. If successful, this returns after the Codec was started and
+    /// `start_time` indicates the time when the hardware started. Note that the Codec's DaiFormat
+    /// must be set (by a successful `SetDaiFormat` call) before calling this method.
+    ///
+    /// Should only be called for Codec devices.
+    flexible CodecStart() -> (table {
+        1: start_time zx.Time;
+    }) error ControlCodecStartError;
+
+    /// Stop the Codec hardware. If successful, this returns after the Codec was stopped and
+    /// `stop_time` indicates the time when the hardware stopped. Note that the Codec's DaiFormat
+    /// must be set (by a successful `SetDaiFormat` call) before calling this method.
+    ///
+    /// Should only be called for Codec devices.
+    flexible CodecStop() -> (table {
+        1: stop_time zx.Time;
+    }) error ControlCodecStopError;
+
+    /// Reset the hardware -- stopping the hardware, releasing any ring buffers, and clearing any
+    /// DaiFormats or RingBufferFormats that were set.
+    ///
+    /// This method returns when the hardware reset is complete.
+    /// After calling this method, the device is still controlled, but any ring buffers must be
+    /// re-created and re-started.
+    /// For devices with DAI_INTERCONNECTs (such as Codecs and some Composites), `SetDaiFormat` and
+    /// `CodecStart` must be called again (in that order) to return the interconnect to the active
+    /// operational mode.
+    /// As applicable, `SetTopology` and `SetElementState` must also be called.
+    ///
+    /// Should only be called for Codec and Composite devices.
+    flexible Reset() -> (table {}) error ControlResetError;
+};
+
+/// Errors returned by `Control/CreateRingBuffer`.
+type ControlCreateRingBufferError = flexible enum {
+    /// This device has encountered an error and can no longer be controlled.
+    DEVICE_ERROR = 1;
+
+    /// This device type does not support the method that was called.
+    WRONG_DEVICE_TYPE = 2;
+
+    /// The previous `CreateRingBuffer` call has not yet completed.
+    ALREADY_PENDING = 3;
+
+    /// The required `element_id` is missing or does not refer to a `RING_BUFFER` element.
+    INVALID_ELEMENT_ID = 4;
+
+    /// The required `options` is missing.
+    INVALID_OPTIONS = 5;
+
+    /// The required `options.format` is missing.
+    INVALID_FORMAT = 6;
+
+    /// The required `options.ring_buffer_min_bytes` is missing.
+    INVALID_MIN_BYTES = 7;
+
+    /// The required `ring_buffer_server` is missing.
+    INVALID_RING_BUFFER = 8;
+
+    /// An active `RingBuffer` instance already exists for this `Control`.
+    ALREADY_ALLOCATED = 9;
+
+    /// The device does not support the specified format.
+    FORMAT_MISMATCH = 10;
+
+    /// The device cannot create a ring buffer with the specified options.
+    BAD_RING_BUFFER_OPTION = 11;
+
+    /// The driver returned some other error. This call may be retried.
+    OTHER = 12;
+};
+
+/// Errors returned by `Control/CreatePacketStream`.
+type ControlCreatePacketStreamError = flexible enum {
+    /// This device has encountered an error and can no longer be controlled.
+    DEVICE_ERROR = 1;
+
+    /// This device type does not support the method that was called.
+    WRONG_DEVICE_TYPE = 2;
+
+    /// The previous `CreatePacketStream` call has not yet completed.
+    ALREADY_PENDING = 3;
+
+    /// The required `element_id` is missing or does not refer to a `PACKET_STREAM` element.
+    INVALID_ELEMENT_ID = 4;
+
+    /// The required `options` is missing.
+    INVALID_OPTIONS = 5;
+
+    /// The required `options.format` is missing.
+    INVALID_FORMAT = 6;
+
+    /// The required `packet_stream_server` is missing.
+    INVALID_PACKET_STREAM = 7;
+
+    /// An active `PacketStream` instance already exists for this `Control`.
+    ALREADY_ALLOCATED = 8;
+
+    /// The device does not support the specified format.
+    FORMAT_MISMATCH = 9;
+
+    /// The device cannot create a packet stream with the specified options.
+    BAD_PACKET_STREAM_OPTION = 10;
+
+    /// The driver returned some other error. This call may be retried.
+    OTHER = 11;
+};
+
+/// Errors returned by `Control/SetDaiFormat`.
+type ControlSetDaiFormatError = flexible enum {
+    /// This device has encountered an error and can no longer be controlled.
+    DEVICE_ERROR = 1;
+
+    /// This device type does not support the method that was called.
+    WRONG_DEVICE_TYPE = 2;
+
+    /// The previous `SetDaiFormat` call has not yet completed.
+    ALREADY_PENDING = 3;
+
+    /// The required `element_id` is missing or does not refer to a `DAI_INTERCONNECT` element.
+    INVALID_ELEMENT_ID = 4;
+
+    /// The required `dai_format` is missing or invalid.
+    INVALID_DAI_FORMAT = 5;
+
+    /// The device does not support the specified dai_format.
+    FORMAT_MISMATCH = 6;
+
+    /// The driver returned some other error. This call may be retried.
+    OTHER = 7;
+};
+
+/// Errors returned by `Control/CodecStart`.
+type ControlCodecStartError = flexible enum {
+    /// This device has encountered an error and can no longer be controlled.
+    DEVICE_ERROR = 1;
+
+    /// This device type does not support the method that was called.
+    WRONG_DEVICE_TYPE = 2;
+
+    /// The previous `CodecStart` call has not yet completed.
+    ALREADY_PENDING = 3;
+
+    /// `SetDaiFormat` was not called before making this call.
+    DAI_FORMAT_NOT_SET = 4;
+
+    /// The device was already started when this call was made.
+    ALREADY_STARTED = 5;
+
+    /// The driver returned some other error. This call may be retried.
+    OTHER = 6;
+};
+
+/// Errors returned by `Control/CodecStop`.
+type ControlCodecStopError = flexible enum {
+    /// This device has encountered an error and can no longer be controlled.
+    DEVICE_ERROR = 1;
+
+    /// This device type does not support the method that was called.
+    WRONG_DEVICE_TYPE = 2;
+
+    /// The previous `CodecStop` call has not yet completed.
+    ALREADY_PENDING = 3;
+
+    /// `SetDaiFormat` was not called before making this call.
+    DAI_FORMAT_NOT_SET = 4;
+
+    /// The device was already stopped when this call was made.
+    ALREADY_STOPPED = 5;
+
+    /// The driver returned some other error. This call may be retried.
+    OTHER = 6;
+};
+
+/// Errors returned by `Control/Reset`.
+type ControlResetError = flexible enum {
+    /// This device has encountered an error and can no longer be controlled.
+    DEVICE_ERROR = 1;
+
+    /// This device type does not support the method that was called.
+    WRONG_DEVICE_TYPE = 2;
+
+    /// The previous `Reset` call has not yet completed.
+    ALREADY_PENDING = 3;
+};

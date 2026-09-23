@@ -1,0 +1,331 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components/fuchsia_test_component.gni")
+import("//build/python/python_action.gni")
+import("//build/python/python_mobly_test.gni")
+import("//build/testing/host_test_data.gni")
+
+performance_testing_environments = [
+  astro_env,
+  nelson_env,
+  nuc7_env,
+  nuc11_env,
+  sherlock_env,
+  sorrel_env,
+  vim3_env,
+]
+
+# Define a Python-driven performance test, specifying a Python host-side entry
+# point specific to the test. This is for tests that involve some test-specific
+# host-side logic. If your test consists of a Fuchsia component that generates a
+# fuchsiaperf file and that requires no test-specific host-side logic, you can
+# use fuchsia_component_perf_test instead.
+#
+# Parameters
+#   main_source (required)
+#     The entrypoint that contains the __main__ to execute the test.
+#     Type: path
+#
+#   expected_metric_names_filepaths (required)
+#     The absolute paths to the files containing the expected metrics.
+#     Type: string
+#
+#   libraries (optional)
+#     Additional libraries that the test depends on if any.
+#     Type: list(string)
+#     Default: empty list
+#
+#   package_deps (optional)
+#     Fuchsia package dependencies to bring into the build graph that
+#     the test needs, which are passed through to the test_spec.
+#     See //build/testing/test_spec.gni for more details.
+#     Type: list(string)
+#     Default: empty list
+#
+#   data_sources (optional)
+#     See build/python/python_binary.gni
+#
+#   data_package_name (optional)
+#     See build/python/python_binary.gni
+#     Default: "test_data"
+#
+#   test_data_deps (optional)
+#    List of GN targets that are needed to build the data sources.
+#    Type: list(string)
+#    Default: empty list
+#
+#   timeout_secs (optional)
+#     See test_spec in build/testing/test_spec.gni
+#
+#   cleanup_period_secs (optional)
+#     See python_mobly_test in build/python/python_mobly_test.gni
+#
+#   enable_mypy (optional)
+#     If true, enable MyPy type checking on the target and respective deps.
+#     Type: boolean
+#     Default: true
+#
+#   local_config_source (optional)
+#     See python_mobly_test in build/python/python_mobly_test.gni
+template("python_perf_test") {
+  if (is_host) {
+    assert(defined(invoker.main_source), "main_source is required")
+    assert(defined(invoker.expected_metric_names_filepaths),
+           "expected_metric_names_filepaths is required")
+
+    _test_target_name = "${target_name}_test"
+
+    # Include expected metric files as data sources.
+    _data_sources = invoker.expected_metric_names_filepaths
+    if (defined(invoker.data_sources)) {
+      _data_sources += invoker.data_sources
+    }
+
+    # TODO(b/340319757): Conditionally require this after soft-transition.
+    _data_package_name = "test_data"
+    if (defined(invoker.data_package_name)) {
+      _data_package_name = invoker.data_package_name
+    }
+
+    if (invoker.expected_metric_names_filepaths != []) {
+      # host_test_data()'s internals require non-empty `sources`
+      _runtime_deps_target = "${_test_target_name}_runtime_deps"
+      _runtime_deps_dir = "${target_out_dir}/${_test_target_name}/runtime_deps"
+      host_test_data(_runtime_deps_target) {
+        sources = invoker.expected_metric_names_filepaths
+
+        outputs = [ "${_runtime_deps_dir}/{{source_file_part}}" ]
+      }
+    }
+
+    # This action checks that expected_metric_names_filepath refers to a file
+    # in an allowlisted directory. Ideally we would do this check directly in
+    # GN.
+    python_action("${_test_target_name}_verify") {
+      binary_label = "//build/testing/perf:verify_expected_metric_path"
+
+      output_file = "$target_gen_dir/$target_name.verified"
+
+      inputs = invoker.expected_metric_names_filepaths
+      outputs = [ output_file ]
+      args = [
+        "--output-file",
+        rebase_path(output_file, root_build_dir),
+      ]
+      foreach(filepath, invoker.expected_metric_names_filepaths) {
+        args += [
+          "--expected-metric-names-filepath",
+          filepath,
+        ]
+      }
+    }
+
+    python_mobly_test("${_test_target_name}") {
+      test_name = "${target_name}"
+
+      if (defined(invoker.enable_mypy)) {
+        enable_mypy = invoker.enable_mypy
+      }
+
+      forward_variables_from(invoker,
+                             [
+                               "honeydew_config",
+                               "isolated",
+                               "local_config_source",
+                               "main_source",
+                               "package_deps",
+                               "params_source",
+                               "params",
+                               "product_bundle",
+                               "test_data_deps",
+                               "timeout_secs",
+                               "cleanup_period_secs",
+                             ])
+      data_sources = _data_sources
+      data_package_name = _data_package_name
+
+      if (defined(invoker.libraries)) {
+        libraries = invoker.libraries
+      }
+
+      deps = []
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+      if (invoker.expected_metric_names_filepaths != []) {
+        deps += [ ":${_runtime_deps_target}" ]
+      }
+
+      # Enabling on internal builders is primarily controlled by GN groups and
+      # not by the "environments" list
+      if (defined(invoker.environments)) {
+        environments = invoker.environments
+      } else {
+        environments = performance_testing_environments
+      }
+    }
+  } else {
+    not_needed(invoker, "*")
+  }
+
+  group("${target_name}") {
+    testonly = true
+    deps = [ ":${target_name}_test($host_toolchain)" ]
+
+    if (defined(invoker.expected_metric_names_filepaths)) {
+      deps += [ ":${target_name}_test_verify($host_toolchain)" ]
+    }
+  }
+}
+
+# This template is for tests where the test consists of a Fuchsia component that
+# generates a fuchsiaperf file and that requires no test-specific host-side
+# logic. If your test requires test-specific host-side logic, use
+# python_perf_test instead.
+#
+# Parameters
+#   package (required)
+#     The label of the package that provides the performance tests.
+#     type: string
+#
+#   package_name (optional)
+#     The name of the package that the given package label generates. This is only necessary if the
+#     name of the package that the label generates doesn't match the name of the label.
+#     type: string
+#     Default: get_label_info(package, "name")
+#
+#   component_name (required)
+#     The name of the test component inside the given package.
+#     Type: string
+#
+#   expected_metric_names_filepath (required)
+#     The absolute path to the file containing the expected metrics.
+#     Type: string
+#
+#   test_type (optional)
+#     The type of test (as also used in fuchsia_test_component) that specifies in which realm to
+#     run the test.
+#     Type: string
+#     Default: none, which would result in running the test in the regular hermetic tests realm.
+#
+#   process_runs (optional)
+#     How many times to run the test. This is useful for tests which exhibit between-process
+#     variation in results.
+#     Type: number
+#     Default: 1
+#
+#   test_component_args (optional)
+#     CLI args to pass to the test component (in addition to the default output path).
+#     Type: list(string)
+#     Default: none
+#
+#   results_path_test_arg (optional)
+#     The arg name passed to the test to specify the output path.
+#     Important: this is just the option (ex: "--out"). The value will be passed by the test.
+#     Type: string
+#     Default: ""
+#
+#   use_component_builtin_args (optional)
+#     By default, fuchsia_component_perf_test will pass command line arguments to the component.
+#     Setting this parameter to true overrides that default so that no arguments are passed to the
+#     component, causing it to use its built-in argument list (as defined in the component's CML
+#     manifest file, for ELF components). Note that when this parameter is set to true,
+#     test_component_args and results_path_test_arg will be ignored.
+#     Default: False
+#
+#   enable_mypy (optional)
+#     If true, enable MyPy type checking on the target and respective deps.
+#     Type: boolean
+#     Default: true
+#
+#   snapshot_on (optional)
+#     When to capture a device snapshot.
+#     Options: "teardown_class", "teardown_class_on_fail", "teardown_test",
+#              "teardown_test_on_fail", "never"
+#     Type: string
+#     Default: "never"
+#
+template("fuchsia_component_perf_test") {
+  assert(defined(invoker.component_name), "component_name is required")
+  assert(defined(invoker.expected_metric_names_filepath),
+         "expected_metric_names_filepath is required")
+  assert(defined(invoker.package), "package is required")
+
+  if (defined(invoker.package_name)) {
+    _package_name = invoker.package_name
+  } else {
+    _package_name = get_label_info(invoker.package, "name")
+  }
+
+  _package = _package_name
+  _component = invoker.component_name
+  _params = {
+    ffx_test_url = "fuchsia-pkg://fuchsia.com/${_package}#meta/${_component}.cm"
+
+    if (defined(invoker.expected_metric_names_filepath)) {
+      expected_metric_names_filepath = invoker.expected_metric_names_filepath
+    }
+
+    if (defined(invoker.process_runs)) {
+      process_runs = invoker.process_runs
+    }
+
+    ffx_test_args = []
+
+    if (defined(invoker.test_type)) {
+      ffx_test_args += [
+        "--realm",
+        type_moniker_map[invoker.test_type],
+      ]
+    }
+
+    if (defined(invoker.test_component_args)) {
+      test_component_args = invoker.test_component_args
+    }
+
+    if (defined(invoker.results_path_test_arg)) {
+      results_path_test_arg = invoker.results_path_test_arg
+    }
+
+    if (defined(invoker.use_component_builtin_args)) {
+      use_component_builtin_args = invoker.use_component_builtin_args
+    }
+
+    if (defined(invoker.snapshot_on)) {
+      snapshot_on = invoker.snapshot_on
+    } else {
+      # For hermetic component tests, we generally don't want snapshots on
+      # failure as they are expensive and usually distinct from the component's
+      # internal state. Users can opt-in if needed.
+      snapshot_on = "never"
+    }
+  }
+
+  python_perf_test(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "environments",
+                             "enable_mypy",
+                           ])
+
+    # LINT.IfChange
+    data_package_name = "test_data"
+
+    # LINT.ThenChange(//src/performance/lib/host_driven/fuchsia_component_perf_test.py)
+    expected_metric_names_filepaths = [ invoker.expected_metric_names_filepath ]
+    main_source =
+        "//src/performance/lib/host_driven/fuchsia_component_perf_test.py"
+    params = _params
+    libraries = [
+      "//src/performance/lib/host_driven",
+      "//src/performance/lib/perf_publish",
+      "//src/testing/end_to_end/honeydew",
+      "//src/testing/end_to_end/mobly_base_tests/fuchsia_base_test",
+      "//third_party/mobly",
+    ]
+
+    package_deps = [ invoker.package ]
+  }
+}

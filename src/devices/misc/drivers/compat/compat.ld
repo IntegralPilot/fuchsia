@@ -1,0 +1,37 @@
+{
+  global:
+    /* DFv2 Symbols */
+    __fuchsia_driver_registration__;
+    /* Compat driver Symbols */
+    device_add_from_driver;
+    device_init_reply;
+    device_async_remove;
+    device_unbind_reply;
+    device_suspend_reply;
+    device_set_profile_by_role;
+    device_get_protocol;
+    device_get_config_vmo;
+    device_get_properties;
+    get_iommu_resource;
+    get_ioport_resource;
+    get_mmio_resource;
+    get_msi_resource;
+    get_irq_resource;
+    get_info_resource;
+    get_smc_resource;
+    get_power_resource;
+    load_firmware_from_driver;
+    device_get_metadata;
+    device_add_composite_spec;
+    driver_log_severity_enabled_internal;
+    driver_logvf_internal;
+    driver_logf_internal;
+    device_get_fragment_protocol;
+    device_get_fragment_metadata;
+    device_register_service_member;
+    device_connect_fragment_fidl_protocol;
+    device_connect_fragment_runtime_protocol;
+    device_connect_ns_protocol;
+  local:
+    *;
+};

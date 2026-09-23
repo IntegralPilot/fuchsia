@@ -1,0 +1,141 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+use crate::common_utils::common::macros::{fx_err_and_bail, with_line};
+use anyhow::Error;
+use fidl_fuchsia_hardware_power_statecontrol::{
+    AdminMarker, AdminProxy, ShutdownAction, ShutdownOptions, ShutdownReason,
+};
+use fuchsia_component as app;
+use log::info;
+
+/// Perform Fuchsia Device Manager fidl operations.
+///
+/// Note this object is shared among all threads created by server.
+///
+#[derive(Debug)]
+pub struct HardwarePowerStatecontrolFacade {}
+
+impl HardwarePowerStatecontrolFacade {
+    pub fn new() -> HardwarePowerStatecontrolFacade {
+        HardwarePowerStatecontrolFacade {}
+    }
+
+    fn get_admin_proxy(&self) -> Result<AdminProxy, Error> {
+        let tag = "HardwarePowerStatecontrolFacade";
+        match app::client::connect_to_protocol::<AdminMarker>() {
+            Ok(p) => Ok(p),
+            Err(err) => fx_err_and_bail!(
+                &with_line!(tag),
+                format_err!("Failed to create device admin proxy: {:?}", err)
+            ),
+        }
+    }
+
+    /// Reboot the Fuchsia device
+    pub async fn suspend_reboot(&self) -> Result<(), Error> {
+        let tag = "HardwarePowerStatecontrolFacade::suspend_reboot";
+        info!("Executing Suspend: REBOOT");
+        if let Err(err) = self
+            .get_admin_proxy()?
+            .shutdown(&ShutdownOptions {
+                action: Some(ShutdownAction::Reboot),
+                reasons: Some(vec![ShutdownReason::DeveloperRequest]),
+                ..Default::default()
+            })
+            .await?
+        {
+            fx_err_and_bail!(
+                &with_line!(tag),
+                format_err!("Failed to change power control state: {:?}", err)
+            )
+        }
+        Ok(())
+    }
+
+    /// Reboot the Fuchsia device into the bootloader
+    pub async fn suspend_reboot_bootloader(&self) -> Result<(), Error> {
+        let tag = "HardwarePowerStatecontrolFacade::suspend_reboot_bootloader";
+        info!("Executing Suspend: REBOOT_BOOTLOADER");
+
+        if let Err(err) = self
+            .get_admin_proxy()?
+            .shutdown(&ShutdownOptions {
+                action: Some(ShutdownAction::RebootToBootloader),
+                reasons: Some(vec![ShutdownReason::DeveloperRequest]),
+                ..Default::default()
+            })
+            .await?
+        {
+            fx_err_and_bail!(
+                &with_line!(tag),
+                format_err!("Failed to change power control state: {:?}", err)
+            )
+        }
+        Ok(())
+    }
+
+    /// Reboot the Fuchsia device into recovery
+    pub async fn suspend_reboot_recovery(&self) -> Result<(), Error> {
+        let tag = "HardwarePowerStatecontrolFacade::suspend_reboot_recovery";
+        info!("Executing Suspend: REBOOT_RECOVERY");
+        if let Err(err) = self
+            .get_admin_proxy()?
+            .shutdown(&ShutdownOptions {
+                action: Some(ShutdownAction::RebootToRecovery),
+                reasons: Some(vec![ShutdownReason::DeveloperRequest]),
+                ..Default::default()
+            })
+            .await?
+        {
+            fx_err_and_bail!(
+                &with_line!(tag),
+                format_err!("Failed to change power control state: {:?}", err)
+            )
+        }
+        Ok(())
+    }
+
+    /// Power off the Fuchsia device
+    pub async fn suspend_poweroff(&self) -> Result<(), Error> {
+        let tag = "HardwarePowerStatecontrolFacade::suspend_poweroff";
+        info!("Executing Suspend: POWEROFF");
+
+        if let Err(err) = self
+            .get_admin_proxy()?
+            .shutdown(&ShutdownOptions {
+                action: Some(ShutdownAction::Poweroff),
+                reasons: Some(vec![ShutdownReason::DeveloperRequest]),
+                ..Default::default()
+            })
+            .await?
+        {
+            fx_err_and_bail!(
+                &with_line!(tag),
+                format_err!("Failed to change power control state: {:?}", err)
+            )
+        }
+        Ok(())
+    }
+
+    /// Suspend MEXEC the Fuchsia device
+    pub async fn suspend_mexec(&self) -> Result<(), Error> {
+        let tag = "HardwarePowerStatecontrolFacade::suspend_mexec";
+        // We limit mexec access here, as its near-term future is in question.
+        fx_err_and_bail!(&with_line!(tag), format!("Unsupported"))
+    }
+
+    /// RSuspend RAM on the Fuchsia device
+    pub async fn suspend_ram(&self) -> Result<(), Error> {
+        let tag = "HardwarePowerStatecontrolFacade::suspend_ram";
+        info!("Executing Suspend: SUSPEND_RAM");
+        if let Err(err) = self.get_admin_proxy()?.suspend_to_ram().await? {
+            fx_err_and_bail!(
+                &with_line!(tag),
+                format_err!("Failed to change power control state: {:?}", err)
+            )
+        }
+        Ok(())
+    }
+}

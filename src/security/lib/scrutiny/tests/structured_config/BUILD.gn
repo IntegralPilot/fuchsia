@@ -1,0 +1,162 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/assembly/bazel_product_bundle.gni")
+import("//build/components.gni")
+import("//build/info/info.gni")
+import("//build/python/python_binary.gni")
+import("//build/security/verifier/verify_structured_config.gni")
+import("//build/testing/host_test.gni")
+import("//src/developer/ffx/config.gni")
+import("//src/storage/fshost/generated_fshost_config.gni")
+import("//zircon/kernel/phys/qemu.gni")
+
+if (is_fuchsia) {
+  bazel_product_bundle("product_bundle") {
+    testonly = true
+    product_bundle_name = "scrutiny-structured-config-test"
+    bazel_product_bundle_target = ":product_bundle"
+    bazel_product_image_target = ":main_image"
+    bazel_product_config_target = ":product_config"
+    bazel_product_config_name = "product_config"
+    image_has_fxfs_blob = false
+    image_has_fvm = false
+    image_use_vbmeta = false
+    image_has_recovery = false
+    bazel_inputs_from_gn = []
+  }
+
+  extract_assembled_structured_config("extractor") {
+    testonly = true
+    component_tree_config = "//src/security/lib/scrutiny/tests/structured_config/component_tree_config.json5"
+    product_bundle_path = "$target_out_dir/product_bundle/product_bundle"
+    output = "$target_out_dir/structured_config.json"
+    deps = [
+      ":product_bundle",
+      ":product_bundle_bazel_action",
+    ]
+  }
+}
+
+if (is_host) {
+  group("host_tests") {
+    testonly = true
+
+    deps = [
+      ":check_extracted_config",
+      ":check_failing_policy",
+      ":verifier_pass",
+    ]
+  }
+
+  labels = {
+    extractor = ":extractor($target_toolchain)"
+    image_assembler = ":assembly.image_assembler($target_toolchain)"
+    product_bundle = ":product_bundle($target_toolchain)"
+    update_package = ":update($target_toolchain)"
+  }
+
+  files = {
+    ffx = "$ffx_test_host_tools_out_dir/ffx-scrutiny"
+
+    component_tree_config = "//src/security/lib/scrutiny/tests/structured_config/component_tree_config.json5"
+
+    product_bundle_target_out_dir =
+        get_label_info(labels.product_bundle, "target_out_dir")
+    product_bundle_target_name = get_label_info(labels.product_bundle, "name")
+
+    product_bundle_dir = "$product_bundle_target_out_dir/$product_bundle_target_name/product_bundle"
+  }
+
+  python_binary("check_extracted_config_bin") {
+    main_source = "check_extracted_structured_config.py"
+  }
+
+  host_test_data("test_bin") {
+    sources = get_target_outputs(":check_extracted_config_bin")
+    deps = [ ":check_extracted_config_bin" ]
+  }
+
+  extracted_config_target_dir =
+      get_label_info(labels.extractor, "target_out_dir")
+  extracted_config_path = "$extracted_config_target_dir/structured_config.json"
+  host_test_data("extracted_config") {
+    sources = [ extracted_config_path ]
+    deps = [ labels.extractor ]
+  }
+  check_extracted_python_binary =
+      get_target_outputs(":check_extracted_config_bin")
+  check_extracted_python_binary = check_extracted_python_binary[0]
+
+  host_test("check_extracted_config") {
+    binary_path = python_exe_src
+    args = [
+      rebase_path(check_extracted_python_binary, root_build_dir),
+      "--extracted-config",
+      rebase_path(extracted_config_path, root_build_dir),
+    ]
+    deps = [
+      ":extracted_config",
+      ":test_bin",
+      "//build/python:interpreter",
+    ]
+  }
+
+  verify_assembled_structured_config("verifier_pass") {
+    testonly = true
+    component_tree_config = "//src/security/lib/scrutiny/tests/structured_config/component_tree_config.json5"
+    product_bundle_path = files.product_bundle_dir
+    policy = "passing_policy.json5"
+    deps = [
+      ":product_bundle_bazel_action($target_toolchain)",
+      labels.product_bundle,
+    ]
+  }
+
+  python_binary("check_failed_verifier_bin") {
+    main_source = "check_failed_verifier_policy.py"
+  }
+
+  host_test_data("failed_policy_test_data") {
+    sources = get_target_outputs(":check_failed_verifier_bin")
+    sources += [
+      "failing_policy.json5",
+      files.component_tree_config,
+      files.product_bundle_dir,
+    ]
+    deps = [
+      ":check_failed_verifier_bin",
+      labels.product_bundle,
+    ]
+  }
+
+  check_failed_verifier_binary =
+      get_target_outputs(":check_failed_verifier_bin")
+  check_failed_verifier_binary = check_failed_verifier_binary[0]
+  host_test("check_failing_policy") {
+    binary_path = python_exe_src
+
+    depfile = "$target_out_dir/check_failed_policy.d"
+    args = [
+      rebase_path(check_failed_verifier_binary, root_build_dir),
+      "--ffx-bin",
+      rebase_path(files.ffx, root_build_dir),
+      "--policy",
+      rebase_path("failing_policy.json5", root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+      "--product-bundle",
+      rebase_path(files.product_bundle_dir, root_build_dir),
+      "--component-tree-config",
+      rebase_path(files.component_tree_config, root_build_dir),
+    ]
+    depfile = [ depfile ]
+
+    deps = [
+      ":failed_policy_test_data",
+      "//build/python:interpreter",
+      "//src/developer/ffx/plugins/scrutiny:ffx_scrutiny_tool_test_data",
+    ]
+  }
+}

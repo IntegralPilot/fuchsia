@@ -1,0 +1,100 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test fx flash
+
+function read_host_platform() {
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/../../lib/platform.sh" || exit $?
+  echo "$HOST_PLATFORM"
+}
+
+BT_FILE_DEPS=(
+  "prebuilt/third_party/jq/$(read_host_platform)/bin/jq"
+  "scripts/fx"
+  "tools/devshell/jq.fx"
+  "tools/devshell/flash"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-flash.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/platform.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+)
+
+BT_MOCKED_TOOLS=(
+  "tools/devshell/build"
+)
+
+declare fx ffx fastboot_mock flash_script flash_manifest
+
+BT_SET_UP() {
+  source "${BT_TEMP_DIR}/tools/devshell/lib/vars.sh"
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+  cat > "${BT_TEMP_DIR}/out/default/args.json" <<EOF
+{
+  "bazel_product_bundle_prefix": "//products/core:product_bundle",
+  "bazel_product_bundle_board": "x64"
+}
+EOF
+  fx-config-read
+  ffx="$(btf::make_installed_hosttools_mock ffx)"
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/get-flash-source"
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/host-tool"
+
+  fastboot_mock="$(btf::make_mock_binary "fastboot")"
+
+  cat > "${BT_TEMP_DIR}/tools/devshell/host-tool.mock_side_effects" <<EOF
+    if [[ "\$1" == "fastboot" ]]; then
+      shift
+      "${fastboot_mock}" "\$@"
+    fi
+    if [[ "\$2" == "ffx" ]]; then
+      shift
+      "${ffx}" "\$@"
+    fi
+EOF
+
+  cat > "${BT_TEMP_DIR}/tools/devshell/get-flash-source.mock_side_effects" <<EOF
+    echo flash-manifest:flash.json
+EOF
+
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts"
+  cat > "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts.mock_side_effects" << "EOF"
+if [[ "$@" == "flash" ]]; then
+  echo "flash"
+else
+  echo "unknown command $@" 1>&2
+  exit 1
+fi
+EOF
+
+}
+
+TEST_fx_flash_ssh_with_ffx_product_bundle() {
+  cat >"${fastboot_mock}.mock_side_effects" <<INPUT
+if [[ "\$1" == "devices" ]]; then
+  echo "97300YCABZZ5AA	fastboot"
+  echo " "
+fi
+INPUT
+  cat >"${ffx}.mock_side_effects" <<INPUT
+if [[ "\$7" == "ssh.pub" ]]; then
+  echo  "${BT_TEMP_DIR}/.ssh/fuchsia_authorized_keys"
+fi
+INPUT
+
+  cat > "${BT_TEMP_DIR}/tools/devshell/get-flash-source.mock_side_effects" <<INPUT
+    echo product-bundle:obj/build/images/fuchsia/product_bundle
+INPUT
+  mkdir -p "${BT_TEMP_DIR}/out/default/obj/build/images/fuchsia/product_bundle"
+
+  BT_EXPECT ${fx} flash --no-build
+  btf::expect-mock-args "${ffx}.mock_state.7" "ffx" "--config" "fuchsia.analytics.ffx_invoker=fx" "target" "flash" "--product-bundle" "${BT_TEMP_DIR}/out/default/obj/build/images/fuchsia/product_bundle" "--authorized-keys" "${BT_TEMP_DIR}/.ssh/fuchsia_authorized_keys"
+}
+
+BT_RUN_TESTS "$@"

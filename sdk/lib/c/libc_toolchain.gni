@@ -1,0 +1,280 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This file exists to find the GN toolchain() instance used to build
+# the version of the C library used for regular Fuchsia packages (which is
+# potentially instrumented), as well as the version used by the Fuchsia
+# system package (which may be different, as it must not be instrumented,
+# but could still be built with a variant like "gcc" or "thinlto").
+#
+# For more details, see the extensive TECHNICAL NOTE in the comments at
+# the end of this file.
+
+import("//build/toolchain/zircon/clang.gni")
+
+# The C library's own GN target label, without a toolchain
+sysroot_libc_label = "//sdk/lib/c"
+
+# The base toolchain used to build the C library. This is the toolchain that is
+# used when no variant is selected by the user through `select_variant` in
+# args.gn.
+sysroot_libc_base_toolchain = "//sdk/lib/c:user.libc_$target_cpu"
+
+# The variant selector fields corresponding to the C library.
+# Keep it in sync with the definitions of user.libc_${target_cpu}
+# in //sdk/lib/c/BUILD.gn!
+#
+_select_host = false
+_select_kernel = false
+_select_testonly = false
+_select_target_type = [ "shared_library" ]
+_select_output_name = [ "libc.so" ]
+_select_label = [ "//sdk/lib/c" ]
+_select_name = [ "libc" ]
+_select_dir = [ "//sdk/lib/c" ]
+_select_exclude_toolchain_tags = [
+  "fuzzer",
+  "kernel-only",
+]
+
+# ======================================================================
+# START OF CODE TO KEEP IN SYNC WITH BUILDCONFIG.gn
+#
+# IMPORTANT: Always keep the code below in sync with the computations
+# performed by variant_target() within //build/config/BUILDCONFIG.gn.
+#
+# LINT.IfChange(variant_selection)
+
+_instrumented_target_variant = ""
+_uninstrumented_target_variant = ""
+
+if (select_variant_canonical != []) {
+  _selected = false
+
+  foreach(_selector, select_variant_canonical) {
+    if (_instrumented_target_variant == "" ||
+        _uninstrumented_target_variant == "") {
+      _selected = true
+      if (_selected && defined(_selector.host)) {
+        _selected = _selector.host == _select_host
+      }
+
+      if (_selected && defined(_selector.kernel)) {
+        _selected = _selector.kernel == _select_kernel
+      }
+
+      if (_selected && defined(_selector.testonly)) {
+        _selected = _selector.testonly == _select_testonly
+      }
+
+      if (_selected && _selector.target_type != []) {
+        _selected = _selector.target_type + _select_target_type -
+                    _select_target_type != _selector.target_type
+      }
+
+      if (_selected && _selector.output_name != []) {
+        _selected = _selector.output_name + _select_output_name -
+                    _select_output_name != _selector.output_name
+      }
+
+      if (_selected && _selector.label != []) {
+        _selected =
+            _selector.label + _select_label - _select_label != _selector.label
+      }
+
+      if (_selected && _selector.name != []) {
+        _selected =
+            _selector.name + _select_name - _select_name != _selector.name
+      }
+
+      if (_selected && _selector.dir != []) {
+        _selected = _selector.dir + _select_dir - _select_dir != _selector.dir
+      }
+
+      if (_selected && _select_exclude_toolchain_tags != []) {
+        _selected = _select_exclude_toolchain_tags + _selector.variant_tags -
+                    _selector.variant_tags == _select_exclude_toolchain_tags
+      }
+
+      if (_selected && _selector.variant != false) {
+        if (_selector.variant_tags + [ "instrumented" ] - [ "instrumented" ] !=
+            _selector.variant_tags) {
+          if (_instrumented_target_variant == "") {
+            _instrumented_target_variant = "-${_selector.variant}"
+          }
+        } else if (_uninstrumented_target_variant == "") {
+          _uninstrumented_target_variant = "-${_selector.variant}"
+        }
+      }
+    }
+  }
+}
+
+# LINT.ThenChange(//build/config/BUILDCONFIG.gn:variant_selection)
+#
+# END OF CODE TO KEEP IN SYNC WITH BUILDCONFIG.gn!
+# ==================================================================
+
+# See technical note below to understand why these computations are necessary.
+if (_instrumented_target_variant != "") {
+  _user_target_variant = _instrumented_target_variant
+} else {
+  _user_target_variant = _uninstrumented_target_variant
+}
+
+_system_target_variant = _uninstrumented_target_variant
+
+# This is the toolchain used to build the C library that appears in the system
+# package, i.e. that is installed under /lib/ld.so.1. It must be a
+# non-instrumented version of the library, though a variant like "gcc" might be
+# applied to it.
+system_libc_toolchain = sysroot_libc_base_toolchain + _system_target_variant
+
+if (is_fuchsia) {
+  # When in a toolchain variant of the Fuchsia base toolchain, find the
+  # corresponding toolchain variant of user.libc_$target_cpu to build
+  # the C library with it.
+  sysroot_libc_toolchain = sysroot_libc_base_toolchain
+  if (toolchain_variant.suffix != "") {
+    sysroot_libc_toolchain =
+        sysroot_libc_base_toolchain +
+        string_replace(toolchain_variant.suffix, "-fuzzer", "")
+  } else {
+    sysroot_libc_toolchain = system_libc_toolchain
+  }
+} else {
+  # This is the toolchain used to build the C library for regular Fuchsia
+  # packages. If an instrumented toolchain is used, it will be installed as
+  # lib/<variant>/ld.so.1 as expected by other user-level binaries.
+  sysroot_libc_toolchain = sysroot_libc_base_toolchain + _user_target_variant
+}
+
+# The GN target that builds the C library for the current variant selection.
+sysroot_libc_target = "$sysroot_libc_label:libc($sysroot_libc_toolchain)"
+sysroot_libc_stub_target = "$sysroot_libc_label($sysroot_libc_toolchain)"
+
+# The paths to the binaries generated by the C library target. Note that these
+# are called libc.so, but are installed in packages or the system as ld.so.1.
+sysroot_libc_stripped =
+    get_label_info(sysroot_libc_target, "root_out_dir") + "/libc.so"
+sysroot_libc_unstripped = sysroot_libc_stripped + ".debug"
+sysroot_libc_stub = get_label_info("$sysroot_libc_label($default_toolchain)",
+                                   "target_gen_dir") + "/c.$clang_cpu/libc.so"
+
+# The GN target that builds the system C library. This is required for certain
+# binaries that are placed in the system package, and expect to find the library
+# under lib/ld.so.1, instead of lib/<variant>/ld.so.1
+system_libc_target = "$sysroot_libc_label:libc($system_libc_toolchain)"
+system_libc_stripped =
+    get_label_info(system_libc_target, "root_out_dir") + "/libc.so"
+system_libc_unstripped = system_libc_stripped + ".debug"
+
+# The C runtime startup object, which must be linked to all Fuchsia executable
+# binaries.
+sysroot_crt1_toolchain = sysroot_libc_toolchain
+sysroot_crt1_target = "//sdk/lib/c:crt1($sysroot_crt1_toolchain)"
+
+sysroot_crt1_obj =
+    get_label_info(sysroot_crt1_target, "target_out_dir") + "/crt1.Scrt1.cc.o"
+# TECHNICAL NOTE
+#
+# This file exists because the C library, while technically not part of the
+# system in Fuchsia, still requires very special care during the build.
+#
+# Its main purpose is to find the GN toolchain() instance that is used to
+# build the uninstrumented version of 'libc.so', based on the current set
+# of variant selectors (i.e. 'select_variant' as defined in
+# 'out/default/args.gn')
+#
+# Some critical considerations to be aware of to understand what's below:
+#
+# - The C library is built as 'libc.so' and 'libc.so.debug', for the stripped
+#   and unstripped versions, respectively.
+#
+#   The stripped version is installed into Fuchsia packages and is used
+#   at runtime. The unstripped version is used at link time and for
+#   debugging + symbolization.
+#
+# - The C library can be built with GCC, instead of Clang. This is usually
+#   done by enabling the "gcc" variant, which is ignored by non-Zircon specific
+#   targets (in other words, Fuchsia user binaries are never built with GCC
+#   even if this variant is enabled).
+#
+# - The stripped C library (libc.so) will be installed as 'lib/ld.so.1'
+#   by default within Fuchsia packages. This is because it implements both
+#   the C runtime and the dynamic loader at the same time. Fuchsia user
+#   executables contain a direct reference to this location inside their
+#   dynamic section.
+#
+#   However, a Fuchsia executable built with an _instrumented_ variant,
+#   will look at runtime for 'lib/<variant>/ld.so.1' instead, which
+#   should contain the version of 'libc.so' compiled for the same variant.
+#
+#   E.g., if the "asan" variant is enabled, then an executable installed
+#   as 'bin/program' will use 'lib/asan/ld.so.1' to find the dynamic loader,
+#   and this file should be a copy of 'out/default/user.libc_x64-asan/libc.so'.
+#
+#   Hence, which version of the C library is associated with a given
+#   executable binary depends on the variant used to build it.
+#
+#   As a reminder, our build system provides the ability to enable different
+#   variants for different targets, e.g.:
+#
+#     select_variant = [
+#       "ubsan/cat",
+#       "profile/echo",
+#       "asan"
+#     ]
+#
+#   Would build the 'cat' executable with the 'ubsan' variant, the
+#   'echo' one with the 'profile' variant, and all other Fuchsia executables
+#   with the 'asan' one.
+#
+# - Even if no variant is enabled in a given build, the "asan" variant of the
+#   C library need to be built and exported to the Fuchsia SDK.
+#   (see //sdk/lib/c/sysroot_entries.gni for details).
+#
+# - The "system package" is a special Fuchsia package that contains system
+#   libraries and binaries (i.e. those required to boot the system). It requires
+#   an un-instrumented C library in 'lib/ld.so.1', since several prebuilt
+#   driver binaries depend on it.
+#
+#   And this, even if a variant is enabled to build all Fuchsia binaries.
+#   Note that non-instrumented variants still need to apply to this binary
+#   (e.g. "gcc" or "thinlto").
+#
+# - Finally, when linking executables or ELF shared objects, the C++ compiler
+#   will by default inject implicit dependencies to various libraries and
+#   object files, i.e.:
+#
+#    - Adding an implicit '-lc' and '-lm' link argument before invoking
+#      the final linker program.
+#
+#    - Adding implicit dependencies to compiler-builtins support libraries
+#      (e.g. '-lgcc'), the C++ runtime library (e.g. '-lc++') and other
+#      instrumentation-related runtime libraries (e.g. '-lclang_rt.asan')
+#      when needed.
+#
+#    - For ELF executables, it will also search for a file named 'Scrt1.o'
+#      which contains the low-level C runtime startup code (i.e. the
+#      one that implements the '_start' entry point, called by the
+#      system once the executable and its dependent libraries are
+#      loaded, its role is to initialize the C runtime, then jump
+#      off to the main() function).
+#
+#   All of these can be controlled by an array of compiler/linker flags,
+#   the most important one being the --sysroot=DIR option used to specify
+#   the location of these system headers and libraries at build time.
+#
+# - Rust and Go binaries do not participate in variant selection. As such
+#   they should always be linked against a non-instrumented version of
+#   the C library, even if an instrumented variant is used for other
+#   C++ Fuchsia binaries.
+#
+# - Apparently, it is ok to link an instrumented executable or loadable
+#   module against a non-instrumented C library at build time, as long
+#   as the proper instrumented binary is installed into the corresponding
+#   Fuchsia package.
+#   It may be possible to use the right instrumented C library at link time
+#   instead.

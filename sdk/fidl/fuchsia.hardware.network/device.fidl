@@ -1,0 +1,185 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.network;
+
+using fuchsia.device.fs;
+using zx;
+
+/// Maximum numbers of supported frame types for rx or tx.
+// NOTE(brunodalbo) 4 seems a sensible number for maximum number of frame types
+// supported by a single device. Most common use cases are going to use 1 or 2
+// types (1 if device operates at L2, 2 if at L3).
+@available(added=HEAD)
+const MAX_FRAME_TYPES uint32 = 4;
+
+/// Maximum length of session label.
+@available(added=HEAD)
+const MAX_SESSION_NAME uint32 = 64;
+
+/// Network device base info.
+@available(added=HEAD)
+type DeviceBaseInfo = table {
+    /// Maximum number of items in rx FIFO (per session). Required.
+    ///
+    /// `rx_depth` is calculated based on the size of the actual backing
+    /// hardware rx queue.
+    1: rx_depth uint16;
+    /// Maximum number of items in tx FIFO (per session). Required.
+    ///
+    /// `tx_depth` is calculated based on the size of the actual backing
+    /// hardware tx queue.
+    2: tx_depth uint16;
+    /// Alignment requirement for buffers in the data VMO.
+    ///
+    /// All buffers in the data VMO *must* be aligned to `buffer_alignment`
+    /// relative to the start of the VMO. `buffer_alignment == 0` is never
+    /// reported. Required.
+    3: buffer_alignment uint32;
+    /// Maximum supported length of buffers in the data VMO, in bytes.
+    ///
+    /// Absent if no maximum buffer length is defined. Must be nonzero.
+    4: max_buffer_length uint32;
+    /// The minimum rx buffer length required for device. Required.
+    5: min_rx_buffer_length uint32;
+    /// The minimum tx buffer length required for the device. Required.
+    ///
+    /// This value accounts only for tx payload length, `min_tx_buffer_head` and
+    /// `min_tx_buffer_tail` are not part of this value.
+    ///
+    /// Clients must zero pad outgoing frames to meet the required minimum
+    /// length.
+    6: min_tx_buffer_length uint32;
+    /// The number of bytes the device requests be free as `head` space in a tx
+    /// buffer. Required.
+    7: min_tx_buffer_head uint16;
+    /// The amount of bytes the device requests be free as `tail` space in a tx
+    /// buffer. Required.
+    8: min_tx_buffer_tail uint16;
+    /// Maximum descriptor chain length accepted by the device. Required.
+    9: max_buffer_parts uint8;
+    /// Minimum amount of Rx buffers the client needs to prepare for the
+    /// network device. Client should use this information to select its
+    /// VMO sizes if using multi-VMO support.
+    12: min_rx_buffers uint16;
+};
+
+/// Network device information.
+@available(added=HEAD)
+type DeviceInfo = table {
+    /// Minimum descriptor length, in 64-bit words. Required.
+    ///
+    /// The minimum length that each buffer descriptor must have for correct
+    /// operation with this device. Devices that support extra frame metadata
+    /// inform larger minimum descriptor lengths that reflect the minimum space
+    /// needed to be able to store frame metadata.
+    1: min_descriptor_length uint8;
+    /// Accepted descriptor version. Required.
+    2: descriptor_version uint8;
+    /// Device base info. Required.
+    3: base_info DeviceBaseInfo;
+};
+
+/// A Network Device.
+@available(added=HEAD)
+closed protocol Device {
+    /// Obtain information about device
+    ///
+    /// - response `info` device information.
+    strict GetInfo() -> (struct {
+        info DeviceInfo;
+    });
+    /// Opens a new session with the network device.
+    ///
+    /// + request `session_name` is used as a debugging label attached to this
+    /// session.
+    /// + request `session_info` contains the necessary information to setup the
+    /// session's data exchange.
+    /// - response `session` a handle to control the session.
+    /// - response `fifos` data-plane FIFOs attached to the session.
+    /// * error `ZX_ERR_NOT_SUPPORTED` if `session_info` contains not supported
+    /// frame types or descriptors set up.
+    /// * error `ZX_ERR_INVALID_ARGS` if `session_info` is missing fields or
+    /// contains invalid information.
+    /// * error `ZX_ERR_INTERNAL` if the data VMO is rejected by the underlying
+    /// device.
+    strict OpenSession(resource struct {
+        session_name string:MAX_SESSION_NAME;
+        session_info SessionInfo;
+    }) -> (resource struct {
+        session client_end:Session;
+        fifos Fifos;
+    }) error zx.Status;
+    /// Connects to a port the given `id`.
+    ///
+    /// + request `id` port to connect to.
+    /// + request `port` server end of port channel.
+    ///
+    /// `port` is closed with a `ZX_ERR_NOT_FOUND` epitaph if no port with `id`
+    /// exists.
+    strict GetPort(resource struct {
+        id PortId;
+        port server_end:Port;
+    });
+    /// Connects a [`PortWatcher`] to this device.
+    ///
+    /// + request `watcher` server end of watcher channel.
+    strict GetPortWatcher(resource struct {
+        watcher server_end:PortWatcher;
+    });
+    /// Establishes a new connection to this device.
+    ///
+    /// + request `device` the server end for the new connection.
+    strict Clone(resource struct {
+        device server_end:Device;
+    });
+};
+
+@available(added=HEAD)
+service Service {
+    device client_end:Device;
+    // TODO(https://issues.fuchsia.dev/issues/501161302): Use the new
+    // `fuchsia.driver.token.NodeBusTopology` instead.
+    device_topology client_end:fuchsia.device.fs.TopologicalPath;
+};
+
+/// Provides iteration over and updates for ports attached to a device.
+@available(added=HEAD)
+closed protocol PortWatcher {
+    /// Get the next port event.
+    ///
+    /// The first N calls return [`DevicePortEvent.existing`] where N is the
+    /// number of ports present on the device at the time of the watcher's
+    /// creation. The next call returns [`DevicePortEvent.idle`] to indicate the
+    /// end of existing ports. Subsequent calls block until a port is added
+    /// ([`DevicePortEvent.added`]) or removed ([`DevicePortEvent.removed`]).
+    ///
+    /// The server closes the `PortWatcher` channel with `ZX_ERR_CANCELED` if
+    /// the number of unread events reaches a server-selected limit that is at
+    /// least two times [`MAX_PORTS`]. Clients are encouraged to maintain a
+    /// hanging call to `Watch` at all times to avoid triggering this condition.
+    ///
+    /// - response `event` next port event.
+    strict Watch() -> (struct {
+        event DevicePortEvent;
+    });
+};
+
+// TODO(https://fxbug.dev/42159332): Use built-in empty struct when available.
+@available(added=HEAD)
+type Empty = struct {};
+
+/// Port creation and destruction events.
+// TODO(https://fxbug.dev/42145610): `PortEvent` is probably a better name here,
+// but it causes rust binding errors.
+@available(added=HEAD)
+type DevicePortEvent = strict union {
+    /// Port existed when watcher was created.
+    1: existing PortId;
+    /// New port was added to device.
+    2: added PortId;
+    /// Port was removed from the device.
+    3: removed PortId;
+    /// Exhausted list of existing ports.
+    4: idle Empty;
+};

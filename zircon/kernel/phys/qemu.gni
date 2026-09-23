@@ -1,0 +1,219 @@
+# Copyright 2020 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/testing/environments.gni")
+import("//zircon/kernel/phys/phys_executable.gni")
+
+# zbi_test() $timeout value for short-running tests launched via QEMU.
+qemu_short_timeout = 30
+
+# This lists the supported kernel image formats for direct booting by QEMU.
+#
+# Type: list(scope)
+#
+#   * disabled
+#     - Optional: If true, the boot tests generated for this boot format will
+#       not be run in automation.  They'll be available for `fx run-boot-test`.
+#     - Type: bool
+#
+#   * environment
+#     - Required: Build environment to instantiate phys_executable() in.
+#     - Type: label_no_toolchain
+#
+#   * deps
+#     - Required: Added to deps of a phys_executable() to make it bootable.
+#       This reaches some source_set() and/or link magic via public_configs
+#       that make the binary image extracted by phys_executable() bootable
+#       via QEMU using this format.
+#     - Type: list(label)
+#
+#   * name
+#     - Required: Name of the format.
+#     - Type: string
+#
+#   * import
+#     - Optional: A .gni file that defines the $target_type template.
+#     - Type: path
+#
+#   * supported_environments
+#     - Required: List as for the $environments parameter to boot_test().
+#     - Type: list(scope)
+#
+#   * target_second_environment
+#     - Optional: A second build environment in which the phys_executable()
+#       (or $target_type()) target should also be evaluated.
+#     - Type: label_no_toolchain
+#
+#   * target_type
+#     - Optional: The target type (template) to use in $environment.
+#     - Type: string
+#     - Default: "phys_executable"
+#
+#   * timeout
+#     - Optional: Passed along to zbi_test() for qemu_kernel_test() tests.
+#       $qemu_short_timeout is a good default for QEMU boots of tiny tests.
+#     - Type: seconds
+#
+qemu_boot_formats = []
+
+# This is the default among the $name strings of $qemu_boot_formats.
+qemu_default_boot_format = ""
+
+if (current_cpu == "x64") {
+  qemu_default_boot_format = "linuxbiboot"
+
+  # The multiboot x86-32 protocol is supported by QEMU and AEMU.
+  multiboot_environments = [
+    qemu_env,
+    aemu_env,
+  ]
+
+  # The Linux/x86 16-bit/32-bit protocol is supported by QEMU and AEMU.
+  linuxboot32_environments = [
+    qemu_env,
+    aemu_env,
+  ]
+
+  # The Linux/x86 64-bit protocol is supported by CrosVM.
+  linuxboot64_environments = [ crosvm_env ]
+
+  qemu_boot_formats += [
+    {
+      name = "multiboot"
+      environment = "//zircon/kernel/arch/x86/phys:kernel.phys32"
+      deps = [ "//zircon/kernel/arch/x86/phys:multiboot" ]
+      shim_deps = [
+        "//zircon/kernel/arch/x86/phys/boot-shim:multiboot-shim($environment)",
+      ]
+      timeout = qemu_short_timeout
+
+      supported_environments = multiboot_environments
+    },
+    {
+      name = "linuxboot"
+      environment = "//zircon/kernel/arch/x86/phys:kernel.phys32"
+      deps = [ "//zircon/kernel/arch/x86/phys:linuxboot" ]
+      shim_deps = [ "//zircon/kernel/arch/x86/phys/boot-shim:linux-x86-32-boot-shim($environment)" ]
+      timeout = qemu_short_timeout
+
+      supported_environments = linuxboot32_environments
+    },
+    {
+      name = "linuxboot64"
+      environment = phys_toolchain
+      deps = [ "//zircon/kernel/arch/x86/phys:linuxboot64" ]
+      shim_deps = [ "//zircon/kernel/arch/x86/phys/boot-shim:linux-x86-64-boot-shim($environment)" ]
+      timeout = qemu_short_timeout
+
+      supported_environments = linuxboot64_environments
+    },
+    {
+      name = "linuxbiboot"
+      environment = "//zircon/kernel/arch/x86/phys:kernel.phys32"
+      import = "//zircon/kernel/arch/x86/phys/linuxbiboot_executable.gni"
+      target_type = "linuxbiboot_executable"
+      target_second_environment = phys_toolchain
+      deps = []
+      shim_deps = [ "//zircon/kernel/arch/x86/phys/boot-shim:linux-x86-boot-shim($environment)" ]
+      timeout = qemu_short_timeout
+
+      supported_environments =
+          linuxboot32_environments + linuxboot64_environments
+    },
+  ]
+} else {
+  # Environment for building raw QEMU kernels (64-bit physical memory).
+  qemu_boot_formats += [
+    {
+      name = "raw"
+      environment = phys_toolchain
+      deps = [ "//zircon/kernel/phys:qemu-header" ]
+      timeout = qemu_short_timeout
+
+      supported_environments = [ qemu_env ]
+    },
+  ]
+}
+if (current_cpu == "arm64" || current_cpu == "riscv64") {
+  qemu_default_boot_format = "linuxboot"
+  qemu_boot_formats += [
+    {
+      name = "linuxboot"
+      environment = phys_toolchain
+      deps = [ "//zircon/kernel/arch/$current_cpu/phys:linuxboot" ]
+      shim_deps = [ "//zircon/kernel/arch/${current_cpu}/phys/boot-shim:linux-${current_cpu}-boot-shim($environment)" ]
+      timeout = qemu_short_timeout
+
+      supported_environments = [ qemu_env ]
+      if (current_cpu == "arm64") {
+        # We don't add crosvm_env since it uses a different UART on ARM than our
+        # QEMU configuration does, meaning that the QEMU kernel boot tests will
+        # not work with crosvm in this case.
+        supported_environments += [ aemu_env ]
+      }
+    },
+  ]
+}
+
+declare_args() {
+  # Boot format to use with QEMU. This chooses the boot format to use with
+  # QEMU, determining which boot shim implementation is used as QEMU "kernel".
+  # Valid alternatives vary by machine, but include "linuxboot".
+  qemu_boot_format = qemu_default_boot_format
+}
+
+# This indicates what boot shim to use as the QEMU "kernel".
+# It's determined by the $qemu_boot_format build argument.
+#
+# Type: scope
+#
+#   * deps
+#     - Required: Direct deps to the target that produces the shim binary.
+#     This should be the target that produces the $path file.
+#     - Type: list(label_with_toolchain)
+#
+#   * path
+#     - Required: Path to the shim binary file, an output of $deps.
+#     - Type: path
+#
+qemu_boot_shim = {
+}
+
+# This is true when evaluated in one of the environments used by
+# a supported format in the $qemu_boot_formats list.
+in_qemu_environment = false
+
+_qemu_boot_format_names = []
+foreach(qemu, qemu_boot_formats) {
+  if (toolchain_variant.base == qemu.environment) {
+    in_qemu_environment = true
+  }
+  _qemu_boot_format_names += [ qemu.name ]
+  if (qemu.name == qemu_boot_format) {
+    qemu_boot_shim = {
+      deps = qemu.shim_deps
+      name = get_label_info(deps[0], "name")
+      if (defined(qemu.shim_path)) {
+        path = qemu.shim_path
+      } else {
+        assert(deps == [ deps[0] ])
+        path = get_label_info("${deps[0]}", "root_out_dir") + "/" +
+               get_label_info(deps[0], "name") + ".bin"
+      }
+      supported_environments = qemu.supported_environments
+    }
+  }
+}
+
+assert(
+    _qemu_boot_format_names + [ qemu_boot_format ] - [ qemu_boot_format ] !=
+        _qemu_boot_format_names,
+    "qemu_boot_format=\"$qemu_boot_format\" not among available formats $_qemu_boot_format_names")
+
+assert(
+    qemu_boot_shim != {
+        },
+    "qemu_boot_format \"$qemu_boot_format\" has no Zircon boot shim available")

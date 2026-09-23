@@ -1,0 +1,92 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//boards/default_for_emulator.gni")
+import("//build/assembly/product_assembly_configuration.gni")
+import("//build/assembly/test_product_bundle.gni")
+import("//build/go/go_library.gni")
+import("//build/go/go_test.gni")
+import("//build/testing/boot_tests/kernel_zbi_test.gni")
+import("//build/testing/boot_tests/zbi_test.gni")
+import("//build/testing/boot_tests/zbi_test_executable.gni")
+
+group("interrupt-test") {
+  testonly = true
+  deps = []
+  if (host_os == "linux") {
+    deps += [ ":uart-interrupt-host-test($host_toolchain)" ]
+  }
+}
+
+if (toolchain_variant.base == default_toolchain) {
+  _target_out_dir =
+      get_label_info(":anything($default_toolchain)", "target_out_dir")
+  zbi = "$_target_out_dir/uart-interrupt-test-zbi.${default_kernel_test_image}.zbi"
+  zbi_test_executable("uart-interrupt-test") {
+    sources = [ "uart-interrupt-test.cc" ]
+    deps = [
+      "//src/zircon/testing/standalone-test",
+      "//zircon/system/ulib/zx",
+      "//zircon/system/ulib/zxtest",
+    ]
+  }
+
+  kernel_zbi_test("uart-interrupt-test-zbi") {
+    deps = [ ":uart-interrupt-test($default_toolchain)" ]
+
+    # TODO(https://fxbug.dev/42066527): This ZBI is not actually a ZBI test, but relies
+    # on the specification just for the `images` metadata implicitly set by
+    # `zbi_test()` and not `zbi()`. Investigate whether we can have `zbi()`
+    # targets set this metadata and update this target accordingly - and
+    # disable the ZBI from being booted as a ZBI test for now.
+    disabled = true
+    metadata = {
+      test_runtime_deps = [ zbi ]
+    }
+  }
+
+  if (current_toolchain == default_toolchain) {
+    # Assert that the zbi path was indeed correct.
+    zbi_outputs = get_target_outputs(
+            ":uart-interrupt-test-zbi.${default_kernel_test_image}.zbi")
+    assert(zbi_outputs + [ zbi ] - [ zbi ] != zbi_outputs)
+
+    test_product_bundle("uart-interrupt-test-product-bundle") {
+      board_config = default_board_for_emulator
+      platform = {
+        build_type = "eng"
+        development_support = {
+          enable_userboot_next_component_manager = true
+        }
+      }
+      kernel_zbi = ":uart-interrupt-test-zbi.${default_kernel_test_image}.zbi"
+    }
+  }
+}
+
+if (is_host) {
+  go_library("lib") {
+    testonly = true
+    sources = [ "uart_interrupt_host_test.go" ]
+    deps = [ "//tools/emulator/emulatortest" ]
+  }
+
+  _pb_label = ":uart-interrupt-test-product-bundle($default_toolchain)"
+  _out_dir = get_label_info(_pb_label, "target_out_dir")
+
+  host_test_data("uart_interrupt_test_data") {
+    sources = [ "${_out_dir}/uart-interrupt-test-product-bundle" ]
+    deps = [ _pb_label ]
+  }
+
+  go_test("uart-interrupt-host-test") {
+    embed = [ ":lib" ]
+    args = [
+      "--emulator.pb-path",
+      rebase_path("${_out_dir}/uart-interrupt-test-product-bundle",
+                  root_build_dir),
+    ]
+    non_go_deps = [ ":uart_interrupt_test_data" ]
+  }
+}

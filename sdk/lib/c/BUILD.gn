@@ -1,0 +1,751 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/bootfs_files_for_assembly.gni")
+import("//build/components.gni")
+import("//build/config/compiler_config.gni")
+import("//build/config/linker.gni")
+import("//build/config/sysroot.gni")
+import("//build/config/zircon/standard.gni")
+import("//build/cpp/verify_public_symbols.gni")
+import("//build/test.gni")
+import("//build/toolchain/ifs_shared_library.gni")
+import("//build/zircon/c_utils.gni")
+import("//build/zircon/migrated_targets.gni")
+import("libc.gni")
+import("libc_toolchain.gni")
+
+assert(libc == get_path_info(get_path_info(".", "abspath"), "dir"),
+       get_path_info(get_path_info(".", "abspath"), "dir"))
+
+# Each subdirectory listed provides some pieces of libc in a uniform way.  The
+# main target is a source_set() for libc proper and the "unittests" target is a
+# libc_test() suitable for inclusion in libc-unittests and Zircon's core-tests.
+libc_components = [
+  "compiler",
+  "ctype",
+  "errno",
+  "fenv",
+  "include",
+  "inttypes",
+  "math",
+  "pthread",
+  "sanitizers",
+  "scudo",
+  "setjmp",
+  "startup",
+  "stdio",
+  "stdlib",
+  "threads",
+  "wchar",
+  "wctype",
+  "zircon",
+]
+
+libc_testonly_components = [
+  "dlfcn",
+  "ld",
+  "link",
+]
+
+if (use_llvm_libc_string_functions) {
+  libc_components += [
+    "string",
+    "strings",
+  ]
+} else {
+  libc_testonly_components += [
+    "string",
+    "strings",
+  ]
+}
+
+group("components") {
+  visibility = [ ":*" ]
+  deps = libc_components
+}
+
+# The older code neither from musl nor from llvm-libc does not have
+# corresponding unit tests.
+group("legacy-components") {
+  visibility = [ ":*" ]
+  deps = [
+    "stubs",
+    "//sdk/lib/zircon-assert:as_libc_source_set",
+  ]
+}
+
+# This isn't a test per se, but using libc_test will apply the test configs
+# we want.
+libc_test("test_utils") {
+  dir = "$llvm_libc/test/UnitTest"
+  sources = [ "TestLogger.cpp" ]
+}
+
+group("unittests") {
+  testonly = true
+  deps = [
+    ":test_utils",
+    ":weak-tests",
+    "errno:errno.testonly",
+  ]
+  foreach(subdir, libc_components + libc_testonly_components) {
+    deps += [ "$subdir:unittests" ]
+  }
+}
+
+# libc.gni uses these configs.
+
+# This is needed for the expectations of the llvm-libc source code, whether
+# compiled into libc or just into unit test code.
+config("llvm-libc.config") {
+  visibility = [ "./*" ]
+  defines = [
+    "LIBC_ENABLE_CONSTEXPR=1",
+    "LIBC_COPT_USE_C_ASSERT=1",
+    "LIBC_CONF_WCTYPE_MODE=LIBC_WCTYPE_MODE_UTF8",
+  ]
+  include_dirs = [
+    ".",
+
+    # This directory provides headers to preempt and wrap certain llvm-libc
+    # headers to align with Fuchsia-specific code defined in this build.
+    "include-preempt",
+
+    llvm_libc,
+  ]
+
+  cflags = []
+  if (is_gcc) {
+    # GCC complains about using __m128i type in template speciailization
+    # because the typedef includes attributes.
+    cflags += [ "-Wno-ignored-attributes" ]
+  }
+
+  if (cxx_rbe_enable) {
+    # Workaround: reclient (for RBE) non-deterministically
+    # fails to include headers in this directory, and some from llvm-libc,
+    # so force them to be included as remote inputs.
+    # TODO(b/471248163, b/478908349): revert workaround when no longer needed
+    cflags += [
+      "--remote-inputs=" + rebase_path("include-preempt", root_build_dir),
+      "--remote-inputs=" +
+          rebase_path("$llvm_libc/include/llvm-libc-types", root_build_dir),
+    ]
+  }
+
+  configs = [ "//build/config:Wmissing-declarations" ]
+}
+
+# This is needed when compiling libc-related code for use in unit tests.
+config("testonly.config") {
+  visibility = [ "./*" ]
+  defines = [
+    "LIBC_COPT_TEST_USE_ZXTEST",
+
+    # This namespace is different from the one used below for building libc
+    # itself, mostly just for more visual clarity looking at backtraces from
+    # unit test code and such.  Since the unit test code only ever gets linked
+    # into a program using libc.so and not statically linked with the non-test
+    # libc code, it's not actually ambiguous what it means in the context of
+    # which binary contained the symbol.  But using a separate name is clearer.
+    "LIBC_NAMESPACE=$libc_test_namespace",
+  ]
+}
+
+# This is needed for compilations of libc-related code to be used in
+# production, not in unit tests.  This applies both to things used outside of
+# libc proper, such as the separate printf_core integrations; and to libc.so
+# itself, which uses llvm-libc-extra.config, below.
+config("llvm-libc-public.config") {
+  visibility = [ "./*" ]
+
+  defines = [
+    # This namespace is invisible to anything outside libc.so, though in an
+    # eventual libc.a for static linking it would be visible at static link
+    # time.  The separate integrations of parts of libc internals, such as
+    # printf_core, also use this namespace because the libc_source_set()s they
+    # depend on are shared targets that also go into libc proper.  In effect,
+    # those separate integrations are using subsets of what an eventual libc.a
+    # could provide to those use cases.
+    "LIBC_NAMESPACE=$libc_namespace",
+  ]
+}
+
+config("llvm-libc-export.config") {
+  visibility = [ "./*" ]
+
+  configs = [ ":llvm-libc-public.config" ]
+
+  defines = [ "LIBC_COPT_PUBLIC_PACKAGING=1" ]
+
+  if (toolchain_environment == "user.libc") {
+    configs += [ ":llvm-libc-function-attr.config" ]
+
+    # libfuzzer also uses libc internally.  By removing the fuzzing
+    # instrumentation we avoid it adding noise to the fuzzing coverage.
+    # TODO(https://fxbug.dev/25073): Once a cleaner solution is found, remove
+    # this.
+    configs += [ "//build/config/zircon:no_fuzzer" ]
+  }
+}
+
+config("llvm-libc-function-attr.config") {
+  visibility = [ "./*" ]
+  defines = [ "LLVM_LIBC_FUNCTION_ATTR=[[gnu::visibility(\"default\")]]" ]
+}
+
+# Every libc_source_set() implicitly depends on this.
+group("libc_source_set.deps") {
+  visibility = [ "./*" ]
+  public_deps = [ "include:headers" ]
+
+  if (is_kernel) {
+    public_deps += [
+      "//zircon/kernel/lib/ktl:headers",
+      "//zircon/kernel/lib/libc:headers",
+    ]
+  } else {
+    # include-preempt/src/__support/CPP/new.h uses <fbl/alloc_checker.h>.
+    public_deps += [ "//zircon/system/ulib/fbl" ]
+  }
+}
+
+# Every libc_test() implicitly depends on this.
+group("libc_test.deps") {
+  visibility = [ "./*" ]
+  testonly = true
+  public_deps = [ ":libc_source_set.deps" ]
+}
+
+# Every libc_test() implicitly depends on one of these two.
+group("zxtest") {
+  visibility = [ "./*" ]
+  testonly = true
+  public_deps = [ "//zircon/system/ulib/zxtest:zxtest-streams" ]
+}
+
+# libc_test() targets with gtest=true use gtest rather than zxtest.  This is
+# only appropriate for code that's not going into "unittests" targets in a
+# subdirectory (which get linked into the zxtest-based libc-unittests), but
+# instead go into separate test() targets that are purely gtest.
+group("gtest") {
+  visibility = [ "./*" ]
+  testonly = true
+  public_configs = [ ":gtest.config" ]
+  public_deps = [
+    "//src/lib/fxl/test:gtest_main",
+    "//third_party/googletest:gmock",
+  ]
+}
+
+# When a libc_test() depends on :gtest, this will come after :testonly.config
+# so it can override it (defines come before cflags on compiler command lines).
+config("gtest.config") {
+  visibility = [ ":gtest" ]
+  defines = [ "LIBC_COPT_TEST_USE_GTEST" ]
+  cflags = [ "-ULIBC_COPT_TEST_USE_ZXTEST" ]
+}
+
+if (current_toolchain == default_toolchain) {
+  import("//build/toolchain/zircon/zircon_toolchain_suite.gni")
+
+  # This introduces a new toolchain suite to mimic the Zircon "user"
+  # toolchain. However, it will only be used to build the C library, so
+  # is named "user.libc" instead.
+  foreach(cpu, standard_fuchsia_cpus) {
+    zircon_toolchain_suite("user.libc_$cpu") {
+      cpu = cpu
+      os = "fuchsia"
+      environment = "user.libc"
+      with_shared = false
+      is_pic_default = true
+      strip = "--strip-sections"
+      configs = [ "//sdk/lib/c:libc_config" ]
+      source_deps = [ "//sdk/lib/c:libc_config_deps" ]
+
+      # NOTE: kernel artifacts currently do not build under fuzzer
+      # variants. This was also true with the Zircon build, but
+      # the Fuchsia build never invoked it with corresponding
+      # variant selectors. Using an exclude_variant_tag is
+      # enough to fix the issue.
+      exclude_variant_tags = [ "fuzzer" ]
+
+      # The Asan-based variants are needed to generate binaries for the SDK.
+      enable_variants = [ "asan" ]
+
+      # TODO(https://fxbug.dev/327442322): Support hwasan for x64 and riscv64.
+      if (target_cpu == "arm64") {
+        enable_variants += [ "hwasan" ]
+      }
+    }
+  }
+} else if (toolchain_variant.base == "//sdk/lib/c:user.libc_$target_cpu") {
+  config("libc_config") {
+    configs = [
+      "//build/config/zircon:user",
+      "//build/config/zircon:user-link",
+      "//build/config:shared_library_config",
+      "//build/config:symbol_no_undefined",
+      "//build/config/zircon:static-libc++",
+    ]
+
+    # TODO(https://fxbug.dev/42055641): Ensure all of libc uses libcalls into the hwasan
+    # runtime for storing frame record info.
+    if (is_fuchsia_hwasan && !is_gcc) {
+      cflags = [
+        "-mllvm",
+        "-hwasan-record-stack-history=libcall",
+
+        # This replaces all hwasan load/store checks with an outlined libcall.
+        # This is done so we can stub out checks on globals which would be
+        # tagged but before we can actually register their tags into shadow.
+        # Note that we could alternatively add NO_ASAN on each function that
+        # accesses a tagged global, but I've found too many instances where
+        # globals can be accessed in the initial execution path and this is
+        # cleaner than adding NO_ASAN on each of them.
+        "-mllvm",
+        "-hwasan-instrument-with-calls=1",
+      ]
+
+      # The instrumented libc++.a doesn't use those same backend switches, so
+      # we can't risk calling into anything there.  Any non-header libc++
+      # dependencies will have to be provided hermetically in libc.
+      ldflags = [ "-nostdlib++" ]
+    }
+  }
+
+  group("libc_config_deps") {
+  }
+  group("libc_config_link_deps") {
+  }
+  group("libc_config_source_deps") {
+    public_deps = [ "include:headers" ]
+  }
+}
+
+# When in a toolchain variant of the Fuchsia base toolchain, find the
+# corresponding toolchain variant of user.libc_$target_cpu to build
+# the C library with it.
+libc_toolchain = sysroot_libc_base_toolchain
+if (toolchain_variant.suffix != "") {
+  libc_toolchain += string_replace(toolchain_variant.suffix, "-fuzzer", "")
+} else {
+  libc_toolchain = system_libc_toolchain
+}
+
+if (current_toolchain == libc_toolchain) {
+  # libc conditionally exports weak sanitizer symbols to satisfy references to
+  # these symbols from libc. They are not meant to be exported, the actual
+  # symbols provided by the sanitizer libraries will be loaded before any user
+  # code needs them. See sanitizer/{asan,hwasan,ubsan}-stubs.cc for detailed
+  # explanations.
+  libc_ifs_exclude = [
+    "__asan*",
+    "__hwasan*",
+    "__ubsan*",
+  ]
+
+  # This builds the actual shared library.  It's only used indirectly via the
+  # "libc" target, see below.
+  shared_library("libc.so") {
+    output_name = "c"
+
+    visibility = [ ":*" ]
+
+    # As a special case, the C library must not be compiled with the default
+    # configs for shared_library() targets, but those or regular source_set() or
+    # static_library() targets. In practice, for the base toolchain, this means
+    # it will be compiled without -fno-rtti, but things get more complicated for
+    # variant toolchains.
+    configs -= default_shared_library_configs
+    configs += default_common_binary_configs
+
+    # At link time and in DT_SONAME, musl is known as libc.so.  But the
+    # (only) place it needs to be installed at runtime is where the
+    # PT_INTERP strings embedded in executables point, which is ld.so.1.
+    install_name = "ld.so.1"
+
+    metadata = {
+      distribution_entries = [
+        {
+          destination = "lib/${toolchain_variant.libprefix}${install_name}"
+          source = rebase_path("$root_out_dir/libc.so", root_build_dir)
+          label = get_label_info(target_name, "label_with_toolchain")
+          elf_runtime_dir = "lib/${toolchain_variant.libprefix}"
+        },
+      ]
+    }
+
+    deps = [
+      ":components",
+      ":legacy-components",
+      "ld:musl-glue",
+      "startup:musl-glue",
+      "startup:shared-only",
+      "threads:musl-glue",
+      "//zircon/third_party/ulib/musl:legacy-impl",
+    ]
+
+    # These things are only used in the new implementation.
+    assert_no_deps = [
+      "dlfcn",
+      "ld",
+      "link",
+    ]
+
+    if (!is_gcc && current_cpu == "riscv64" &&
+        toolchain_variant.tags + [ "instrumented" ] - [ "instrumented" ] !=
+        toolchain_variant.tags) {
+      # TODO(https://fxbug.dev/42072830): There is no R_RISCV_GLOB_DAT and instead
+      # R_RISCV_64 is used for all GOT relocs; this means that they all must be
+      # presumed to have potentially nonzero addends that matter.  The ld.so
+      # bootstrap hack of saving the in-place DT_REL addends on the stack
+      # depends on the total number of addend-using relocs in ld.so being
+      # fairly small.  Luckily, it normally is even with all its plain GOT
+      # slots requiring addends (though in practice they're probably all zero
+      # anyway).  However, with instrumentation that makes runtime outcalls
+      # that number can increase quite a lot.  So when building with such
+      # instrumentation, stick to DT_RELA format where the addend-saving hack
+      # is not required at all.  The profile instrumentation doesn't use
+      # outcalls but happens to increase the number of relocs too.
+      ldflags = [ "-Wl,-z,rela" ]
+    }
+
+    validations = [ ":verify-abi" ]
+  }
+
+  verify_public_symbols("verify-abi") {
+    visibility = [ ":*" ]
+
+    deps = [ ":libc.so" ]
+    current = "$root_out_dir/libc.ifs"
+
+    reference = "libc.ifs"
+    library_name = "libc"
+
+    ifs_args = []
+    foreach(pattern, libc_ifs_exclude) {
+      ifs_args += [ "--exclude=$pattern" ]
+    }
+  }
+
+  # TODO(https://fxbug.dev/342469121): This is in an experimental state.
+  shared_library("new-libc") {
+    visibility = [ ":*" ]
+    testonly = true
+
+    # Use the same SONAME string as the production libc, since the ABI is a
+    # sufficient subset for the needs of (at least most) other shared libraries
+    # linked against the production libc's link stub.
+    ldflags = [ "-Wl,-soname=libc.so" ]
+    install_name = "libc.so"
+
+    public_configs = [ "//build/config/zircon:nolibc" ]
+
+    deps = [
+      ":components",
+      ":legacy-components",
+      "dlfcn",
+      "ld",
+      "link",
+      "startup",
+      "startup:shared-only",
+      "threads",
+      "//zircon/third_party/ulib/musl:common-impl",
+    ]
+
+    validations = [ ":new-libc.verify-abi" ]
+
+    # TODO(https://fxbug.dev/483475945): Work around RBE linking bug.
+    configs += [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+  }
+
+  # TODO(https://fxbug.dev/342469121): Test targets using :new-libc can do so
+  # via this target to fix up manifest issues when going inside an in-package
+  # sandbox as //sdk/lib/ld/test/modules targets do.  $default_toolchain
+  # targets get implicit deps that always lead to the production libc, and
+  # that's pretty much impossible to avoid.  So instead, this can come into the
+  # explicit deps that are earlier in each target's deps list than other paths
+  # to the production libc.  The metadata walks for distribution_entries will
+  # only touch each target in the whole deps graph once.  So when the path
+  # through this target reaches :libc.so _first_, the metadata collection will
+  # yield its distribution_entries followed by the entry here that defangs it.
+  # Since it's only reached via a data_deps arc, :libc.so won't affect the
+  # dependent's link; but that will still count as the first path to it in the
+  # metadata walk.
+  group("new-libc-test") {
+    testonly = true
+
+    public_deps = [
+      ":new-libc",
+      "//sdk/lib/c/startup:nostartfiles",
+      "//sdk/lib/ld:startup",
+    ]
+
+    data_deps = [ ":libc.so" ]
+    metadata = {
+      # There's no way to elide the file from the manifest entirely.  This
+      # rewrites the entry in :libc.so to a new destination that nothing will
+      # look at.
+      distribution_entries = [
+        {
+          destination = "unused/${toolchain_variant.libprefix}libc.so"
+          renamed_source = rebase_path("$root_out_dir/libc.so", root_build_dir)
+          label = get_label_info(":$target_name", "label_with_toolchain")
+        },
+      ]
+    }
+  }
+
+  # TODO(https://fxbug.dev/342469121): At this stage of development, the new
+  # libc is missing some symbols in the production libc ABI.  Rather than
+  # putting a separate new-libc.ifs into the source tree, generate it as a
+  # subset of the libc.ifs that lives in the source tree.
+  new_libc_missing_symbols = [
+    "__tls_get_addr",
+    "_dl_debug_addr",
+    "dl_set_loader_service",
+    "dlclose",
+    "dlerror",
+    "dlinfo",
+    "dlopen",
+    "dlopen_vmo",
+    "dlopen_vmo_vmar",
+    "dlsym",
+  ]
+  toolchain_utils_action("new-libc.ifs") {
+    visibility = [ ":*" ]
+    testonly = true
+
+    sources = [ "libc.ifs" ]
+    outputs = [ "$target_gen_dir/$target_name" ]
+    utils = [ "llvm-ifs" ]
+    script = true
+    args = [ "--output-ifs=" + rebase_path(outputs[0], root_build_dir) ] +
+           rebase_path(sources, root_build_dir)
+
+    foreach(symbol, new_libc_missing_symbols) {
+      args += [ "--exclude=$symbol" ]
+    }
+  }
+
+  verify_public_symbols("new-libc.verify-abi") {
+    visibility = [ ":*" ]
+    testonly = true
+
+    deps = [
+      ":new-libc",
+      ":new-libc.ifs",
+    ]
+    current = "$root_out_dir/libnew-libc.ifs"
+    reference = "$target_gen_dir/new-libc.ifs"
+    library_name = "new-libc"
+
+    ifs_args = []
+    foreach(pattern, libc_ifs_exclude) {
+      ifs_args += [ "--exclude=$pattern" ]
+    }
+  }
+} else {
+  # TODO(https://fxbug.dev/342469121): This is in an experimental state.
+  group("new-libc-test") {
+    testonly = true
+    public_deps = [ ":new-libc-test($libc_toolchain)" ]
+  }
+}
+
+# This gets the actual shared_library() target defined above.
+libc_impl_label = ":libc.so($libc_toolchain)"
+
+source_set("asm-linkage") {
+  visibility = [ "./*" ]
+  public = [ "asm-linkage.h" ]
+  public_deps = [ "//zircon/kernel/lib/arch:headers" ]
+}
+
+source_set("weak") {
+  visibility = [ "./*" ]
+  public = [ "weak.h" ]
+}
+
+libc_test("weak-tests") {
+  visibility = [ ":*" ]
+  sources = [ "weak-tests.cc" ]
+  deps = [ ":weak" ]
+}
+
+# This is used by the sysroot creation (see libc_toolchain.gni and
+# sysroot_entries.gni).  It reaches the actual implementation binary, to get it
+# built and packaged, and also ensures the implementation has been checked
+# against the checked-in libc.ifs file.
+group("libc") {
+  visibility = [
+    ":*",
+    "//zircon/public/sysroot/*",
+    "//zircon/public/sysroot_sdk/*",
+  ]
+
+  # This has to be public_deps so that the shared_library() target's output
+  # files can be input files of the setup and packaging targets that depend on
+  # this "libc" wrapper target.
+  public_deps = [ libc_impl_label ]
+}
+
+group("libc_fshost") {
+  visibility = [ "//bundles/assembly/*" ]
+
+  # This has to be public_deps so that the shared_library() target's output
+  # files can be input files of the setup and packaging targets that depend on
+  # this "libc" wrapper target.
+  public_deps = [ libc_impl_label ]
+}
+
+bootfs_files_for_assembly("bootfs") {
+  deps = [ libc_impl_label ]
+}
+
+# This is the linking stub that binaries are actually linked against.
+# //zircon/public/sysroot is in the implicit deps added to every linking
+# target, and it uses this.
+ifs_shared_library("c") {
+  abi = "libc.ifs"
+}
+
+if (toolchain_environment != "user.libc") {
+  group("static") {
+    public_deps = [ ":static($libc_toolchain)" ]
+  }
+} else {
+  static_library("static") {
+    complete_static_lib = true
+    output_name = "c"
+    public_configs = [
+      "//build/config/zircon:user-executable",
+      "//build/config/fuchsia:static_cpp_standard_library",
+    ]
+    public_deps = [ ":rust-static-libc" ]
+    deps = [
+      ":components",
+      ":legacy-components",
+      "dlfcn",
+      "ld",
+      "link",
+      "startup:static-only",
+      "threads",
+      "//zircon/third_party/ulib/musl:common-impl",
+    ]
+
+    # TODO(https://fxbug.dev/435557561): Work around RBE linking bugs handling
+    # the maze of linker scripts that come with static libc.
+    public_configs += [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+  }
+}
+
+if (is_fuchsia && !is_kernel) {
+  # Believe it.
+  prebuilt_python_dir = "//prebuilt/third_party/python3/$host_platform"
+
+  group("rust-static-libc") {
+    visibility = [ ":static" ]
+    public_configs = [
+      ":rust-static-libc.config",
+      "//build/config/fuchsia:static_rust_standard_library",
+    ]
+    public_deps = [ ":rust-static-linker" ]
+  }
+
+  # The Rust linker will be replaced by the wrapper script in Python.  But the
+  # RBE sandbox requires extra plumbing to be able to run the hermetic prebuilt
+  # Python, and that requires a little sh wrapper script.  The contents could be
+  # in a generated_file() that happens at `gn gen` time, but there's no way to
+  # make a file executable that way.  So another Python script is required to
+  # generate the sh wrapper script required to run the Python wrapper script.
+  action("rust-static-linker") {
+    visibility = [ ":rust-static-libc" ]
+    outputs = [ "$target_gen_dir/rust-static-linker" ]
+    mnemonic = "GENERATE"
+    script = "gen-wrapper.py"
+    args = [ "--output=" + rebase_path(outputs[0], root_build_dir) ] +
+           rebase_path([
+                         "$prebuilt_python_dir/bin/python3",
+                         "rust-static-linker.py",
+                       ],
+                       root_build_dir)
+  }
+
+  compiler_config("rust-static-libc.config") {
+    if (linker == "lld") {
+      assert(!is_gcc)
+      linker_path = "$clang_prefix/lld"
+    } else {
+      assert(is_gcc)
+      assert(linker == "")
+      linker_path = "$gcc_tool_dir/$clang_cpu-elf-ld"
+    }
+
+    inputs = get_target_outputs(":rust-static-linker") + [
+               linker_path,
+               prebuilt_python_dir,
+               "rust-static-linker.py",
+             ]
+    rustflags = [ "-Clinker=" + rebase_path(inputs[0], root_build_dir) ]
+    rust_linker_flags =
+        [ "--wrapper-run=" + rebase_path(linker_path, root_build_dir) ]
+    if (rust_rbe_enable) {
+      rustflags += [ "--remote-inputs=" +
+                     string_join(",", rebase_path(inputs, root_build_dir)) ]
+    }
+
+    # Turn the two-argument forms into single-argument forms to normalize.
+    wrapper_join = [
+      "-l",
+      "-L",
+      "-z",
+    ]
+    wrapper_join_eq = [
+      "--dynamic-linker",
+      "-dynamic-linker",
+    ]
+    foreach(join, wrapper_join) {
+      rust_linker_flags += [ "--wrapper-join=$join" ]
+    }
+    foreach(join_eq, wrapper_join_eq) {
+      rust_linker_flags += [ "--wrapper-join-eq=$join_eq" ]
+    }
+
+    # Match after normalization things what shouldn't be in there, but just oy.
+    pt_interp = "${toolchain_variant.libprefix}ld.so.1"
+    wrapper_elide = [
+      "-lc",
+      "-lfdio",
+      "-lunwind",
+      "-L" + rebase_path(sysroot, root_build_dir),
+      "--sysroot=" + rebase_path(sysroot, root_build_dir),
+      "--dynamic-linker=$pt_interp",
+      "-dynamic-linker=$pt_interp",
+    ]
+    foreach(elide, wrapper_elide) {
+      rust_linker_flags += [ "--wrapper-elide=$elide" ]
+    }
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    "dlfcn:tests",
+    "test:tests",
+  ]
+}
+
+group("bootfs-tests") {
+  testonly = true
+  deps = [ "test:bootfs-tests" ]
+}
+
+group("boot_tests") {
+  testonly = true
+  deps = [ "test:boot_tests" ]
+}

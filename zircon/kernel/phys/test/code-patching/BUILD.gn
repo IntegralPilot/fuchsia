@@ -1,0 +1,190 @@
+# Copyright 2020 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/testing/boot_tests/zbi_test.gni")
+import("//build/zbi/zbi_input.gni")
+import("//zircon/kernel/kernel_package.gni")
+import("//zircon/kernel/lib/code-patching/code-patching.gni")
+import("//zircon/kernel/phys/kernel_elf_binary.gni")
+import("//zircon/kernel/phys/kernel_elf_interp.gni")
+import("//zircon/kernel/phys/test/physload_binary_test.gni")
+import("//zircon/kernel/phys/zbi_executable.gni")
+
+code_patching_hermetic_alternative("multiply_by_two") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "multiply_by_two.S" ]
+  deps = [ "//zircon/kernel/lib/arch" ]
+}
+
+code_patching_hermetic_alternative("multiply_by_ten") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "multiply_by_ten.S" ]
+  deps = [ "//zircon/kernel/lib/arch" ]
+}
+
+code_patching_hermetic_stub("multiply_by_factor") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  case_id_header = "test.h"
+  deps = [
+    ":multiply_by_ten",
+    ":multiply_by_two",
+  ]
+  include_dirs = [ "." ]
+}
+
+source_set("add-one") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  public_deps = [ ":test-api" ]
+  sources = [ "add-one.S" ]
+  deps = [
+    "//zircon/kernel/lib/arch",
+    "//zircon/kernel/lib/code-patching",
+  ]
+}
+
+source_set("test-api") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  public = [ "test.h" ]
+  public_deps = [
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+  ]
+}
+
+zbi_executable("zbi-self-code-patching-test.executable") {
+  testonly = true
+
+  sources = [ "self-code-patching-test.cc" ]
+
+  deps = [
+    ":add-one",
+    ":multiply_by_factor",
+    ":test-api",
+    "..:zbi-test-main",
+    "//src/lib/zbitl",
+    "//zircon/kernel/lib/code-patching",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+    "//zircon/kernel/phys:address-space",
+    "//zircon/kernel/phys:allocation",
+    "//zircon/kernel/phys:elf-image",
+    "//zircon/kernel/phys:zbi-memory",
+    "//zircon/kernel/phys:zbitl-allocation",
+    "//zircon/kernel/phys/lib/memalloc",
+    "//zircon/system/ulib/fbl",
+  ]
+
+  include_dirs = [ "." ]
+}
+
+code_patches("code-patches") {
+  testonly = true
+
+  deps = [ ":zbi-self-code-patching-test.executable" ]
+}
+
+# We use a kernel package to transport code-patches.bin and the patch
+# alternatives, as that is how they will be transported in production.
+kernel_package("code-patches-test") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  deps = [
+    ":code-patches",
+    ":multiply_by_ten",
+    ":multiply_by_two",
+  ]
+}
+
+# This tags a test module with the PT_INTERP matching the test's build ID.
+kernel_elf_interp("elf-code-patching-test.interp") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  deps = [ ":elf-code-patching-test.binary" ]
+}
+
+kernel_elf_binary("elf-code-patching-test-add-one") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  install_name = "add-one"
+
+  configs += [ "//zircon/kernel/phys:phys-elf-module.config" ]
+  ldflags = [ "-Wl,-e,AddOne" ]
+
+  deps = [
+    ":add-one",
+    ":elf-code-patching-test.interp",
+    "//zircon/kernel/phys:boot-options",
+  ]
+}
+
+kernel_elf_binary("elf-code-patching-test-multiply") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  install_name = "multiply_by_factor"
+
+  configs += [ "//zircon/kernel/phys:phys-elf-module.config" ]
+  ldflags = [ "-Wl,-e,multiply_by_factor" ]
+
+  deps = [
+    ":elf-code-patching-test.interp",
+    ":multiply_by_factor",
+    "//zircon/kernel/phys:boot-options",
+  ]
+}
+
+physload_binary_test("elf-code-patching-test") {
+  visibility = [ ":*" ]
+
+  has_patches = false
+
+  sources = [ "elf-code-patching-test.cc" ]
+  deps = [
+    ":test-api",
+    "//src/lib/zbitl",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+    "//zircon/kernel/phys:elf-image",
+    "//zircon/kernel/phys:kernel-package",
+    "//zircon/kernel/phys:phys-elf-loading",
+    "//zircon/kernel/phys:symbolize",
+  ]
+
+  data_deps = [
+    ":elf-code-patching-test-add-one($phys_toolchain)",
+    ":elf-code-patching-test-multiply($phys_toolchain)",
+  ]
+}
+
+zbi_test("zbi-self-code-patching-test") {
+  args = []
+  deps = [
+    ":code-patches-test($phys_toolchain)",
+    ":zbi-self-code-patching-test.executable($phys_toolchain)",
+  ]
+}
+
+group("code-patching") {
+  testonly = true
+
+  deps = [
+    ":elf-code-patching-test",
+    ":zbi-self-code-patching-test",
+  ]
+}

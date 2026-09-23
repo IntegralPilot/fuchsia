@@ -1,0 +1,163 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// The fuchsia.net.routes.admin API is split into two variants, one supporting
+// IPv4 routes and the other supporting IPv6 routes. The two halves are a mirror
+// image of one another, and should be kept in sync moving forward. Edits
+// made here should also be applied to "ipv6.fidl".
+// LINT.IfChange
+library fuchsia.net.routes.admin;
+
+using fuchsia.net.resources;
+using fuchsia.net.routes;
+
+/// Vends isolated administrative access to the system's IPv4 routing table.
+///
+/// A main route table is accessible through the discoverable [`RouteTableV4`]
+/// protocol. Other tables can be installed using the `NewRouteTable` method
+/// on [`RouteTableProviderV4`]. The [`RouteTableV4`] also encodes the lifetime
+/// of the underlying route table, dropping the client end of the protocol
+/// causes the underlying route table to be removed unless it is detached. The
+/// main table is detached by default.
+@discoverable
+closed protocol RouteTableV4 {
+    compose BaseRouteTable;
+
+    /// Creates an empty route set.
+    ///
+    /// + request `route_set` grants access to the [`RouteSetV4`] protocol.
+    strict NewRouteSet(resource struct {
+        route_set server_end:RouteSetV4;
+    });
+};
+
+/// This protocol allows the client to create route tables.
+@discoverable
+closed protocol RouteTableProviderV4 {
+    /// Creates a new route table. If the client end of the `provider` is
+    /// closed, the route table is removed (unless detached).
+    strict NewRouteTable(resource struct {
+        provider server_end:RouteTableV4;
+        options @generated_name("RouteTableOptionsV4") table {
+            /// This name is optional and only used for debugging purposes.
+            1: name fuchsia.net.routes.TableName;
+        };
+    });
+
+    /// Gets the interface-local route table for this interface.
+    ///
+    /// + request credential of the interface to get local route table.
+    /// - response client end of the `RouteTableV4` protocol if successfully.
+    ///
+    /// This table is only removed after the interface is removed AND all
+    /// outstanding `RouteTableV4` channels are closed.
+    ///
+    /// Calling detach on the route table is a no-op.
+    strict GetInterfaceLocalTable(resource struct {
+        credential fuchsia.net.resources.ProofOfInterfaceAuthorization;
+    }) -> (resource struct {
+        route_table client_end:RouteTableV4;
+    }) error GetInterfaceLocalTableError;
+};
+
+/// Provides mutable access over a set of system's IPv4 routes.
+///
+/// The system maintains a single global routing table. A route set offers an
+/// isolated window into a subset of the global routing table: clients are free
+/// to manage the routes within their own route set, but not the route set of
+/// others. Thus the global routing table represents the union of all existing
+/// route sets. A route must be removed from all route sets to which it belongs
+/// before it will be removed from the global table.
+///
+/// This protocol encodes the lifetime of the route set. Closing the client end
+/// removes the route set, and will also remove any routes that were
+/// solely-owned by this route set.
+///
+/// Note that the system reserves the right to remove routes out from underneath
+/// this route set. This will always manifest as a `removed` event on the
+/// [`fuchsia.net.routes/WatcherV4`] protocol.
+///
+/// If the route table backing this route set is removed, then this protocol
+/// will be closed with a `ZX_ERR_UNAVAILABLE` epitaph.
+closed protocol RouteSetV4 {
+    /// Authenticate this route set to manage routes on the provided interface.
+    /// Authentication is valid for the lifetime of the route set.
+    ///
+    /// + request `interface` the authentication credential for an interface.
+    strict AuthenticateForInterface(resource struct {
+        credential fuchsia.net.resources.ProofOfInterfaceAuthorization;
+    }) -> () error AuthenticateForInterfaceError;
+
+    /// Adds a route to this route set.
+    ///
+    /// + request `route` the route to add.
+    /// - response `did_add` true iff the route was added to this `RouteSet`
+    ///            as a result of this call.
+    strict AddRoute(resource struct {
+        route fuchsia.net.routes.RouteV4;
+    }) -> (struct {
+        did_add bool;
+    }) error RouteSetError;
+
+    /// Removes a route from this route set.
+    ///
+    /// Note that if this route also exists other route sets, it will not be
+    /// removed from the global routing table.
+    ///
+    /// + request `route` the route to remove.
+    /// - response `did_remove` true iff the route was removed from this
+    ///            `RouteSet` as a result of this call.
+    strict RemoveRoute(resource struct {
+        route fuchsia.net.routes.RouteV4;
+    }) -> (struct {
+        did_remove bool;
+    }) error RouteSetError;
+};
+
+/// Gives isolated access to the system's policy routing rules.
+@discoverable
+closed protocol RuleTableV4 {
+    /// Returns an empty rule set at requested priority.
+    ///
+    /// Clients are free to manage the rules within their own rule set, but not
+    /// the rule set of others. Only one rule set is allowed at each `priority`
+    /// level. Channel is closed with `ZX_ERR_ALREADY_EXISTS` if there's already
+    /// a rule set at the given `priority`.
+    ///
+    /// + request `priority` the priority of this `RuleSetV4`, all rule sets are
+    ///   globally ordered according to this number.
+    /// + request `rule_set` grants access to the `RuleSetV4` protocol.
+    strict NewRuleSet(resource struct {
+        priority fuchsia.net.routes.RuleSetPriority;
+        rule_set server_end:RuleSetV4;
+    });
+};
+
+/// Provides mutable access over a set of the system's IPv4 route rules.
+///
+/// A `RuleSet` has a priority and a rule has an index. A global order among the
+/// rules is determined first by the priority of the `RuleSet` the rule belongs
+/// to, and then the index of the rule inside the `RuleSet`.
+///
+/// This protocol encodes the lifetime of the rule set. Closing the client end
+/// removes the rule set, and all the rules that are owned by the rule set.
+closed protocol RuleSetV4 {
+    compose BaseRuleSet;
+
+    /// Adds a rule to this rule set.
+    ///
+    /// If there is already a rule at the provided `index`, `RULE_ALREADY_EXISTS`
+    /// is returned.
+    ///
+    /// + request `index` where to insert the rule.
+    /// + request `matcher` the matcher of the rule.
+    /// + request `action` action of the rule.
+    strict AddRule(resource struct {
+        index fuchsia.net.routes.RuleIndex;
+        matcher fuchsia.net.routes.RuleMatcherV4;
+        action fuchsia.net.routes.RuleAction;
+    }) -> () error RuleSetError;
+};
+
+// LINT.ThenChange(ipv6.fidl)

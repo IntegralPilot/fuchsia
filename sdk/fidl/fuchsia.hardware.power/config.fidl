@@ -1,0 +1,136 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// `PowerElementConfiguration` and types contained in that struct define
+/// the configuration that drivers can expect from board drivers. This
+/// configuration information is intended to be reflected into the
+/// power management system by the receivers of that configuration.
+///
+/// `PowerTokenService` is what drivers should implement to provide their
+/// children with access to the driver's power elements.
+library fuchsia.hardware.power;
+
+using zx;
+
+const MAX_NAME_LENGTH uint16 = 63;
+
+/// This means we could have up to 128 power levels, which seems like more than
+/// enough.
+const MAX_TRANSITIONS uint16 = 127;
+
+/// Should be MAX_TRANSITIONS + 1
+const MAX_LEVELS uint16 = 128;
+
+const MAX_DEPENDENCIES uint16 = 128;
+
+/// The length of time it takes to move to a power level.
+/// + `target_level` is the power level we're moving to.
+/// + `latency_us` is the time it takes to move to the level in microseconds.
+type Transition = table {
+    1: target_level uint8;
+    2: latency_us uint32;
+};
+
+type FrameworkElementLevels = strict enum {
+    OFF = 0;
+    ON = 1;
+};
+
+/// A zero-indexed set of levels that a device can assume.
+/// + `level` is the zero-indexed level of this `PowerLevel`.
+/// + `name` is a human-readable label for this `PowerLevel`, used only for
+///   debugging.
+/// + `transitions` describes the levels that are valid transitions from this
+///   `PowerLevel`.
+type PowerLevel = table {
+    1: level uint8;
+    2: name string:MAX_NAME_LENGTH;
+    3: transitions vector<Transition>:MAX_TRANSITIONS;
+};
+
+/// Set of `PowerLevel`s and a human-readable identifier. A `PowerLevel` itself
+/// contains information about valid transitions out of that level.
+type PowerElement = table {
+    1: name string:MAX_NAME_LENGTH;
+    2: levels vector<PowerLevel>:MAX_LEVELS;
+};
+
+/// Represents a dependency between two power levels of two different
+/// `PowerElement`s.
+type LevelTuple = table {
+    1: child_level uint8;
+    2: parent_level uint8;
+};
+
+/// Describes the relationship between the `PowerLevel`s of two
+/// `PowerElement`s. `child` is the name of the `PowerElement` which has
+/// `PowerLevel`s that depend on `parent`.
+/// + `child` is the name for a `PowerElement` which a driver owns.
+/// + `parent` is the name for a `PowerElement` which a driver has access to
+/// + `level_deps` is the map of level dependencies from `child` to `parent`.
+type PowerDependency = table {
+    1: child string:MAX_NAME_LENGTH;
+    2: parent ParentElement;
+    3: level_deps vector<LevelTuple>:MAX_LEVELS;
+};
+
+/// Contains the `PowerElement` description and any dependencies it has on
+/// other `PowerElement`s.
+type PowerElementConfiguration = table {
+    1: element PowerElement;
+    2: dependencies vector<PowerDependency>:MAX_DEPENDENCIES;
+};
+
+const MAX_POWER_ELEMENTS uint16 = 32;
+
+/// The configuration for a component's power elements.
+type ComponentPowerConfiguration = struct {
+    power_elements vector<PowerElementConfiguration>:MAX_POWER_ELEMENTS;
+};
+
+// NOTE: This is _not_ a complete list of SAG elements. This enum only lists
+// the elements supported by the power support library. For a complete list
+// of SAG elements, see `fuchsia.power.system.PowerElements`.
+type SagElement = strict enum {
+    EXECUTION_STATE = 1;
+    APPLICATION_ACTIVITY = 4;
+};
+
+/// Represents the power elements related to controlling the CPU. This is an
+/// enum with a single variant to add flexibility for future addition of more
+/// elements related to CPU power state.
+type CpuPowerElement = strict enum {
+    CPU = 1;
+};
+
+/// Identifier for an element that is another element's parent, in other words
+/// an element that the other element depends upon.
+type ParentElement = strict union {
+    /// The parent element is one of SAG's elements and the access token should
+    /// be obtained from the appropriate SAG-related protocol.
+    1: sag SagElement;
+
+    /// The parent element's access token should be available from
+    /// `/svc/fuchsia.hardware.power.PowerTokenProvider/{instance_name}`.
+    2: instance_name string:MAX_NAME_LENGTH;
+
+    /// The parent element comes from the fuchsia.power.system/CpuElementManager
+    /// protocol.
+    3: cpu_control CpuPowerElement;
+};
+
+@discoverable
+open protocol PowerTokenProvider {
+    /// Returns a token which can be used with `fuchsia.power.broker` APIs to
+    /// create a relationship between this driver's power element(s) and the
+    /// power element this token is associated with.
+    flexible GetToken() -> (resource struct {
+        handle zx.Handle:EVENT;
+    }) error zx.Status;
+};
+
+@available(added=HEAD)
+service PowerTokenService {
+    token_provider client_end:PowerTokenProvider;
+};

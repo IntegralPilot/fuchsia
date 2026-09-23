@@ -1,0 +1,105 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/testing/boot_tests/boot_test.gni")
+import("//build/testing/environments.gni")
+import("linux_test_initramfs.gni")
+
+# Defines a boot test that runs under pKVM, specifically that provided by
+# Android's GKI Linux prebuilt within QEMU TCG.
+#
+# If /bin/firmware is present in the initramfs, it will be treated as pKVM
+# firmware (e.g., pvmfw). If /data/dtbo is present, it will be used as a
+# devicetree overlay.
+#
+# Parameters:
+#
+#  * init:
+#    - Required: A linux_test_init() target (e.g.,
+#      //src/microfuchsia/testing:linux-test-init-crosvm-exec), responsible for
+#      booting the images in the associated product bundle - found at runtime at
+#      /data/kernel and /data/ramdisk - and either facilitating its own boot
+#      test success string printing or deferring to that done by the booted
+#      images.
+#    - Type: label
+#
+#  * product_bundle
+#    - Required: A target transitively dependent on a product bundle, from
+#      which the test will source its boot shim and ZBI to run under crosvm.
+#      In particular, this may be another boot_test() target.
+#    - Type: label
+#
+#  * deps
+#    - Optional: Additional resources to assemble into the initramfs.
+#    - Type: list(label)
+#
+#  * visibility
+#    - Optional: The usual GN meanings.
+#
+template("gki_pkvm_boot_test") {
+  assert(current_cpu == "arm64",
+         "pKVM is not yet supported on non-arm64 architectures")
+
+  assert_ctx = "gki_pkvm_boot_test($target_name)"
+  assert(defined(invoker.init), "$assert_ctx: `init` must be defined")
+  assert(defined(invoker.product_bundle),
+         "$assert_ctx: `product_bundle` must be defined")
+
+  main_target = target_name
+  initramfs_target = "${target_name}.initramfs"
+
+  linux_test_initramfs(initramfs_target) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "init_mode",
+                             "visibility",
+                           ])
+    if (defined(visibility)) {
+      visibility += [ ":*" ]
+    }
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [
+      "//src/microfuchsia/testing:crosvm",
+      "//src/microfuchsia/testing:linux-runtime-sysroot",
+      invoker.init,
+      invoker.product_bundle,
+    ]
+  }
+
+  boot_test(main_target) {
+    qemu_kernel = "//src/microfuchsia/testing:gki"
+    ramdisk = ":$initramfs_target"
+    environments = [
+      {
+        dimensions = {
+          device_type = device_types.qemu
+        }
+
+        emulator = {
+          # In order to use GKI's pKVM, we need pure emulation and cannot rely
+          # on nested virtualization.
+          name = "TCG"
+          accel = "none"
+
+          # The kernel in this case is Linux, which we naturally do not control.
+          # Accordingly we need to sidecar core kernel arguments here.
+          kernel_args = [
+            # Wires up serial to the QEMU console.
+            "console=ttyAMA0",
+
+            # Enables pKVM.
+            "kvm-arm.mode=protected",
+
+            # Prevents the system from boot-looping once a boot test is
+            # finished.
+            "panic=0",
+          ]
+        }
+      },
+    ]
+  }
+}

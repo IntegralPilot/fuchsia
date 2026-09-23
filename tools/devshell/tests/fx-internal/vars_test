@@ -1,0 +1,617 @@
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../../lib/vars.sh || exit $?
+
+BT_FILE_DEPS=(
+  "prebuilt/third_party/jq/${HOST_PLATFORM}/bin/jq"
+  "tools/devshell/jq.fx"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/platform.sh"
+)
+
+# Replace fx-regenerator with stub.
+unset -f fx-regenerator
+
+function fx-regenerator {
+    ln -sf "${BT_TEMP_DIR}/${BUILD_DIR}"/rust-project.json "${FUCHSIA_DIR}"/rust-project.json
+    ln -sf "${BT_TEMP_DIR}/${BUILD_DIR}"/compile_commands.json "${FUCHSIA_DIR}"/compile_commands.json
+}
+
+BT_SET_UP() {
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  local _BUILD_DIR="out/default"
+  echo "${_BUILD_DIR}" > "${BT_TEMP_DIR}/.fx-build-dir"
+  _create_build_dir "$_BUILD_DIR"
+
+  ffx="$(btf::make_installed_hosttools_mock ffx)"
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/host-tool"
+  cat > "${BT_TEMP_DIR}/tools/devshell/host-tool.mock_side_effects" <<EOF
+    if [[ "\$2" == "ffx" ]]; then
+      shift
+      "${ffx}" "\$@"
+    fi
+EOF
+}
+
+_create_build_dir() {
+  local _BUILD_DIR="$1"
+  mkdir -p "${BT_TEMP_DIR}/${_BUILD_DIR}"
+  touch "${BT_TEMP_DIR}/${_BUILD_DIR}/args.gn"
+  touch "${BT_TEMP_DIR}/${_BUILD_DIR}/fx.config"
+}
+
+TEST_environment() {
+  # This variable should be empty.
+  BT_EXPECT_EMPTY "${devshell_lib_dir}"
+}
+
+TEST_fx-warn() {
+  BT_ASSERT_FUNCTION_EXISTS fx-warn
+
+  # Capture stderr.
+  local result
+  result=$( fx-warn some warning 2>&1 )
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${result}" "some warning"
+}
+
+TEST_fx-error() {
+  BT_ASSERT_FUNCTION_EXISTS fx-error
+
+  # Capture stderr.
+  local result
+  result=$( fx-error some error 2>&1 )
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${result}" "some error"
+}
+
+TEST_fx-change-build-dir() {
+  BT_ASSERT_FUNCTION_EXISTS fx-change-build-dir
+
+  local -r BUILD_DIR="out/nondefault"
+  _create_build_dir "$BUILD_DIR"
+  fx-change-build-dir "${BUILD_DIR}"
+
+  local -r EXPECTED_FILE="${FUCHSIA_DIR}/.fx-build-dir"
+  BT_EXPECT_FILE_CONTAINS "${EXPECTED_FILE}" "${BUILD_DIR}"
+}
+
+TEST_fx-change-build-dir-links-artifacts() {
+  BT_ASSERT_FUNCTION_EXISTS fx-change-build-dir
+
+  local -r BUILD_DIR="out/nondefault"
+  _create_build_dir "$BUILD_DIR"
+
+  touch "${BT_TEMP_DIR}/${BUILD_DIR}/compile_commands.json"
+  touch "${BT_TEMP_DIR}/${BUILD_DIR}/rust-project.json"
+
+  fx-change-build-dir "${BUILD_DIR}"
+
+  local -r EXPECTED_FILE="${FUCHSIA_DIR}/.fx-build-dir"
+  BT_EXPECT_FILE_CONTAINS "${EXPECTED_FILE}" "${BUILD_DIR}"
+
+  # The build directory's compile_commands.json and rust-project.json should
+  # now be symlinked to the source root.
+  BT_EXPECT_FILE_EXISTS "${FUCHSIA_DIR}/compile_commands.json"
+  BT_EXPECT_FILE_EXISTS "${FUCHSIA_DIR}/rust-project.json"
+}
+
+TEST_fx-build-dir-if-present() {
+  BT_ASSERT_FUNCTION_EXISTS fx-build-dir-if-present
+
+  FUCHSIA_BUILD_DIR=""
+  local -r FX_BUILD_DIR_FILE_PATH="${FUCHSIA_DIR}/.fx-build-dir"
+  local -r BUILD_DIR_PATH="out/mybuild"
+  echo "${BUILD_DIR_PATH}" > "${FX_BUILD_DIR_FILE_PATH}"
+
+  BT_EXPECT fx-build-dir-if-present
+
+  # Expect an absolute path.
+  BT_EXPECT_EQ "${FUCHSIA_BUILD_DIR}" "${FUCHSIA_DIR}/${BUILD_DIR_PATH}"
+}
+
+TEST_fx-build-config-load() {
+  BT_ASSERT_FUNCTION_EXISTS fx-build-config-load
+
+  FUCHSIA_BUILD_DIR="out"
+  local -r EXPECT_BUILD_DIR="${FUCHSIA_DIR}/${FUCHSIA_BUILD_DIR}"
+  mkdir -p "${EXPECT_BUILD_DIR}"
+  local -r FX_CONFIG_FILE_PATH="${EXPECT_BUILD_DIR}/fx.config"
+
+  # Confirm testvar is not set before setting up the config file.
+  BT_EXPECT_EQ "${testvar}" ""
+  local -r TESTVAR_VALUE="my_value"
+  echo "testvar=${TESTVAR_VALUE}" > "${FX_CONFIG_FILE_PATH}"
+
+  BT_EXPECT fx-build-config-load
+
+  # fx-build-config-load ensures FUCHSIA_BUILD_DIR is an absolute path.
+  BT_EXPECT_EQ "${FUCHSIA_BUILD_DIR}" "${EXPECT_BUILD_DIR}"
+
+  # fx-build-config-load should have loaded testvar from fx.config.
+  BT_EXPECT_EQ "${testvar}" "${TESTVAR_VALUE}" \
+    "testvar has unexpected value (${testvar})"
+}
+
+TEST_fx-rbe-enabled-exists() {
+  BT_ASSERT_FUNCTION_EXISTS fx-rbe-enabled
+}
+
+TEST_fx-rbe-enabled-default-disabled() {
+  local -r BUILD_DIR="out/nondefault-2"
+  _create_build_dir "${BUILD_DIR}"
+  fx-change-build-dir "${BUILD_DIR}"
+  local -r RBE_SETTINGS_FILE="${BT_TEMP_DIR}/${BUILD_DIR}"/rbe_settings.json
+
+  # RBE is default disabled.
+  echo "" > "${RBE_SETTINGS_FILE}"
+  BT_EXPECT_FAIL fx-rbe-enabled
+}
+
+TEST_fx-rbe-enabled-disabled() {
+  local -r BUILD_DIR="out/nondefault-3"
+  _create_build_dir "${BUILD_DIR}"
+  fx-change-build-dir "${BUILD_DIR}"
+  local -r RBE_SETTINGS_FILE="${BT_TEMP_DIR}/${BUILD_DIR}"/rbe_settings.json
+
+  # RBE is disabled.
+  echo '{ "final": { "needs_reproxy": false }}' > "${RBE_SETTINGS_FILE}"
+  BT_EXPECT_FAIL fx-rbe-enabled
+}
+
+TEST_fx-rbe-enabled-enabled() {
+  local -r BUILD_DIR="out/nondefault-4"
+  _create_build_dir "${BUILD_DIR}"
+  fx-change-build-dir "${BUILD_DIR}"
+  local -r RBE_SETTINGS_FILE="${BT_TEMP_DIR}/${BUILD_DIR}"/rbe_settings.json
+
+  # RBE is disabled.
+  echo '{ "final": { "needs_reproxy": true }}' > "${RBE_SETTINGS_FILE}"
+  BT_EXPECT fx-rbe-enabled
+}
+
+# Test parsing valid and invalid device names passed to "fx -t"
+TEST_fx-getdeviceraw-and-isvaliddevice() {
+  # Use subshells (parenthesis) in calls to get-device-raw to avoid premature exit
+  local valids=(
+      "127.0.0.1" "127.0.0.1:8022"
+      ":8122"
+      "strut-wind-ahead-turf" "strut-wind-ahead-turf:8111"
+      "[::1]:22" "[fe80::7:8%eth0]:222" "[fe80::7:8%eth0]"
+      "[fe80::4607:bff:fe68:41c9%zircon1-4]"
+      # no brackets but also no port:
+      "::1" "::1:22" "fe80::7:8%eth0"
+      # serial and id:
+      "serial:EM-C0B2F2D96" "serial:12345" "serial:my-target_device.0"
+      "id:EM-C0B2F2D96" "id:12345" "id:my-target_device.0"
+      # valid uart targets:
+      "uart:/dev/ttyUSB0" "uart:/tmp/pontis/serial-0403-6001" "uart:user" "uart:1234"
+  )
+  for valid in "${valids[@]}"; do
+    BT_EXPECT is-valid-device "${valid}"
+    echo "${valid}" > "${ffx}.mock_stdout"
+    BT_EXPECT "(" get-device-raw ")" > /dev/null
+  done
+  local invalids=(
+      # no brackets but has a port
+      "fe80::7:8%eth0:222"
+      # invalid host names:
+      "AAbbb" "aa_bbb" "xyz@bla.com"
+      # more than 7 colons:
+      "[2001:db8:aaaa:bbbb:cccc:dddd:0:1:0]" "[2001:db8:aaaa:bbbb:cccc:dddd:0:1:44f%enx44070ba0044e]"
+      # invalid port numbers:
+      ":122333" ":232a" ":-1"
+      # invalid serial and id:
+      "serial:" "id:" "serial:foo@bar" "id:foo#bar" "serial:foo/bar" "id:foo:bar"
+      # invalid uart targets:
+      "uart:" "uart:   "
+    )
+  for invalid in "${invalids[@]}"; do
+    BT_EXPECT_FAIL is-valid-device "${invalid}"
+    echo "${invalid}" > "${ffx}.mock_stdout"
+    BT_EXPECT_FAIL "("get-device-raw ")" 2> /dev/null
+  done
+}
+
+# Test get-device-name with various device formats
+TEST_fx-get-device-name() {
+  local targets=(
+      "strut-wind-ahead-turf:8111" "strut-wind-ahead-turf"
+      "127.0.0.1:8022" "127.0.0.1"
+      "[fe80::7:8%eth0]:222" "[fe80::7:8%eth0]"
+      "serial:EM-C0B2F2D96" "serial:EM-C0B2F2D96"
+      "serial:12345" "serial:12345"
+      "id:EM-C0B2F2D96" "id:EM-C0B2F2D96"
+      "id:12345" "id:12345"
+      "uart:/dev/ttyUSB0" "uart:/dev/ttyUSB0"
+      "uart:1234" "uart:1234"
+  )
+  for ((i=0; i<${#targets[@]}; i+=2)); do
+    local input="${targets[i]}"
+    local expected="${targets[i+1]}"
+    echo "${input}" > "${ffx}.mock_stdout"
+    BT_EXPECT_EQ "$(get-device-name)" "${expected}"
+  done
+}
+
+# Test extracting port from device name passed to "fx -t"
+TEST_fx-get-device-ssh-port() {
+  FUCHSIA_NODENAME="127.0.0.1"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-ssh-port)" ""
+
+  FUCHSIA_NODENAME="127.0.0.1:8811"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-ssh-port)" "8811"
+
+  FUCHSIA_NODENAME=":8812"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-ssh-port)" "8812"
+
+  FUCHSIA_NODENAME="[::1]"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-ssh-port)" ""
+
+  FUCHSIA_NODENAME="[::1]:22"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-ssh-port)" "22"
+
+  FUCHSIA_NODENAME="strut-wind-ahead-turf:822"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-ssh-port)" "822"
+
+  FUCHSIA_NODENAME="[2001:db8:aaaa:bbbb:cccc:dddd:0:44f%enx44070ba0044e]"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-ssh-port)" ""
+
+  # seven colons inside the brackets plus the one prefixing the port, so 8 total
+  FUCHSIA_NODENAME="[2001:db8:aaaa:bbbb:cccc:dddd:0:44f%enx44070ba0044e]:22"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-ssh-port)" "22"
+}
+
+TEST_fx-get-device-addr-resource() {
+  FUCHSIA_NODENAME="127.0.0.1"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-resource)" "127.0.0.1"
+
+  FUCHSIA_NODENAME="127.0.0.1:8811"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-resource)" "127.0.0.1"
+
+  FUCHSIA_NODENAME="[::1]"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-resource)" "[::1]"
+
+  FUCHSIA_NODENAME="[::1]:22"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-resource)" "[::1]"
+
+  FUCHSIA_NODENAME="[2001:db8:aaaa:bbbb:cccc:dddd:0:44f%enx44070ba0044e]"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-resource)" "[2001:db8:aaaa:bbbb:cccc:dddd:0:44f%enx44070ba0044e]"
+}
+
+TEST_fx-get-device-addr-url() {
+  FUCHSIA_NODENAME="127.0.0.1"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-url)" "127.0.0.1"
+
+  FUCHSIA_NODENAME="127.0.0.1:8811"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-url)" "127.0.0.1"
+
+  FUCHSIA_NODENAME="[::1]"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-url)" "[::1]"
+
+ FUCHSIA_NODENAME="[::1]:22"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-url)" "[::1]"
+
+ FUCHSIA_NODENAME="[2001:db8:aaaa:bbbb:cccc:dddd:0:44f%enx44070ba0044e]"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  BT_EXPECT_EQ "$(get-device-addr-url)" "[2001:db8:aaaa:bbbb:cccc:dddd:0:44f%25enx44070ba0044e]"
+}
+
+# `ffx target default get` gives stderr when no default target is set.
+# This stderr should be suppressed.
+TEST_fx-unset-device-stderr() {
+    cat >"${ffx}.mock_side_effects" <<INPUT
+      case "\$@" in
+        *"target list --format a"*)
+          echo '[fe80::dd57:127d:366d:28bb%5]:22'
+          echo '127.0.0.1:34715'
+        ;;
+        *)
+          echo "No default target set." >&2
+          exit 1
+        ;;
+      esac
+INPUT
+  BT_EXPECT_EQ "$(get-device-raw 2>&1)" ""
+  BT_EXPECT_EQ "$(get-device-name 2>&1)" ""
+  BT_EXPECT_EQ "$(get-device-ssh-port 2>&1)" ""
+}
+
+TEST_fx-export-device-address() {
+  unset FUCHSIA_NODENAME
+  unset FX_DEVICE_NAME
+  unset FX_DEVICE_ADDR
+  unset FX_SSH_ADDR
+  unset FX_SSH_PORT
+
+  export FUCHSIA_NODENAME="[::2%lo0]:1234"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+
+  fx-export-device-address
+
+  BT_EXPECT_EQ "${FX_DEVICE_NAME}" "[::2%lo0]"
+  BT_EXPECT_EQ "${FX_DEVICE_ADDR}" "::2%lo0"
+  BT_EXPECT_EQ "${FX_SSH_ADDR}" "[::2%lo0]"
+  BT_EXPECT_EQ "${FX_SSH_PORT}" "1234"
+
+  unset -f fx-target-finder-resolve
+  fx-target-finder-resolve() {
+    echo "::3%lo0:1234"
+  }
+
+  export FUCHSIA_NODENAME="foo-bar-baz-quux:1234"
+  echo "${FUCHSIA_NODENAME}" > "${ffx}.mock_stdout"
+  fx-export-device-address
+
+  BT_EXPECT_EQ "${FX_DEVICE_NAME}" "foo-bar-baz-quux"
+  BT_EXPECT_EQ "${FX_DEVICE_ADDR}" "::3%lo0"
+  BT_EXPECT_EQ "${FX_SSH_ADDR}" "[::3%lo0]"
+  BT_EXPECT_EQ "${FX_SSH_PORT}" "1234"
+}
+
+# Ensure that fx-zbi uses FUCHSIA_ZBI_COMPRESSION
+TEST_fx-zbi() {
+  export FUCHSIA_ZBI_COMPRESSION="zstd.max"
+  export FUCHSIA_BUILD_DIR="${BT_TEMP_DIR}/out/default"
+  local zbi="${FUCHSIA_BUILD_DIR}/host/zbi"
+  btf::make_mock "${zbi}"
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts"
+  cat > "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts.mock_side_effects" << "EOF"
+if [[ "$@" == "--name zbi --expect-one tools" ]] ; then
+  echo "host/zbi"
+fi
+EOF
+
+  BT_EXPECT fx-zbi
+  source "${zbi}.mock_state"
+  BT_EXPECT_EQ "${BT_MOCK_ARGS[1]}" "--compressed=${FUCHSIA_ZBI_COMPRESSION}" \
+    "Expected a --compressed=${FUCHSIA_ZBI_COMPRESSION} argument to zbi binary, got '${BT_MOCK_ARGS[@]:1}'"
+}
+
+# Ensure that fx-zbi-default-compression doesn't use FUCHSIA_ZBI_COMPRESSION.
+TEST_fx-zbi-default-compression() {
+  export FUCHSIA_ZBI_COMPRESSION="zstd.max"
+  export FUCHSIA_BUILD_DIR="${BT_TEMP_DIR}/out/default"
+  local zbi="${FUCHSIA_BUILD_DIR}/host/zbi"
+  btf::make_mock "${zbi}"
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts"
+  cat > "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts.mock_side_effects" << "EOF"
+if [[ "$@" == "--name zbi --expect-one tools" ]] ; then
+  echo "host/zbi"
+fi
+EOF
+
+  BT_EXPECT fx-zbi-default-compression
+  source "${zbi}.mock_state"
+  BT_EXPECT_EQ "${#BT_MOCK_ARGS[@]}" "1" \
+    "Expected no args to zbi binary, got '${BT_MOCK_ARGS[@]:1}'"
+}
+
+TEST_fx-is-bringup() {
+  export FUCHSIA_BUILD_DIR="${BT_TEMP_DIR}"
+  echo 'import("//products/bringup.gni")' > "${BT_TEMP_DIR}/args.gn"
+  BT_EXPECT fx-is-bringup
+
+  echo '  import("//products/bringup.gni")' > "${BT_TEMP_DIR}/args.gn"
+  BT_EXPECT fx-is-bringup
+
+  echo 'import("foo")  import("//products/bringup.gni")' > "${BT_TEMP_DIR}/args.gn"
+  BT_EXPECT fx-is-bringup
+
+  echo 'import("//products/core.gni")' > "${BT_TEMP_DIR}/args.gn"
+  BT_EXPECT_FAIL fx-is-bringup
+
+  echo '#import("//products/bringup.gni")' > "${BT_TEMP_DIR}/args.gn"
+  BT_EXPECT_FAIL fx-is-bringup
+
+  echo 'import("//products/core.gni") #import("//products/bringup.gni")' > "${BT_TEMP_DIR}/args.gn"
+  BT_EXPECT_FAIL fx-is-bringup
+}
+
+# Ensure that fx-command-run can find and execute a command defined in a
+# metadata (*.fx) file.
+TEST_fx-command-run() {
+  local mycmd="${BT_TEMP_DIR}/prebuilt/third_party/mycmdexec"
+  btf::make_mock "${mycmd}"
+  local mymetadata="${BT_TEMP_DIR}/tools/devshell/mycmd.fx"
+  echo "#### EXECUTABLE=\${PREBUILT_3P_DIR}/mycmdexec" > "${mymetadata}"
+  BT_EXPECT fx-command-run mycmd myarg1
+  source "${mycmd}.mock_state"
+  BT_EXPECT_EQ "${BT_MOCK_ARGS[1]}" "myarg1" \
+    "Expected a single argument 'myarg1' to mycmd, got '${BT_MOCK_ARGS[@]:1}'"
+}
+
+# Ensure that FX_CALLER is set as expected
+TEST_fx-caller() {
+  local called_cmd="${BT_TEMP_DIR}/tools/devshell/called_cmd"
+  btf::make_mock "${called_cmd}"
+  {
+    echo "#!/bin/bash"
+    echo 'echo $FX_CALLER'
+  } > "${called_cmd}.mock_side_effects"
+  BT_EXPECT_EQ "$($called_cmd)" ""
+
+  local caller_run_cmd="${BT_TEMP_DIR}/tools/devshell/caller_run_cmd"
+  btf::make_mock "${caller_run_cmd}"
+  {
+    echo "#!/bin/bash"
+    echo "source ${BT_TEMP_DIR}/tools/devshell/lib/vars.sh || exit \$?"
+    echo "fx-command-run called_cmd"
+  } > "${caller_run_cmd}.mock_side_effects"
+  BT_EXPECT_EQ "$($caller_run_cmd)" "$caller_run_cmd"
+
+  local caller_exec_cmd="${BT_TEMP_DIR}/tools/devshell/caller_exec_cmd"
+  btf::make_mock "${caller_exec_cmd}"
+  {
+    echo "#!/bin/bash"
+    echo "source ${BT_TEMP_DIR}/tools/devshell/lib/vars.sh || exit \$?"
+    echo "fx-command-exec called_cmd"
+  } > "${caller_exec_cmd}.mock_side_effects"
+
+  BT_EXPECT_EQ "$($caller_exec_cmd)" "$caller_exec_cmd"
+}
+
+TEST_get-ssh-components() {
+    cat >"${ffx}.mock_side_effects" <<INPUT
+if [[ "\$7" == "ssh.pub" ]]; then
+  echo  "${BT_TEMP_DIR}/.ssh/fuchsia_authorized_keys"
+elif [[ "\$7" == "ssh.priv" ]]; then
+  echo  "${BT_TEMP_DIR}/.ssh/fuchsia_private"
+fi
+INPUT
+
+  local privkey="${BT_TEMP_DIR}/.ssh/fuchsia_private"
+  local authkey="${BT_TEMP_DIR}/.ssh/fuchsia_authorized_keys"
+
+  BT_EXPECT_EQ "$(get-ssh-privkey 2>/dev/null)" "${privkey}"
+  BT_EXPECT_EQ "$(get-ssh-authkeys 2>/dev/null)" "${authkey}"
+}
+
+TEST_get-ssh-components-unbuilt-ffx() {
+  local ffx_backup="${ffx}.bak"
+  mv "${ffx}" "${ffx_backup}"
+
+  # Test with FUCHSIA_SSH_KEY and FUCHSIA_AUTHORIZED_KEYS pointing to existing files
+  local custom_priv="${BT_TEMP_DIR}/custom_priv"
+  local custom_auth="${BT_TEMP_DIR}/custom_auth"
+  touch "${custom_priv}" "${custom_auth}"
+
+  (
+    export FUCHSIA_SSH_KEY="${custom_priv}"
+    export FUCHSIA_AUTHORIZED_KEYS="${custom_auth}"
+    BT_EXPECT_EQ "$(get-ssh-privkey)" "${custom_priv}"
+    BT_EXPECT_EQ "$(get-ssh-authkeys)" "${custom_auth}"
+  )
+
+  # Test with default HOME/.ssh keys
+  local fake_home="${BT_TEMP_DIR}/fake_home"
+  mkdir -p "${fake_home}/.ssh"
+  local default_priv="${fake_home}/.ssh/fuchsia_ed25519"
+  local default_auth="${fake_home}/.ssh/fuchsia_authorized_keys"
+  touch "${default_priv}" "${default_auth}"
+
+  (
+    export HOME="${fake_home}"
+    unset FUCHSIA_SSH_KEY
+    unset FUCHSIA_AUTHORIZED_KEYS
+    BT_EXPECT_EQ "$(get-ssh-privkey)" "${default_priv}"
+    BT_EXPECT_EQ "$(get-ssh-authkeys)" "${default_auth}"
+  )
+
+  mv "${ffx_backup}" "${ffx}"
+}
+
+TEST_check-ssh-config-unbuilt-ffx() {
+  local ffx_backup="${ffx}.bak"
+  mv "${ffx}" "${ffx_backup}"
+
+  local fake_home="${BT_TEMP_DIR}/fake_home_config"
+  mkdir -p "${fake_home}/.ssh"
+  local default_priv="${fake_home}/.ssh/fuchsia_ed25519"
+  touch "${default_priv}"
+
+  (
+    export HOME="${fake_home}"
+    unset FUCHSIA_SSH_KEY
+    unset FUCHSIA_AUTHORIZED_KEYS
+    check-ssh-config
+    local conffile="${FUCHSIA_BUILD_DIR}/ssh-keys/ssh_config"
+    BT_EXPECT_FILE_EXISTS "${conffile}"
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${conffile}" "IdentityFile ${default_priv}"
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING "${conffile}" "IdentitiesOnly no"
+  )
+
+  mv "${ffx_backup}" "${ffx}"
+}
+
+TEST_json_config() {
+  local json_test_file="${BT_TEMP_DIR}/config.json"
+  # expect the file doesn't already exist
+  BT_EXPECT_FILE_DOES_NOT_EXIST "${json_test_file}"
+
+  # Fail if there's no file there
+  BT_EXPECT_FAIL json-config-del "${json_test_file}" "something"
+
+  json-config-set "${json_test_file}" "test.value" "something"
+  BT_EXPECT_FILE_CONTAINS "${json_test_file}" '{"test":{"value":"something"}}'
+
+  json-config-set "${json_test_file}" "test.something" "else"
+  BT_EXPECT_FILE_CONTAINS "${json_test_file}" '{"test":{"something":"else","value":"something"}}'
+
+  json-config-del "${json_test_file}" "test.value"
+  BT_EXPECT_FILE_CONTAINS "${json_test_file}" '{"test":{"something":"else"}}'
+
+  BT_EXPECT_FAIL json-config-del "${json_test_file}" "not.existing"
+  BT_EXPECT_FILE_CONTAINS "${json_test_file}" '{"test":{"something":"else"}}'
+}
+
+TEST_device_addr() {
+  local addrs=(
+    # default-target address-with-port address-without-port
+    "foo 1.2.3.4" "1.2.3.4"
+    "foo 1.2.3.4:5678" "1.2.3.4"
+    "foo fe80::4607:bff:fe68:41c9%zircon1-4" "fe80::4607:bff:fe68:41c9%zircon1-4"
+    "foo [fe80::4607:bff:fe68:41c9%zircon1-4]:1234" "fe80::4607:bff:fe68:41c9%zircon1-4"
+    "1.2.3.4" "1.2.3.4" "1.2.3.4"
+    "1.2.3.4:5678" "1.2.3.4:5678" "1.2.3.4"
+    "fe80::4607:bff:fe68:41c9%zircon1-4" "fe80::4607:bff:fe68:41c9%zircon1-4" "fe80::4607:bff:fe68:41c9%zircon1-4"
+    "[fe80::4607:bff:fe68:41c9%zircon1-4]:1234" "[fe80::4607:bff:fe68:41c9%zircon1-4]:1234" "fe80::4607:bff:fe68:41c9%zircon1-4"
+  )
+
+  echo "${addrs[@]}" | xargs -n 3 |while read default_target addr_port addr; do
+    cat >"${ffx}.mock_side_effects" <<INPUT
+      echo "\$@" >> /tmp/xxx
+      case "\$@" in
+        *"target default get")
+          echo $default_target
+        ;;
+        *"target list --format a"*)
+          echo $addr_port
+        ;;
+        *)
+          exit 1
+        ;;
+      esac
+INPUT
+    BT_ASSERT_EQ "$(get-fuchsia-device-addr)" $addr
+  done
+}
+
+TEST_ffx-default-repository-name() {
+  FUCHSIA_BUILD_DIR="${FUCHSIA_DIR}/out/default"
+  BT_EXPECT_EQ "$(ffx-default-repository-name)" "default"
+
+  FUCHSIA_BUILD_DIR="${FUCHSIA_DIR}/out/core.x64"
+  BT_EXPECT_EQ "$(ffx-default-repository-name)" "core-x64"
+
+  FUCHSIA_BUILD_DIR="${FUCHSIA_DIR}/out/fuchsia_internal.arm64-balanced.2"
+  BT_EXPECT_EQ "$(ffx-default-repository-name)" "fuchsia-internal-arm64-balanced-2"
+
+  FUCHSIA_BUILD_DIR="${FUCHSIA_DIR}/out/Custom_Build.ARM64.1"
+  BT_EXPECT_EQ "$(ffx-default-repository-name)" "custom-build-arm64-1"
+}
+
+BT_RUN_TESTS "$@"

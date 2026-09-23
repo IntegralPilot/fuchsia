@@ -1,0 +1,209 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/python_interpreter.gni")
+import("//build/toolchain/concurrent_jobs.gni")
+import("//build/toolchain/rbe.gni")
+import("//build/toolchain/restat.gni")
+
+_restat_switches = [ "--preserve_unchanged_output_mtime" ]
+
+# This provides some common values useful in toolchain() tool() definitions to
+# enable RBE for compilation and/or linking.
+rbe_toolchain_vars = {
+  # This is set below to the appropriate concurrent_jobs subscope.  tool()
+  # definitions do forward_variables_from(cxx_concurrent_jobs, "*").
+  cxx_concurrent_jobs = {
+  }
+  cxx_link_concurrent_jobs = {
+  }
+
+  # This is set below to the appropriate concurrent_jobs subscope.  tool()
+  # definitions do forward_variables_from(rust_concurrent_jobs, "*").
+  rust_concurrent_jobs = concurrent_jobs.remote
+
+  # This is the common part of the tool() $command_launcher string for C-family
+  # (and assembly) compilation commands to use reclient to build remotely, as a
+  # list of strings.  After this more should be appended that's not constant
+  # here, and then a "--".
+  cxx_launcher = []
+
+  # This is analogous to $cxx_launcher, but for C-family link steps.
+  cxx_link_launcher = []
+
+  # This is analogous to $cxx_launcher, but it must be used as a prefix on the
+  # tool() $command string rather than going onto the $command_launcher.  It
+  # needs to use {{...}}  substitutions that are only available in $command.
+  # It does not need anything else appended.
+  rust_command_prefix = []
+
+  # This is a list of common flags passed to the RBE wrappers for all link and
+  # link-like steps.
+  link_rbe_flags = RBE_EXEC_STRATEGY_MAP[link_rbe_exec_strategy]
+  if (disable_xattr_for_rbe) {
+    link_rbe_flags += [ "--disable-xattr" ]
+  }
+
+  # This is the common part of the RBE linking wrapper prefixed to generic
+  # link-like commands that aren't using a compiler driver.  Various switches
+  # like `--inputs` and `--output_files` must come after this, and `--`.
+  common_tool_prefix = []
+
+  _link_check_modes = {
+    determinism = {
+      jobs = concurrent_jobs.local
+      switches = [
+        "--local",
+        "--check-determinism",
+      ]
+    }
+    consistency = {
+      jobs = concurrent_jobs.local
+      switches = [ "--compare" ]
+    }
+    none = {
+      jobs = concurrent_jobs.remote
+      switches = link_rbe_flags
+    }
+  }
+  _link_check_mode = _link_check_modes[link_rbe_check]
+  cxx_link_concurrent_jobs = _link_check_mode.jobs
+  _link_check_switches = _link_check_mode.switches
+  if (disable_xattr_for_rbe) {
+    _link_check_switches += [ "--disable-xattr" ]
+  }
+
+  common_tool_prefix =
+      [
+        rebase_path(python_exe_src, root_build_dir),
+        "-S",
+        rebase_path(prebuilt_tool_remote_wrapper, root_build_dir),
+      ] + _restat_switches + _link_check_switches
+
+  cxx_link_launcher = [
+                        rebase_path(python_exe_src, root_build_dir),
+                        "-S",
+                        rebase_path(cxx_link_remote_wrapper, root_build_dir),
+                      ] + _link_check_switches
+
+  if (cxx_rbe_minimalist_wrapper) {
+    _cxx_remote_wrapper_path =
+        rebase_path(cxx_remote_wrapper_minimalist, root_build_dir)
+    _working_subdir = rebase_path(root_build_dir, "//")
+    cxx_launcher = [
+      _cxx_remote_wrapper_path,
+      "--working-subdir=" + _working_subdir,
+    ]
+  } else {
+    _cxx_remote_wrapper_path = rebase_path(cxx_remote_wrapper, root_build_dir)
+    cxx_launcher = [
+      rebase_path(python_exe_src, root_build_dir),
+      "-S",
+      _cxx_remote_wrapper_path,
+    ]
+  }
+
+  rust_compilation_deps_path =
+      "{{target_gen_dir}}/{{label_name}}.rust_compilation_deps"
+  rust_sources_path = "{{target_gen_dir}}//{{label_name}}.rust_sources"
+
+  rust_command_prefix = [
+    rebase_path(python_exe_src, root_build_dir),
+    "-S",
+    rebase_path(rustc_remote_wrapper, root_build_dir),
+    "--rust-compilation-deps-path=$rust_compilation_deps_path",
+    "--rust-sources-path=$rust_sources_path",
+  ]
+
+  if (disable_xattr_for_rbe) {
+    cxx_launcher += [ "--disable-xattr" ]
+    rust_command_prefix += [ "--disable-xattr" ]
+  }
+
+  if (cxx_rbe_check == "consistency") {
+    # Compare local vs. remote build.
+    # Allow caching.
+    # Use local concurrency.
+    # TODO(https://fxbug.dev/42079382): enable file trace comparison
+    cxx_launcher += [
+      "--compare",
+
+      # "--fsatrace-path",
+      # rebase_path("//prebuilt/fsatrace/fsatrace", root_build_dir),
+      "--miscomparison-export-dir",
+      rebase_path(comparison_diagnostics_dir, root_build_dir),
+      "--exec_strategy=remote",
+    ]
+    cxx_concurrent_jobs = concurrent_jobs.local
+  } else if (cxx_rbe_check == "determinism") {
+    # Determinism check is run locally, and doesn't use RBE,
+    # even though it uses the same wrapper script.
+    cxx_launcher += [
+      "--local",
+      "--check-determinism",
+      "--miscomparison-export-dir",
+      rebase_path(comparison_diagnostics_dir, root_build_dir),
+    ]
+    cxx_concurrent_jobs = concurrent_jobs.local
+  } else {
+    cxx_launcher += RBE_EXEC_STRATEGY_MAP[cxx_rbe_exec_strategy]
+    if (!cxx_rbe_download_obj_files) {  # download everything except the
+                                        # object file
+      cxx_launcher += [ "--download_regex='-.*\\.o\$\$'" ]
+    }
+    cxx_concurrent_jobs = concurrent_jobs.remote
+  }
+
+  if (rust_rbe_check == "consistency") {
+    # Compare local vs. remote build.
+    # Allow caching.
+    # Use local concurrency.
+    _rust_concurrent_jobs = concurrent_jobs.local
+    rust_command_prefix += [
+      "--compare",
+      "--fsatrace-path",
+      rebase_path("//prebuilt/fsatrace/fsatrace", root_build_dir),
+      "--exec_strategy=remote",
+      "--miscomparison-export-dir",
+      rebase_path(comparison_diagnostics_dir, root_build_dir),
+    ]
+  } else if (rust_rbe_check == "determinism") {
+    # Determinism check is run locally, and doesn't use RBE,
+    # even though it uses the same wrapper script.
+    _rust_concurrent_jobs = concurrent_jobs.local
+    rust_command_prefix += [
+      "--local",
+      "--check-determinism",
+      "--miscomparison-export-dir",
+      rebase_path(comparison_diagnostics_dir, root_build_dir),
+    ]
+  } else {
+    assert(
+        rust_rbe_check == "none",
+        "rust_rbe_check must be one of {none,consistency,determinism}, but got: ${rust_rbe_check}.")
+    _rust_concurrent_jobs = concurrent_jobs.remote
+    rust_rbe_exec_strategy_flags = RBE_EXEC_STRATEGY_MAP[rust_rbe_exec_strategy]
+    rust_command_prefix += rust_rbe_exec_strategy_flags
+  }
+
+  if (!link_rbe_download_unstripped_outputs) {
+    # The remote link wrapper will download everything except the main
+    # output.
+    cxx_link_launcher += [
+      "--download_outputs=false",
+      "--output-is-executable",  # workaround for b/285030257
+    ]
+  }
+
+  # re-client has built-in support for write-if-changed behavior
+  if (restat_cc) {
+    cxx_launcher += _restat_switches
+    cxx_link_launcher += _restat_switches
+  }
+  if (restat_rust) {
+    rust_command_prefix += _restat_switches
+  }
+
+  rust_command_prefix += [ "--" ]
+}

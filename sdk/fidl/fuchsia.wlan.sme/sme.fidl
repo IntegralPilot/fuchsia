@@ -1,0 +1,487 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.wlan.sme;
+
+using fuchsia.wlan.common;
+using fuchsia.wlan.ieee80211 as ieee80211;
+using fuchsia.wlan.internal;
+using fuchsia.wlan.stats;
+using zx;
+
+/// Security protection which should mirror the Protection enum defined in wlan lib common
+type Protection = strict enum {
+    UNKNOWN = 0;
+    OPEN = 1;
+    WEP = 2;
+    WPA1 = 3;
+    WPA1_WPA2_PERSONAL_TKIP_ONLY = 4;
+    WPA2_PERSONAL_TKIP_ONLY = 5;
+    WPA1_WPA2_PERSONAL = 6;
+    WPA2_PERSONAL = 7;
+    WPA2_WPA3_PERSONAL = 8;
+    WPA3_PERSONAL = 9;
+    WPA2_ENTERPRISE = 10;
+    WPA3_ENTERPRISE = 11;
+    OWE = 12;
+    /// Describes an open BSS with OWE transition element.
+    OPEN_OWE_TRANSITION = 13;
+};
+
+type UserDisconnectReason = strict enum {
+    UNKNOWN = 0;
+    FAILED_TO_CONNECT = 1;
+    FIDL_CONNECT_REQUEST = 2;
+    FIDL_STOP_CLIENT_CONNECTIONS_REQUEST = 3;
+    PROACTIVE_NETWORK_SWITCH = 4;
+    DISCONNECT_DETECTED_FROM_SME = 5;
+    REGULATORY_REGION_CHANGE = 6;
+    STARTUP = 7;
+    NETWORK_UNSAVED = 8;
+    NETWORK_CONFIG_UPDATED = 9;
+    RECOVERY = 10;
+
+    // The following reasons should only be used for development and testing.
+    WLANSTACK_UNIT_TESTING = 124;
+    WLAN_SME_UNIT_TESTING = 125;
+    WLAN_SERVICE_UTIL_TESTING = 126;
+    WLAN_DEV_TOOL = 127;
+};
+
+type DisconnectCause = struct {
+    mlme_event_name DisconnectMlmeEventName;
+    reason_code ieee80211.ReasonCode;
+};
+
+type DisconnectMlmeEventName = strict enum {
+    DEAUTHENTICATE_INDICATION = 1;
+    DISASSOCIATE_INDICATION = 2;
+    // Roam start indication was malformed, so roam could not proceed.
+    ROAM_START_INDICATION = 3;
+    // Roam result indication reported failure (or was malformed), causing the disconnect.
+    ROAM_RESULT_INDICATION = 4;
+    // SAE handshake failed (or timed out).
+    SAE_HANDSHAKE_RESPONSE = 5;
+    // Roam request was malformed or selected BSS was incompatible, so roam could not proceed.
+    ROAM_REQUEST = 6;
+    // Roam confirmation reported failure (or was malformed), causing the disconnect.
+    ROAM_CONFIRMATION = 7;
+};
+
+type DisconnectSource = strict union {
+    1: ap DisconnectCause;
+    2: user UserDisconnectReason;
+    3: mlme DisconnectCause;
+};
+
+type DisjointSecurityProtocol = struct {
+    protocol fuchsia.wlan.internal.Protocol;
+    role fuchsia.wlan.common.WlanMacRole;
+};
+
+// Compatibility of a BSS with respect to a scanning interface.
+//
+// When a BSS is compatible with a scanning interface, this type describes the
+// mutually supported modes of operation than can be used to establish a
+// connection, such as the compatible set of security protocols.
+//
+// The data provided by this type is only applicable or meaningful when the
+// local scanning interface is compatible with a BSS. As such, it is a logic
+// error to construct or transmit this type with data that implies
+// incompatibility.
+//
+// See `ScanResult`.
+type Compatibility = strict union {
+    1: compatible Compatible;
+    2: incompatible Incompatible;
+};
+
+type Compatible = struct {
+    // Mutually supported security protocols.
+    //
+    // This field describes the intersection of security protocols supported by
+    // a remote BSS and a local scanning interface. In this context an empty set
+    // is a logic error (implies incompatibility) and so this field must never
+    // be empty.
+    mutual_security_protocols vector<fuchsia.wlan.internal.Protocol>:16;
+};
+
+type Incompatible = struct {
+    description string:MAX;
+    disjoint_security_protocols vector<DisjointSecurityProtocol>:<32, optional>;
+};
+
+// Describes a BSS detected by a scan.
+type ScanResult = struct {
+    // The compatibility of the scanning interface and a BSS.
+    //
+    // If this field is absent, then the scanning interface and BSS are
+    // incompatible and will not be able to establish a connection.
+    compatibility Compatibility;
+    // Time of the scan result relative to when the system was powered on.
+    // See https://fuchsia.dev/fuchsia-src/concepts/time/language_support#monotonic_time
+    timestamp_nanos zx.Time;
+    // Describes the BSS detected by the scan.
+    bss_description ieee80211.BssDescription;
+};
+
+type ScanResultVector = struct {
+    results vector<ScanResult>;
+};
+
+type ScanErrorCode = strict enum {
+    NOT_SUPPORTED = 1;
+    INTERNAL_ERROR = 2;
+    INTERNAL_MLME_ERROR = 3;
+    SHOULD_WAIT = 4;
+    CANCELED_BY_DRIVER_OR_FIRMWARE = 5;
+};
+
+type ScanRequest = strict union {
+    1: active ActiveScanRequest;
+    2: passive PassiveScanRequest;
+};
+
+type PassiveScanRequest = struct {
+    // TODO(https://fxbug.dev/42170679): SME should instead require the higher layer to specify
+    // which channels to scan and return an error if the list is empty.
+    /// Channels to scan on. Leave empty for all supported channels.
+    channels vector<uint8>:500;
+};
+
+type ActiveScanRequest = struct {
+    /// List of SSIDs to scan for. An empty list of ssids is the same as specifying
+    /// a list containing only the wildcard SSID.
+    ///
+    /// There is no limit on the number of SSIDs specified, but a large number of
+    /// SSIDs may result in extended scan times or the error ZX_ERR_INVALID_ARGS to be
+    /// returned.
+    ssids vector<ieee80211.Ssid>:MAX;
+    // TODO(https://fxbug.dev/42170679): SME should instead require the higher layer to specify
+    // which channels to scan and return an error if the list is empty.
+    /// Channels to scan on. Leave empty for all supported channels.
+    channels vector<uint8>:500;
+};
+
+type ConnectResult = struct {
+    code ieee80211.StatusCode;
+    /// `is_credential_rejected` is true if connect failure is likely due to wrong credential.
+    /// Policy uses this to determine whether to retry with the same password.
+    is_credential_rejected bool;
+    /// If `is_reconnect` is false, the result comes from the initial connection request.
+    /// If it's true, the result comes from an SME-initiated reconnection.
+    is_reconnect bool;
+};
+
+/// Result of a roam attempt.
+type RoamResult = struct {
+    /// BSSID of the selected BSS for this roam attempt.
+    bssid ieee80211.MacAddr;
+
+    status_code ieee80211.StatusCode;
+
+    /// Whether the original BSS association has been maintained through the roam attempt.
+    /// A successful roam always incurs disassociation from the original BSS, so if `status_code` is
+    /// success then this field must be set to false; a roam failure typically incurs disassociation
+    /// from the original BSS, but may not in some cases (e.g. in some Fast BSS Transition scenarios).
+    original_association_maintained bool;
+
+    bss_description box<ieee80211.BssDescription>;
+
+    /// If the roam attempt failed and the original association was not maintained, this field must
+    /// be populated; otherwise this field must be empty.
+    disconnect_info box<DisconnectInfo>;
+
+    /// `is_credential_rejected` is true if roam failure is likely due to wrong credential.
+    /// Policy may use this to determine whether to decide whether to roam to this BSS in the future.
+    is_credential_rejected bool;
+};
+
+type DisconnectInfo = struct {
+    /// Whether SME is attempting to reconnect by itself
+    is_sme_reconnecting bool;
+    /// Where the disconnect originated and associated reason
+    disconnect_source DisconnectSource;
+};
+
+closed protocol ConnectTransaction {
+    /// Return the result of the initial connection request or later SME-initiated reconnection.
+    strict -> OnConnectResult(struct {
+        result ConnectResult;
+    });
+
+    /// Notify that the client has disconnected. If DisconnectInfo indicates that SME is
+    /// attempting to reconnect by itself, there's not need for caller to intervene for now.
+    strict -> OnDisconnect(struct {
+        info DisconnectInfo;
+    });
+
+    /// Report the result of a roam attempt.
+    strict -> OnRoamResult(struct {
+        result RoamResult;
+    });
+
+    /// Give an update of the latest signal report.
+    strict -> OnSignalReport(struct {
+        ind fuchsia.wlan.internal.SignalReportIndication;
+    });
+
+    /// Give an update of the channel switching.
+    strict -> OnChannelSwitched(struct {
+        info fuchsia.wlan.internal.ChannelSwitchInfo;
+    });
+};
+
+/// Transaction channel for a scheduled scan operation. To cancel a scheduled scan, drop this
+/// channel. If the scan is canceled by the driver/firmware, this channel will be closed by SME.
+closed protocol ScheduledScanTransaction {
+    /// Indicates that an individual scan within the scheduled scan plan has been completed
+    /// and all results have been sent for that individual scan.
+    strict -> OnScheduledScanMatchesAvailable(resource struct {
+        scan_results zx.Handle:VMO;
+    });
+};
+
+type RadioConfig = struct {
+    phy ieee80211.WlanPhyType;
+    primary ieee80211.ChannelNumber;
+    bandwidth ieee80211.ChannelBandwidth;
+};
+
+/// Empty struct used for union variants with no associated data.
+type Empty = struct {};
+
+type ConnectRequest = struct {
+    ssid ieee80211.Ssid;
+    bss_description ieee80211.BssDescription;
+    /// Informs SME whether multiple candidates were available, for metrics.
+    multiple_bss_candidates bool;
+    /// Authentication method.
+    ///
+    /// Describes how SME authenticates when connecting to the target network.
+    authentication fuchsia.wlan.internal.Authentication;
+
+    /// Deprecated. SME makes internal decision on whether to perform a passive or active
+    /// scan during connect. Setting this field will not affect anything for FullMAC, but
+    /// currently SoftMAC still honor this argument.
+    deprecated_scan_type fuchsia.wlan.common.ScanType;
+};
+
+type RoamRequest = struct {
+    bss_description ieee80211.BssDescription;
+};
+
+type ServingApInfo = struct {
+    bssid ieee80211.MacAddr;
+    ssid ieee80211.Ssid;
+    rssi_dbm int8;
+    snr_db int8;
+    primary ieee80211.ChannelNumber;
+    protection Protection;
+    bandwidth ieee80211.ChannelBandwidth;
+    vht_secondary_80_channel ieee80211.ChannelNumber;
+};
+
+type ClientStatusResponse = strict union {
+    1: connected ServingApInfo;
+    2: connecting ieee80211.Ssid;
+    3: idle Empty;
+    4: roaming ieee80211.MacAddr;
+};
+
+closed protocol ClientSme {
+    strict Scan(resource struct {
+        req ScanRequest;
+    }) -> (resource struct {
+        // The VMO encodes ScanResultVector with RFC-0120 FIDL persistence.
+        scan_results zx.Handle:VMO;
+    }) error ScanErrorCode;
+
+    /// Starts scheduled scanning.
+    strict StartScheduledScan(resource struct {
+        req fuchsia.wlan.common.ScheduledScanRequest;
+        txn server_end:ScheduledScanTransaction;
+    }) -> () error zx.Status;
+
+    /// Returns whether any scheduled scans are currently active.
+    strict GetScheduledScanEnabled() -> (struct {
+        enabled bool;
+    }) error zx.Status;
+
+    strict Connect(resource struct {
+        req ConnectRequest;
+        txn server_end:<ConnectTransaction, optional>;
+    });
+    strict Roam(struct {
+        req RoamRequest;
+    });
+    strict Disconnect(struct {
+        reason UserDisconnectReason;
+    }) -> ();
+    strict Status() -> (struct {
+        resp ClientStatusResponse;
+    });
+    strict WmmStatus() -> (struct {
+        resp fuchsia.wlan.internal.WmmStatusResponse;
+    }) error int32;
+
+    // This API is for Fuchsia Controller only.
+    // This call will fail if scan results exceed the maximum FIDL message size.
+    // This provides no functionality over the `Scan` API, and should only be
+    // used by Fuchsia Controller where VMO return values are not permitted.
+    // TODO(b/334937123): Remove this API when VMO messages are supported.
+    strict ScanForController(resource struct {
+        req ScanRequest;
+    }) -> (resource struct {
+        scan_results vector<ScanResult>;
+    }) error ScanErrorCode;
+    // Sets the MAC address of the client interface. To reset the MAC address to the default/factory
+    // value, retrieve the `factory_addr` from the GenericSme `Query` method and pass it here.
+    strict SetMacAddress(struct {
+        mac_addr ieee80211.MacAddr;
+    }) -> () error zx.Status;
+
+    // APF (Android Packet Filter) functionality
+    strict InstallApfPacketFilter(struct {
+        program vector<uint8>:MAX;
+    }) -> () error zx.Status;
+    strict ReadApfPacketFilterData() -> (struct {
+        memory vector<uint8>:MAX;
+    }) error zx.Status;
+    strict SetApfPacketFilterEnabled(struct {
+        enabled bool;
+    }) -> () error zx.Status;
+    strict GetApfPacketFilterEnabled() -> (struct {
+        enabled bool;
+    }) error zx.Status;
+};
+
+type ApConfig = struct {
+    ssid ieee80211.Ssid;
+    password vector<uint8>:64;
+    radio_cfg RadioConfig;
+};
+
+type StartApResultCode = strict enum {
+    SUCCESS = 0;
+    ALREADY_STARTED = 1;
+    INTERNAL_ERROR = 2;
+    CANCELED = 3;
+    TIMED_OUT = 4;
+    PREVIOUS_START_IN_PROGRESS = 5;
+    INVALID_ARGUMENTS = 6;
+};
+
+type StopApResultCode = strict enum {
+    SUCCESS = 0;
+    INTERNAL_ERROR = 1;
+    TIMED_OUT = 2;
+};
+
+type Ap = struct {
+    ssid ieee80211.Ssid;
+    channel uint8;
+    num_clients uint16;
+};
+
+type ApStatusResponse = struct {
+    running_ap box<Ap>;
+};
+
+closed protocol ApSme {
+    strict Start(struct {
+        config ApConfig;
+    }) -> (struct {
+        code StartApResultCode;
+    });
+    strict Stop() -> (struct {
+        code StopApResultCode;
+    });
+    strict Status() -> (struct {
+        resp ApStatusResponse;
+    });
+};
+
+closed protocol Telemetry {
+    strict QueryTelemetrySupport() -> (struct {
+        resp fuchsia.wlan.stats.TelemetrySupport;
+    }) error zx.Status;
+    strict GetIfaceStats() -> (struct {
+        stats fuchsia.wlan.stats.IfaceStats;
+    }) error zx.Status;
+    strict GetHistogramStats() -> (struct {
+        stats fuchsia.wlan.stats.IfaceHistogramStats;
+    }) error zx.Status;
+    strict GetSignalReport() -> (struct {
+        stats fuchsia.wlan.stats.SignalReport;
+    }) error zx.Status;
+    strict CloneInspectVmo() -> (resource struct {
+        inspect_vmo zx.Handle:VMO;
+    }) error zx.Status;
+};
+
+type LegacyPrivacySupport = struct {
+    wep_supported bool;
+    wpa1_supported bool;
+};
+
+closed protocol UsmeBootstrap {
+    strict Start(resource struct {
+        generic_sme_server server_end:GenericSme;
+        legacy_privacy_support LegacyPrivacySupport;
+    }) -> (resource struct {
+        inspect_vmo zx.Handle:VMO;
+    });
+};
+
+// High level SME info independent of the current MAC role.
+type GenericSmeQuery = struct {
+    role fuchsia.wlan.common.WlanMacRole;
+    // Current station MAC address.
+    sta_addr ieee80211.MacAddr;
+    // MAC address assigned by the factory.
+    factory_addr ieee80211.MacAddr;
+};
+
+closed protocol GenericSme {
+    /// Query the underlying SME to determine basic properties. This should
+    /// generally be called first to determine which SME protocol to request
+    /// for the SME.
+    strict Query() -> (resource struct {
+        resp GenericSmeQuery;
+    });
+    /// Query the underlying SME to determine extended properties.
+    strict QueryIfaceCapabilities() -> (struct {
+        /// Android Packet Filter support
+        apf_support fuchsia.wlan.common.ApfPacketFilterSupport;
+    }) error zx.Status;
+    /// Attempt to establish a new connection to an underlying Client SME.
+    /// Connections may be established for the whole lifetime of the SME,
+    /// but concurrent connections might lead to unexpected behavior.
+    /// Likely errors include:
+    ///     * NOT_SUPPORTED: The underlying SME is not a Client SME.
+    ///     * PEER_CLOSED: The underlying SME is shutting down.
+    strict GetClientSme(resource struct {
+        sme_server server_end:ClientSme;
+    }) -> () error zx.Status;
+    /// Attempt to establish a new connection to an underlying AP SME.
+    /// Connections may be established for the whole lifetime of the SME,
+    /// but concurrent connections might lead to unexpected behavior.
+    /// Likely errors include:
+    ///     * NOT_SUPPORTED: The underlying SME is not an AP SME.
+    ///     * PEER_CLOSED: The underlying SME is shutting down.
+    strict GetApSme(resource struct {
+        sme_server server_end:ApSme;
+    }) -> () error zx.Status;
+    /// Attempt to establish a new connection to telemetry information for the
+    /// underlying SME.
+    /// Connections may be established for the whole lifetime of the SME, and
+    /// concurrent connections are safe since this is a read-only API.
+    /// Likely errors include:
+    ///     * NOT_SUPPORTED: The underlying SME does not support telemetry.
+    ///     * PEER_CLOSED: The underlying SME is shutting down.
+    strict GetSmeTelemetry(resource struct {
+        telemetry_server server_end:Telemetry;
+    }) -> () error zx.Status;
+};

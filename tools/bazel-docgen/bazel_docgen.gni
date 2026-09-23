@@ -1,0 +1,126 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_build_action.gni")
+import("//build/compiled_action.gni")
+
+# Provides a mechanism for creating a zip file containing all of the
+# documentation defined in the bazel build rules.
+#
+# Args:
+#   bazel_config: (required)
+#     See `bazel_action()`.
+#
+#   bazel_targets: (required)
+#     The set of Bazel targets that generate the text protos.
+#     These targets should be `starlark_doc_extract()` targets and should not
+#     include the textproto ending.
+#     Type: list of strings (Bazel labels)
+#
+#   docset_name: (required)
+#     The name of the docset to generate.
+#
+#   reference_repo_path: (required)
+#     The path to copy these documents when built in infrastructure.
+#
+#   docsite_base_path: (required)
+#      The base path for all docs on the docsite. eg. reference/bazel_sdk
+#
+#   output_name: (optional)
+#     The name of the zip file to create. This file will be created relative to
+#     the target_gen_dir.
+#     Default: docs.zip
+#     Type: String
+#
+#   deps:
+#   testonly:
+#   visibility:
+#     Usual GN meaning.
+template("bazel_docgen") {
+  assert(defined(invoker.bazel_config), "bazel_config must be defined")
+  assert(defined(invoker.bazel_targets), "bazel_targets must be defined")
+  assert(defined(invoker.docset_name), "docset_name must be defined")
+  assert(defined(invoker.reference_repo_path),
+         "reference_repo_path must be defined")
+  assert(defined(invoker.docsite_base_path),
+         "docsite_base_path must be defined")
+
+  _protos = []
+  _gn_copy_targets = []
+  foreach(bazel_target, invoker.bazel_targets) {
+    _bazel_target_name = get_label_info(bazel_target, "name")
+    _output_name = "${_bazel_target_name}.docs.textproto"
+    _gn_target_name = "${target_name}.${_output_name}"
+    _gn_copy_targets += [ ":${_gn_target_name}" ]
+    _protos += [ "${target_out_dir}/${_output_name}" ]
+
+    bazel_build_action(_gn_target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "bazel_config",
+                               "testonly",
+                               "visibility",
+                             ])
+      bazel_target = "${bazel_target}.textproto"
+      copy_outputs = [
+        {
+          bazel = "{{BAZEL_TARGET_OUT_PATH}}"
+          ninja = _output_name
+        },
+      ]
+    }
+  }
+
+  compiled_action(target_name) {
+    tool = "//tools/bazel-docgen:bin"
+    tool_output_name = "bazel-docgen"
+
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    proto_args = []
+    foreach(_proto, _protos) {
+      proto_args += [
+        "--proto",
+        rebase_path(_proto, root_build_dir),
+      ]
+    }
+
+    zip_file = "docs.zip"
+    if (defined(invoker.output_name)) {
+      zip_file = invoker.output_name
+    }
+    out_zip = "${target_gen_dir}/${zip_file}"
+
+    args = proto_args + [
+             "--zip_file",
+             rebase_path(out_zip, root_build_dir),
+             "--base_path",
+             invoker.docsite_base_path,
+           ]
+
+    outputs = [ out_zip ]
+
+    deps = _gn_copy_targets
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+
+    metadata = {
+      # Record metadata for the //tools/docsgen build API.
+      generated_docset = [
+        {
+          name = invoker.docset_name
+          archive = {
+            origin_file = rebase_path(out_zip, root_build_dir)
+          }
+          dest_folder = invoker.reference_repo_path
+        },
+      ]
+    }
+  }
+}

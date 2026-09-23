@@ -1,0 +1,372 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "Protocol:ForwardDeclaration:WireMessagingHeader" }}
+  {{ EnsureNamespace . }}
+  class {{ .Name }};
+{{- end }}
+
+
+
+{{- define "Method:ClientAllocationComment:Helper" -}}
+  {{- if SyncCallTotalStackSizeV2 . -}}
+    {{ "" }} Allocates {{ SyncCallTotalStackSizeV2 . }} bytes of {{ "" -}}
+    {{- if not .Request.ClientAllocationV2.IsStack -}}
+      response
+    {{- else -}}
+      {{- if not .Response.ClientAllocationV2.IsStack -}}
+        request
+      {{- else -}}
+        message
+      {{- end -}}
+    {{- end }} buffer on the stack.
+  {{- end }}
+  {{- if and .Request.ClientAllocationV2.IsStack .Response.ClientAllocationV2.IsStack -}}
+    {{ "" }} No heap allocation necessary.
+  {{- else }}
+    {{- if not .Request.ClientAllocationV2.IsStack }} Request is heap-allocated. {{- end }}
+    {{- if not .Response.ClientAllocationV2.IsStack }} Response is heap-allocated. {{- end }}
+  {{- end }}
+{{- end }}
+
+
+
+{{- define "Protocol:WireMessagingHeader" }}
+
+{{- range .Methods }}
+  {{- template "Method:Types:WireMessagingHeader" . }}
+{{- end }}
+
+{{ EnsureNamespace . }}
+
+{{- template "Protocol:Dispatcher:WireMessagingHeader" . }}
+
+{{- range .Methods }}
+  {{- if .HasRequest }}
+    {{- template "Method:Request:WireMessagingHeader" . }}
+  {{- end }}
+  {{- if .HasResponse }}
+    {{- if .IsEvent }}
+    {{- template "Method:Event:WireMessagingHeader" . }}
+    {{- else }}
+    {{- template "Method:Response:WireMessagingHeader" . }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+{{ EnsureNamespace "fidl" }}
+{{ template "Protocol:Traits:WireMessagingHeader" . }}
+
+{{- EnsureNamespace "" }}
+{{- range .TwoWayMethods -}}
+  {{- if eq .Transport.Name "Channel" }}
+    template<>
+    struct {{ .IncomingMessageHandleStorageForResponse }} final
+        : public ::fidl::internal::ChannelHandleStorageBase<{{ .IncomingMessageHandleStorageForResponse }}> {
+      static constexpr uint32_t kNumHandles =
+          {{- if .HasResponsePayload }}
+            fidl::internal::ClampedHandleCount<{{ .WireResponse }}, fidl::MessageDirection::kReceiving>()
+          {{- else }}
+            0
+          {{- end }};
+
+      ::std::array<zx_handle_t, kNumHandles> handles_;
+      ::std::array<fidl_channel_handle_metadata_t, kNumHandles> handle_metadata_;
+    };
+
+    template<>
+    struct {{ .IncomingMessageStorageForResponse }} final
+        : public ::fidl::internal::ChannelMessageStorageBase<{{ .IncomingMessageStorageForResponse }}> {
+      {{ .Response.ClientAllocationV2.BackingBufferType }} bytes_;
+      {{ .IncomingMessageHandleStorageForResponse }} handles_storage_;
+    };
+  {{- end }}
+  {{- if eq .Transport.Name "Driver" }}
+    template<>
+    struct {{ .IncomingMessageStorageForResponse }} final
+        : public ::fidl::internal::DriverMessageStorageBase<{{ .IncomingMessageStorageForResponse }}> {};
+  {{- end }}
+{{- end }}
+
+{{- if eq .Transport.Name "Channel" }}
+  template <>
+  struct {{ .IncomingEventsHandleStorage }} final :
+      public ::fidl::internal::ChannelHandleStorageBase<{{ .IncomingEventsHandleStorage }}> {
+   public:
+    static constexpr uint32_t kNumHandles = {{ .SyncEventAllocationV2.NumHandles }};
+
+    ::std::array<zx_handle_t, kNumHandles> handles_;
+    ::std::array<fidl_channel_handle_metadata_t, kNumHandles> handle_metadata_;
+  };
+
+  template <>
+  struct {{ .IncomingEventsStorage }} final :
+      public ::fidl::internal::ChannelMessageStorageBase<{{ .IncomingEventsStorage }}> {
+   public:
+    {{ .SyncEventAllocationV2.BackingBufferType }} bytes_;
+    {{ .IncomingEventsHandleStorage }} handles_storage_;
+  };
+{{- end }}
+
+
+{{- EnsureNamespace "" }}
+{{- range .ClientMethods -}}
+  {{- if .Transport.HasSyncClient }}
+  {{- if eq .Transport.Name "Channel" }}
+  {{- template "Method:Result:WireMessagingHeader" . }}
+  {{- end }}
+  {{- end }}
+  {{- if eq .Transport.Name "Driver" }}
+  {{- template "driver/Method:UnownedResult:MessagingHeader" . }}
+  {{- else }}
+  {{- template "Method:UnownedResult:WireMessagingHeader" . }}
+  {{- end }}
+{{- end }}
+
+{{- template "Protocol:EventHandler:WireMessagingHeader" . }}
+{{- if .Transport.HasSyncClient }}
+{{- if eq .Transport.Name "Driver" }}
+{{- template "driver/Protocol:Caller:MessagingHeader" . }}
+{{- else }}
+{{- template "Protocol:Caller:WireMessagingHeader" . }}
+{{- end }}
+{{- end }}
+{{- template "Protocol:Interface:WireMessagingHeader" . }}
+
+{{- end }}
+
+
+
+{{- define "Protocol:Traits:WireMessagingHeader" -}}
+{{ $protocol := . -}}
+{{ range .Methods -}}
+{{ $method := . -}}
+{{- if .HasRequest }}
+
+template <>
+struct IsFidlType<{{ .WireTransactionalRequest }}> : public std::true_type {};
+template <>
+struct IsFidlTransactionalMessage<{{ .WireTransactionalRequest }}> : public std::true_type {};
+{{- if .Request.IsResource }}
+template <>
+struct IsResource<{{ .WireTransactionalRequest }}> : public std::true_type {};
+{{- end }}
+
+
+template <>
+struct TypeTraits<{{ .WireTransactionalRequest }}> {
+  static constexpr uint32_t kMaxNumHandles = {{ .Request.TypeShapeV2.MaxHandles }};
+  static constexpr uint32_t kMaxDepth = {{ .Request.TypeShapeV2.Depth }};
+  static constexpr uint32_t kPrimarySize = FIDL_ALIGN({{ .Request.TypeShapeV2.InlineSize }} + sizeof(fidl_message_header_t));
+  static constexpr uint32_t kMaxOutOfLine = {{ .Request.TypeShapeV2.MaxOutOfLine }};
+  static constexpr bool kHasFlexibleEnvelope = {{ .Request.TypeShapeV2.HasFlexibleEnvelope }};
+  static constexpr bool kHasPointer = {{ .Request.TypeShapeV2.HasPointer }};
+  static constexpr ::fidl::internal::TransactionalMessageKind kMessageKind =
+    ::fidl::internal::TransactionalMessageKind::kRequest;
+};
+
+{{- end }}
+
+{{- if .HasResponse }}
+
+{{- if .IsEvent }}
+
+template <>
+struct IsFidlType<{{ .WireTransactionalEvent }}> : public std::true_type {};
+template <>
+struct IsFidlTransactionalMessage<{{ .WireTransactionalEvent }}> : public std::true_type {};
+{{- if .Response.IsResource }}
+template <>
+struct IsResource<{{ .WireTransactionalEvent }}> : public std::true_type {};
+{{- end }}
+
+
+template <>
+struct TypeTraits<{{ .WireTransactionalEvent }}> {
+  static constexpr uint32_t kMaxNumHandles = {{ .Response.TypeShapeV2.MaxHandles }};
+  static constexpr uint32_t kMaxDepth = {{ .Response.TypeShapeV2.Depth }};
+  static constexpr uint32_t kPrimarySize = FIDL_ALIGN({{ .Response.TypeShapeV2.InlineSize }} + sizeof(fidl_message_header_t));
+  static constexpr uint32_t kMaxOutOfLine = {{ .Response.TypeShapeV2.MaxOutOfLine }};
+  static constexpr bool kHasFlexibleEnvelope = {{ .Response.TypeShapeV2.HasFlexibleEnvelope }};
+  static constexpr bool kHasPointer = {{ .Response.TypeShapeV2.HasPointer }};
+  static constexpr ::fidl::internal::TransactionalMessageKind kMessageKind =
+    ::fidl::internal::TransactionalMessageKind::kResponse;
+};
+
+{{- else }}
+
+template <>
+struct IsFidlType<{{ .WireTransactionalResponse }}> : public std::true_type {};
+template <>
+struct IsFidlTransactionalMessage<{{ .WireTransactionalResponse }}> : public std::true_type {};
+{{- if .HasResponsePayload }}
+template <>
+struct IsFidlType<{{ .WireResponse }}> : public std::true_type {};
+{{- end }}
+{{- if .Response.IsResource }}
+template <>
+struct IsResource<{{ .WireTransactionalResponse }}> : public std::true_type {};
+template <>
+struct IsResource<{{ .WireResponse }}> : public std::true_type {};
+{{- end }}
+
+
+template <>
+struct TypeTraits<{{ .WireTransactionalResponse }}> {
+  static constexpr bool kHasServerToClientBody = {{ if .ResponseArgs }}true{{ else }}false{{ end }};
+  static constexpr uint32_t kMaxNumHandles = {{ .Response.TypeShapeV2.MaxHandles }};
+  static constexpr uint32_t kMaxDepth = {{ .Response.TypeShapeV2.Depth }};
+  static constexpr uint32_t kPrimarySize = FIDL_ALIGN({{ .Response.TypeShapeV2.InlineSize }} + sizeof(fidl_message_header_t));
+  static constexpr uint32_t kMaxOutOfLine = {{ .Response.TypeShapeV2.MaxOutOfLine }};
+  static constexpr bool kHasFlexibleEnvelope = {{ .Response.TypeShapeV2.HasFlexibleEnvelope }};
+  static constexpr bool kHasPointer = {{ .Response.TypeShapeV2.HasPointer }};
+  static constexpr ::fidl::internal::TransactionalMessageKind kMessageKind =
+    ::fidl::internal::TransactionalMessageKind::kResponse;
+};
+
+{{- if .HasResponsePayload }}
+template <>
+struct TypeTraits<{{ .WireResponse }}> {
+  static constexpr bool kHasServerToClientBody = {{ if .ResponseArgs }}true{{ else }}false{{ end }};
+  static constexpr uint32_t kMaxNumHandles = {{ .Response.TypeShapeV2.MaxHandles }};
+  static constexpr uint32_t kMaxDepth = {{ .Response.TypeShapeV2.Depth }};
+  static constexpr uint32_t kPrimarySize = {{ .Response.TypeShapeV2.InlineSize }};
+  static constexpr uint32_t kMaxOutOfLine = {{ .Response.TypeShapeV2.MaxOutOfLine }};
+  static constexpr bool kHasFlexibleEnvelope = {{ .Response.TypeShapeV2.HasFlexibleEnvelope }};
+  static constexpr bool kHasPointer = {{ .Response.TypeShapeV2.HasPointer }};
+  static constexpr ::fidl::internal::TransactionalMessageKind kMessageKind =
+    ::fidl::internal::TransactionalMessageKind::kResponse;
+};
+{{- end }}
+
+{{- end }}
+
+{{- end }}
+{{- end }}
+{{- end }}
+
+
+
+{{- define "Protocol:WireMessagingSource" }}
+{{ $protocol := . -}}
+
+{{- range .Methods }}
+  {{ $method := . -}}
+  {{ EnsureNamespace .OrdinalName }}
+  [[maybe_unused]]
+  constexpr uint64_t {{ .OrdinalName.Name }} = {{ .Ordinal }}lu;
+  {{ EnsureNamespace .DynamicFlagsName }}
+  [[maybe_unused]]
+  constexpr ::fidl::MessageDynamicFlags {{ .DynamicFlagsName.Name }} = {{ .DynamicFlags }};
+
+  {{- if .RequestArgs }}
+    static_assert(sizeof({{ .WireTransactionalRequest }})
+        == ::fidl::TypeTraits<{{ .WireTransactionalRequest }}>::kPrimarySize);
+    static_assert(offsetof({{ .WireTransactionalRequest }}, header) == 0);
+    {{- if .RequestArgs }}
+      static_assert(offsetof({{ .WireTransactionalRequest }}, body) == sizeof(fidl_message_header_t));
+    {{- end }}
+
+    static_assert(sizeof({{ .RequestPayload }})
+        == ::fidl::TypeTraits<{{ .RequestPayload }}>::kPrimarySize);
+      {{- if .RequestFlattened }}
+        {{- range $index, $param := .RequestArgs }}
+          static_assert(offsetof({{ $method.RequestPayload }}, {{ $param.Name }}) == {{ $param.OffsetV2 }});
+        {{- end }}
+      {{- end }}
+  {{- end }}
+
+  {{- if .IsEvent }}
+    static_assert(sizeof({{ .WireTransactionalEvent }})
+      == ::fidl::TypeTraits<{{ .WireTransactionalEvent }}>::kPrimarySize);
+    static_assert(offsetof({{ .WireTransactionalEvent }}, header) == 0);
+    {{- if .ResponseArgs }}
+      static_assert(offsetof({{ .WireTransactionalEvent }}, body) == sizeof(fidl_message_header_t));
+    {{- end }}
+  {{- else }}
+    {{- if .ResponseArgs }}
+      static_assert(sizeof({{ .WireResponse }})
+          == ::fidl::TypeTraits<{{ .WireResponse }}>::kPrimarySize);
+      {{- if .ResponseFlattened }}
+        {{- range $index, $param := .ResponseArgs }}
+          static_assert(offsetof({{ $method.WireResponse }}, {{ $param.Name }}) == {{ $param.OffsetV2 }});
+        {{- end }}
+      {{- end }}
+      static_assert(sizeof({{ .WireTransactionalResponse }})
+          == ::fidl::TypeTraits<{{ .WireTransactionalResponse }}>::kPrimarySize);
+      static_assert(offsetof({{ .WireTransactionalResponse }}, header) == 0);
+      static_assert(offsetof({{ .WireTransactionalResponse }}, body) == sizeof(fidl_message_header_t));
+    {{- end }}
+
+  {{- end }}
+
+{{- end }}
+
+{{- /* Client-calling functions do not apply to events. */}}
+{{- range .ClientMethods -}}
+{{ "" }}
+    {{- if .Transport.HasSyncClient }}
+    {{- if eq .Transport.Name "Channel" }}
+    {{- template "Method:Result:WireMessagingSource" . }}
+    {{- end }}
+    {{- end }}
+{{ "" }}
+    {{- if eq .Transport.Name "Driver" }}
+    {{- template "driver/Method:UnownedResult:MessagingSource" . }}
+    {{- else }}
+    {{- template "Method:UnownedResult:WireMessagingSource" . }}
+    {{- end }}
+{{ "" }}
+{{- end }}
+
+{{- if eq .Transport.Name "Driver" }}
+{{ template "Protocol:ClientImpl:driver/MessagingSource" . }}
+{{- else }}
+{{ template "Protocol:ClientImpl:WireMessagingSource" . }}
+{{- end }}
+
+{{ template "Protocol:EventHandler:WireMessagingSource" . }}
+
+{{- /* Server implementation */}}
+{{ template "Protocol:Dispatcher:WireMessagingSource" . }}
+
+{{- if .Methods }}
+  {{- range .TwoWayMethods -}}
+    {{- if eq .Transport.Name "Driver" }}
+    {{- template "Method:CompleterBase:driver/WireMessagingSource" . }}
+    {{- else }}
+    {{- template "Method:CompleterBase:WireMessagingSource" . }}
+    {{- end }}
+  {{- end }}
+
+  {{- range .Methods }}
+
+    {{- if .HasRequest }}{{ template "Method:Request:WireMessagingSource" . }}{{ end }}
+    {{ "" }}
+
+    {{- if .HasResponse }}
+    {{- if .IsEvent }}
+    {{ template "Method:Event:WireMessagingSource" . }}
+    {{- else }}
+    {{ template "Method:Response:WireMessagingSource" . }}
+    {{- end }}
+    {{ end }}
+    {{ "" }}
+
+  {{- end }}
+{{- end }}
+
+{{ template "Protocol:Caller:WireMessagingSource" . }}
+
+{{- end }}
+
+
+
+{{- define "Protocol:NaturalMessagingHeader" }}
+  {{- range .Methods }}
+    {{- template "Method:Types:NaturalMessagingHeader" . }}
+  {{- end }}
+{{- end }}

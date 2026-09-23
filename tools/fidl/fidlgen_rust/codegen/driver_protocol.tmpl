@@ -1,0 +1,285 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "DriverProtocolDeclaration" }}
+{{- $protocol := . }}
+{{- if eq $protocol.OverTransport "Driver" }}
+#[cfg(feature = "driver")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct {{ $protocol.Marker }};
+
+#[cfg(feature = "driver")]
+impl fidl_driver::endpoints::DriverProtocolMarker for {{ $protocol.Marker }} {
+    const DEBUG_NAME: &'static str = "{{ $protocol.DebugName }}";
+}
+
+{{- range $method := $protocol.Methods }}
+{{- if and $method.HasError (not $method.IsComposed) }}
+pub type {{ $method.Response.TupleType }} = {{ $method.Response.TupleTypeAliasRhs }};
+{{- end }}
+{{- end }}
+{{ "" }}
+{{- range .DocComments }}
+///{{ . }}
+{{- end }}
+{{ "" }}
+#[cfg(feature = "driver")]
+#[derive(Debug)]
+pub enum {{ $protocol.Request }} {
+    {{- range $method := $protocol.Methods }}
+    {{- if $method.HasRequest }}
+    {{- range .DocComments }}
+    ///{{ . }}
+    {{- end }}
+    {{ $method.CamelName }} {
+        {{- range $method.Request.Parameters }}
+        {{ .Name }}: {{ .OwnedType }},
+        {{- end }}
+        {{- if $method.HasResponse }}
+        responder: {{ $method.Responder }},
+        {{- end }}
+    },
+    {{- end }}
+    {{- end }}
+
+    {{- if $protocol.OneWayUnknownInteractions }}
+    /// An interaction was received which does not match any known method.
+    #[non_exhaustive]
+    _UnknownMethod {
+        /// Ordinal of the method that was called.
+        ordinal: u64,
+        {{- if $protocol.TwoWayUnknownInteractions }}
+        method_type: fidl::MethodType,
+        {{- end }}
+    },
+    {{- end }}
+}
+
+#[cfg(feature = "driver")]
+impl {{ $protocol.Request }} {
+    {{- range $method := $protocol.Methods }}
+    {{- if $method.HasRequest }}
+    {{ "" }}
+    #[allow(irrefutable_let_patterns)]
+    pub fn into_{{ $method.Name }}(self) -> Option<(
+        {{- range $method.Request.Parameters }}
+        {{ .OwnedType }},
+        {{- end }}
+        {{- if $method.HasResponse }}
+        {{ $method.Responder }}
+        {{- end }}
+    )> {
+        if let {{ $protocol.Request }}::{{ $method.CamelName }} {
+            {{- range $method.Request.Parameters }}
+            {{ .Name }},
+            {{- end }}
+            {{- if $method.HasResponse }}
+            responder,
+            {{- end }}
+        } = self {
+            Some((
+                {{- range $method.Request.Parameters }}
+                {{- .Name }},
+                {{- end }}
+                {{- if $method.HasResponse }}
+                responder
+                {{- end -}}
+            ))
+        } else {
+            None
+        }
+    }
+    {{- end }}
+    {{- end }}
+
+    {{- range $method := $protocol.Methods }}
+    {{- if $method.HasRequest }}
+    {{ "" }}
+    pub fn new_{{ $method.Name }}(self,
+        {{- range $method.Request.Parameters }}
+        {{ .Name }}: {{ .OwnedType }},
+        {{- end }}
+        {{- if $method.HasResponse }}
+        tx_id: u32,
+        {{- end }}
+    ) -> Self {
+        Self::{{ $method.CamelName }} {
+            {{- range $method.Request.Parameters }}
+            {{ .Name }},
+            {{- end }}
+            {{- if $method.HasResponse }}
+            responder: {{ $method.Responder }} { tx_id },
+            {{- end }}
+        }
+    }
+    {{- end }}
+    {{- end }}
+
+    {{- range $method := $protocol.Methods }}
+    {{- if $method.HasRequest }}
+    {{ "" }}
+    pub fn r#{{ $method.Name }}_as_message(
+        arena: fdf::Arena,
+        {{- range $method.Request.Parameters }}
+        mut {{ .Name }}: {{ .Type }},
+        {{- end }}
+        {{- if $method.HasResponse }}
+        tx_id: u32,
+        {{- end }}
+    ) -> Result<fdf::Message<[u8]>, fidl::Error> {
+        {{- if not $method.HasResponse }}
+        let tx_id = 0;
+        {{- end }}
+        let ordinal = {{ .Ordinal | printf "%#x" }};
+        let dynamic_flags = {{ .DynamicFlags }};
+        let body = {{ .Request.EncodeExpr }};
+        let msg =
+            fidl::encoding::TransactionMessage { header: fidl::encoding::TransactionHeader::new(tx_id, ordinal, dynamic_flags), body };
+        fidl::encoding::with_tls_encoded::<fidl::encoding::TransactionMessageType<{{ .Request.FidlType "fidl::encoding::DefaultFuchsiaResourceDialect" }}>, fidl::encoding::DefaultFuchsiaResourceDialect, fdf::Message<[u8]>>(msg, |bytes, mut handles| {
+            let handles = arena.insert_from_iter(std::mem::take(handles).into_iter().map(fidl_driver::encoding::mixed_from_handle_disposition));
+            Ok(fdf::Message::new(&arena, Some(arena.insert_slice(bytes)), Some(handles)))
+        })
+    }
+    {{- end }}
+    {{- end }}
+
+    #[allow(irrefutable_let_patterns)]
+    pub fn read_from(
+        bytes: &[u8],
+        _handles: &mut [zx::HandleInfo]
+    ) -> Result<Self, fidl::Error> {
+        let (header, _body_bytes) = fidl::encoding::decode_transaction_header(bytes)?;
+
+        match header.ordinal {
+            {{- range $method := $protocol.Methods }}
+            {{- if $method.HasRequest }}
+            {{ .Ordinal | printf "%#x" }} => {
+                header.validate_request_tx_id(
+                {{- if $method.HasResponse -}}
+                    fidl::MethodType::TwoWay
+                {{- else -}}
+                    fidl::MethodType::OneWay
+                {{- end -}}
+                )?;
+                let mut req = fidl::new_empty!({{ $method.Request.FidlType "fidl::encoding::DefaultFuchsiaResourceDialect" }}, fidl::encoding::DefaultFuchsiaResourceDialect);
+                fidl::encoding::Decoder::<fidl::encoding::DefaultFuchsiaResourceDialect>::decode_into::<{{ $method.Request.FidlType "fidl::encoding::DefaultFuchsiaResourceDialect" }}>(&header, _body_bytes, _handles, &mut req)?;
+                Ok({{ $protocol.Request }}::{{ $method.CamelName }} {
+                    {{- call $method.Request.ConvertToFields "req" }}
+                    {{- if $method.HasResponse }}
+                    responder: {{ $method.Responder }} {
+                        tx_id: header.tx_id,
+                    },
+                    {{- else }}
+                    {{- end }}
+                })
+            }
+            {{- end }}
+            {{- end }}
+            {{- if $protocol.OneWayUnknownInteractions }}
+            _ if header.tx_id == 0 && header.dynamic_flags().contains(fidl::encoding::DynamicFlags::FLEXIBLE) => {
+                Ok({{ $protocol.Request }}::_UnknownMethod {
+                    ordinal: header.ordinal,
+                    {{- if $protocol.TwoWayUnknownInteractions }}
+                    method_type: fidl::MethodType::OneWay,
+                    {{- end }}
+                })
+            }
+            {{- if $protocol.TwoWayUnknownInteractions }}
+            _ if header.dynamic_flags().contains(fidl::encoding::DynamicFlags::FLEXIBLE) => {
+                Ok({{ $protocol.Request }}::_UnknownMethod {
+                    ordinal: header.ordinal,
+                    method_type: fidl::MethodType::TwoWay,
+                })
+            }
+            {{- end }}
+            {{- end }}
+            _ => Err(fidl::Error::UnknownOrdinal {
+                ordinal: header.ordinal,
+                protocol_name: <{{ $protocol.Marker }} as fidl_driver::endpoints::DriverProtocolMarker>::DEBUG_NAME
+            }),
+        }
+    }
+
+    pub fn read_from_message(mut message: fdf::Message<[u8]>) -> Result<(fdf::Arena, Self), fidl::Error> {
+        let (arena, Some(body), handles) = message.take_arena_boxes() else {
+            return Err(fidl::Error::Invalid)
+        };
+        let mut handles = handles
+            .map(|handles| arena.try_insert_from_iter(handles.into_iter().map(|handle| {
+                unsafe { fidl_driver::encoding::mixed_into_handle_info(handle) }
+            })))
+            .transpose();
+        let res = match handles {
+            Ok(ref mut handles) => Self::read_from(&*body, handles.as_deref_mut().unwrap_or(&mut []))?,
+            Err(_) => return Err(fidl::Error::Invalid),
+        };
+        std::mem::drop((body, handles));
+        Ok((message.take_arena(), res))
+    }
+
+    /// Name of the method defined in FIDL
+    pub fn method_name(&self) -> &'static str {
+        match *self {
+            {{- range $method := $protocol.Methods }}
+            {{- if $method.HasRequest }}
+            {{ $protocol.Request }}::{{ $method.CamelName }}{..} => "{{ $method.Name }}",
+            {{- end }}
+            {{- end }}
+
+            {{- if $protocol.TwoWayUnknownInteractions }}
+            {{ $protocol.Request }}::_UnknownMethod {
+                method_type: fidl::MethodType::OneWay, ..
+            } => "unknown one-way method",
+            {{ $protocol.Request }}::_UnknownMethod {
+                method_type: fidl::MethodType::TwoWay, ..
+            } => "unknown two-way method",
+            {{- else if $protocol.OneWayUnknownInteractions }}
+            {{ $protocol.Request }}::_UnknownMethod {..} => "unknown one-way method",
+            {{- end }}
+        }
+    }
+}
+
+/// Like [`{{ $protocol.Request }}::read_from_message`] except it drops the [`Arena`].
+#[cfg(feature = "driver")]
+impl std::convert::TryFrom<fdf::Message<[u8]>> for {{ $protocol.Request }} {
+    type Error = fidl::Error;
+    fn try_from(msg: fdf::Message<[u8]>) -> Result<{{ $protocol.Request }}, fidl::Error> {
+        Ok({{ $protocol.Request }}::read_from_message(msg)?.1)
+    }
+}
+
+{{- range $method := $protocol.Methods }}
+{{ "" }}
+{{- if and $method.HasRequest $method.HasResponse }}
+#[must_use = "FIDL methods require a response to be sent"]
+#[cfg(feature = "driver")]
+#[derive(Debug)]
+pub struct {{ $method.Responder }} {
+    tx_id: u32,
+}
+
+#[cfg(feature = "driver")]
+impl {{ $method.Responder }} {
+    pub fn send_response(&self, server_handle: &fdf::Channel<[u8]>,
+        {{- range $method.Response.Parameters }}
+        mut {{ .Name }}: {{ .Type }},
+        {{- end }}
+    ) -> Result<(), fidl::Error> {
+        let msg = fidl::encoding::TransactionMessage {
+            header: fidl::encoding::TransactionHeader::new(self.tx_id, {{ $method.Ordinal | printf "%#x" }}, {{ $method.DynamicFlags }}),
+            body: {{ $method.Response.EncodeExpr }},
+        };
+        fidl::encoding::with_tls_encoded::<fidl::encoding::TransactionMessageType<{{ $method.Response.FidlType "fidl::encoding::DefaultFuchsiaResourceDialect" }}>, fidl::encoding::DefaultFuchsiaResourceDialect, ()>(msg, |body, _handles| {
+            server_handle.write_with_data(fdf::Arena::new(), |arena| arena.insert_slice(&body)).unwrap();
+            Ok(())
+        })
+    }
+}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

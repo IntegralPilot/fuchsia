@@ -1,0 +1,42 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_UI_SCENIC_LIB_SCHEDULING_VSYNC_TIMING_H_
+#define SRC_UI_SCENIC_LIB_SCHEDULING_VSYNC_TIMING_H_
+
+#include <lib/syslog/cpp/macros.h>
+#include <lib/zx/time.h>
+
+#include "src/ui/scenic/lib/scheduling/median_duration_predictor.h"
+
+namespace scheduling {
+
+class VsyncTiming {
+ public:
+  VsyncTiming();
+
+  // Obtain the time of the last Vsync, in nanoseconds.
+  zx::time last_vsync_time() const { return last_vsync_time_; }
+
+  void set_last_vsync_time(zx::time last_vsync_time) { last_vsync_time_ = last_vsync_time; }
+
+  // Obtain the smoothed, median-filtered vsync interval, in nanoseconds.
+  zx::duration vsync_interval() const { return vsync_interval_predictor_.GetPrediction(); }
+
+  void AddVsyncInterval(zx::duration vsync_interval) {
+    vsync_interval_predictor_.InsertNewMeasurement(vsync_interval);
+  }
+
+ private:
+  // Vsync interval of a 60 Hz screen.
+  // Used as a default value before real timings arrive.
+  static constexpr zx::duration kNsecsFor60fps = zx::nsec(16'666'667);  // 16.666667ms
+
+  zx::time last_vsync_time_;
+  MedianDurationPredictor vsync_interval_predictor_;
+};
+
+}  // namespace scheduling
+
+#endif  // SRC_UI_SCENIC_LIB_SCHEDULING_VSYNC_TIMING_H_

@@ -1,0 +1,16 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef BUILD_BAZEL_SDK_TESTS_FUCHSIA_DEVICETREE_TEST_SOC_INCLUDE_SOC_HW_H_
+#define BUILD_BAZEL_SDK_TESTS_FUCHSIA_DEVICETREE_TEST_SOC_INCLUDE_SOC_HW_H_
+
+// gpio
+#define TEST_SOC_GPIO_BASE 0xff634400
+#define TEST_SOC_GPIO_LENGTH 0x400
+#define TEST_SOC_GPIO_AO_BASE 0xff800000
+#define TEST_SOC_GPIO_AO_LENGTH 0x1000
+#define TEST_SOC_GPIO_INTERRUPT_BASE 0xffd00000
+#define TEST_SOC_GPIO_INTERRUPT_LENGTH 0x10000
+
+#endif  // BUILD_BAZEL_SDK_TESTS_FUCHSIA_DEVICETREE_TEST_SOC_INCLUDE_SOC_HW_H_

@@ -1,0 +1,316 @@
+#!/bin/bash
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Source tree
+### runs static analysis checks on modified files
+
+## Usage: fx lint
+##           [--dry-run] [--verbose] [--fix] [--all]
+##           [--files=FILES,[FILES ...]]
+##           [--target=GN_TARGET]
+##           [--only=CHECK] [--skip=CHECK]
+##           [--commit-msg] [--json-output=PATH]
+##           [--git] [--changed-lines] [-- PATTERN]
+##
+##   --dry-run Stops the program short of running the linters
+##   --all     Lints all code in the git repo under the current working
+##             directory.
+##   --fix     Applies automated fixes/replacements emitted by linters.
+##   --files   Allows the user to specify files. Files are comma separated.
+##             Does not support globs. To lint all files in a directory, use
+##             `cd <dir> && fx lint --all`.
+##   --target  Allows the user to specify a gn target.
+##   --only    Runs only the specified SHAC check (e.g. `--only=buildifier_lint`).
+##   --skip    Skips the specified SHAC check (e.g. `--skip=clippy`).
+##   --commit-msg
+##             Runs commit message checks against the current commit.
+##   --json-output
+##             Path to write SARIF JSON report to.
+##   --git     The default; it uses `git diff` against the newest parent
+##             commit in the upstream branch (or against HEAD if no such commit
+##             is found). Files that are locally modified, staged or touched by
+##             any commits introduced on the local branch are linted.
+##   --changed-lines
+##             Lint changed lines only. Supported for C++ clang-tidy.
+##   --parallel
+##             Lints all files in parallel where applicable.
+##   --verbose Print all lint commands prior to execution.
+##    -- PATTERN
+##             For --all or --git, passes along -- PATTERN to `git ls-files`
+##             to filter what files are affected.
+##
+## Supported Ecosystems: Bazel/Starlark, C/C++, FIDL, Markdown, Python, Rust, Commit Messages
+
+set -e
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+
+function usage() {
+  fx-command-help
+}
+
+function zap-commas() {
+  printf %s "$1" | tr ',' '\n'
+}
+
+function get-diff-base() {
+  local upstream=$(git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null)
+  if [[ -z "${upstream}" ]]; then
+    # Make sure upstream is always an ancestor commit.
+    if git merge-base --is-ancestor origin/main HEAD; then
+      upstream="origin/main"
+    elif git merge-base --is-ancestor JIRI_HEAD HEAD; then
+      if git merge-base --is-ancestor JIRI_HEAD origin/main; then
+        upstream=$(git merge-base HEAD origin/main)
+      else
+        upstream="JIRI_HEAD"
+      fi
+    else
+      upstream="HEAD"
+    fi
+  fi
+  local local_commit=$(git rev-list HEAD ^${upstream} --  2>/dev/null | tail -1)
+  if [[ -z "${local_commit}" ]]; then
+    printf "HEAD"
+  else
+    git rev-parse "${local_commit}"^
+  fi
+}
+
+function print-and-execute() {
+  if [[ -n "${VERBOSE}" ]]; then
+    echo "$@"
+  fi
+  "$@"
+}
+
+function canonicalize() {
+  local root_dir="$1"
+  shift
+  for fileglob in "${@}"; do
+    if [[ "${fileglob}" = //* || "${fileglob}" = [^/]* ]]; then
+      local dir="${root_dir}"/
+    else
+      local dir=""
+    fi
+    for file in "${dir}""${fileglob#"//"}"; do
+      printf "${file}\n"
+    done
+  done
+}
+
+DRY_RUN=
+VERBOSE=
+FIX=
+PARALLEL=
+FILES_SPECIFIED=
+CHANGED_LINES=
+COMMIT_MSG=
+SHAC_EXTRA_ARGS=()
+
+fx-config-read
+
+GET_FILES=get_git_files
+while [ $# -gt 0 ]; do
+  ARG="$1"
+  case "$1" in
+    --verbose) VERBOSE="1" ;;
+    --dry-run) DRY_RUN="1" ;;
+    --fix) FIX="1" ;;
+    --parallel) PARALLEL="1" ;;
+    --changed-lines) CHANGED_LINES="1" ;;
+    --commit-msg|--commit) COMMIT_MSG="1" ;;
+    --all)
+      GET_FILES=get_all_files
+      ;;
+    --git)
+      GET_FILES=get_git_files
+      ;;
+    --only=*)
+      SHAC_EXTRA_ARGS+=("${ARG}")
+      ;;
+    --skip=*)
+      SHAC_EXTRA_ARGS+=("${ARG}")
+      ;;
+    --json-output=*)
+      SHAC_EXTRA_ARGS+=("${ARG}")
+      ;;
+    --files=*)
+      FILES_SPECIFIED="1"
+      GET_FILES=:
+      OLDIFS=$IFS && IFS=$'\n' \
+      && FILES=( \
+        $(canonicalize "${PWD}" $(zap-commas "${ARG#--files=}")) \
+      ) \
+      && IFS=$OLDIFS
+      ;;
+    --target=*)
+      FILES_SPECIFIED="1"
+      GET_FILES=:
+      OLDIFS=$IFS && IFS=$'\n' \
+      && FILES=( \
+        $(canonicalize "${FUCHSIA_DIR}" \
+          $(fx-gn desc "${FUCHSIA_BUILD_DIR}" "${ARG#--target=}" sources)) \
+      ) \
+      && IFS=$OLDIFS
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --) break ;;
+    *) usage && printf "Unknown flag %s\n" "${ARG}" && exit 1 ;;
+  esac
+  shift
+done
+
+GIT_FILTER=(
+  "$@"
+  ":(top,exclude)third_party/bazel_vendor"
+  ":(top,exclude)third_party/golibs/vendor"
+  ":(top,exclude)third_party/rust_crates"
+  ":(top,exclude)src/devices/tools/fidlgen_banjo/tests"
+  ":(top,exclude)src/devices/tools/fidlgen_banjo/src/backends/templates/rust"
+  ":(top,exclude)build/bazel/fuchsia_idk/validation_data"
+  ":(top,exclude)build/sdk/generate_prebuild_idk/validation_data"
+  ":(exclude)*/goldens/*"
+)
+
+get_git_files() {
+  OLDIFS=$IFS && IFS=$'\n' \
+    && FILES=( \
+    $(canonicalize $(git rev-parse --show-toplevel) \
+      $(git diff --name-only $(get-diff-base) "${GIT_FILTER[@]}")) \
+    ) \
+    && IFS=$OLDIFS
+}
+
+get_all_files() {
+  OLDIFS=$IFS && IFS=$'\n' && FILES=( \
+    $(canonicalize "${PWD}" $(git ls-files "${GIT_FILTER[@]}")) \
+  ) \
+  && IFS=$OLDIFS
+}
+
+if [[ -n "${COMMIT_MSG}" ]]; then
+  SHAC_EXTRA_ARGS+=("--only=commit_msg")
+fi
+
+$GET_FILES
+
+if [[ -n "${VERBOSE}" ]]; then
+  printf "Files to be linted:\n%s\n" "${FILES[@]}"
+fi
+
+# Stage 1: Build required host tools just-in-time
+compiled_linter_extensions=(
+  "fidl-lint=.fidl"
+  "clippy-reporter=.rs"
+)
+
+tool_targets=()
+for entry in "${compiled_linter_extensions[@]}"; do
+  tool="${entry%%=*}"
+  extensions="${entry##*=}"
+  needed=false
+  for file in "${FILES[@]}"; do
+    for ext in ${extensions}; do
+      if [[ ${file} = *${ext} ]]; then
+        needed=true
+      fi
+    done
+  done
+
+  if $needed; then
+    tool_path="$( fx-command-run list-build-artifacts --expect-one --name "${tool}" tools 2>/dev/null || true )"
+    if [[ -n "${tool_path}" && ! -x "${FUCHSIA_BUILD_DIR}/${tool_path}" ]]; then
+      fx-info "${tool} not built; building now..."
+      tool_label="$( fx-command-run list-build-artifacts --show-label --expect-one --name "${tool}" tools 2>/dev/null || true )"
+      if [[ -n "${tool_label}" ]]; then
+        tool_targets+=("$tool_label")
+      fi
+    fi
+  fi
+done
+
+if [[ ${#tool_targets[@]} -gt 0 ]]; then
+  fx-command-run build "${tool_targets[@]}"
+fi
+
+[[ -n "${DRY_RUN}" ]] && exit 0
+
+# Separate files for clang-tidy and SHAC
+clang_tidy_files=()
+shac_files=()
+for file in "${FILES[@]}"; do
+  if [[ ! -f "${file}" ]]; then
+    if [[ -n "${FILES_SPECIFIED}" ]]; then
+      fx-error "no such file: ${file}"
+    fi
+    continue
+  fi
+  shac_files+=("$file")
+
+  case "${file}" in
+    *.c|*.cc|*.cpp|*.h|*.hh|*.hpp)
+      clang_tidy_files+=("${file}")
+      ;;
+  esac
+done
+
+# Stage 2: Direct clang-tidy execution on C++ files
+if [[ ${#clang_tidy_files[@]} -gt 0 && -z "${COMMIT_MSG}" ]]; then
+  declare CLANG_TIDY="${PREBUILT_CLANG_DIR}/bin/clang-tidy"
+  declare CLANG_APPLY_REPLACEMENTS="${PREBUILT_CLANG_DIR}/bin/clang-apply-replacements"
+  declare RUN_CLANG_TIDY="${PREBUILT_CLANG_DIR}/bin/run-clang-tidy"
+
+  if [[ -f "${FUCHSIA_BUILD_DIR}/compile_commands.json" ]]; then
+    clang_tidy_cmd=(
+      "${PREBUILT_PYTHON3}"
+      "${RUN_CLANG_TIDY}"
+      -clang-tidy-binary "${CLANG_TIDY}"
+      -clang-apply-replacements-binary "${CLANG_APPLY_REPLACEMENTS}"
+      -p "${FUCHSIA_BUILD_DIR}"
+    )
+    if [[ -n "${FIX}" ]]; then
+      clang_tidy_cmd+=("-fix")
+    fi
+    print-and-execute "${clang_tidy_cmd[@]}" "${clang_tidy_files[@]}" || true
+  else
+    fx-warn "compile_commands.json not found in ${FUCHSIA_BUILD_DIR}; skipping clang-tidy. Run 'fx compdb' or 'fx gen' to enable C++ linting."
+  fi
+fi
+
+# Stage 3: Run SHAC for universal static analysis
+shac_workdir="$FUCHSIA_DIR"
+if [[ "$(git rev-parse --is-inside-work-tree 2> /dev/null)" == "true" ]] && \
+    [ -f "$(git rev-parse --show-toplevel)/shac.star" ]; then
+  shac_workdir="$(pwd)"
+fi
+
+if [[ -z "${JIRI_PACKAGES_DIR}" ]]; then
+  if git_common_dir=$(git -C "${FUCHSIA_DIR}" rev-parse --git-common-dir 2>/dev/null) && [[ -d "${git_common_dir}" ]]; then
+    parent_root=$(cd "${git_common_dir}/.." 2>/dev/null && pwd)
+    packages_dir="${parent_root}/.jiri_root/packages"
+    if [[ -d "${packages_dir}" ]]; then
+      export JIRI_PACKAGES_DIR="${packages_dir}"
+    fi
+  fi
+fi
+
+shac_subcommand="check"
+if [[ -n "${FIX}" ]]; then
+  shac_subcommand="fix"
+fi
+
+if [[ ${#shac_files[@]} -gt 0 || -n "${COMMIT_MSG}" || "${GET_FILES}" == "get_all_files" ]]; then
+  print-and-execute "${PREBUILT_SHAC}" "${shac_subcommand}" \
+    -C "${shac_workdir}" \
+    --var fuchsia_build_dir="${FUCHSIA_BUILD_DIR#"$FUCHSIA_DIR/"}" \
+    "${SHAC_EXTRA_ARGS[@]}" \
+    "${shac_files[@]}"
+fi
+
+exit 0

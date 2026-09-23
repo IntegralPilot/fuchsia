@@ -1,0 +1,309 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=16)
+library fuchsia.debugger;
+
+using fuchsia.component;
+using zx;
+
+@available(added=HEAD)
+closed protocol AttachedProcessIterator {
+    strict GetNext() -> (struct {
+        process_names vector<string:zx.MAX_NAME_LEN>:MAX;
+    });
+};
+
+@available(added=HEAD)
+type ThreadDetailsInterest = table {
+    /// Produce a backtrace in symbolizer markup format for each thread.
+    /// If this is unspecified, no backtrace will be included in the
+    /// ThreadDetails yielded by ProcessInfoIterator.
+    1: backtrace bool;
+};
+
+/// Details about a particular thread. The fields will be included as per the
+/// ThreadDetailsInterest supplied when creating the ProcessInfoIterator via
+/// |GetProcessInfo|.
+@available(added=HEAD)
+type ThreadDetails = table {
+    /// A stack trace from the current thread in symbolizer markup format.
+    1: backtrace string:MAX;
+};
+
+@available(added=HEAD)
+type ProcessInfo = struct {
+    process zx.Koid;
+    moniker string:fuchsia.component.MAX_MONIKER_LENGTH;
+
+    /// The koid of the thread that produced the information in |details|.
+    thread zx.Koid;
+
+    /// Details about the thread with |koid|, as specified in the
+    /// ThreadDetailsInterest given to |GetProcessInfo|.
+    details ThreadDetails;
+};
+
+@available(added=HEAD)
+type ProcessInfoError = flexible enum {
+    /// There were no attached processes to iterate over.
+    NO_PROCESSES = 1;
+    /// A process has died such that the iterator is invalid.
+    PROCESS_GONE = 2;
+    /// A process's threads have been mutated such that the iterator is invalid.
+    THREAD_GONE = 3;
+};
+
+/// Collects details from all threads of all attached processes. The exact
+/// details that are yielded from the iterator are controlled via
+/// ThreadDetailsInterest passed to |GetProcessInfo|. The iterator will yield an
+/// empty vector after all attached process' threads have been iterated. It is
+/// an error if there are no processes supplied to this iterator, which could be
+/// from too restrictive of a filter passed to |GetProcessInfo| or DebugAgent is
+/// not attached to anything.
+///
+/// This iteration is inherently racy, there is no way for DebugAgent to prevent
+/// other system entities from causing a process or thread to disappear while we
+/// are traversing them, so it's possible for this iterator to return errors
+/// when those threads or processes have been destroyed. These are not fatal
+/// errors, but can happen multiple times in one iteration.
+///
+/// For example, take this process structure, and assume DebugAgent is attached
+/// to everything:
+///
+/// pr: "process-1" 1234
+///   t: "pr1234-t1" 1
+///   t: "pr1234-t2" 2
+/// pr: "process-2" 2345
+///   t: "pr2345-t1" 3
+///
+/// If "process-1" is killed after "pr1234-t1" is yielded, but before
+/// "pr1234-t2" is yielded, a THREAD_GONE error will be returned on the next
+/// |GetNext| call. Calling |GetNext| again will yield "pr2345-t1".
+@available(added=HEAD)
+closed protocol ProcessInfoIterator {
+    /// Collects information about the next attached thread. There is no
+    /// guarantee of order of processes, but all threads from a given process
+    /// will be iterated before another process's threads.
+    strict GetNext() -> (struct {
+        info vector<ProcessInfo>:MAX;
+    }) error ProcessInfoError;
+};
+
+@available(added=HEAD)
+type FilterError = flexible enum {
+    /// Indicates that there was no pattern given in the filter.
+    NO_PATTERN = 1;
+    /// FilterType was either unspecified or an otherwise unknown type to this agent.
+    UNKNOWN_TYPE = 2;
+    /// The set of options given in FilterOptions was not valid.
+    INVALID_OPTIONS = 3;
+};
+
+@available(added=HEAD)
+type FilterType = flexible enum : uint8 {
+    /// Performs an exact match against a component's URL, sans hash values.
+    /// e.g. pattern fuchsia-pkg://fuchsia.com/package#meta/component.cm will
+    /// match fuchsia-pkg://fuchsia.com/package?hash=1234abcd#meta/component.cm.
+    URL = 0;
+    /// Performs an exact match against a component's full moniker.
+    MONIKER = 1;
+    /// Matches any component moniker that includes the pattern as a prefix.
+    MONIKER_PREFIX = 2;
+    /// Matches any component moniker that includes the pattern as a suffix.
+    MONIKER_SUFFIX = 3;
+};
+
+@available(added=HEAD)
+type FilterOptions = table {
+    /// Whether or not to also match all child components in the matching
+    /// component's realm. When true, the matching component's full moniker will
+    /// be assumed to be the root of the realm, and all processes in all
+    /// children components launched in this realm will be attached to.
+    1: recursive bool;
+
+    /// Whether or not to attach directly to the parent job of the process
+    /// matching the filter. When true, the parent job's standard exception
+    /// channel will be bound, rather than the exception channel of the process.
+    /// See https://fuchsia.dev/fuchsia-src/concepts/kernel/exceptions#exception_channel_types
+    /// for more details. Note that this is *not* the same as the "Debugger"
+    /// exception channel, which only delivers process starting "exceptions" but
+    /// not architectural exceptions.
+    2: job_only bool;
+};
+
+/// A filter that will apply to processes and components running now and in the
+/// future. Any component or process that matches the given pattern and type
+/// will be attached, thereafter allowing clients to query information about the
+/// program(s). A valid filter will always contain a non-empty pattern string,
+/// and a FilterType to discern what to compare the pattern against. Additional
+/// options may be specified via FilterOptions.
+@available(added=HEAD)
+type Filter = struct {
+    /// A string pattern to be matched against the given |type|. An empty
+    /// pattern will result in a NO_PATTERN error.
+    pattern string:MAX;
+
+    /// How to interpret |pattern|. See FilterType.
+    type FilterType;
+
+    /// Additional options for this filter. See FilterOptions.
+    options FilterOptions;
+};
+
+@available(added=HEAD)
+type MinidumpError = flexible enum {
+    /// No processes were yielded to the iterator. This could mean that the
+    /// supplied filter did not match any attached processes, or DebugAgent is
+    /// not attached to any processes.
+    NO_PROCESSES = 1;
+    /// An error occurred while generating the minidump. These errors are opaque
+    /// to DebugAgent.
+    INTERNAL_ERROR = 2;
+};
+
+/// An iterator that collects and returns a minidump for a set of processes. An
+/// empty VMO will be returned when there are no more processes.
+@available(added=HEAD)
+closed protocol MinidumpIterator {
+    strict GetNext() -> (resource struct {
+        minidump zx.Handle:VMO;
+    }) error MinidumpError;
+};
+
+@available(added=HEAD)
+type MinidumpOptions = table {
+    /// This will not install any new filters and will not cause new processes
+    /// to be attached. Rather, this filter will be applied to already attached
+    /// processes.
+    1: filter Filter;
+};
+
+@available(added=HEAD)
+type GetProcessInfoOptions = table {
+    /// A filter that will reduce the number of processes that are iterated
+    /// over. This will not install any new filters and will not cause new
+    /// processes to be attached. Instead, this filter will be applied to
+    /// already attached processes, which can be useful if there are many
+    /// processes currently attached.
+    1: filter Filter;
+
+    /// Clients should specify the data they are interested in being yielded
+    /// from the iterator here. Any unspecified fields will be assumed to be
+    /// false. See ThreadDetailsInterest for descriptions of possible data.
+    2: interest ThreadDetailsInterest;
+};
+
+@discoverable
+open protocol DebugAgent {
+    /// Hand the DebugAgent a socket that connects it to the debugger. This
+    /// will return ZX_ERR_ALREADY_BOUND if a connection already exists. When
+    /// the socket is closed, the DebugAgent will exit.
+    flexible Connect(resource struct {
+        socket zx.Handle:SOCKET;
+    }) -> () error zx.Status;
+
+    /// Iterator over all processes that this agent is attached to. Note this is
+    /// not the same as the set of installed filters, but rather the set of
+    /// filters that matched and were later successfully attached.
+    @available(added=HEAD)
+    flexible GetAttachedProcesses(resource struct {
+        iterator server_end:AttachedProcessIterator;
+    });
+
+    /// Use the given filter to attach to any existing or subsequently created
+    /// components. This method will return the number of matches that were
+    /// present at the time of calling this method. All attached processes will
+    /// be detached when this agent is destroyed.
+    ///
+    /// |filter| will be inspected for validity, with corresponding errors
+    /// returned. If the filter is invalid, no attaches will occur and the
+    /// filter will not be installed.
+    ///
+    /// |num_matches| will contain the number of matches that were found
+    /// immediately upon filter installation if there was no error, that is, the
+    /// number of processes immediately within (or recursively in this realm, if
+    /// the option is specified) this component's corresponding job. Note that
+    /// filters may be installed _before_ any components are actually resolved
+    /// and matched, so this number may be 0. This return value may be safely
+    /// ignored.
+    ///
+    /// Invalid filters will return an error, see Filter above for details on
+    /// how to construct a filter.
+    @available(added=HEAD)
+    flexible AttachTo(Filter) -> (struct {
+        num_matches uint32;
+    }) error FilterError;
+
+    /// The given server_end of the iterator will iterate over all threads, of
+    /// all attached processes. The options parameter may be passed to filter
+    /// the already attached processes and to express interest in what should be
+    /// yielded by the iterator. Including a filter is recommended if DebugAgent
+    /// is attached to a large number of processes. Note that this filter will
+    /// not cause any new processes to be attached and will not be saved after
+    /// this method returns. It is purely to reduce the bounds of the iterator.
+    /// The threads will be suspended for the duration of information capture,
+    /// which could be interrupted by other system processes, see
+    /// |ProcessInfoIterator| for an example.
+    @available(added=HEAD)
+    flexible GetProcessInfo(resource struct {
+        options GetProcessInfoOptions;
+        iterator server_end:ProcessInfoIterator;
+    }) -> () error FilterError;
+
+    /// Collect minidumps for all attached processes. |options| may contain a
+    /// filter to reduce the number of minidumps that are yielded by the
+    /// iterator.
+    @available(added=HEAD)
+    flexible GetMinidumps(resource struct {
+        options MinidumpOptions;
+        iterator server_end:MinidumpIterator;
+    }) -> () error FilterError;
+
+    /// Report exceptions to clients. If no debug_ipc clients are connected, the
+    /// exception will be immediately released, which may result in the process
+    /// crashing.
+    @available(added=HEAD)
+    flexible -> OnFatalException(table {
+        /// The faulting thread's koid.
+        1: thread zx.Koid;
+        /// A stack trace from the faulting thread in symbolizer markup format.
+        2: backtrace string:MAX;
+    });
+};
+
+@available(added=HEAD)
+type Agent = resource struct {
+    name fuchsia.component.child_name;
+    client_end client_end:DebugAgent;
+};
+
+@available(added=HEAD)
+closed protocol AgentIterator {
+    strict GetNext() -> (resource struct {
+        agents vector<Agent>:MAX;
+    });
+};
+
+@available(added=HEAD)
+type LaunchOptions = table {
+    1: monitor_root_job bool;
+};
+
+@discoverable
+@available(added=HEAD)
+open protocol Launcher {
+    /// Launch a new instance of DebugAgent listening on |agent|. The DebugAgent
+    /// will exit upon closing the corresponding client_end of this channel.
+    /// Clients must not close the channel until the debugging session is
+    /// completed.
+    flexible Launch(resource struct {
+        agent server_end:DebugAgent;
+        options LaunchOptions;
+    }) -> () error zx.Status;
+
+    /// Iterator over all DebugAgent instances.
+    flexible GetAgents(resource struct {
+        iterator server_end:AgentIterator;
+    });
+};

@@ -1,0 +1,941 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/config/clang/clang.gni")
+import("//build/cpp/library_headers.gni")
+import("//build/go/go_library.gni")
+import("//build/rust/config.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//build/toolchain/zircon/user_basic_redirect.gni")
+
+# LINT.IfChange
+
+# TODO(https://fxbug.dev/42172629, https://fxbug.dev/42175173): "cpp"
+supported_zither_backends = [
+  "asm",  # Assembly data layout bindings.
+  "c",  # C data layout bindings.
+  "go",  # Go data layout bindings.
+  "rust",  # Rust data layout bindings.
+  "legacy_syscall_cdecl",  # Legacy C syscall declarations.
+  "zircon_ifs",  # Syscall text ABI bindings.
+  "kernel",  # Internal kernel bindings.
+  "go_runtime",  # go.git source files for Fuchsia support.
+  "rust_syscall",  # Thin Rust FFI syscall wrappers.
+  "syscall_docs",  # Syscall documentation markdown.
+]
+
+_clang_format = {
+  script = "$clang_prefix/clang-format"
+  inputs = [ "//.clang-format" ]
+  args = [ "--style=file:" + rebase_path(inputs[0], root_build_dir) ]
+  extensions = [ ".h" ]
+}
+
+_gofmt = {
+  script = "//prebuilt/third_party/go/$host_platform/bin/gofmt"
+
+  # The go backends emits both go and non-go files (e.g., text and assembly);
+  # restrict the use of the formatter to the go files.
+  extensions = [ "go" ]
+}
+
+_rustfmt = {
+  script = "$rustc_prefix/bin/rustfmt"
+  inputs = [ "//rustfmt.toml" ]
+  args = [ "--config-path=" + rebase_path(inputs[0], root_build_dir) ]
+}
+
+# Information on supported Zither backends, accessible via
+# `supported_zither_backend_info[ "$backend" ]`.
+#
+# Each backend scope contains the following:
+#
+#  * output_namespace
+#    - Required: Describes the output subdirectory of the output directory
+#      passed to zither in which the backend artifacts will be written. This
+#      subdirectory has backend-specific significance as a C include path,
+#      Go package name, etc. Given a FIDL library name `library_name` and
+#      referring to this scope as `output_namespace_info`, one can reconstruct
+#      this path as follows:
+#      ```
+#      output_namespace_info = {
+#        prefix_parts = []
+#        suffix_parts = []
+#        part_separator = "/"
+#        forward_variables_from(backend_info.output_namespace, "*")
+#        parts = prefix_parts
+#        if (defined(library_name_separator)) {
+#         parts += [ string_replace(library_name, ".", library_name_separator) ]
+#        }
+#        path += suffix_parts
+#        path = string_join(part_separator, parts)
+#      }
+#      output_namespace = output_namespace_info.path
+#      ```
+#    - Type: scope
+#
+#    The scope contains the following:
+#      * prefix_parts
+#        - Optional: The path parts that prefix the output subdirectory.
+#        - Type: list(string)
+#        - Default: []
+#
+#      * library_name_separator
+#        - Optional: The separator with which the '.'-separated tokens of the
+#          FIDL library name should be joined in the output subdirectory
+#          namespace (in between the prefix and suffix parts ). A value of "."
+#          will just use the library name unchanged as path token.
+#        - Type: string
+#
+#      * suffix_parts
+#        - Optional: The path parts that suffix the output subdirectory.
+#        - Type: list(string)
+#        - Default: []
+#
+#      * part_separator
+#        - Optional: The path part separator.
+#        - Type: string
+#        - Default: "/"
+#
+#  * formatter
+#    - Optional: A formatting specification for Zither outputs. The shape and
+#      semantics of this parameter are identical to the `formatter` parameter
+#      of `golden_files()`. While `formatter.extensions` is not consumed by
+#      Zither - it makes sure to only format the appropriate files - it is
+#      consumed in zither_golden_files() for the formatting of goldens outside
+#      of Zither.
+#    - Type: scope
+#
+supported_zither_backend_info = {
+  c = {
+    output_namespace = {
+      library_name_separator = "."
+      suffix_parts = [ "c" ]
+      supports_override = true
+    }
+    formatter = _clang_format
+
+    _library_template = "_zither_c_family_library"
+  }
+
+  asm = {
+    output_namespace = {
+      library_name_separator = "."
+      suffix_parts = [ "asm" ]
+      supports_override = true
+    }
+    formatter = _clang_format
+
+    _library_template = "_zither_c_family_library"
+  }
+
+  go = {
+    output_namespace = {
+      library_name_separator = "/"
+    }
+    formatter = _gofmt
+
+    _library_template = "_zither_go_library"
+  }
+
+  rust = {
+    output_namespace = {
+      library_name_separator = "-"
+      part_separator = "-"
+    }
+    formatter = _rustfmt
+    _library_template = "_zither_rust_library"
+  }
+
+  zircon_ifs = {
+    output_namespace = {
+    }
+    _library_template = "_zither_zircon_ifs_file"
+  }
+
+  kernel = {
+    formatter = _clang_format
+    output_namespace = {
+      prefix_parts = [
+        "lib",
+        "syscalls",
+      ]
+    }
+
+    _library_template = "_zither_kernel_sources"
+  }
+
+  legacy_syscall_cdecl = {
+    formatter = _clang_format
+    output_namespace = {
+      prefix_parts = [
+        "zircon",
+        "syscalls",
+        "gen",
+      ]
+    }
+    _library_template = "_zither_legacy_syscall_cdecl_sources"
+  }
+
+  rust_syscall = {
+    output_namespace = {
+      library_name_separator = "-"
+    }
+    formatter = _rustfmt
+    _library_template = "_zither_rust_library"
+  }
+
+  go_runtime = {
+    output_namespace = {
+    }
+    formatter = _gofmt
+    _library_template = "_zither_go_runtime_sources"
+  }
+
+  syscall_docs = {
+    output_namespace = {
+    }
+    _library_template = "_zither_syscall_docs"
+  }
+}
+
+# Internal Zither invocation helper template used by `zither_library()`.
+#
+# Parameters:
+#
+#  * backend
+#    - Required: The Zither backend to invoke.
+#    - Type: string
+#
+#  * fidl_ir_json
+#    - Required: The path to the associated FIDL IR JSON file.
+#    - Type: path
+#
+#  * fidl_ir_target
+#    - Required: The label of the target that generates the FIDL IR JSON file.
+#    - Type: label
+#
+#  * output_dir
+#    - Required: The directory for Zither outputs.
+#    - Type: path
+#
+#  * generated_files
+#    - Required: The expected set of Zither outputs, which necessarily must
+#      start with "$output_dir/".
+#    - Type: list(path)
+#
+#  * formatter
+#    - Optional: See `supported_zither_backend_info`.
+#    - Type: scope.
+#
+#  * testonly, visibility, deps
+#    - Usual GN meanings. `deps` is just expected to contain whatever produced
+#      the FIDL IR file.
+#
+template("_zither") {
+  if (current_toolchain == default_toolchain) {
+    forward_variables_from(invoker,
+                           [
+                             "generated_files",
+                             "backend",
+                             "output_dir",
+                             "output_namespace_override",
+                             "formatter",
+                           ])
+
+    main_target = target_name
+
+    # Internal subtarget used to check that a given backend's outputs were
+    # fully specified; used for testing.
+    output_check_target = "$target_name.check"
+
+    output_manifest = "$output_dir/outputs.json"
+
+    compiled_action(main_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "fidl_ir_json",
+                               "fidl_ir_target",
+                             ])
+      visibility = [ ":*" ]
+
+      tool = "//zircon/tools/zither"
+      mnemonic = "ZITHER"
+
+      inputs = [ fidl_ir_json ]
+
+      # Ensure that outputs.json is first so that related template internals
+      # may readily access it.
+      outputs = [ output_manifest ] + generated_files
+      args = [
+        "-ir",
+        rebase_path(fidl_ir_json, root_build_dir),
+        "-backend",
+        backend,
+        "-output-manifest",
+        rebase_path(output_manifest, root_build_dir),
+        "-output-dir",
+        rebase_path(output_dir, root_build_dir),
+        "-source-dir",
+        rebase_path("//", root_build_dir),
+      ]
+
+      if (defined(output_namespace_override)) {
+        args += [
+          "-output-namespace",
+          output_namespace_override,
+        ]
+      }
+
+      if (defined(formatter)) {
+        inputs += [ formatter.script ]
+        args += [
+          "-formatter",
+          rebase_path(formatter.script, root_build_dir),
+        ]
+        if (defined(formatter.args)) {
+          args += [ "-formatter-args" ] + formatter.args
+        }
+        if (defined(formatter.inputs)) {
+          inputs += formatter.inputs
+        }
+      }
+      deps = [ fidl_ir_target ]
+
+      metadata = {
+        distribution_entries_barrier = []
+      }
+    }
+
+    # Ensures that the outputs were fully specified above.
+    action(output_check_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+
+      script = "//zircon/tools/zither/scripts/check-outputs.py"
+
+      # Stamp file.
+      outputs = [ "$target_gen_dir/$output_check_target.stamp" ]
+
+      inputs = generated_files + [ output_manifest ]
+      args = [
+               "--stamp",
+               rebase_path(outputs[0], root_build_dir),
+               "--manifest",
+               rebase_path(output_manifest, root_build_dir),
+             ] + rebase_path(generated_files, root_build_dir)
+      deps = [ ":$main_target" ]
+    }
+  } else {
+    group(target_name) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":*" ]
+      deps = [ ":$target_name($default_toolchain)" ]
+    }
+    not_needed(invoker, "*", [ "testonly" ])
+  }
+}
+
+#
+# Internal language library helper templates used by `zither_library()`.
+#
+# Parameters:
+#
+#  * source_names
+#    - Required: The list of the basenames (i.e., stripped of .fidl and
+#      .test.fidl extensions) of the source FIDL files.
+#
+#  * output_namespace
+#    - Required: The subdirectory of `output_dir` that has the Zither outputs
+#      for entries.
+#    - Type: relative path
+#
+#  * fidl_ir_json, fidl_ir_target, output_dir, formatter
+#    - Same as `_zither()`.
+#
+#  * testonly, visibility, deps
+#    - Usual GN meanings.
+#
+
+template("_zither_c_family_library") {
+  main_target = target_name
+  zither_target = "$target_name.gen"
+
+  forward_variables_from(invoker,
+                         [
+                           "source_names",
+                           "output_dir",
+                           "output_namespace",
+                         ])
+
+  generated_files = []
+  foreach(name, source_names) {
+    generated_files += [ "${output_dir}/${output_namespace}/${name}.h" ]
+  }
+  if (invoker.backend == "c") {
+    generated_files += [ "${output_dir}/README.md" ]
+  }
+
+  _zither(zither_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "deps",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "generated_files",
+                             "backend",
+                             "formatter",
+                           ])
+    if (defined(invoker.output_namespace_override) &&
+        invoker.output_namespace_override) {
+      output_namespace_override = output_namespace
+    }
+  }
+
+  library_headers(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "generated_files",
+                           ])
+    include_dir = output_dir
+    headers = rebase_path(generated_files, include_dir)
+    deps = [
+      ":${zither_target}($default_toolchain)",
+      ":${zither_target}.check($default_toolchain)",
+    ]
+  }
+}
+
+template("_zither_go_library") {
+  assert(invoker.backend == "go")
+
+  main_target = target_name
+  zither_target = "$target_name.gen"
+
+  forward_variables_from(invoker,
+                         [
+                           "source_names",
+                           "output_dir",
+                           "output_namespace",
+                         ])
+
+  generated_files = [ "${output_dir}/${output_namespace}/pkg_name.txt" ]
+  foreach(name, source_names) {
+    generated_files += [ "${output_dir}/${output_namespace}/${name}.go" ]
+  }
+
+  _zither(zither_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "deps",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "generated_files",
+                             "formatter",
+                           ])
+    backend = "go"
+  }
+
+  go_library(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "testonly",
+                             "generated_files",
+                           ])
+    name = output_namespace
+    source_dir = "${output_dir}/${output_namespace}"
+    sources = rebase_path(generated_files, source_dir)
+    non_go_deps = [
+      ":${zither_target}($default_toolchain)",
+      ":${zither_target}.check($default_toolchain)",
+    ]
+  }
+}
+
+template("_zither_rust_library") {
+  assert(invoker.backend == "rust" || invoker.backend == "rust_syscall")
+
+  main_target = target_name
+  zither_target = "$target_name.gen"
+
+  forward_variables_from(invoker,
+                         [
+                           "source_names",
+                           "output_namespace",
+                         ])
+
+  # Underscore to prevent rustc_library() from thinking that this value is a
+  # specification of output_dir for the associated rlib.
+  _output_dir = invoker.output_dir
+
+  generated_files = []
+  if (invoker.backend == "rust_syscall") {
+    crate_name = "zx-sys"
+    crate_root = "${_output_dir}/${output_namespace}/src/definitions.rs"
+    crate_deps = [ "//sdk/rust/zx-types" ]
+    not_needed([ "source_names" ])
+  } else {
+    foreach(name, source_names) {
+      name = string_replace(name, "-", "_")
+      generated_files += [ "${_output_dir}/${output_namespace}/src/${name}.rs" ]
+    }
+    crate_name = output_namespace
+    crate_root = "${_output_dir}/${output_namespace}/src/lib.rs"
+    crate_deps = [
+      "//third_party/rust_crates:bitflags",
+      "//third_party/rust_crates:zerocopy",
+    ]
+  }
+  generated_files += [ crate_root ]
+
+  _zither(zither_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "deps",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "generated_files",
+                             "backend",
+                             "formatter",
+                             "output_dir",
+                           ])
+  }
+
+  rustc_library(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "testonly",
+                           ])
+    edition = "2024"
+    source_root = crate_root
+
+    # Namespace by target so that there is no rlib collision between fidl()
+    # targets in the same file.
+    output_dir = "$target_out_dir/$main_target"
+
+    sources = generated_files
+    non_rust_deps = [
+      ":${zither_target}($default_toolchain)",
+      ":${zither_target}.check($default_toolchain)",
+    ]
+    deps = crate_deps
+    configs += [ "//build/config/rust/lints:deny_unused_results" ]
+    configs += [ "//build/config/rust/lints:allow_missing_unsafe_on_extern" ]
+    disable_clippy = true
+  }
+}
+
+template("_zither_zircon_ifs_file") {
+  assert(invoker.backend == "zircon_ifs")
+
+  main_target = target_name
+  zither_target = "$target_name.gen"
+
+  not_needed(invoker, [ "source_names" ])
+
+  forward_variables_from(invoker, [ "output_dir" ])
+  ifs_file = "${output_dir}/zircon.ifs"
+  json_file = "${output_dir}/libzircon.json"
+
+  _zither(zither_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "deps",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                           ])
+    backend = "zircon_ifs"
+    generated_files = [
+      ifs_file,
+      json_file,
+    ]
+  }
+
+  group(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    public_deps = [
+      ":${zither_target}($default_toolchain)",
+      ":${zither_target}.check($default_toolchain)",
+    ]
+
+    metadata = {
+      link_output_barrier = []
+      link_output_path = [ rebase_path(ifs_file, root_build_dir) ]
+    }
+  }
+}
+
+template("_zither_kernel_sources") {
+  assert(invoker.backend == "kernel")
+
+  main_target = target_name
+  zither_target = "$target_name.gen"
+
+  not_needed(invoker, [ "source_names" ])
+
+  forward_variables_from(invoker,
+                         [
+                           "output_dir",
+                           "output_namespace",
+                         ])
+  generated_files = [
+    "$output_dir/${output_namespace}/category.inc",
+    "$output_dir/${output_namespace}/kernel.inc",
+    "$output_dir/${output_namespace}/kernel-wrappers.inc",
+    "$output_dir/${output_namespace}/syscall_sigs.rs",
+    "$output_dir/${output_namespace}/syscalls.inc",
+    "$output_dir/${output_namespace}/zx-syscall-numbers.h",
+  ]
+
+  _zither(zither_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "deps",
+                             "backend",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "generated_files",
+                             "formatter",
+                           ])
+  }
+
+  library_headers(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "generated_files",
+                           ])
+    include_dir = output_dir
+    headers = rebase_path(generated_files, include_dir)
+    deps = [
+      ":${zither_target}($default_toolchain)",
+      ":${zither_target}.check($default_toolchain)",
+    ]
+  }
+}
+
+template("_zither_legacy_syscall_cdecl_sources") {
+  assert(invoker.backend == "legacy_syscall_cdecl")
+
+  main_target = target_name
+  zither_target = "$target_name.gen"
+  headers_target = "$target_name.headers"
+
+  not_needed(invoker, [ "source_names" ])
+
+  forward_variables_from(invoker,
+                         [
+                           "output_dir",
+                           "output_namespace",
+                         ])
+
+  # This list must be kept in sync with
+  # //build/bazel/fuchsia_idk/generate_repository.py:sysroot_generated_cdecl_sources.
+  # An IFTTT comment cannot be used because there is already one for the file.
+  generated_files = [
+    "$output_dir/${output_namespace}/cdecls.inc",
+    "$output_dir/${output_namespace}/cdecls-next.inc",
+    "$output_dir/${output_namespace}/testonly-cdecls.inc",
+  ]
+
+  _zither(zither_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "deps",
+                             "backend",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "generated_files",
+                             "formatter",
+                           ])
+  }
+
+  # HACK: Our build's redefinition of `source_set()` automatically includes
+  # a dependency on the Zircon public headers in the conventional, Fuchsia
+  # toolchains, which in turn depend on this target. Such a dependency is not
+  # conferred in the user.basic toolchain.
+  if (toolchain_environment == "user.basic") {
+    library_headers(headers_target) {
+      visibility = [ ":*" ]
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "generated_files",
+                             ])
+      include_dir = output_dir
+      headers = rebase_path(generated_files, include_dir)
+      public_deps = [ ":${zither_target}($default_toolchain)" ]
+      deps = [ ":${zither_target}.check($default_toolchain)" ]
+    }
+  } else {
+    not_needed(invoker, "*")
+    not_needed("*")
+  }
+
+  user_basic_redirect(main_target) {
+    select = true
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    fuchsia = true
+    public_deps = [ ":$headers_target" ]
+  }
+}
+
+template("_zither_go_runtime_sources") {
+  assert(invoker.backend == "go_runtime")
+
+  main_target = target_name
+  zither_target = "$target_name.gen"
+
+  not_needed(invoker, [ "source_names" ])
+
+  _zither(zither_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "deps",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "formatter",
+                             "output_dir",
+                           ])
+    backend = "go_runtime"
+    generated_files = [
+      "${output_dir}/src/runtime/vdso_keys_fuchsia.go",
+      "${output_dir}/src/runtime/vdsocalls_fuchsia_amd64.s",
+      "${output_dir}/src/runtime/vdsocalls_fuchsia_arm64.s",
+      "${output_dir}/src/syscall/zx/syscalls_fuchsia_amd64.s",
+      "${output_dir}/src/syscall/zx/syscalls_fuchsia_arm64.s",
+      "${output_dir}/src/syscall/zx/syscalls_fuchsia.go",
+    ]
+  }
+
+  group(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = [
+      ":${zither_target}($default_toolchain)",
+      ":${zither_target}.check($default_toolchain)",
+    ]
+  }
+}
+
+template("_zither_syscall_docs") {
+  assert(invoker.backend == "syscall_docs")
+
+  main_target = target_name
+  zither_target = "$target_name.gen"
+
+  not_needed(invoker, [ "source_names" ])
+
+  _zither(zither_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "deps",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                             "output_dir",
+                           ])
+    backend = "syscall_docs"
+
+    # The set of generated files is not statically known and is instead
+    # dynamically determined from zither's output manifest, outputs.json.
+    generated_files = []
+  }
+
+  group(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    # We purposefully do not depend on
+    # ":${zither_target}.check($default_toolchain)" as we do not statically
+    # know the set of backend outputs in GN.
+    public_deps = [ ":${zither_target}($default_toolchain)" ]
+  }
+}
+
+# Define a full set of per-backend targets for a Zither library.
+#
+# `zither_library()` is meant to be instantiated within `fidl()`. It consumes
+# FIDL source and defines the relevant language library targets that collect
+# the bindings of the various supported Zither backends. These backends are
+# listed in `supported_zither_backends` and the details of their bindings can
+# be found in //zircon/tools/zither/README.md. The associated backend library
+# subtargets are as follows where `${output_namespace}` is as described above in
+# `supported_zither_backend_info`:
+#
+# Subtargets:
+#  * ${target_name}.${backend_name}
+#    Each supported backend, corresponding to a named entry of
+#    `supported_zither_backends`, yields a subtarget for generating the
+#    associated bindings. For more information about a given backend's set of
+#    bindings see //zircon/tools/zither/backends/${backend_name}/README.md.
+#
+# Parameters - supplied indirectly via fidl():
+#
+#  * library_name
+#    - Required: The name of the FIDL library.
+#    - Type: string
+#
+#  * sources
+#    - Required: The input FIDL sources, comprising one library necessarily of the
+#      name $target_name.
+#    - Type: list(path)
+#
+#  * fidl_gen_dir
+#    - Required: The directory under which Zither outputs should be generated.
+#    - Type: path
+#
+#  * fidl_ir_json
+#    - Required: The path to the associated FIDL IR JSON file.
+#    - Type: path
+#
+#  * fidl_ir_target
+#    - Required: The label of the target that generates the FIDL IR JSON file.
+#    - Type: label
+#
+# Parameters - supplied directly via `fidl() { zither = {...} }`:
+#
+#  * ${backend_name}
+#    - Optional: Additional backend-specific parameters
+#    - Type: scope
+#
+#    Each scope contains:
+#    * output_namespace
+#      - Optional: This is the namespace/layout under which backend outputs are
+#        generated within the specified output directory. By default, this is
+#        backend-specific. The value can determine the name of the resulting
+#        library/package/crate/etc. (when a function of source layout), as well
+#        as the 'include' namespace of the headers generated by a C family
+#        backend. A backend only supports this parameter if
+#        `supported_zither_backend_info["$backend_name"].output_namespace.supports_overrides`
+#        is defined and true.
+#      - Type: string or relative path
+#
+template("zither_library") {
+  assert(defined(invoker.sources),
+         "zither_library(\"$target_name\") requires `sources`")
+  assert(defined(invoker.library_name),
+         "zither_library(\"target_name\") must define `library_name`")
+  assert(defined(invoker.fidl_gen_dir),
+         "zither_library(\"target_name\") must define `fidl_gen_dir`")
+  assert(defined(invoker.fidl_ir_json),
+         "zither_library(\"target_name\") must define `fidl_ir_json`")
+  assert(defined(invoker.fidl_ir_target),
+         "zither_library(\"target_name\") must define `fidl_ir_target`")
+
+  foreach(backend, supported_zither_backends) {
+    backend_info = {
+    }  # Clear from previous iteration.
+    backend_info = supported_zither_backend_info[backend]
+
+    target(backend_info._library_template, "${target_name}.${backend}") {
+      forward_variables_from(invoker,
+                             [
+                               "backend",
+                               "fidl_gen_dir",
+                               "fidl_ir_json",
+                               "fidl_ir_target",
+                               "testonly",
+                               "visibility",
+                             ])
+      forward_variables_from(backend_info, [ "formatter" ])
+
+      output_dir = "${fidl_gen_dir}/${backend}"
+
+      # TODO(crbug.com/gn/328): For some reason, replacing the predicate with
+      # `defined(invoker[backend])` yields an "Assignment had no effect..."
+      # error.
+      if ({
+            forward_variables_from(invoker, [ backend ])
+          } !=
+          {
+          }) {
+        forward_variables_from(invoker[backend], "*")
+      }
+
+      if (defined(output_namespace)) {
+        output_namespace_info = backend_info.output_namespace
+        assert(
+            defined(output_namespace_info.supports_override) &&
+                output_namespace_info.supports_override,
+            "Zither backend \"$backend\" does not support output namespace overrides (\"$output_namespace\")")
+        output_namespace_override = true
+      } else {
+        output_namespace_info = {
+          prefix_parts = []
+          suffix_parts = []
+          part_separator = "/"
+          forward_variables_from(backend_info.output_namespace, "*")
+          parts = prefix_parts
+          if (defined(library_name_separator)) {
+            _lib_name = string_replace(invoker.library_name, "zither.", "")
+            parts += [ string_replace(_lib_name, ".", library_name_separator) ]
+          }
+          parts += suffix_parts
+          path = string_join(part_separator, parts)
+        }
+        if (output_namespace_info.path != "") {
+          output_namespace = output_namespace_info.path
+        }
+      }
+
+      source_names = []
+      foreach(source, invoker.sources) {
+        # Strip any .fidl or .test.fidl extensions.
+        name = get_path_info(source, "name")
+        if (get_path_info(name, "extension") == "test") {
+          name = get_path_info(name, "name")
+        }
+
+        # Ignore overview.fidl files, which do not contribute declarations:
+        #
+        # See https://fuchsia.dev/fuchsia-src/development/languages/fidl/guides/style#library-overview.
+        if (name != "overview") {
+          source_names += [ name ]
+        }
+      }
+    }
+  }
+}
+# LINT.ThenChange(zither_library.bzl)

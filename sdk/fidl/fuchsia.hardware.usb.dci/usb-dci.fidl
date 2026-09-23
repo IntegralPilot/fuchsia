@@ -1,0 +1,383 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.usb.dci;
+
+using zx;
+using fuchsia.hardware.usb.descriptor;
+using fuchsia.hardware.usb.endpoint;
+
+const MAX_SUPPORTED_TYPES uint32 = 4;
+const MAX_ENDPOINTS uint32 = 32;
+
+/// Hardware capability and limit information for a specific endpoint transfer type.
+type SupportedEndpointInfo = table {
+    /// The transfer type supported (`BULK`, `CONTROL`, `ISOCHRONOUS`, or `INTERRUPT`).
+    ///
+    /// Required.
+    1: endpoint_type fuchsia.hardware.usb.descriptor.EndpointType;
+
+    /// The maximum packet size supported for this transfer type in bytes.
+    ///
+    /// Required.
+    2: max_packet_size_limit uint16;
+
+    /// For isochronous endpoints: minimum lead time required in number of transfers.
+    ///
+    /// Optional even when `endpoint_type` is `ISOCHRONOUS`. Interpreted as 0
+    /// (no additional lead time required) if absent.
+    3: min_lead_time uint64;
+};
+
+/// Static configuration and supported types for a physical endpoint.
+type EndpointInfo = table {
+    /// The endpoint address, as defined in USB 2.0 specification section 9.6.6.
+    /// e.g., 0x81 (IN 1), 0x02 (OUT 2).
+    ///
+    /// Required.
+    1: ep_address uint8;
+
+    /// The transfer types supported by this physical endpoint, along with any
+    /// type-specific hardware limits.
+    ///
+    /// Required.
+    2: supported_types vector<SupportedEndpointInfo>:MAX_SUPPORTED_TYPES;
+};
+
+/// Overall hardware capability summary of the DCI controller.
+type DciHardwareInfo = table {
+    /// List of physical endpoint capabilities supported by the controller.
+    ///
+    /// Required if `supports_dynamic_ep_sizing` is false.
+    1: endpoints vector<EndpointInfo>:MAX_ENDPOINTS;
+
+    /// If true, usb-peripheral must use [`UsbDci.AllocEndpoint`].
+    ///
+    /// Optional. Interpreted as false if absent.
+    2: supports_dynamic_ep_sizing bool;
+};
+
+/// Request parameters when dynamically allocating a physical endpoint from the DCI driver.
+type EndpointAllocationRequest = table {
+    /// The required direction of the endpoint (`IN` or `OUT`).
+    ///
+    /// Required.
+    1: direction fuchsia.hardware.usb.descriptor.EndpointDirection;
+
+    /// The transfer type required for this endpoint (`BULK`, `CONTROL`,
+    /// `ISOCHRONOUS`, or `INTERRUPT`).
+    ///
+    /// Required.
+    2: endpoint_type fuchsia.hardware.usb.descriptor.EndpointType;
+
+    /// The maximum packet size required by this endpoint in bytes.
+    ///
+    /// Required.
+    3: max_packet_size uint16;
+};
+
+// References:
+//   usb20 - Universal Serial Bus Specification rev. 2.0
+
+/// Protocol implemented by the USB Device Controller Interface (DCI) hardware driver.
+///
+/// Used by the USB peripheral controller driver (`usb-peripheral`) to control the hardware
+/// controller's state and configure physical endpoints.
+@discoverable
+open protocol UsbDci {
+    /// Connect to an endpoint.
+    ///
+    /// Must only be called after `SetInterface` has successfully bound a callback interface.
+    /// Typically called before `StartController` to prepare endpoints for configuration, or during
+    /// operation when new interfaces/endpoints are configured.
+    ///
+    /// If the client closes its end of the `ep` channel, the DCI server must automatically release
+    /// and unbind the physical endpoint, abort any pending transfers without sending completion
+    /// events, and allow subsequent `ConnectToEndpoint` calls to succeed.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_NOT_FOUND` if endpoint address does not exist on the controller.
+    ///     * `ZX_ERR_ALREADY_BOUND` if the endpoint is already connected to another active
+    ///       channel.
+    ///     * `ZX_ERR_BAD_STATE` if called before `SetInterface`.
+    flexible ConnectToEndpoint(resource struct {
+        ep_addr uint8;
+        ep server_end:fuchsia.hardware.usb.endpoint.Endpoint;
+    }) -> () error zx.Status;
+
+    /// Bind to the callback interface (`UsbDciInterface`) implemented by `usb-peripheral`.
+    ///
+    /// The controller uses this channel to dispatch control transfers and connection events.
+    ///
+    /// Must be called before `StartController`.
+    ///
+    /// If the client closes its end of the `interface` channel, the DCI server must automatically
+    /// stop the controller if it is running (performing soft disconnect from host if connected),
+    /// disable all endpoints, and abort any pending requests, sending completion events with
+    /// `ZX_ERR_CANCELED`.
+    ///
+    /// The DCI driver may call methods on `UsbDciInterface` at any point after `StartController` is
+    /// called, up until `StopController` completes. It does not call `UsbDciInterface` methods
+    /// synchronously while handling a `UsbDci` request.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_INVALID_ARGS` if the interface handle is invalid.
+    ///     * `ZX_ERR_ALREADY_BOUND` if a callback interface is already bound.
+    ///     * `ZX_ERR_BAD_STATE` if called while the controller is already running.
+    flexible SetInterface(resource struct {
+        interface client_end:UsbDciInterface;
+    }) -> () error zx.Status;
+
+    /// Start running in peripheral mode.
+    ///
+    /// Connect the device to the USB host. Called by `usb-peripheral` once all function drivers
+    /// have bound to their interfaces and are ready to receive host traffic.
+    ///
+    /// Must only be called after `SetInterface` has successfully bound a callback interface.
+    ///
+    /// Calling this when the controller is already running is a no-op and returns `ZX_OK`.
+    ///
+    /// This method replies after hardware registers are initialized and the physical D+ pull-up is
+    /// asserted. It does not wait for bus enumeration or configuration from the host to complete.
+    ///
+    /// After this replies successfully, the controller may begin calling `SetConnected` and
+    /// `SetSpeed` on the bound `UsbDciInterface` as physical bus state changes.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_BAD_STATE` if called before `SetInterface` has bound a callback.
+    ///     * `ZX_ERR_IO` if hardware initialization fails due to a hardware error.
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the controller hardware is not present or powered off.
+    flexible StartController() -> () error zx.Status;
+
+    /// Stop running in peripheral mode.
+    ///
+    /// Disconnect the device from the host (soft disconnect). Must only be called after
+    /// `SetInterface` has successfully bound a callback interface.
+    ///
+    /// Calling this when the controller is already stopped is a no-op and returns `ZX_OK`.
+    ///
+    /// This method replies after physical disconnection has been completed (the pull-up is
+    /// deasserted) and endpoints are disabled in hardware.
+    ///
+    /// This triggers an asynchronous `UsbDciInterface::SetConnected(false)` event.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_IO` if the hardware fails to stop or reset.
+    flexible StopController() -> () error zx.Status;
+
+    /// Configure an endpoint with the given configuration parameters.
+    ///
+    /// See usb20 9.6.6 (Standard Endpoint Descriptor).
+    ///
+    /// Typically called in response to host `SET_CONFIGURATION` or `SET_INTERFACE` control
+    /// requests routed via `Control`.
+    ///
+    /// Calling this for an already configured endpoint reconfigures it.
+    ///
+    /// This method replies after hardware registers for the physical endpoint (direction, type,
+    /// packet size) have been updated and the endpoint is enabled.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_INVALID_ARGS` if the endpoint address or type is invalid (e.g. EP0).
+    ///     * `ZX_ERR_NOT_SUPPORTED` if the endpoint type (e.g. Isochronous) is not supported.
+    ///     * `ZX_ERR_NO_RESOURCES` if there are insufficient hardware resources (e.g. TX FIFO
+    ///       space).
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the controller is powered off.
+    ///     * `ZX_ERR_BAD_STATE` if the controller is stopped or interface is not bound.
+    flexible ConfigureEndpoint(struct {
+        ep_descriptor fuchsia.hardware.usb.descriptor.UsbEndpointDescriptor;
+        ss_comp_descriptor fuchsia.hardware.usb.descriptor.UsbSsEpCompDescriptor;
+    }) -> () error zx.Status;
+
+    /// Disable the given endpoint.
+    ///
+    /// Must only be called for endpoints that have been previously configured. Calling this when
+    /// the endpoint is already disabled is a no-op.
+    ///
+    /// This method replies after hardware has disabled the endpoint and rejected any further host
+    /// tokens on it. All pending transfers on the endpoint are cancelled, sending completion events
+    /// with `ZX_ERR_CANCELED`.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_INVALID_ARGS` if the endpoint address is invalid.
+    ///     * `ZX_ERR_BAD_STATE` if the controller is stopped.
+    flexible DisableEndpoint(struct {
+        ep_address uint8;
+    }) -> () error zx.Status;
+
+    /// Set stall condition (`HALT` feature) for the given endpoint.
+    ///
+    /// See usb20 8.5.3.4 (Stall Handshakes).
+    ///
+    /// Must only be called for endpoints that have been configured via `ConfigureEndpoint` and
+    /// have not been disabled. Calling this on an already stalled endpoint is a no-op.
+    ///
+    /// This method replies after hardware has been configured to return `STALL` handshakes. All
+    /// pending transfers on the endpoint are cancelled, sending completion events with
+    /// `ZX_ERR_CANCELED`. Note that setting stall does not modify the endpoint's data toggle bit.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_INVALID_ARGS` if the endpoint address is invalid or not active.
+    ///     * `ZX_ERR_NOT_SUPPORTED` if stall is not supported for this endpoint.
+    ///     * `ZX_ERR_BAD_STATE` if the controller is stopped.
+    flexible EndpointSetStall(struct {
+        ep_address uint8;
+    }) -> () error zx.Status;
+
+    /// Clear stall condition for the given endpoint.
+    ///
+    /// See usb20 8.5.3.4 (Stall Handshakes) / 9.4.5 (Clear Feature).
+    ///
+    /// Must only be called for endpoints that have been configured via `ConfigureEndpoint` and
+    /// have not been disabled. Calling this on an endpoint that is not stalled is a no-op.
+    ///
+    /// As required by USB 2.0 Section 9.4.5, clearing the halt feature also resets the endpoint's
+    /// data toggle bit to `DATA0` in hardware.
+    ///
+    /// This method replies after the hardware stall is cleared and the data toggle is reset.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_INVALID_ARGS` if the endpoint address is invalid or not active.
+    ///     * `ZX_ERR_BAD_STATE` if the controller is stopped.
+    flexible EndpointClearStall(struct {
+        ep_address uint8;
+    }) -> () error zx.Status;
+
+    /// Cancel all pending transactions for the given endpoint.
+    ///
+    /// All cancelled transactions are completed with `ZX_ERR_CANCELED`.
+    ///
+    /// Must only be called for active/configured endpoints. Calling this when there are no pending
+    /// transfers is a no-op.
+    ///
+    /// This method replies after hardware FIFOs are flushed and all requests are cancelled.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_INVALID_ARGS` if the endpoint address is invalid.
+    flexible CancelAll(struct {
+        ep_address uint8;
+    }) -> () error zx.Status;
+
+    /// Query the DCI driver for hardware-specific endpoint limits.
+    ///
+    /// This method retrieves the static endpoint configuration and capabilities of the DCI
+    /// controller. It is typically called once by the peripheral manager during startup.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the DCI controller is not ready or accessible to handle
+    ///       hardware queries (for example, if underlying hardware conditions such as power, clock
+    ///       or reset states prevent safe register access).
+    ///     * `ZX_ERR_NOT_SUPPORTED` if the DCI driver does not support hardware queries (legacy
+    ///       drivers).
+    flexible GetHardwareInfo() -> (struct {
+        info DciHardwareInfo;
+    }) error zx.Status;
+
+    /// Request the DCI driver to allocate a physical endpoint.
+    ///
+    /// This is used by the peripheral manager to dynamically allocate a physical endpoint matching
+    /// the requested `direction`, `endpoint_type`, and `max_packet_size` specified in
+    /// [`EndpointAllocationRequest`]. This method must only be called if `GetHardwareInfo` reported
+    /// `supports_dynamic_ep_sizing` as true.
+    ///
+    /// The allocation is atomic. If the DCI driver cannot satisfy the request, it returns an error
+    /// and no hardware state is modified.
+    ///
+    /// Closing the `UsbDci` channel automatically frees all endpoints allocated through it.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the DCI controller is not ready to take allocation requests
+    ///       (for example, in controller drivers that update hardware registers during allocation,
+    ///       if underlying hardware conditions such as power, clocks, reset, or MMIO accessibility
+    ///       prevent register access).
+    ///     * `ZX_ERR_NO_RESOURCES` if no physical endpoints matching the request are available.
+    ///     * `ZX_ERR_NOT_SUPPORTED` if the DCI driver does not support dynamic endpoint allocation.
+    flexible AllocEndpoint(EndpointAllocationRequest) -> (struct {
+        ep_address uint8;
+    }) error zx.Status;
+
+    /// Free a previously dynamically allocated endpoint.
+    ///
+    /// Release the physical endpoint back to the DCI driver's pool. The endpoint must be disabled
+    /// via `DisableEndpoint` before calling this method.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the DCI controller is not ready or accessible to process
+    ///       deallocation requests.
+    ///     * `ZX_ERR_NOT_FOUND` if the endpoint was not dynamically allocated.
+    ///     * `ZX_ERR_BAD_STATE` if the endpoint is still active or enabled.
+    flexible FreeEndpoint(struct {
+        ep_address uint8;
+    }) -> () error zx.Status;
+};
+
+// Calculated to hit the maximum FIDL message size on the control request.
+const MAX_CONTROL_REQUEST_LEN uint64 = 65508;
+
+/// Interface for parent (typically DCI driver) to call into its child (currently `usb-peripheral`
+/// driver). Use [`UsbDci.SetInterface`] to bind the client end in the parent driver.
+open protocol UsbDciInterface {
+    /// Dispatch a control transaction (EP0 SETUP transfer).
+    ///
+    /// See usb20 8.5.3 (Control Transfers) and 9.6 (Standard Device Requests).
+    ///
+    /// Only called by DCI while the controller is running, after a SETUP packet is received on EP0.
+    ///
+    /// This method replies after the peripheral controller or the target function driver has
+    /// processed the request.
+    ///
+    /// To comply with USB 2.0 Section 9.2.6 (Request Processing Timing), the peripheral driver must
+    /// process and reply to requests without a data stage (and `SET_ADDRESS`) within 50 ms. For
+    /// requests with a data stage, it must reply (beginning the data stage) within 500 ms. Both
+    /// drivers must process these requests within these limits to prevent host-side timeouts and
+    /// enumeration failures.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_NOT_SUPPORTED` if the request is not recognized.
+    ///     * `ZX_ERR_BAD_STATE` if called while the controller is stopped or interface is not
+    ///       bound.
+    ///     Note: For any error returned by this method, the DCI driver stalls EP0 with a `STALL`
+    ///     handshake to signal the failure to the USB host.
+    flexible Control(struct {
+        setup fuchsia.hardware.usb.descriptor.UsbSetup;
+        write vector<uint8>:MAX_CONTROL_REQUEST_LEN;
+    }) -> (struct {
+        read vector<uint8>:MAX_CONTROL_REQUEST_LEN;
+    }) error zx.Status;
+
+    /// Inform driver of current port connection state (physical cable plug in/out).
+    ///
+    /// Called by DCI while the controller is running, when a physical connection change is
+    /// detected.
+    ///
+    /// If `is_connected` is false, it transitions `usb-peripheral` to an unconfigured state. This
+    /// results in `DisableEndpoint` and `CancelAll` calls to `UsbDci` from the peripheral driver.
+    ///
+    /// * error:
+    ///     * Any error status indicates the peripheral driver failed to process the event. The DCI
+    ///       driver typically logs these errors but takes no further action.
+    flexible SetConnected(struct {
+        is_connected bool;
+    }) -> () error zx.Status;
+
+    /// Inform driver of current bus speed negotiated with the host.
+    ///
+    /// Called by DCI while the controller is running, after physical connection is established
+    /// (`SetConnected(true)`), before routing control requests.
+    ///
+    /// Record the speed to be used during subsequent descriptor validation and endpoint resource
+    /// allocation.
+    ///
+    /// * error:
+    ///     * Any error status indicates the peripheral driver failed to process the event. The DCI
+    ///       driver typically logs these errors but takes no further action.
+    flexible SetSpeed(struct {
+        speed fuchsia.hardware.usb.descriptor.UsbSpeed;
+    }) -> () error zx.Status;
+};
+
+/// Service exposing the UsbDci protocol device instance.
+service UsbDciService {
+    device client_end:UsbDci;
+};

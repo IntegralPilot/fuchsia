@@ -1,0 +1,266 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=15)
+library fuchsia.memory.heapdump.client;
+
+using zx;
+
+const MAX_BUILD_ID_LENGTH uint32 = 32;
+
+alias StackTraceKey = uint64;
+alias ThreadInfoKey = uint64;
+
+/// The reason why a method failed.
+type CollectorError = flexible enum {
+    /// The given ProcessSelector value is not supported.
+    PROCESS_SELECTOR_UNSUPPORTED = 1;
+
+    /// The given ProcessSelector value does not match any process.
+    PROCESS_SELECTOR_NO_MATCH = 2;
+
+    /// The given ProcessSelector value matches more than one process but the requested operation
+    /// needs a unique match.
+    PROCESS_SELECTOR_AMBIGUOUS = 3;
+
+    /// Failed to take a live snapshot.
+    LIVE_SNAPSHOT_FAILED = 4;
+
+    /// The requested StoredSnapshot does not exist.
+    STORED_SNAPSHOT_NOT_FOUND = 5;
+};
+
+/// Filter to restrict an operation to a subset of the available processes.
+type ProcessSelector = flexible union {
+    /// Matches any process with the given ZX_PROP_NAME.
+    1: by_name string:zx.MAX_NAME_LEN;
+
+    /// Matches the process with the given koid.
+    /// ZX_KOID_KERNEL(1) stands for the kernel.
+    2: by_koid zx.Koid;
+};
+
+/// Marks the beginning of a new snapshot.
+///
+/// Note: this element is only present in live snapshots taken with
+/// `multi_process` set to true.
+@available(added=HEAD)
+type SnapshotHeader = table {
+    /// ZX_PROP_NAME of the process the snapshot is about.
+    1: process_name string:zx.MAX_NAME_LEN;
+
+    /// Koid of the process.
+    2: process_koid zx.Koid;
+};
+
+/// One or more allocated memory blocks.
+type Allocation = table {
+    /// Address of the memory block.
+    1: address uint64;
+
+    /// Total memory blocks size, in bytes.
+    2: size uint64;
+
+    /// Number of allocated memory blocks that have been aggregated into this element.
+    /// 1 by default.
+    @available(added=29)
+    6: count uint64;
+
+    /// Stack trace of the allocation site.
+    3: stack_trace_key StackTraceKey;
+
+    /// Allocation timestamp.
+    4: timestamp zx.InstantMono;
+
+    /// Allocating thread.
+    5: thread_info_key ThreadInfoKey;
+};
+
+/// A stack trace.
+///
+/// In order to avoid exceeding the channel's maximum message size, stack traces can be split in
+/// multiple chunks. Receivers should be prepared to handle multiple StackTrace elements with the
+/// same key and reassemble them by concatenating their program addresses.
+type StackTrace = table {
+    /// A number that uniquely identifies this stack trace within the parent snapshot.
+    1: stack_trace_key StackTraceKey;
+
+    /// The program counters corresponding to stack each frame.
+    ///
+    /// Entries are listed in reverse call order: the first entry refers to the leaf frame, and the
+    /// last entry refers to the frame at the root of the call stack.
+    2: program_addresses vector<uint64>:MAX;
+};
+
+/// Information on a given thread.
+///
+/// Note: Under some circumstances, more than one entry could exist for a given koid (e.g. if the
+/// thread changed its name between different allocations).
+type ThreadInfo = table {
+    /// A number that uniquely identifies this entry within the parent snapshot.
+    1: thread_info_key ThreadInfoKey;
+
+    /// The koid of the thread that this entry refers to.
+    2: koid zx.Koid;
+
+    /// The name of the thread that this entry refers to.
+    3: name string:zx.MAX_NAME_LEN;
+};
+
+/// An ELF build ID.
+type BuildId = struct {
+    value vector<uint8>:MAX_BUILD_ID_LENGTH;
+};
+
+/// A memory region containing code loaded from an ELF file.
+type ExecutableRegion = table {
+    /// The address of the memory region.
+    1: address uint64;
+
+    /// Region size, in bytes.
+    2: size uint64;
+
+    /// The file offset corresponding to the first byte within the region.
+    3: file_offset uint64;
+
+    /// The build ID of the ELF file.
+    4: build_id BuildId;
+
+    /// The address of the memory region relative to the file's load address.
+    @available(added=27)
+    5: vaddr uint64;
+
+    /// Description of the memory region (e.g. ELF soname or VMO name).
+    @available(added=27)
+    6: name string:MAX;
+};
+
+/// The contents of an allocated memory block.
+///
+/// In order to avoid exceeding the channel's maximum message size, bigger blocks can be split in
+/// chunks. Receivers should be prepared to handle multiple BlockContents with the same address and
+/// reassemble them by concatenating their payloads. Each block's reassembled size always matches
+/// the size field of the corresponding Allocation.
+type BlockContents = table {
+    /// The address of the corresponding memory block.
+    1: address uint64;
+
+    /// The payload.
+    2: contents vector<byte>:MAX;
+};
+
+/// An element that is part of a snapshot.
+type SnapshotElement = flexible union {
+    1: allocation Allocation;
+    2: stack_trace StackTrace;
+    3: executable_region ExecutableRegion;
+    4: block_contents BlockContents;
+    5: thread_info ThreadInfo;
+    @available(added=HEAD)
+    6: snapshot_header SnapshotHeader;
+};
+
+/// Protocol to transmit snapshot(s) as a stream of elements.
+closed protocol SnapshotReceiver {
+    /// Delivers a batch of snapshot elements.
+    ///
+    /// It will be called for each batch of elements, and finally with an empty
+    /// batch to indicate that all data has been sent.
+    ///
+    /// If `multi_process` was set to true, two extra batches will be sent to
+    /// enclose each snapshot:
+    ///  - A batch with exactly one SnapshotHeader at the beginning.
+    ///  - An empty batch at the end.
+    strict Batch(struct {
+        batch vector<SnapshotElement>:MAX;
+    }) -> ();
+
+    /// Reports an error. No other batches or errors will follow.
+    strict ReportError(struct {
+        error CollectorError;
+    }) -> ();
+};
+
+/// A snapshot that is stored on the device and that can be downloaded.
+///
+/// Application-initiated snapshots belong to this category.
+type StoredSnapshot = table {
+    /// A number that uniquely identifies this snapshot within a Collector.
+    1: snapshot_id uint32;
+
+    /// The name given to this snapshot.
+    2: snapshot_name string:zx.MAX_NAME_LEN;
+
+    /// The koid of the process that this snapshot refers to.
+    3: process_koid zx.Koid;
+
+    /// The name of the process that this snapshot refers to.
+    4: process_name string:zx.MAX_NAME_LEN;
+};
+
+/// Protocol to retrieve a list of StoredSnapshots.
+closed protocol StoredSnapshotIterator {
+    /// Retrieves the next batch of StoredSnapshots elements.
+    ///
+    /// An empty response signals the end of the list.
+    strict GetNext() -> (struct {
+        batch vector<StoredSnapshot>:MAX;
+    }) error CollectorError;
+};
+
+/// Protocol to request and retrieve memory profiles.
+@discoverable
+open protocol Collector {
+    /// Obtains a snapshot of the current live allocations in an instrumented process.
+    flexible TakeLiveSnapshot(resource table {
+        /// The instrumented process(es) to operate on.
+        ///
+        /// If not set, any process will be considered a match.
+        1: process_selector ProcessSelector;
+
+        /// Where the elements of the requested snapshot will be sent to.
+        ///
+        /// Required.
+        2: receiver client_end:SnapshotReceiver;
+
+        /// Whether the snapshot should include the contents of each memory block.
+        ///
+        /// If not set, false is assumed.
+        3: with_contents bool;
+
+        /// Whether this call is allowed to take a snapshot of more than one process
+        /// and, therefore, return more than one snapshot.
+        ///
+        /// If not set, false is assumed.
+        ///
+        /// If set to true, each snapshot will be preceded by a SnapshotHeader.
+        @available(added=HEAD)
+        4: multi_process bool;
+    });
+
+    /// Retrieves the list of all the available stored snapshots.
+    flexible ListStoredSnapshots(resource table {
+        /// The server_end of the StoredSnapshotIterator that will be used to retrieve the results.
+        ///
+        /// Required.
+        1: iterator server_end:StoredSnapshotIterator;
+
+        /// If present, only retrieve snapshots that refer to matching processes.
+        2: process_selector ProcessSelector;
+    });
+
+    /// Retrieves a stored snapshot.
+    flexible DownloadStoredSnapshot(resource table {
+        /// The identifier of the snapshot to be downloaded.
+        ///
+        /// The list of the available snapshots can be retrieved with ListStoredSnapshots.
+        ///
+        /// Required.
+        1: snapshot_id uint32;
+
+        /// Where the elements of the requested snapshot will be sent to.
+        ///
+        /// Required.
+        2: receiver client_end:SnapshotReceiver;
+    });
+};

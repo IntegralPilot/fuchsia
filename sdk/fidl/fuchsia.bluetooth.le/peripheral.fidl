@@ -1,0 +1,250 @@
+// Copyright 2017 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.bluetooth.le;
+using fuchsia.bluetooth as bt;
+
+@strict_audit(bug="https://fxbug.dev/467127725", state="PENDING_REVIEW")
+type PeripheralError = strict enum {
+    /// The operation or parameters requested are not supported on the current hardware.
+    NOT_SUPPORTED = 1;
+
+    /// The provided advertising data exceeds the maximum allowed length when encoded.
+    ADVERTISING_DATA_TOO_LONG = 2;
+
+    /// The provided scan response data exceeds the maximum allowed length when encoded.
+    SCAN_RESPONSE_DATA_TOO_LONG = 3;
+
+    /// The requested parameters are invalid.
+    INVALID_PARAMETERS = 4;
+
+    /// The request to start advertising was aborted, for example by issuing a new request with new
+    /// parameters.
+    ABORTED = 5;
+
+    /// Advertising could not be initiated due to a hardware or system error.
+    FAILED = 6;
+};
+
+/// A client can indicate the transmission rate of advertising packets by specifying a mode. The
+/// mode provides a hint to the system when configuring the controller with advertising interval and
+/// window parameters.
+///
+/// The mode affects how quickly a scanner or central is able to discover the peripheral; however it
+/// can have an adverse effect on power consumption. While the system will try to honor a client's
+/// request, it is not guaranteed to do so.
+@strict_audit(bug="https://fxbug.dev/467127725", state="PENDING_REVIEW")
+type AdvertisingModeHint = strict enum : uint8 {
+    /// Advertise with a very short interval and window for fast discovery at the cost of higher
+    /// power consumption. This corresponds to a 30-60ms interval on the 1M PHYs and 90-180ms on the
+    /// coded PHY.
+    VERY_FAST = 1;
+
+    /// Advertise with a short interval and window that uses less power than `VERY_FAST`.
+    /// This corresponds to a 100-150ms interval on the 1M PHYs and 300-450ms on the coded PHY.
+    FAST = 2;
+
+    /// Advertise with a moderate interval and window. This corresponds to 1-1.2s on the 1M PHYs and 3s
+    /// on the coded PHY.
+    SLOW = 3;
+};
+
+@available(added=24)
+type AdvertisingProcedure = flexible union {
+    /// Advertise using legacy advertising packets. All devices should be able
+    /// to discover this type of packet.
+    1: legacy table {};
+
+    /// Advertise using extended advertising packets. Extended advertising
+    /// packets allow for a much larger amount of data to be advertised than
+    /// legacy advertising packets (31 bytes vs 251 bytes per PDU). Extended
+    /// advertising packets support up to 1,650 bytes in an advertisement chain,
+    /// but they are only discoverable by newer devices using Bluetooth 5.0+.
+    ///
+    /// Extended advertising packets are not supported by all
+    /// products. PeripheralError::NOT_SUPPORTED will be returned if requested
+    /// and not supported.
+    2: extended table {};
+};
+
+/// Represents the parameters for configuring advertisements.
+type AdvertisingParameters = table {
+    /// The fields that will be encoded in the data section of advertising packets.
+    ///
+    /// This field is required.
+    1: data AdvertisingData;
+
+    /// The fields that are to be sent in a scan response packet. Clients may use this to send
+    /// additional data that does not fit inside an advertising packet on platforms that do not
+    /// support the advertising data length extensions.
+    ///
+    /// If present advertisements will be configured to be scannable.
+    2: scan_response AdvertisingData;
+
+    /// The desired advertising frequency. See [`fuchsia.bluetooth.le/AdvertisingModeHint`].
+    /// Defaults to [`fuchsia.bluetooth.le/AdvertisingModeHint.SLOW`] if not present.
+    3: mode_hint AdvertisingModeHint;
+
+    /// If present and true then the controller will broadcast connectable advertisements which
+    /// allows remote LE centrals to initiate a connection to the Peripheral. If false or otherwise
+    /// not present then the advertisements will be non-connectable.
+    @deprecated("Prefer to use the connection_options field for new code.")
+    4: connectable bool;
+
+    /// If present, the controller will broadcast connectable advertisements
+    /// which allow peers to initiate connections to the Peripheral. The fields
+    /// of `ConnectionOptions` will configure any connections set up from
+    /// advertising.
+    5: connection_options ConnectionOptions;
+
+    /// Specifies the advertising type to use (e.g. legacy, extended, etc).
+    ///
+    /// If not present, we default to legacy advertising to maintain optimal compatibility with
+    /// pre-Bluetooth 5.0 devices. See field descriptions within AdvertisingProcedure for more
+    /// information.
+    @available(added=24)
+    6: advertising_procedure AdvertisingProcedure;
+
+    /// If privacy is not enabled, the address type will always be public.
+    ///
+    /// If privacy is enabled and the client is not privileged, the address will be a random
+    /// private address (either resolvable or non-resolvable). A non-privileged client requesting a
+    /// public address will return an error.
+    ///
+    /// If privacy is enabled and the client is privileged, they may request any address type,
+    /// or will default to a random private address.
+    ///
+    /// If this field is unset, the address type will be public or random depending on if privacy
+    /// is enabled in the system.
+    @available(added=24)
+    7: address_type bt.AddressType;
+};
+
+/// Capability that is valid for the duration of advertising. The caller can close the handle to
+/// stop advertising. If the system internally stops advertising for any reason, the handle will be
+/// closed to communicate this to the client.
+closed protocol AdvertisingHandle {};
+
+/// Protocol that is valid for the duration of advertising. The caller can close
+/// the protocol to stop advertising. If the system internally stops advertising
+/// for any reason, the protocol will be closed to communicate this to the
+/// client.
+closed protocol AdvertisedPeripheral {
+    /// Called when a remote LE central connects to this peripheral when
+    /// connectable advertising is enabled via
+    /// [`fuchsia.bluetooth.le/Peripheral.Advertise`]. When this call is made,
+    /// the system has paused advertising, and will not continue until it
+    /// receives a response.
+    ///
+    /// The returned [`fuchsia.bluetooth.le/Connection`] protocol can be used to
+    /// interact with the peer. It also represents a peripheral's ownership over
+    /// the connection: the client can drop the protocol to request a
+    /// disconnection. Similarly, the protocol is closed by the system to
+    /// indicate that the connection to the peer has been lost.
+    ///
+    /// + request `peer` Information about the central that initiated the
+    ///   connection.
+    /// + request `connection` Represents the connection.
+    /// - response An empty response should be sent to acknowledge the
+    ///   connection and resume advertising (for flow control).
+    strict OnConnected(resource struct {
+        peer Peer;
+        connection client_end:Connection;
+    }) -> ();
+};
+
+@discoverable(server="platform")
+closed protocol Peripheral {
+    /// A [`Peripheral`] may reserve L2CAP connection-oriented channels for
+    /// receiving connections from peers.
+    @available(added=24)
+    compose ChannelListenerRegistry;
+
+    /// Start advertising continuously as a LE peripheral. If advertising cannot
+    /// be initiated then `advertised_peripheral` will be closed and an error
+    /// will be returned.
+    ///
+    /// This method may be called any number of times. To reconfigure an
+    /// advertisement, first close the original advertisement and then initiate
+    /// a new advertisement after an empty response is returned.
+    ///
+    /// If the client closes its end of the
+    /// [`fuchsia.bluetooth.le/AdvertisedPeripheral`] channel,
+    /// advertising will be stopped. If the handle is closed before the request
+    /// is fulfilled, advertising may be briefly enabled before it is
+    /// terminated. AdvertisedPeripheral lifetime is bounded by the lifetime of
+    /// the Peripheral protocol, but this may be changed in the future
+    /// (https://fxbug.dev/42157682).
+    ///
+    /// + request `parameters` Parameters used while configuring the advertising
+    ///   instance.
+    /// + request `advertised_peripheral` Protocol that remains valid for the
+    ///   duration of this advertising session.
+    /// - response An empty response will be sent when the advertisement is
+    ///   successfully stopped (due to release of the `advertised_peripheral`
+    ///   protocol). To prevent overlapping similar advertisements and transient
+    ///   errors with limited advertising resources, waiting for a response is
+    ///   recommended before calling `Advertise` again.
+    /// * error If an error occurs, `advertised_peripheral` will be closed and a
+    ///   `PeripheralError` will be returned.
+    strict Advertise(resource struct {
+        parameters AdvertisingParameters;
+        advertised_peripheral client_end:AdvertisedPeripheral;
+    }) -> () error PeripheralError;
+
+    /// Start advertising as a LE peripheral. An empty response is sent to indicate when advertising
+    /// has successfully initiated. If advertising cannot be initiated, then the response will
+    /// contain a [`fuchsia.bluetooth.le/PeripheralError`].
+    ///
+    /// This method can get called any number of times and successive calls can be made to
+    /// reconfigure the advertising parameters. However only the most recent
+    /// [`fuchsia.bluetooth.le/AdvertisingHandle`] will remain valid.
+    ///
+    /// An instance of [`fuchsia.bluetooth.le/Peripheral`] can only have one active advertisement at
+    /// a time. Clients must obtain multiple Peripheral instances for multiple simultaneous
+    /// advertisements.
+    ///
+    /// If the client closes its end of the [`fuchsia.bluetooth.le/AdvertisingHandle`] channel,
+    /// advertising will be stopped. If the handle is closed before the request is fulfilled,
+    /// advertising will be briefly enabled before it is terminated.
+    ///
+    /// + request `parameters` Parameters used while configuring the advertising instance.
+    /// + request `handle` Handle that remains valid for the duration of this advertising session.
+    /// * error Returns a [`fuchsia.bluetooth.le/PeripheralError`] if advertising cannot be
+    ///         initiated. In this case the `handle` will be closed.
+    @deprecated
+    strict StartAdvertising(resource struct {
+        parameters AdvertisingParameters;
+        handle server_end:AdvertisingHandle;
+    }) -> () error PeripheralError;
+
+    /// Event delivered when a remote LE central initiates a connection to this Peripheral when
+    /// connectable advertising is enabled via
+    /// [`fuchsia.bluetooth.le/Peripheral.StartAdvertising`].
+    ///
+    /// The returned [`fuchsia.bluetooth.le/Connection`] handle can be used to interact with the
+    /// peer. It also represents a peripheral's ownership over the connection: the client can drop
+    /// the handle to request a disconnection. Similarly, the handle is closed by the system to
+    /// indicate that the connection to the peer has been lost.
+    ///
+    /// + request `peer` Information about the central that initiated the connection.
+    /// + request `connection` Represents the connection.
+    @deprecated("Use AdvertisedPeripheral.OnConnected instead")
+    strict -> OnPeerConnected(resource struct {
+        peer Peer;
+        connection client_end:Connection;
+    });
+};
+
+/// Privileged version of the Peripheral protocol.
+/// This protocol should only be routed to trusted and system components. Using this protocol will
+/// enable the client to break normal privacy restrictions which could leak information about the
+/// location or owner of the device.
+///
+/// Use cases which reveal information are noted in documentation and marked as only available
+/// through PrivilegedPeripheral, and are an error if used through Peripheral.
+@available(added=24)
+@discoverable(server="platform")
+closed protocol PrivilegedPeripheral {
+    compose Peripheral;
+};

@@ -1,0 +1,320 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// The Inspect VMO Validator program starts and controls a "puppet" program to
+/// exercise each Inspect library. This file defines the protocol to exercise
+/// the library (and report the result of commands). (After executing some
+/// commands, the Validator program will analyze the VMO contents for
+/// correctness and memory-packing efficiency.)
+library diagnostics.validate;
+
+using fuchsia.inspect as inspect;
+using zx;
+
+/// InitializationParams tells how to initialize the Inspect library.
+type InitializationParams = table {
+    1: vmoSize uint64;
+};
+
+/// TestResult tells the result of executing an Initialize or Act command.
+type TestResult = flexible enum {
+    /// The function call completed without error.
+    OK = 0;
+    /// The Inspect library doesn't implement a requested feature.
+    UNIMPLEMENTED = 1;
+    /// The Inspect library reported a failure executing the function.
+    FAILED = 2;
+    /// The driver and/or puppet-wrapper was in an illegal state.
+    ILLEGAL = 3;
+};
+
+// One-to-one mapping flag used in LINK block
+type LinkDisposition = strict enum {
+    CHILD = 0;
+    INLINE = 1;
+};
+
+/// The data in the VMO is tree-structured, and
+/// ROOT_ID identifies the (virtual) root node.
+const ROOT_ID uint32 = 0;
+
+/// Tells the puppet to create a Node with the given name, parentage, and ID
+/// (the id is specified so other nodes can later be created under it).
+type CreateNode = struct {
+    parent uint32;
+    id uint32;
+    name string;
+};
+
+/// Tells the puppet to delete the given node.
+type DeleteNode = struct {
+    id uint32;
+};
+
+type ValueType = flexible enum : uint8 {
+    INT = 1;
+    UINT = 2;
+    DOUBLE = 3;
+    STRING = 4;
+};
+
+type Value = flexible union {
+    1: int_t int64;
+    2: uint_t uint64;
+    3: double_t float64;
+    4: string_t string;
+};
+
+/// Tells the puppet to create a property with the given numeric value.
+type CreateNumericProperty = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    value Value;
+};
+
+/// Tells the puppet to create a property with the given byte array value.
+type CreateBytesProperty = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    value vector<uint8>;
+};
+
+/// Tells the puppet to create a property with the given string value.
+type CreateStringProperty = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    value string;
+};
+
+/// Tells the puppet to create a property with the given bool value.
+type CreateBoolProperty = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    value bool;
+};
+
+/// Tells the puppet to delete an existing property.
+type DeleteProperty = struct {
+    id uint32;
+};
+
+type AddNumber = struct {
+    id uint32;
+    value Value;
+};
+
+type SubtractNumber = struct {
+    id uint32;
+    value Value;
+};
+
+type SetNumber = struct {
+    id uint32;
+    value Value;
+};
+
+type SetBytes = struct {
+    id uint32;
+    value vector<uint8>;
+};
+
+type SetString = struct {
+    id uint32;
+    value string;
+};
+
+type SetBool = struct {
+    id uint32;
+    value bool;
+};
+
+type CreateArrayProperty = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    slots uint64;
+    value_type ValueType;
+};
+
+type ArraySet = struct {
+    id uint32;
+    index uint64;
+    value Value;
+};
+
+type ArrayAdd = struct {
+    id uint32;
+    index uint64;
+    value Value;
+};
+
+type ArraySubtract = struct {
+    id uint32;
+    index uint64;
+    value Value;
+};
+
+type CreateLinearHistogram = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    floor Value;
+    step_size Value;
+    buckets uint64;
+};
+
+type CreateExponentialHistogram = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    floor Value;
+    initial_step Value;
+    step_multiplier Value;
+    buckets uint64;
+};
+
+type Insert = struct {
+    id uint32;
+    value Value;
+};
+
+type InsertMultiple = struct {
+    id uint32;
+    value Value;
+    count uint64;
+};
+
+// Action sent to instruct a Puppet to create a lazy node.
+// TODO(https://fxbug.dev/42126047): This should be modified to allow for creating lazy nodes past 1-level deep.
+type CreateLazyNode = struct {
+    // Unique id for parent block.
+    parent uint32;
+
+    // Unique id used between Controller and Puppet to uniquely identify lazy node.
+    id uint32;
+
+    // Name passed in to CreateLazy{Node,Values) method
+    name string;
+
+    // Disposition flag that determines appropriate method.
+    disposition LinkDisposition;
+
+    // Send a sequence of actions to execute within the lambda to create Inspect
+    // tree.
+    actions vector<Action>;
+};
+
+// Action sent to instruct a Puppet to delete a lazy node.
+type DeleteLazyNode = struct {
+    // Unique id used between Controller and Puppet to uniquely identify lazy node.
+    id uint32;
+};
+
+/// Tells the puppet to do something to modify the VMO.
+type Action = flexible union {
+    1: create_node CreateNode;
+    2: delete_node DeleteNode;
+    3: create_numeric_property CreateNumericProperty;
+    4: create_bytes_property CreateBytesProperty;
+    5: create_string_property CreateStringProperty;
+    6: delete_property DeleteProperty;
+    7: set_number SetNumber;
+    8: set_string SetString;
+    9: set_bytes SetBytes;
+    10: add_number AddNumber;
+    11: subtract_number SubtractNumber;
+    12: create_array_property CreateArrayProperty;
+    13: array_set ArraySet;
+    14: array_add ArrayAdd;
+    15: array_subtract ArraySubtract;
+    16: create_linear_histogram CreateLinearHistogram;
+    17: create_exponential_histogram CreateExponentialHistogram;
+    18: insert Insert;
+    19: insert_multiple InsertMultiple;
+    20: create_bool_property CreateBoolProperty;
+    21: set_bool SetBool;
+};
+
+/// Tells the puppet to do something to modify a lazy node.
+type LazyAction = flexible union {
+    1: create_lazy_node CreateLazyNode;
+    2: delete_lazy_node DeleteLazyNode;
+};
+
+/// Indicate the preferred DiffType on failed tests.
+type DiffType = flexible enum {
+    /// Get the full rendering of both trees.
+    FULL = 0;
+
+    /// Get the diff between the trees.
+    DIFF = 1;
+
+    /// Get both the full rendering of both trees, and their diff.
+    BOTH = 2;
+};
+
+@discoverable
+open protocol InspectPuppet {
+    /// Initializes the Inspect library being tested by the puppet.
+    flexible Initialize(struct {
+        params InitializationParams;
+    }) -> (resource struct {
+        vmo zx.Handle:optional;
+        result TestResult;
+    });
+
+    /// Provides configuration values for the validator.
+    flexible GetConfig() -> (resource struct {
+        printable_name string:MAX;
+        options resource table {
+            /// Defaults to false
+            1: has_runner_node bool;
+
+            /// Defaults to FULL
+            2: diff_type DiffType;
+        };
+    });
+
+    /// Use instead of `Initialize` on puppets which support the Tree / Lazy method of getting VMOs.
+    /// The root VMO can be obtained via the returned Tree protocol.
+    flexible InitializeTree(struct {
+        params InitializationParams;
+    }) -> (resource struct {
+        tree client_end:<inspect.Tree, optional>;
+        result TestResult;
+    });
+
+    /// Instruct the puppet to publish its current data over InspectSink.
+    ///
+    /// Note: It is an error for more than one Validate connection to
+    /// Publish at once. Unpublish must be called to cleanup.
+    flexible Publish() -> (struct {
+        result TestResult;
+    });
+
+    /// Modifies the contents of the VMO.
+    flexible Act(struct {
+        action Action;
+    }) -> (struct {
+        result TestResult;
+    });
+
+    /// Modifies the contents of a lazy node.
+    flexible ActLazy(struct {
+        lazy_action LazyAction;
+    }) -> (struct {
+        result TestResult;
+    });
+
+    /// Checks that !Send lazy values work correctly, using a LazyAction similar to ActLazy.
+    flexible ActLazyThreadLocal(struct {
+        lazy_action LazyAction;
+    }) -> (struct {
+        result TestResult;
+    });
+};

@@ -1,0 +1,169 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/host.gni")
+import("//build/sdk/sdk_host_tool.gni")
+import("//build/testing/host_test.gni")
+import("//build/testing/host_test_data.gni")
+import("//src/developer/ffx/build/ffx.gni")
+import("//src/developer/ffx/config.gni")
+
+visibility = [ "//src/developer/ffx/*" ]
+
+assert(is_host, "ffx is for use with the host toolchain only")
+
+# A note for developers interested in generating a Cargo.toml file for this
+# tool:
+# FFX generates a `ffx_bin_unversioned` rule, which is what should be used as the target for
+# cargo gen. The appropriate command is:
+# fx gen-cargo \
+#   '//src/developer/ffx/frontends/ffx:ffx_bin_unversioned(//build/toolchain:host_x64)'
+
+ffx("ffx") {
+  sdk_category = "not-yet-specified"
+  version = "0.1.0"
+  edition = "2024"
+  with_unit_tests = true
+
+  plugin_deps = required_ffx_plugins + included_ffx_plugins  # from config.gni
+
+  # If `ffx_build_dual_mode_plugins_as_subtools` config is set, we won't
+  # include any plugin that doesn't have to be included, and they will be
+  # built as independent subtools instead.
+  #
+  # If you're looking to reduce build times, set the above flag and it will
+  # make it so you won't have to re-link all of ffx to build a single plugin's
+  # code.
+  if (!ffx_build_dual_mode_plugins_as_subtools) {
+    large_ffx_binary_optimizations = true
+    plugin_deps += dual_mode_plugins  # from config.gni
+  }
+
+  deps = [
+    "//src/developer/ffx/lib/fho:lib",
+    "//third_party/rust_crates:anyhow",
+  ]
+
+  ffx_deps = [
+    ":ffx_lib_args",
+    ":ffx_lib_sub_command",
+    ":ffx_lib_suite",
+    "//src/developer/ffx/command:lib",
+    "//src/developer/ffx/config:lib",
+    "//src/developer/ffx/lib/errors:lib",
+    "//src/developer/ffx/lib/fho:lib",
+    "//src/developer/ffx/lib/traceable_error:lib",
+    "//src/lib/fuchsia-async",
+    "//third_party/rust_crates:argh",
+    "//third_party/rust_crates:async-trait",
+    "//third_party/rust_crates:log",
+  ]
+
+  args_sources = [ "src/args.rs" ]
+  args_deps = [
+    "//src/developer/ffx/core:lib",
+    "//third_party/rust_crates:argh",
+  ]
+
+  sources = [
+    "src/lib.rs",
+    "src/main.rs",
+  ]
+
+  test_deps = [ "//src/lib/fuchsia" ]
+}
+
+_ffx_e2e_config = [
+  # TODO(https://fxbug.dev/42165781): remove log.level=DEBUG when we no longer have flake
+  "--config",
+  "log.level=DEBUG",
+  "--config",
+  "sdk.root=.",
+  "--config",
+  "ffx.subtool-manifest=\"\"",
+  "--config",
+  "ffx.subtool-search-paths=host-tools",
+]
+
+host_test("ffx-e2e-without-target") {
+  visibility += [ "//:*" ]
+  binary_path = "$root_out_dir/ffx"
+  args = _ffx_e2e_config + [
+           "self-test",
+           "--include-target",
+           "false",
+         ]
+
+  deps = [
+    ":ffx_bin",
+    "//src/developer/ffx/plugins/self-test:ffx_selftest_tool",
+  ]
+  data_deps = [
+    "//src/developer/ffx:suite_test_data",
+    "//src/developer/ffx/plugins/self-test:ffx_selftest_tool_test_data",
+  ]
+}
+
+host_test("ffx-e2e-with-target") {
+  visibility += [ "//:*" ]
+  binary_path = "$root_out_dir/ffx"
+  args = _ffx_e2e_config + [ "self-test" ]
+
+  deps = [
+    ":ffx_bin",
+    "//src/developer/ffx/plugins/self-test:ffx_selftest_tool",
+
+    # Required by the test_debug_limbo in `ffx self-test`. We cannot add it to
+    # the dependency of `ffx self-test` plugin because that will make the
+    # crasher into all production builds.
+    "//src/developer/forensics/crasher($target_toolchain)",
+  ]
+  data_deps = [
+    ":ffx-e2e-test-data",
+    "//src/developer/ffx:suite_test_data",
+    "//src/developer/ffx/plugins/self-test:ffx_selftest_tool_test_data",
+  ]
+
+  # TODO(https://fxbug.dev/42138890): split additional dimensions such as multi-device
+  # mac + device, etc.
+  environments = [
+    # XXX(https://fxbug.dev/42143551): support arm64 HTI tests
+    # emu_env,
+    nuc7_env,
+    nuc11_env,
+  ]
+}
+
+host_test_data("ffx-e2e-test-data") {
+  sources = [
+    "$root_out_dir/ffx",
+    "$root_out_dir/zxdb",
+  ]
+}
+
+group("e2e_tests") {
+  # These are end to end tests, which are different from host-tests since
+  # e2e tests require devices and/or complete images or product bundles.
+  testonly = true
+  public_deps = [
+    # ffx end to end tests, through `ffx self-test` invocations, one includes
+    # tests that must have a target present, the other can be run without a
+    # target present.
+    ":ffx-e2e-with-target",
+  ]
+}
+
+group("host_tests") {
+  testonly = true
+  deps = [ ":ffx-e2e-without-target" ]
+}
+
+group("tests") {
+  testonly = true
+  public_deps = [
+    # Most ffx plugin test suites are included downstream of the group defined
+    # by the ffx template above.
+    ":ffx_tests",
+  ]
+}

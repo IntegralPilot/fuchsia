@@ -1,0 +1,350 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.update;
+
+/// The Manager protocol is used by a client that wishes to either check for an
+/// update, or follow the status of ongoing updates.
+///
+/// The Manager provides a mechanism for checking for updates via the
+/// [`Manager.CheckNow`] message.
+@discoverable(server="platform")
+closed protocol Manager {
+    /// Immediately check for an update, and optionally track the state and
+    /// progress of that update check.
+    ///
+    /// + request `options` Options for how this request should be performed.
+    ///                     E.g. What kind of entity initiated this request?
+    ///                     E.g. Is monitoring an existing update check that
+    ///                          is already in process an acceptable
+    ///                          alternative?
+    ///
+    /// + request `monitor` An interface on which to receive the status events
+    ///                     for this update check.  The monitor is only valid
+    ///                     for this single update check, after that it will
+    ///                     not receive any more notifications and will be
+    ///                     closed.
+    ///
+    /// * error If an update check cannot be started, an error will be returned.
+    ///         The [`Monitor`], if provided, will not receive any notifications.
+    strict CheckNow(resource struct {
+        options CheckOptions;
+        monitor client_end:<Monitor, optional>;
+    }) -> () error CheckNotStartedReason;
+
+    /// Performs any pending reboot of the system into an updated OS, if an
+    /// update has been staged for the next system startup.
+    ///
+    /// Replaced by
+    /// `fuchsia.power/CollaborativeRebootInitiator.PerformPendingReboot`.
+    @available(deprecated=27, removed=31)
+    strict PerformPendingReboot() -> (struct {
+        rebooting bool;
+    });
+
+    /// Monitor all update attempts as they start, as well as an in-progress
+    /// attempt, if there is one.
+    ///
+    /// Arguments:
+    /// * |attempts_monitor| A protocol on which to receive |Monitor| instances
+    /// as update attempts start.
+    strict MonitorAllUpdateChecks(resource struct {
+        attempts_monitor client_end:AttemptsMonitor;
+    });
+};
+
+/// Configuration options for an update check.
+type CheckOptions = table {
+    /// Who or what initiated this update attempt.  This is taken as input to
+    /// Policy, and may influence how the update check is performed.
+    ///
+    /// **This is a required field.**
+    1: initiator Initiator;
+
+    /// If an update check is already in progress, it's acceptable to instead
+    /// attach a Monitor to that in-progress update instead of failing this
+    /// request to check for updates.  This may convert situations that would
+    /// have resulted in the ALREADY_IN_PROGRESS to be treated as non-error
+    /// cases.
+    2: allow_attaching_to_existing_update_check bool;
+};
+
+/// Who or what initiated the update check.
+@strict_audit(bug="https://fxbug.dev/467128508", state="PENDING_REVIEW")
+type Initiator = strict enum {
+    /// The update check was initiated by an interactive user, or the user is
+    /// otherwise blocked and waiting for the result of this update check.  This
+    /// SHOULD only be used when there is a UI element or flow that a user has
+    /// interacted with which has initiated this update check.
+    USER = 1;
+
+    /// The update check was initiated by a service, not a user-facing aspect
+    /// of the system.
+    SERVICE = 2;
+};
+
+/// Monitors update attempts as they start.
+///
+/// Clients interested in receiving progress information for an update check
+/// should implement this protocol and provide the client end to
+/// [`Manager.MonitorAllUpdateChecks`].
+/// The Manager will close the client end of the AttemptsMonitor if there are
+/// more than 2 outstanding requests.
+closed protocol AttemptsMonitor {
+    /// Called when a new update attempt has started.
+    ///
+    /// Arguments:
+    /// * |options| Options for how this request should be performed.
+    /// * |monitor| A protocol on which to receive progress updates.
+    strict OnStart(resource struct {
+        options AttemptOptions;
+        monitor server_end:Monitor;
+    }) -> ();
+};
+
+/// Details for an update attempt monitor.
+type AttemptOptions = table {
+    /// Who or what initiated this update attempt.  This may influence how the
+    /// update check is performed.
+    1: initiator Initiator;
+};
+
+/// Monitors a single update check.
+///
+/// Clients interested in receiving progress information for an update check
+/// should implement this protocol and provide the client end to
+/// [`Manager.CheckNow`].
+closed protocol Monitor {
+    /// Receives a status update for this update check.
+    ///
+    /// This request will be called for all state changes, skipping none.
+    /// However, message delivery is throttled by the rate at which the
+    /// implementation acknowledges the messages.
+    ///
+    /// The throttled delivery doesn't impact the underlying state of the
+    /// [`Manager`].  It does not wait for any acknowledgements before it moves
+    /// on to the next state in its state machine.  The [`Manager`] will simply
+    /// queue up the states for the [`Monitor`] implementation to receive.
+    ///
+    /// During the installing_update state, the [`Manager`] may, at its
+    /// discretion, collapse redundant information like the fraction completed,
+    /// in the event that the [`Monitor`] implementation is not responding to
+    /// the `OnState()` requests in a timely manner.
+    ///
+    /// + request `state` The new state of the update check.
+    /// - response        The implementation is ready to receive the next
+    ///                   [`State`] from the [`Manager`].
+    strict OnState(struct {
+        state State;
+    }) -> ();
+};
+
+/// The set of states that a [`Monitor`] can receive during an update check.
+///
+/// An update check ends when it enters a terminal state, denoted below as the
+/// states on the right-hand side of the diagram with no arrows leading out of
+/// them.
+///
+/// # State Machine Diagram
+///
+/// ```
+///     +----------------------+     +---------------------------------+
+///     | checking_for_updates |---->|    error_checking_for_update    |
+///     +----------------------+     +---------------------------------+
+///                |
+///                |                 +---------------------------------+
+///                +---------------->|       no_update_available       |
+///                |                 +---------------------------------+
+///                |
+///                |                 +---------------------------------+
+///                +---------------->| installation_deferred_by_policy |
+///                |                 +---------------------------------+
+///                v
+///     +----------------------+     +---------------------------------+
+///     |  installing_update   |---->|       installation_error        |
+///     +----------------------+     +---------------------------------+
+///                |
+///                |                 +---------------------------------+
+///                +---------------->|       waiting_for_reboot        |
+///                                  +---------------------------------+
+/// ```
+@strict_audit(bug="https://fxbug.dev/467128508", state="PENDING_REVIEW")
+type State = strict union {
+
+    /// The Manager is currently checking for an update.
+    ///
+    /// Next states:
+    /// * `installing_update` update is available and allowed by policy
+    /// * `error_checking_for_update` on error
+    /// * `update_deferred_by_policy` update is available but deferred by policy
+    1: checking_for_updates CheckingForUpdatesData;
+
+    /// The Manager encountered an error while checking for the existence of a
+    /// a new update.
+    ///
+    /// **This is a terminal state**
+    ///
+    2: error_checking_for_update ErrorCheckingForUpdateData;
+
+    /// There is not update available at this time.
+    ///
+    /// **This is a terminal state**
+    ///
+    3: no_update_available NoUpdateAvailableData;
+
+    /// The Manager has found an available update but is not acting on it at
+    /// this time due to policy restrictions.
+    ///
+    /// **This is a terminal state**
+    ///
+    4: installation_deferred_by_policy InstallationDeferredData;
+
+    /// The Manager is installing the available update.
+    ///
+    /// Next states:
+    /// * `waiting_for_reboot` on success
+    /// * `installation_error` on error
+    5: installing_update InstallingData;
+
+    /// The update has been installed, and the device is waiting to be rebooted.
+    ///
+    /// Next states:
+    /// * (none, the device reboots)
+    ///
+    /// **This is a terminal state**
+    ///
+    6: waiting_for_reboot InstallingData;
+
+    /// The Manager encountered an error during the installation of the update.
+    ///
+    /// **This is a terminal state**
+    ///
+    7: installation_error InstallationErrorData;
+};
+
+/// This is the set of data associated with `checking_for_updates`.
+/// (currently none)
+type CheckingForUpdatesData = table {};
+
+/// This is the set of data associated with the `error_checking_for_update`
+/// state.
+/// (currently none)
+type ErrorCheckingForUpdateData = table {};
+
+/// This is the set of data associated with the `no_update_available` state.
+/// (currently none)
+type NoUpdateAvailableData = table {};
+
+/// This is the set of data associated with the
+/// `installation_deferred_by_policy` state.
+type InstallationDeferredData = table {
+    1: update UpdateInfo;
+    2: deferral_reason InstallationDeferralReason;
+};
+
+/// This is the set of data associated with the states involved with installing
+/// an update:
+/// * `installing_update`
+/// * `waiting_for_reboot`
+type InstallingData = table {
+    1: update UpdateInfo;
+    2: installation_progress InstallationProgress;
+};
+
+/// This is the set of data associated with the `installation_error` state.
+/// (currently none)
+type InstallationErrorData = table {
+    1: update UpdateInfo;
+    2: installation_progress InstallationProgress;
+};
+
+/// This describes the update that is available to be installed.
+type UpdateInfo = table {
+    /// A string that describes the version that is available.  This may be
+    /// either a semantic version (A.B.C.D) or an opaque hash.  Clients MUST
+    /// not attempt to inspect this value, it is for display purposes only.
+    1: version_available string:MAX_VERSION_STRING_SIZE;
+
+    /// The total number of bytes that may be downloaded to apply this update.
+    2: download_size uint64;
+
+    /// Whether the update was marked as urgent. Default is false.
+    3: urgent bool;
+};
+
+/// This is the maximum length of a version string that will be returned by the
+/// protocol
+const MAX_VERSION_STRING_SIZE uint32 = 128;
+
+/// This describes the progress installing the update that has been made so far.
+type InstallationProgress = table {
+    /// The fraction [0-1.0f] of the installation that has been completed.
+    1: fraction_completed float32;
+};
+
+/// This is the set of values that are returned by an request to immediately
+/// check for an update.
+@strict_audit(bug="https://fxbug.dev/467128508", state="PENDING_REVIEW")
+type CheckNotStartedReason = strict enum {
+
+    /// There was an internal error in starting the update check.  The client
+    /// is not expected to be able to do something meaningful about this error,
+    /// except to try again later (after an appropriate delay and back-off in
+    /// the event of multiple errors.
+    INTERNAL = 1;
+
+    /// If there are required arguments or options (or option values in
+    /// conflict), provided via the CheckOptions table to CheckNow, this error
+    /// will be returned.
+    INVALID_OPTIONS = 2;
+
+    /// There was already another update check in progress when this request was
+    /// made.  A new update check will not be started.
+    ALREADY_IN_PROGRESS = 3;
+
+    /// The update check was not started, because too many requests to check for
+    /// updates have been made by clients in a short period of time.
+    ///
+    /// **NOTE:** Clients MUST NOT attempt to cause background update checks to
+    /// happen at a more frequent rate than the fuchsia.update.Manager will do
+    /// them.
+    ///
+    /// If a client attempts to abuse this, it will be throttled.
+    THROTTLED = 4;
+};
+
+/// This is the set of values that are provided when an update installation
+/// is deferred.
+type InstallationDeferralReason = flexible enum {
+
+    /// The update was not installed because the currently booted system is not
+    /// committed. Consumers are encouraged to use the [`CommitStatusProvider`]
+    /// to determine when to retry the update check such that the update will
+    /// be installed.
+    CURRENT_SYSTEM_NOT_COMMITTED = 1;
+};
+
+/// Used by components to wait for the first software update check to complete.
+@available(added=HEAD)
+@discoverable
+open protocol Listener {
+    /// Subscribe for a notification when the software update checker has
+    /// completed its post-boot check (with or without error) and is not trying
+    /// to reboot.
+    /// If the update checker will never perform an update check, then it will close the connection
+    /// with epitaph `ZX_ERR_NOT_SUPPORTED` and close the `notifier` connection without calling
+    /// [`fuchsia.update/Notifier.Notify`].
+    strict NotifyOnFirstUpdateCheck(resource table {
+        /// Entity notified after post-boot check. This is a required field.
+        1: notifier client_end:Notifier;
+    });
+};
+
+/// Notifier for [`Listener`].
+@available(added=HEAD)
+@discoverable
+closed protocol Notifier {
+    /// Notify is called when the software update checker has completed its
+    /// post-boot check (with or without error) and is not trying to reboot.
+    strict Notify();
+};

@@ -1,0 +1,112 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_action.gni")
+import("//build/sdk/sdk_atom.gni")
+import("//sdk/categories/compatibility.gni")
+
+# Declares an in-tree Python E2E Mobly test for distribution in the SDK.
+#
+# Example:
+# ```
+# python_mobly_test("my-test") {
+#   main_source = "main.py"
+#   testonly = false  # Required for SDK inclusion.
+# }
+#
+# sdk_python_mobly_test("my-sdk-test") {
+#   sdk_name = "my-test"
+#   test_label = ":my-test"
+#   category = "partner"
+# }
+# ```
+#
+# Parameters
+#
+#   test_label
+#     The Python E2E test to distribute. Must point to a python_mobly_test()
+#     target.
+#     Type: label.
+#
+#   sdk_name
+#     Name of the test in the SDK.
+#     Type: string.
+#
+#   category
+#     Publication level of the library in SDKs.
+#     See //build/sdk/sdk_atom.gni for more.
+#     Type: string.
+#
+#   sdk_area (optional)
+#     [string] The API area responsible for maintaining this library.
+#     See //build/sdk/sdk_atom.gni.
+template("sdk_python_mobly_test") {
+  visibility = [ ":*" ]
+
+  assert(defined(invoker.category), "Must define an SDK category")
+  assert(defined(invoker.sdk_name),
+         "Must define a distribution name for this test.")
+
+  _sdk_name = invoker.sdk_name
+
+  # IDK-bound targets cannot depend on `testonly` targets so instead of
+  # depending on the main python_mobly_test() target which is a host_test()
+  # with `testonly` hardcoded to true, we can instead depend on the
+  # `.binary_and_config` group target for bundling purposes.
+  _full_test_label = get_label_info(invoker.test_label, "label_no_toolchain")
+  _full_test_bundle_label = "${_full_test_label}.binary_and_config"
+
+  _targets = {
+    test_sources_list = "${target_name}_test_sources"
+  }
+
+  _files = {
+    test_sources_list = "${target_gen_dir}/${target_name}_test_sources.json"
+  }
+
+  generated_file(_targets.test_sources_list) {
+    public_deps = [ _full_test_bundle_label ]
+
+    outputs = [ _files.test_sources_list ]
+    output_conversion = "json"
+    data_keys = [ "hermetic_test_sources" ]
+  }
+
+  sdk_atom(target_name) {
+    # TODO(https://fxbug.dev/347094435): Make `sdk_atom()` support `visibility` and uncomment.
+    # visibility = ["//sdk:*"]
+
+    forward_variables_from(invoker,
+                           [
+                             "category",
+                             "sdk_area",
+                           ])
+
+    id = "sdk://python/${_sdk_name}"
+
+    meta = {
+      type = "experimental_python_e2e_test"
+      dest = "python/${_sdk_name}/meta.json"
+      source_prebuild_info = {
+        name = _sdk_name
+        file_base = "python/${_sdk_name}"
+        api_level = "unversioned"
+        test_sources_list =
+            "GN_GENERATED(" +
+            rebase_path(_files.test_sources_list, root_build_dir) + ")"
+      }
+    }
+
+    non_sdk_deps = [ ":${_targets.test_sources_list}" ]
+
+    # Ensure all FIDL dependencies meet the compatibility and stability
+    # requirements.
+    # There are currently exceptions for host tests: https://fxbug.dev/326090508.
+    assert(invoker.category == "partner")
+
+    # Since these tests can depend on ffx, allow use of APIs from the
+    # "host_tool" category.
+    assert_no_deps = markers_partner_idk_host_tools_must_not_depend_on
+  }
+}

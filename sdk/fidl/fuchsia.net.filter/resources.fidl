@@ -1,0 +1,435 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.net.filter;
+
+using fuchsia.ebpf;
+using fuchsia.net;
+using fuchsia.net.matchers;
+
+const MAX_NAME_LEN uint8 = 255;
+
+/// A unique identifier for a [`Namespace`].
+alias NamespaceId = string:MAX_NAME_LEN;
+
+/// A namespace.
+///
+/// A namespace is a scoped collection of filtering state, specifically
+/// [`Routine`]s. It is analogous to a table in Netfilter.
+type Namespace = table {
+    /// The identifier of the namespace.
+    ///
+    /// Must be unique within the scope of the controller in which the namespace
+    /// is created.
+    1: id NamespaceId;
+    /// The domain (or domains) in which the namespace operates.
+    2: domain @generated_name("Domain") flexible enum {
+        IPV4 = 1;
+        IPV6 = 2;
+        ALL_IP = 3;
+    };
+};
+
+/// A unique identifier for a [`Routine`].
+type RoutineId = struct {
+    /// The namespace in which the routine is installed.
+    namespace NamespaceId;
+    /// The name of the routine.
+    ///
+    /// Must be unique within the namespace in which the routine is created.
+    name string:MAX_NAME_LEN;
+};
+
+type Empty = struct {};
+
+/// The priority of the routine relative to other routines installed on the same
+/// hook. For a given packet traversing a given hook, all installed routines are
+/// executed in order of priority (stopping early only if a terminal action is
+/// hit).
+///
+/// If two routines are installed with the same priority on the same hook, the
+/// routine that was installed earlier will be evaluated first.
+alias Priority = int32;
+
+/// A routine.
+///
+/// A routine is a sequence of [`Rule`]s. It is analogous to a chain in
+/// Netfilter.
+type Routine = table {
+    /// The ID of the routine.
+    ///
+    /// Must be unique within the scope of the namespace in which the routine is
+    /// created.
+    1: id RoutineId;
+    /// The type of the routine.
+    ///
+    /// IP routines can only include rules with ordinary filter actions, whereas
+    /// NAT routines can also include rules with NAT actions.
+    ///
+    /// Note that NAT routines are only executed *once* for a given connection,
+    /// for the first packet in the flow.
+    2: type @generated_name("RoutineType") flexible union {
+        1: ip @generated_name("IpRoutine") table {
+            /// Installed routines are evaluated iff a packet hits the hook on
+            /// which it is installed.
+            ///
+            /// Uninstalled routines are useful for organizational purposes and
+            /// are only traversed when jumped to from another routine.
+            ///
+            /// If left unset, will be an uninstalled routine.
+            1: installation @generated_name("InstalledIpRoutine") table {
+                /// The hook on which the routine is installed.
+                ///  * The `INGRESS` hook occurs for incoming traffic before a
+                ///    routing decision has been made.
+                ///  * The `LOCAL_INGRESS` hook occurs for incoming traffic that
+                ///    is destined for the local host.
+                ///  * The `FORWARDING` hook occurs for incoming traffic that is
+                ///    destined for another node.
+                ///  * The `LOCAL_EGRESS` hook occurs for locally-generated
+                ///    traffic before a final routing decision has been made.
+                ///  * The `EGRESS` hook occurs for all outgoing traffic after a
+                ///    routing decision has been made.
+                ///
+                /// Required.
+                1: hook @generated_name("IpInstallationHook") flexible enum {
+                    INGRESS = 1;
+                    LOCAL_INGRESS = 2;
+                    FORWARDING = 3;
+                    LOCAL_EGRESS = 4;
+                    EGRESS = 5;
+                };
+                /// The priority of the routine relative to other routines
+                /// installed on the same hook.
+                ///
+                /// Interpreted as `DEFAULT_ROUTINE_PRIORITY` if unset.
+                2: priority Priority;
+            };
+        };
+        2: nat @generated_name("NatRoutine") table {
+            /// Installed routines are evaluated whenever a packet hits the hook
+            /// on which it is installed.
+            ///
+            /// Uninstalled routines are useful for organizational purposes and
+            /// are only traversed when jumped to from another routine.
+            ///
+            /// If left unset, will be an uninstalled routine.
+            1: installation @generated_name("InstalledNatRoutine") table {
+                /// The optional hook in which to install the routine. If a
+                /// routine is not installed on a particular hook, it can only
+                /// be reached from other routines.
+                ///  * The `INGRESS` hook occurs for incoming traffic before a
+                ///    routing decision has been made.
+                ///  * The `LOCAL_INGRESS` hook occurs for incoming traffic that
+                ///    is destined for the local host.
+                ///  * The `LOCAL_EGRESS` hook occurs for locally-generated
+                ///    traffic before a routing decision has been made.
+                ///  * The `EGRESS` hook occurs for all outgoing traffic after a
+                ///    routing decision has been made.
+                ///
+                /// Required.
+                1: hook @generated_name("NatInstallationHook") flexible enum {
+                    INGRESS = 1;
+                    LOCAL_INGRESS = 2;
+                    LOCAL_EGRESS = 3;
+                    EGRESS = 4;
+                };
+                /// The priority of the routine relative to other routines
+                /// installed on the same hook.
+                ///
+                /// Interpreted as `DEFAULT_ROUTINE_PRIORITY` if unset.
+                2: priority Priority;
+            };
+        };
+    };
+};
+
+/// A unique identifier for a [`Rule`].
+type RuleId = struct {
+    /// The routine to which the rule is added.
+    routine RoutineId;
+    /// The index of the rule.
+    ///
+    /// Must be unique within the routine to which the rule is added. Within a
+    /// given routine, rules will be executed in order of `index`. Note that
+    /// indices in a routine can be sparse; this allows removal and insertion of
+    /// rules while maintaining stable indices for rules that were unchanged.
+    index uint32;
+};
+
+/// The criteria that a packet must match for a rule to be applied.
+///
+/// Each field is optional, and will only be checked if provided. An unset
+/// field will be considered to match any packet. (An entirely empty table
+/// would match every packet.) Another way to think of the matching criteria
+/// for a given rule is as an AND of every provided matcher.
+///
+/// Some matchers are only available in certain contexts. For example, the
+/// `in_interface` is not available in the `EGRESS` hook. If a matcher is
+/// provided that is not available in the context in which the rule is
+/// installed, the installation will fail with an error.
+type Matchers = table {
+    /// The interface on which the packet entered the stack.
+    ///
+    /// Only available in `INGRESS`, `LOCAL_INGRESS`, and `FORWARDING`.
+    1: in_interface fuchsia.net.matchers.Interface;
+    /// The interface through which the packet exits the stack.
+    ///
+    /// Only available in `FORWARDING`, `LOCAL_EGRESS`, and `EGRESS`.
+    2: out_interface fuchsia.net.matchers.Interface;
+    /// Matcher for the source IP address.
+    3: src_addr fuchsia.net.matchers.Address;
+    /// Matcher for the destination IP address.
+    4: dst_addr fuchsia.net.matchers.Address;
+    /// Matchers for the transport layer protocol.
+    ///
+    /// Note that the variants of the `TransportProtocol` union allow matching
+    /// on the transport layer protocol itself; to match on specific properties
+    /// at the transport layer (such as TCP or UDP ports), clients should use
+    /// the fields of a protocol-specific matcher.
+    5: transport_protocol fuchsia.net.matchers.PacketTransportProtocol;
+    /// An eBPF program used as a matcher.
+    ///
+    /// The program should be registered by calling
+    /// ['fuchsia.net.filter.NamespaceController/RegisterEbpfProgram'] prior to
+    /// committing the rule containing the matcher.
+    ///
+    /// When the program is executed, a non-zero result from the program
+    /// indicates a match.
+    6: ebpf_program fuchsia.ebpf.ProgramId;
+};
+
+/// An inclusive range of transport-layer ports.
+type PortRange = struct {
+    /// The inclusive start of the port range.
+    start uint16;
+    /// The inclusive end of the port range.
+    end uint16;
+};
+
+/// The type of the message to send in REJECT action. The exact type of the
+/// rejection message sent depends on IP version of the protocol being processed.
+type RejectType = flexible enum {
+    /// TCP RST packet.
+    ///
+    /// Allowed only for rules that match TCP packets.
+    TCP_RESET = 0;
+
+    /// Network unreachable.
+    ///
+    /// IPv4: ICMP Destination network unreachable (type 3, code 0).
+    /// IPv6: ICMPv6 No route to destination (type 1, code 0).
+    NET_UNREACHABLE = 1;
+
+    /// Host unreachable.
+    ///
+    /// IPv4: ICMP Host unreachable (type 3, code 1).
+    /// IPv6: ICMPv6 Address unreachable (type 1, code 3).
+    HOST_UNREACHABLE = 2;
+
+    /// Protocol unreachable.
+    ///
+    /// IPv4: ICMP Protocol unreachable (type 3, code 2).
+    /// IPv6: ICMPv6 Unrecognized Next Header type encountered (type 4, code 1).
+    PROTO_UNREACHABLE = 3;
+
+    /// Port unreachable.
+    ///
+    /// IPv4: ICMP Port unreachable (type 3, code 3).
+    /// IPv6: ICMPv6 Port unreachable (type 1, code 4).
+    PORT_UNREACHABLE = 4;
+
+    /// Route to the destination network is prohibited.
+    ///
+    /// IPv4: ICMP Network administratively prohibited (type 3, code 9).
+    /// IPv6: ICMPv6 Source address failed ingress/egress policy (type 1, code 5).
+    ROUTE_POLICY_FAIL = 5;
+
+    /// Reject route.
+    ///
+    /// IPv4: ICMP Host administratively prohibited (type 3, code 10).
+    /// IPv6: ICMPv6 Reject route to destination (type 1, code 6).
+    REJECT_ROUTE = 6;
+
+    /// Communication administratively prohibited.
+    ///
+    /// IPv4: ICMP Communication administratively prohibited (type 3, code 13).
+    /// IPv6: ICMPv6 Communication administratively prohibited (type 1, code 1).
+    ADMIN_PROHIBITED = 7;
+};
+
+/// The action to take on a packet.
+type Action = flexible union {
+    /// Accept the packet.
+    ///
+    /// This is a terminal action for the current *installed* routine, i.e. no
+    /// further rules will be evaluated for this packet in the installed routine
+    /// (or any subroutines) in which this rule is installed. Subsequent
+    /// routines installed on the same hook will still be evaluated.
+    1: accept Empty;
+    /// Drop the packet.
+    ///
+    /// This is a terminal action, i.e. no further rules will be evaluated for
+    /// this packet, even in other routines on the same hook.
+    2: drop Empty;
+    /// Jump from the current routine to the routine identified by the provided
+    /// name.
+    ///
+    /// The target routine must be in the same namespace as the calling routine,
+    /// and it cannot be installed on a hook; it must be an uninstalled routine.
+    3: jump string:MAX_NAME_LEN;
+    /// Stop evaluation of the current routine and return to the calling routine
+    /// (the routine from which the current routine was jumped), continuing
+    /// evaluation at the next rule.
+    ///
+    /// If invoked in an installed routine, equivalent to `accept`, given packets
+    /// are accepted by default in the absence of any matching rules.
+    4: return Empty;
+    /// Redirect the packet to a local socket without changing the packet header
+    /// in any way.
+    ///
+    /// This is a terminal action for the current hook, i.e. no further rules
+    /// will be evaluated for this packet, even in other routines on the same
+    /// hook. However, note that this does not preclude actions on *other* hooks
+    /// from having an effect on this packet; for example, a packet that hits
+    /// TransparentProxy in INGRESS could still be dropped in LOCAL_INGRESS.
+    ///
+    /// This action is only valid in IP routines on the INGRESS hook. This action
+    /// is also only valid in a rule that ensures the presence of a TCP or UDP
+    /// header by matching on the transport protocol, so that the packet can be
+    /// properly dispatched.
+    ///
+    /// Also note that transparently proxied packets will only be delivered to
+    /// sockets with the transparent socket option enabled. If no such socket
+    /// exists, the packet will be dropped.
+    ///
+    /// This is analogous to the `tproxy` statement in Netfilter.
+    5: transparent_proxy @generated_name("TransparentProxy") flexible union {
+        /// The bound address of the local socket to redirect the packet to.
+        ///
+        /// The destination port of the packet is used for local delivery.
+        1: local_addr fuchsia.net.IpAddress;
+        /// The bound port of the local socket to redirect the packet to. It
+        /// must be nonzero.
+        ///
+        /// The destination IP address of the packet is used for local delivery.
+        2: local_port uint16;
+        /// The bound address and port of the local socket to redirect the
+        /// packet to. The port must be nonzero.
+        3: local_addr_and_port @generated_name("SocketAddr") struct {
+            addr fuchsia.net.IpAddress;
+            port uint16;
+        };
+    };
+    /// A special case of destination NAT (DNAT) that redirects the packet to
+    /// the local host.
+    ///
+    /// This is a terminal action for all NAT routines on the current hook. The
+    /// packet is redirected by rewriting the destination IP address to one
+    /// owned by the ingress interface (if operating on incoming traffic in
+    /// INGRESS) or the loopback address (if operating on locally-generated
+    /// traffic in LOCAL_EGRESS). If this rule is installed on INGRESS and no IP
+    /// address is assigned to the incoming interface, the packet is dropped.
+    ///
+    /// As with all DNAT actions, this action is only valid in the INGRESS and
+    /// LOCAL_EGRESS hooks. If a destination port is specified, this action is
+    /// only valid in a rule that ensures the presence of a TCP or UDP header by
+    /// matching on the transport protocol, so that the destination port can be
+    /// rewritten.
+    ///
+    /// This is analogous to the `redirect` statement in Netfilter.
+    6: redirect @generated_name("Redirect") table {
+        /// The optional range of destination ports used to rewrite the packet.
+        ///
+        /// If specified, the destination port of the packet will be rewritten
+        /// to some randomly chosen port in the range. If absent, the
+        /// destination port of the packet will not be rewritten.
+        1: dst_port PortRange;
+    };
+    /// A special case of source NAT (SNAT) that reassigns the source IP address
+    /// of the packet to an address that is assigned to the outgoing interface.
+    ///
+    /// This is a terminal action for all NAT routines on the current hook. If
+    /// no address is assigned to the outgoing interface, the packet will be
+    /// dropped.
+    ///
+    /// This action is only valid in the EGRESS hook. If a source port range is
+    /// specified, this action is only valid in a rule that ensures the presence
+    /// of a TCP or UDP header by matching on the transport protocol, so that
+    /// the source port can be rewritten.
+    ///
+    /// This is analogous to the `masquerade` statement in Netfilter.
+    7: masquerade @generated_name("Masquerade") table {
+        /// The optional range of source ports used to rewrite the packet.
+        ///
+        /// The source port will be rewritten if necessary to ensure the
+        /// packet's flow does not conflict with an existing tracked connection.
+        /// Note that the source port may be rewritten whether or not this range
+        /// is specified.
+        ///
+        /// If specified, this overrides the default behavior and restricts the
+        /// range of possible values to which the source port can be rewritten.
+        1: src_port PortRange;
+    };
+    /// Applies the mark action to the given mark domain.
+    ///
+    /// This is a non-terminal action for both routines and hooks. This is also
+    /// only available in [`IpRoutine`]s because [`NatRoutines`]s only runs on
+    /// the first packet in a connection and it is likely a misconfiguration
+    /// that packets after the first are marked differently or unmarked.
+    ///
+    /// Note: If we find use cases that justify this being in [`NatRoutine`]s we
+    /// should relax this limitation and support it.
+    ///
+    /// This is analogous to the `mark` statement in Netfilter.
+    8: mark @generated_name("Mark") struct {
+        /// The domain to apply the mark action.
+        domain fuchsia.net.MarkDomain;
+        /// The action to apply.
+        action MarkAction;
+    };
+
+    /// A non-terminal action that does nothing. Useful to run matchers that may
+    /// have side-effects, particularly eBPF matchers.
+    9: none Empty;
+
+    /// Rejects the packet by dropping it and responding to the sender.
+    ///
+    /// `reject_type` defines the message sent back to the source address.
+    /// Allowed only in [`IpRoutine`]'s installed at `LOCAL_INGRESS`,
+    /// `FORWARDING` and `LOCAL_EGRESS` hooks.
+    ///
+    /// This is a terminal action.
+    10: reject @generated_name("Reject") struct {
+        /// The type of the message to send.
+        reject_type RejectType;
+    };
+};
+
+/// An action that can be applied to a mark.
+type MarkAction = flexible union {
+    /// This action sets the mark specified by the `mark` and `clearing_mask`.
+    ///
+    /// If the current mark is [`None`], it sets it to `mark`.
+    1: set_mark struct {
+        /// The bits specified by this mask are cleared out from the existing
+        /// mark.
+        clearing_mask uint32;
+        /// This value is combined with the result of the masking using a
+        /// bitwise OR to get the final mark.
+        mark uint32;
+    };
+};
+
+/// A rule is a set of criteria (matchers) and a resultant action.
+type Rule = struct {
+    /// The ID of the rule.
+    ///
+    /// Must be unique within the scope of the routine to which the rule is
+    /// added.
+    id RuleId;
+    /// The criteria that a packet must match for the action to be executed.
+    matchers Matchers;
+    /// The action to take on a matching packet.
+    action Action;
+};

@@ -1,0 +1,284 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/fuchsia/target_api_level.gni")
+import("//build/sdk/sdk_atom.gni")
+import("//build/sdk/sdk_noop_atom.gni")
+import("//tools/cmc/build/expect_includes.gni")
+
+# Defines an in-tree package for distribution in the SDK, landing
+# the end package manifest at
+# `sdk://packages/{arch}/release/${distribution_name}/package_manifest.json`.
+# May only be used in the default_toolchain.
+# Does not define any targets when targeting API level "PLATFORM".
+#
+# Example:
+# ```
+# fuchsia_package("my-package") {
+#   deps = [
+#     ":main_component",
+#   ]
+# }
+#
+# sdk_fuchsia_package("my-sdk-package") {
+#   distribution_name = "my-package"
+#   package_label = ":my-package"
+#   category = "partner"
+#   expected_files_exact = [
+#     "relative/path/to/file_a",
+#   ]
+# }
+# ```
+#
+# Parameters
+#
+#   package_label
+#     The fuchsia_package to distribute. Must point to a fuchsia_package() target, or
+#     one of its wrappers (e.g. fuchsia_test_package()).
+#     Type: label.
+#
+#   distribution_name
+#     Distribution name of the package. The package manifest will be edited to use this
+#     name.
+#     Type: string.
+#
+#   category
+#     The SDK category for the package. Must be "partner".
+#     See //build/sdk/sdk_atom.gni for more.
+#     Type: string.
+#
+#   sdk_area (optional)
+#     [string] The API area responsible for maintaining this package.
+#     See //build/sdk/sdk_atom.gni.
+#
+#   api_level_added
+#     API level at which the package was added to the SDK. API level defined at:
+#     https://fuchsia.dev/fuchsia-src/contribute/governance/rfcs/0002_platform_versioning#sdk
+#     Type: unsigned integer.
+#
+#   api_level_removed (optional)
+#     API level at which the package was removed from the SDK. If unspecified,
+#     we assume the package is available at all API levels after
+#     `api_level_added`. API level defined at:
+#     https://fuchsia.dev/fuchsia-src/contribute/governance/rfcs/0002_platform_versioning#sdk
+#     Type: unsigned integer.
+#
+#   expected_files_exact (optional)
+#     List of paths, relative to the package's root, for all files that
+#     participate in that package's content checklist file. Their content hash will be
+#     compared to the ones in
+#     //sdk/packages/${distribution_name}/${target_cpu}/release/content_checklist.api.
+#     Any paths specified in this list that are not found, or do not have hashes that match
+#     their golden content checklist file equivalent, will cause an error during checklist
+#     file generation.
+#     Type: list of relative package paths.
+#
+#   expected_files_present (optional)
+#     List of paths, relative to the package's root, for all files that
+#     do not participate in that package's content checklist file. Their content
+#     does not matter for verification, but these paths must appear in
+#     the golden
+#     //sdk/packages/${distribution_name}/${target_cpu}/release/content_checklist.api file
+#     and in the same order.
+#     Any paths specified in this list that are not found in the specified
+#     manifest will cause an error during checklist file generation.
+#     Type: list of relative package paths.
+#
+template("sdk_fuchsia_package") {
+  assert(!defined(invoker.stable), "Packages are always stable.")
+  assert(
+      current_toolchain == default_toolchain,
+      "Unexpected use of `sdk_fuchsia_package` template with non-default toolchain `${current_toolchain}`.")
+  assert(defined(invoker.api_level_added),
+         "Must specify the API level at which the package was added")
+  assert(defined(invoker.package_label), "Must define a package to distribute.")
+  assert(defined(invoker.distribution_name),
+         "Must define a distribution name for this package.")
+
+  assert(defined(invoker.category),
+         "Must define an SDK category for this package.")
+
+  valid_categories = [
+    # "compat_test" is only for ABI compatibility and thus not applicable.
+    # "host_tool" is only for ABI compatibility and thus not applicable.
+    # "prebuilt" is only for ABI compatibility and thus not applicable.
+    "partner",
+  ]
+  assert(
+      valid_categories + [ invoker.category ] - [ invoker.category ] !=
+          valid_categories,
+      "'${target_name}' has unsupported SDK category '${invoker.category}'. Must be one of ${valid_categories}.")
+
+  # The IDK only contains packages for specific API levels.
+  if (current_build_target_api_level != "PLATFORM") {
+    # Build the package for supported API levels.
+    package_in_target_api_level =
+        invoker.api_level_added <= current_build_target_api_level_as_integer
+
+    if (package_in_target_api_level && defined(invoker.api_level_removed)) {
+      package_in_target_api_level =
+          current_build_target_api_level_as_integer < invoker.api_level_removed
+    }
+
+    if (package_in_target_api_level) {
+      if (defined(invoker.expected_files_exact)) {
+        expected_files_exact = invoker.expected_files_exact
+      } else {
+        expected_files_exact = []
+      }
+      if (defined(invoker.expected_files_present)) {
+        expected_files_present = invoker.expected_files_present
+      } else {
+        expected_files_present = []
+      }
+
+      # Label of package to be included in the SDK. Used for tracking
+      # `package_manifest.json`
+      _full_package_label =
+          get_label_info(invoker.package_label, "label_no_toolchain")
+      package_manifest_file =
+          get_label_info(_full_package_label, "target_out_dir") + "/" +
+          get_label_info(_full_package_label, "name") + "/package_manifest.json"
+
+      # End output directory, different for each arch and API level.
+      base = "${target_cpu_dir_name_for_target_api_level}"
+
+      _sdk_package_dir = "${target_out_dir}/sdk_packages/${base}/release"
+      _distribution_name = invoker.distribution_name
+
+      # Note: Golden file does not support multiple API level currently.
+      golden_content_checklist_file =
+          "//sdk/packages/${_distribution_name}/release/content_checklist.api"
+      computed_content_checklist_file =
+          "${_sdk_package_dir}/content_checklist.api"
+      _content_checklist_target = "${target_name}.content_checklist"
+      _content_checklist_depfile =
+          "${target_gen_dir}/${_content_checklist_target}.d"
+
+      _tool_deps = []
+      _ffx_package_bin = "${host_out_dir}/ffx-package_unversioned"
+      _far_tool_bin = "${host_out_dir}/far"
+
+      if (host_tools_base_path_override == "") {
+        _tool_deps += [
+          "//src/developer/ffx/plugins/package:ffx_package_tool($host_toolchain)",
+          "//src/sys/pkg/bin/far:bin($host_toolchain)",
+        ]
+      } else {
+        _host_tool_dir = "${root_build_dir}/${host_tools_base_path_override}"
+        _ffx_package_bin =
+            _host_tool_dir + "/" + rebase_path(_ffx_package_bin, root_build_dir)
+        _far_tool_bin =
+            _host_tool_dir + "/" + rebase_path(_far_tool_bin, root_build_dir)
+      }
+
+      # Generates content checklist file using input package manifest, and runs
+      # checks against golden. See
+      # `//build/packages/generate_sdk_package_content_checklist.py` for more.
+      action(_content_checklist_target) {
+        forward_variables_from(invoker, [ "testonly" ])
+
+        script = "//build/packages/generate_sdk_package_content_checklist.py"
+
+        inputs = [
+          package_manifest_file,
+          _ffx_package_bin,
+          _far_tool_bin,
+        ]
+        outputs = [ computed_content_checklist_file ]
+        deps = [ _full_package_label ] + _tool_deps
+        depfile = _content_checklist_depfile
+
+        args = [
+          "--manifest",
+          rebase_path(package_manifest_file, root_build_dir),
+          "--output",
+          rebase_path(computed_content_checklist_file, root_build_dir),
+          "--reference",
+          rebase_path("${golden_content_checklist_file}", root_build_dir),
+          "--ffx-bin",
+          rebase_path(_ffx_package_bin, root_build_dir),
+          "--far-bin",
+          rebase_path(_far_tool_bin, root_build_dir),
+          "--depfile",
+          rebase_path(depfile, root_build_dir),
+        ]
+
+        # FIXME(https://fxbug.dev/42082703)
+        if (is_coverage) {
+          args += [ "--is-coverage" ]
+        }
+
+        foreach(exact_file, expected_files_exact) {
+          args += [
+            "--expected-files-exact",
+            exact_file,
+          ]
+        }
+        foreach(present_file, expected_files_present) {
+          args += [
+            "--expected-files-present",
+            present_file,
+          ]
+        }
+      }
+
+      sdk_atom(target_name) {
+        forward_variables_from(invoker,
+                               [
+                                 "testonly",
+                                 "category",
+                                 "sdk_area",
+                               ])
+
+        id = "sdk://packages/${_distribution_name}"
+        idk_name = _distribution_name
+
+        meta = {
+          type = "package"
+          dest = "packages/${_distribution_name}/meta.json"
+          source_prebuild_info = {
+            api_level = "$current_build_target_api_level"
+            arch = target_cpu
+            package_manifest =
+                rebase_path(package_manifest_file, root_build_dir)
+          }
+        }
+
+        non_sdk_deps = [ ":${_content_checklist_target}" ]
+
+        # Barrier enforced to prevent assembly from adding to `base` set,
+        # keeping this target as an SDK-only addition.
+        metadata = {
+          package_barrier = []
+        }
+      }
+    } else {
+      # Current API level is not supported, so create an empty atom.
+      print(
+          "Empty IDK atom created for package `${target_name}`, which is not supported in API level ${current_build_target_api_level}.")
+      sdk_noop_atom(target_name) {
+        forward_variables_from(invoker,
+                               [
+                                 "testonly",
+                                 "category",
+                                 "sdk_area",
+                               ])
+
+        id = "sdk://packages/${invoker.distribution_name}"
+      }
+
+      # Suppress unused variable warnings.
+      not_needed(invoker,
+                 [
+                   "distribution_name",
+                   "expected_files_exact",
+                   "expected_files_present",
+                   "package_label",
+                 ])
+    }  # end if (package_in_target_api_level)
+  } else {
+    not_needed(invoker, "*")
+  }
+}

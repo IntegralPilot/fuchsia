@@ -1,0 +1,56 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_DEVICES_BLOCK_DRIVERS_FTL_NAND_DRIVER_H_
+#define SRC_DEVICES_BLOCK_DRIVERS_FTL_NAND_DRIVER_H_
+
+#include <fuchsia/hardware/badblock/c/banjo.h>
+#include <fuchsia/hardware/nand/c/banjo.h>
+#include <inttypes.h>
+#include <lib/ddk/device.h>
+#include <zircon/compiler.h>
+#include <zircon/types.h>
+
+#include <memory>
+
+#include "src/storage/lib/ftl/ftln/ndm-driver.h"
+
+namespace ftl {
+
+struct OperationCounters {
+  void Reset() { *this = OperationCounters(); }
+
+  constexpr unsigned int GetSum() const { return page_read + page_write + block_erase; }
+
+  unsigned int page_read = 0;
+  unsigned int page_write = 0;
+  unsigned int block_erase = 0;
+};
+
+// Implementation of the FTL library's driver interface in terms of a device implementing Fuchsia's
+// NAND protocol.
+class NandDriver : public ftl::NdmBaseDriver {
+ public:
+  static std::unique_ptr<NandDriver> Create(const nand_protocol_t* parent,
+                                            const bad_block_protocol_t* bad_block,
+                                            uint32_t ftl_original_size = 0);
+
+  static std::unique_ptr<NandDriver> CreateWithCounters(const nand_protocol_t* parent,
+                                                        const bad_block_protocol_t* bad_block,
+                                                        OperationCounters* counters,
+                                                        uint32_t ftl_original_size = 0);
+
+  virtual const nand_info_t& info() const = 0;
+
+  // Cleans all non bad blocks in a given block range. Erase failures are logged amd deemed non
+  // fatal.
+  virtual void TryEraseRange(uint32_t start_block, uint32_t end_block) = 0;
+
+ protected:
+  explicit NandDriver(FtlLogger logger) : NdmBaseDriver(logger) {}
+};
+
+}  // namespace ftl.
+
+#endif  // SRC_DEVICES_BLOCK_DRIVERS_FTL_NAND_DRIVER_H_

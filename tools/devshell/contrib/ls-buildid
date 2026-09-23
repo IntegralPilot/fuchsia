@@ -1,0 +1,163 @@
+#!/bin/bash
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Build
+### Find binaries among build directories, the checkout, and Google Cloud
+### Storage (GCS) matching a given build ID.
+
+## usage: fx ls-buildid [--help|-h] [--verbose|-v] [--local|-l] BUILD_ID
+##
+## Searches for all binaries having the given GNU build ID across all build
+## directories, prebuilt .build-id directories, and (optionally) within
+## Google Cloud Storage (GCS).
+##
+## Search includes GCS by default, but this can be overridden to be strictly
+## local with `--local`. Remote search takes a dependency on `gcloud` being on
+## one's $PATH, as well as users having authenticated with GCS via
+## `gcloud auth login`.
+##
+## It is assumed that build directories are of all of the form
+## $FUCHSIA_DIR/out/foo.
+##
+##  --verbose|-v   Be explicit in the build directories and GCS buckets being
+##                 searched.
+##
+##  --local|-l     Limit the search to local files (i.e., excluding cloud
+##                 storage).
+##
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh || exit $?
+fx-config-read
+
+# These are the standard buckets to which official Fuchsia infrastructure
+# uploads binaries.
+readonly GSUTIL_BUCKETS=(
+  fuchsia-artifacts
+  fuchsia-artifacts-internal
+  fuchsia-artifacts-release
+)
+
+id=""
+local=false
+verbose=false
+while [[ $# -ne 0 ]]; do
+  case "$1" in
+  --help|-h)
+    fx-command-help
+    exit 0
+    ;;
+  --remote|-r)
+    fx-error "Remote search is now the default!"
+    fx-command-help
+    exit 0
+    ;;
+  --local|-l)
+    local=true
+    ;;
+  --verbose|-v)
+    verbose=true
+    ;;
+  -*)
+    fx-error "Unknown flag: $1"
+    fx-command-help
+    exit 1
+    ;;
+  *)
+    if [[ -z "${id}" ]]; then
+      id="$1"
+    else
+      fx-error "Unexpected argument: '$1'"
+      exit 1
+    fi
+    ;;
+  esac
+  shift
+done
+
+# With a remote search, let's make sure we can actually access GCS.
+if ! $local ; then
+  if ( ! type gcloud &>/dev/null ); then
+    fx-warn "\`gcloud\` not on \$PATH. Proceeding with a strictly local search..."
+    local=true
+  elif ( ! gcloud auth print-access-token &>/dev/null ); then
+    fx-warn "You've not yet run \`gcloud auth login\`! Proceeding with a strictly local search..."
+    local=true
+  fi
+fi
+
+# Relativize against the current working directory on a best-effort basis,
+# because that makes for nicer output.
+readonly out_dir="${FUCHSIA_OUT_DIR#"$(pwd)"/}"
+prebuilt_dir="${FUCHSIA_DIR}/prebuilt"
+readonly prebuilt_dir="${prebuilt_dir#"$(pwd)"/}"
+
+# Aggregate all .build-id directories across the various build directories, as
+# well as those shipped with prebuilts in the checkout.
+build_id_dirs=("${out_dir}"/**/.build-id)
+mapfile -t -O "${#build_id_dirs[@]}" build_id_dirs < <(find "${prebuilt_dir}" -type d -name .build-id)
+
+if $verbose ; then
+  fx-info "Searching the following .build-id directories:"
+  printf "* %s\n" "${build_id_dirs[@]}"
+fi
+
+matches=()
+for build_id_dir in "${build_id_dirs[@]}"; do
+  # The would-be entry in the .build-id directory.
+  dirent="${build_id_dir}/${id:0:2}/${id:2}"
+
+  # Whether the .build-id directory is in a build or prebuilt directory, the
+  # binaries it corresponds to should all lie within the parent.
+  search_dir="$(dirname "${build_id_dir}")"
+  if [[ -f "${dirent}" ]]; then
+      mapfile -t -O "${#matches[@]}" matches < <(find "${search_dir}" -samefile "${dirent}")
+  fi
+done
+
+# Build up a list of inaccessible buckets.
+inaccessible_buckets=()
+if ! $local ; then
+  if $verbose ; then
+    fx-info "Searching the following GCS buckets:"
+    printf "* gs://%s\n" "${GSUTIL_BUCKETS[@]}"
+  fi
+
+  for bucket in "${GSUTIL_BUCKETS[@]}"; do
+    # This gives the current GCS scheme for binaries indexed by build ID.
+    url="gs://$bucket/debug/${id}.debug"
+
+    # `gcloud storage` offers no convenient way to check whether the user has
+    # access to a given GCS bucket. When we attempt to `ls` a file, and an error
+    # is returned, it becomes difficult to disambiguate between a situation
+    # where we have insufficient privileges to access to the storage, from one
+    # where the file simply does not exist.  For now, if we have a non-zero
+    # error code, we check the output for the string "matched no objects".  If
+    # we see that, we just assume that the file does not exist.  Otherwise, we
+    # assume something went wrong and report it to the user as a potential lack
+    # of privilege.
+    output=$(gcloud storage ls "${url}" 2>&1)
+    result=$?
+    if [[ $result != 0 && "${output}" != *"matched no objects"* ]]; then
+      inaccessible_buckets+=("gs://${bucket}")
+      continue
+    fi
+    if [[ $result == 0 ]]; then
+      matches+=("${url}")
+    fi
+  done
+fi
+
+if [[ ${#matches[@]} -eq 0 ]] ; then
+  fx-warn "No binaries found with build ID \"${id}\""
+
+  # It's only worth printing this in the event of no matches.
+  if [[ ${#inaccessible_buckets[@]} -ne 0 ]] ; then
+    fx-warn "Something went wrong when attempting to access the following buckets:"
+    printf "* %s\n" "${inaccessible_buckets[@]}"
+    fx-warn "You may have insufficient privileges and might need to run 'gcloud auth login'"
+  fi
+else
+  printf "%s\n" "${matches[@]}"
+fi

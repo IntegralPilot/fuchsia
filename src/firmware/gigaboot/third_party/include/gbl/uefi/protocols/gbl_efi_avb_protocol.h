@@ -1,0 +1,158 @@
+/*
+ * Copyright (C) 2024 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0 OR BSD-2-Clause-Patent
+ *
+ * You may choose to use or redistribute this file under
+ *  (a) the Apache License, Version 2.0, or
+ *  (b) the BSD 2-Clause Patent license.
+ *
+ * Unless you expressly elect the BSD-2-Clause-Patent terms, the Apache-2.0
+ * terms apply by default.
+ */
+
+#ifndef __GBL_EFI_AVB_PROTOCOL_H__
+#define __GBL_EFI_AVB_PROTOCOL_H__
+
+#include <stdint.h>
+
+#include <efi/types.h>
+#include <gbl/uefi/gbl_protocol_utils.h>
+
+static const uint64_t GBL_EFI_AVB_PROTOCOL_REVISION = GBL_PROTOCOL_REVISION(1, 0);
+
+typedef uint64_t GblEfiAvbDeviceStatus;
+
+// Indicates device is unlocked.
+static const GblEfiAvbDeviceStatus GBL_EFI_AVB_DEVICE_STATUS_UNLOCKED = 0x1 << 0;
+// Indicates a dm-verity error has occurred.
+static const GblEfiAvbDeviceStatus GBL_EFI_AVB_DEVICE_STATUS_DM_VERITY_FAILED = 0x1 << 1;
+// Indicates device is unlocked for critical operations.
+static const GblEfiAvbDeviceStatus GBL_EFI_AVB_DEVICE_STATUS_UNLOCKED_CRITICAL = 0x1 << 2;
+// Indicates the device bootloader can be unlocked.
+static const GblEfiAvbDeviceStatus GBL_EFI_AVB_DEVICE_STATUS_UNLOCKABLE = 0x1 << 3;
+
+// Os boot state color flags.
+//
+// https://source.android.com/docs/security/features/verifiedboot/boot-flow#communicating-verified-boot-state-to-users
+typedef uint64_t GblEfiAvbBootColorFlags;
+static const GblEfiAvbBootColorFlags GBL_EFI_AVB_BOOT_COLOR_RED = 0x1 << 0;
+static const GblEfiAvbBootColorFlags GBL_EFI_AVB_BOOT_COLOR_ORANGE = 0x1 << 1;
+static const GblEfiAvbBootColorFlags GBL_EFI_AVB_BOOT_COLOR_YELLOW = 0x1 << 2;
+static const GblEfiAvbBootColorFlags GBL_EFI_AVB_BOOT_COLOR_GREEN = 0x1 << 3;
+static const GblEfiAvbBootColorFlags GBL_EFI_AVB_BOOT_COLOR_RED_EIO = 0x1 << 4;
+
+// Vbmeta key validation status.
+//
+// https://source.android.com/docs/security/features/verifiedboot/boot-flow#locked-devices-with-custom-root-of-trust
+EFI_ENUM(GblEfiAvbKeyValidationStatus, uint32_t, GBL_EFI_AVB_KEY_VALIDATION_STATUS_INVALID,
+         GBL_EFI_AVB_KEY_VALIDATION_STATUS_VALID_CUSTOM_KEY,
+         GBL_EFI_AVB_KEY_VALIDATION_STATUS_VALID);
+
+typedef uint64_t GblEfiAvbPartitionFlags;
+static const GblEfiAvbPartitionFlags GBL_EFI_AVB_PARTITION_FLAG_VERIFY = 0x1 << 0;
+static const GblEfiAvbPartitionFlags GBL_EFI_AVB_PARTITION_FLAG_VERIFY_IF_EXISTS = 0x1 << 1;
+static const GblEfiAvbPartitionFlags GBL_EFI_AVB_PARTITION_FLAG_FLASH_CRITICAL = 0x1 << 2;
+static const GblEfiAvbPartitionFlags GBL_EFI_AVB_PARTITION_FLAG_FDR = 0x1 << 3;
+
+EFI_ENUM(GblEfiAvbLockType, uint8_t, GBL_EFI_AVB_LOCK_TYPE_DEVICE, GBL_EFI_AVB_LOCK_TYPE_CRITICAL);
+
+EFI_ENUM(GblEfiAvbLockState, uint8_t, GBL_EFI_AVB_LOCK_STATE_UNLOCKED,
+         GBL_EFI_AVB_LOCK_STATE_LOCKED);
+
+typedef struct {
+  // On input - `base_name` buffer size
+  // On output - actual `base_name` length
+  size_t base_name_len;
+  EfiChar8* base_name;
+  GblEfiAvbPartitionFlags flags;
+} GblEfiAvbPartitionAttributes;
+
+typedef struct {
+  // UTF-8, null terminated
+  const EfiChar8* base_name;
+  size_t data_size;
+  const uint8_t* data;
+} GblEfiAvbLoadedPartition;
+
+typedef struct {
+  // UTF-8, null terminated
+  const EfiChar8* base_partition_name;
+  // UTF-8, null terminated
+  const EfiChar8* key;
+  // Excluding null terminator
+  size_t value_size;
+  const uint8_t* value;
+} GblEfiAvbProperty;
+
+typedef struct {
+  GblEfiAvbBootColorFlags color_flags;
+  // Pointer to nul-terminated ASCII hex digest calculated by libavb. May be
+  // null in case of verification failed (RED boot state color).
+  const EfiChar8* digest;
+  size_t num_partitions;
+  const GblEfiAvbLoadedPartition* partitions;
+  size_t num_properties;
+  const GblEfiAvbProperty* properties;
+  uint64_t reserved[8];
+} GblEfiAvbVerificationResult;
+
+typedef struct GblEfiAvbProtocol {
+  uint64_t revision;
+
+  EfiStatus (*read_partition_attributes)(struct GblEfiAvbProtocol* self,
+                                         /* in-out */ size_t* num_partitions,
+                                         /* in-out */ GblEfiAvbPartitionAttributes* partitions);
+
+  EfiStatus (*read_device_status)(struct GblEfiAvbProtocol* self,
+                                  /* out */ GblEfiAvbDeviceStatus* status_flags);
+
+  EfiStatus (*validate_vbmeta_public_key)(
+      struct GblEfiAvbProtocol* self,
+      /* in */ size_t public_key_length,
+      /* in */ const uint8_t* public_key_data,
+      /* in */ size_t public_key_metadata_length,
+      /* in */ const uint8_t* public_key_metadata,
+      /* out */ GblEfiAvbKeyValidationStatus* validation_status);
+
+  EfiStatus (*read_rollback_index)(struct GblEfiAvbProtocol* self,
+                                   /* in */ size_t index_location,
+                                   /* out */ uint64_t* rollback_index);
+
+  EfiStatus (*write_rollback_index)(struct GblEfiAvbProtocol* self,
+                                    /* in */ size_t index_location,
+                                    /* in */ uint64_t rollback_index);
+
+  EfiStatus (*read_persistent_value)(struct GblEfiAvbProtocol* self,
+                                     /* in */ const EfiChar8* name,
+                                     /* in-out */ size_t* value_size,
+                                     /* out */ uint8_t* value);
+
+  EfiStatus (*write_persistent_value)(struct GblEfiAvbProtocol* self,
+                                      /* in */ const EfiChar8* name,
+                                      /* in */ size_t value_size,
+                                      /* in */ const uint8_t* value);
+
+  EfiStatus (*handle_verification_result)(struct GblEfiAvbProtocol* self,
+                                          /* in */ const GblEfiAvbVerificationResult* result);
+
+  EfiStatus (*write_lock_state)(struct GblEfiAvbProtocol* self,
+                                /* in */ GblEfiAvbLockType type,
+                                /* in */ GblEfiAvbLockState state);
+
+  EfiStatus (*factory_data_reset)(struct GblEfiAvbProtocol* self);
+} GblEfiAvbProtocol;
+
+#endif  //__GBL_EFI_AVB_PROTOCOL_H__

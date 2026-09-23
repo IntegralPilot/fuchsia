@@ -1,0 +1,131 @@
+{{/*
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+#![cfg(test)]
+#![allow(unused_imports)]
+#![allow(clippy::approx_constant)]
+
+use {
+    assert_matches::assert_matches,
+    fidl::{AsHandleRef, Error, NullableHandle, HandleDisposition, HandleInfo, HandleOp, ObjectType, Rights},
+    fidl::encoding::{Context, Decode, Decoder, DefaultFuchsiaResourceDialect, Encoder, WireFormatVersion},
+    fidl_test_conformance as test_conformance,
+    zx_status::Status,
+    zx_types as zx_types,
+    gidl_util::{
+        HandleDef, HandleSubtype, copy_handle, create_handles, decode_value,
+        get_handle_koid, get_info_handle_valid, repeat, select_handle_infos,
+        select_raw_handle_infos, to_zx_handle_disposition_t,
+    },
+};
+
+const _V2_CONTEXT: Context = Context { wire_format_version: WireFormatVersion::V2 };
+
+{{ range .EncodeSuccessCases }}
+#[test]
+fn test_{{ .Name }}_encode() {
+    {{- if .HandleDefs }}
+    let handle_defs = create_handles(&{{ .HandleDefs }});
+    {{- end }}
+    let{{ if .IsResource }} mut{{ end }} value = {{ .Value }};
+    let mut bytes = Vec::new();
+    let mut handle_dispositions = Vec::new();
+    bytes.resize(65536, 0xcd); // fill with junk data
+    Encoder::<DefaultFuchsiaResourceDialect>::encode_with_context::<{{ .ValueType }}>(
+        {{ .Context }}, &mut bytes, &mut handle_dispositions, &{{ if .IsResource }}mut {{ end }} value).unwrap();
+    assert_eq!(bytes, &{{ .Bytes }});
+    {{- if .HandleDispositions }}
+    assert_eq!(
+        handle_dispositions.into_iter().map(to_zx_handle_disposition_t).collect::<Vec<_>>(),
+        &{{ .HandleDispositions }}
+    );
+    {{- else if .Handles }}
+    assert_eq!(
+        handle_dispositions.iter().map(|h| h.raw_handle()).collect::<Vec<_>>(),
+        &{{ .Handles }}
+    );
+    {{- else }}
+    assert_eq!(handle_dispositions, &[]);
+    {{- end }}
+}
+{{ end }}
+
+{{ range .DecodeSuccessCases }}
+#[test]
+fn test_{{ .Name }}_decode() {
+    let bytes = &{{ .Bytes }};
+    {{- if .HandleDefs }}
+    let handle_defs = create_handles(&{{ .HandleDefs }});
+    let _handle_koids = handle_defs.iter().map(get_handle_koid).collect::<Vec<_>>();
+    let mut handle_infos = select_handle_infos(&handle_defs, &{{ .Handles }});
+    {{- else }}
+    let mut handle_infos = Vec::new();
+    {{- end }}
+    let mut value = fidl::new_empty!({{ .ValueType }}, DefaultFuchsiaResourceDialect);
+    Decoder::<DefaultFuchsiaResourceDialect>::decode_with_context::<{{ .ValueType }}>({{ .Context }}, bytes, &mut handle_infos, &mut value).unwrap();
+    {{ .EqualityCheck }}
+    {{- if .UnusedHandles }}
+    let unused_handles = select_raw_handle_infos(&handle_defs, &{{ .UnusedHandles }});
+    assert_eq!(
+        unused_handles.iter().map(get_info_handle_valid).collect::<Vec<_>>(),
+        repeat(Err(Status::BAD_HANDLE), unused_handles.len()),
+    );
+    {{- end }}
+}
+{{ end }}
+
+{{ range .EncodeFailureCases }}
+#[test]
+fn test_{{ .Name }}_encode_failure() {
+    {{- if .HandleDefs }}
+    let handle_defs = create_handles(&{{ .HandleDefs }});
+    {{- end }}
+    let{{ if .IsResource }} mut{{ end }} value = {{ .Value }};
+    let mut bytes = Vec::new();
+    let mut handles = Vec::new();
+    bytes.resize(65536, 0xcd); // fill with junk data
+    match Encoder::<DefaultFuchsiaResourceDialect>::encode_with_context::<{{ .ValueType }}>(
+        {{ .Context }}, &mut bytes, &mut handles, &{{ if .IsResource }}mut {{ end }}value
+    ) {
+        Err(err) => assert_matches!(err, {{ .ErrorCode }} { .. }),
+        Ok(_) => panic!("unexpected successful encoding"),
+    }
+    {{- if .HandleDefs }}
+    drop(value);
+    drop(handles);
+    assert_eq!(
+        handle_defs.iter().map(get_info_handle_valid).collect::<Vec<_>>(),
+        repeat(Err(Status::BAD_HANDLE), handle_defs.len()),
+    );
+    {{- end }}
+}
+{{ end }}
+
+{{ range .DecodeFailureCases }}
+#[test]
+fn test_{{ .Name }}_decode_failure() {
+    let bytes = &{{ .Bytes }};
+    {{- if .HandleDefs }}
+    let handle_defs = create_handles(&{{ .HandleDefs }});
+    let mut handle_infos = select_handle_infos(&handle_defs, &{{ .Handles }});
+    {{- else }}
+    let mut handle_infos = Vec::new();
+    {{- end }}
+    let mut value = fidl::new_empty!({{ .ValueType }}, DefaultFuchsiaResourceDialect);
+    match Decoder::<DefaultFuchsiaResourceDialect>::decode_with_context::<{{ .ValueType }}>({{ .Context }}, bytes, &mut handle_infos, &mut value) {
+        Err(err) => assert_matches!(err, {{ .ErrorCode }} { .. }),
+        Ok(_) => panic!("unexpected successful decoding"),
+    }
+    {{- if .HandleDefs }}
+    drop(value);
+    drop(handle_infos);
+    assert_eq!(
+        handle_defs.iter().map(get_info_handle_valid).collect::<Vec<_>>(),
+        repeat(Err(Status::BAD_HANDLE), handle_defs.len()),
+    );
+    {{- end }}
+}
+{{ end }}

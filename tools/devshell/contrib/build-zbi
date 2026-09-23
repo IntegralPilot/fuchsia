@@ -1,0 +1,164 @@
+#!/bin/bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Kernel
+### Publish a product zbi to be flashed to a device for development.
+
+# Currently only supports products that use bazel assembly.
+
+## usage: fx build-zbi [--platform-artifacts PATH] [--product-config PATH] [--board-config PATH] [--board-name PATH]
+##
+##   --platform-artifacts PATH     Path to platform artifacts. If not provided, tries to auto-discover.
+##   --product-config PATH         Path to product configuration. If not provided, tries to auto-discover.
+##   --board-config PATH           Path to board configuration. If not provided, tries to auto-discover.
+##   --board-name PATH             Path to board name. If not provided, tries to auto-discover.
+
+set -o errexit
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh
+fx-config-read
+
+# Default values
+
+platform_artifacts="$FUCHSIA_BUILD_DIR/obj/bundles/assembly/eng/platform_artifacts"
+product_config=""
+board_config=""
+board_name=""
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h|--help)
+      fx-command-help
+      exit 0
+      ;;
+
+    --platform-artifacts)
+      platform_artifacts="$2"
+      shift 2
+      ;;
+    --product-config)
+      product_config="$2"
+      shift 2
+      ;;
+    --board-name)
+      board_name="$2"
+      shift 2
+      ;;
+    --board-config)
+      board_config="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# Auto-discovery
+
+main_pb_label="$(fx-command-run jq -r ".main_pb_label // empty" "$FUCHSIA_BUILD_DIR/args.json")"
+
+if [[ -z "$main_pb_label" ]]; then
+  echo "Error: main_pb_label is not set in args.json. Please make sure you're using a product that supports fx build-zbi (such as fuchsia.x64) and use fx set-main-pb to select the product."
+  exit 1
+fi
+
+if [[ -z "$product_config" ]]; then
+  echo "Using main pb label: $main_pb_label"
+  main_pb_path=${main_pb_label//:/\/}
+  product_config=$FUCHSIA_BUILD_DIR/obj/${main_pb_path:2}_product_config
+  echo "Using product config: $product_config"
+fi
+
+# Query the metadata to find the board config label
+if [[ -z $board_name ]]; then
+  board_name=${main_pb_label#*.}
+fi
+
+echo "Board name: $board_name"
+board_config_label="$(fx-command-run jq -r ".[] | select(.name == \"$board_name\") | .label" "$FUCHSIA_BUILD_DIR/boards.json")"
+
+if [[ -z "$board_config" ]]; then
+  if [[ -n "$board_config_label" ]]; then
+    echo "Using board config label: $board_config_label"
+    # Change : to / and remove the trailing toolchain parens
+    board_config_path=${board_config_label//:/\/}
+    board_config_path=${board_config_path%(*}
+    board_config=$FUCHSIA_BUILD_DIR/obj/${board_config_path:2}
+    echo "Using board config: $board_config"
+  else
+    echo "Error: Could not find board_config_label in metadata for $main_pb_label. Please run fx build and make sure the board you're using is built."
+    exit 1
+  fi
+fi
+
+# Validate files exist
+
+if [[ ! -d "$platform_artifacts" ]]; then
+  # We'll let the tool fail if it's not a directory, but warn here.
+  echo "Warning: Platform artifacts not found at $platform_artifacts. Tool might fail."
+fi
+
+
+echo "Using Platform Artifacts: $platform_artifacts"
+if [[ -n "$product_config" ]]; then
+  echo "Using Product Config: $product_config"
+fi
+if [[ -n "$board_config" ]]; then
+  echo "Using Board Config: $board_config"
+fi
+
+developer_overrides="$FUCHSIA_BUILD_DIR/obj/build/assembly/overrides/build_zbi_developer_overrides.json"
+if [[ -f "$developer_overrides" ]]; then
+  rm "$developer_overrides"
+fi
+
+# Build the platform artifacts
+echo "Building platform artifacts..."
+build_targets=("//bundles/assembly")
+build_targets+=("${board_config_label}")
+build_targets+=("${main_pb_label}_product_config")
+build_targets+=("//build/assembly/overrides:build_zbi_developer_overrides.json")
+
+echo "Invoking fx build with targets: ${build_targets[*]}"
+fx-command-run build "${build_targets[@]}"
+echo "fx build finished."
+
+# Run the tool
+outdir="$FUCHSIA_BUILD_DIR/obj/build/images/fuchsia/build_zbi"
+mkdir -p "$outdir"
+
+echo "Running ffx product-bundle create..."
+
+# We need to use the ffx from the build directory to ensure we have the plugin changes.
+ffx_path="$FUCHSIA_BUILD_DIR/host_x64/ffx"
+if [[ ! -x "$ffx_path" ]]; then
+    # Fallback/Check for arm64
+    ffx_path="$FUCHSIA_BUILD_DIR/host_arm64/ffx"
+fi
+
+if [[ ! -x "$ffx_path" ]]; then
+    echo "Error: Could not find ffx at $ffx_path"
+    exit 1
+fi
+
+ffx_args=()
+if [[ -n "$developer_overrides" && -f "$developer_overrides" ]]; then
+  echo "Using Developer Overrides: $developer_overrides"
+  ffx_args+=(--developer-overrides "$developer_overrides")
+fi
+
+"$ffx_path" product-bundle create \
+  --product-config "$product_config" \
+  --board-config "$board_config" \
+  --out "$outdir" \
+  --platform "$platform_artifacts" \
+  --zbi-only \
+  --auth no-auth \
+  "${ffx_args[@]}"
+
+echo "You can now flash the kernel with fastboot."

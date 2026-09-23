@@ -1,0 +1,147 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.virtualization;
+
+using zx;
+
+type GuestError = strict enum {
+    /// Catch all VMM error.
+    INTERNAL_ERROR = 1;
+
+    /// A device endpoint was requested via the guest client API, but the device isn't enabled.
+    DEVICE_NOT_PRESENT = 2;
+
+    /// The config failed VMM validation for reasons such as a missing required field.
+    BAD_CONFIG = 3;
+
+    /// The VMM failed to initialize the guest object, usually due to capability routing issues
+    /// or memory layout problems.
+    GUEST_INITIALIZATION_FAILURE = 4;
+
+    /// The VMM failed to initialize a device.
+    DEVICE_INITIALIZATION_FAILURE = 5;
+
+    /// The VMM failed to start a device, usually because the device component returned a failure.
+    DEVICE_START_FAILURE = 6;
+
+    /// Two or more devices have attempted to register overlapping memory ranges.
+    DEVICE_MEMORY_OVERLAP = 7;
+
+    /// Failed to connect to a required service. Check the routing in the manifest.
+    FAILED_SERVICE_CONNECT = 8;
+
+    /// Failed to add a public service.
+    DUPLICATE_PUBLIC_SERVICES = 9;
+
+    /// General error when loading the guest kernel.
+    KERNEL_LOAD_FAILURE = 10;
+
+    /// Error when starting a VCPU.
+    VCPU_START_FAILURE = 11;
+
+    /// A VCPU encountered a fatal error while running.
+    VCPU_RUNTIME_FAILURE = 12;
+
+    /// The VMM was asked to run before it was created.
+    NOT_CREATED = 13;
+
+    /// A VMM is already running. The VMM must be stopped and a new VMM must be created before it
+    /// can be run again.
+    ALREADY_RUNNING = 14;
+
+    /// A running VMM was forced to stop by the VMM controller.
+    CONTROLLER_FORCED_HALT = 15;
+};
+
+/// The guest control plane allowing for creating, starting, and stopping the guest.
+@discoverable
+closed protocol GuestLifecycle {
+    /// Create a VMM configured with the provided config. This instantiates all devices and loads
+    /// the kernel without starting the VCPU or device dispatch loops.
+    ///
+    /// Possible errors:
+    ///     - ALREADY_RUNNING: A VMM instance is already running, and must be stopped before being
+    ///         recreated.
+    ///
+    /// All other errors are related to VMM initialization.
+    strict Create(resource struct {
+        guest_config GuestConfig;
+    }) -> () error GuestError;
+
+    /// Binds to the Guest protocol for an initialized guest.
+    ///
+    /// This operation must be called between `Create` and `Stop`, otherwise the provided channel
+    /// will be immediately closed.
+    strict Bind(resource struct {
+        guest server_end:Guest;
+    });
+
+    /// Start the primary VCPU and any dispatch loop. This will not return until the VMM stops
+    /// running. On a clean shutdown (either guest or client initiated) this will return success.
+    ///
+    /// Possible errors:
+    ///     - ALREADY_RUNING: The VMM has already been started.
+    ///     - NOT_CREATED: Run was called before the VMM was created.
+    ///     - CONTROLLER_FORCED_HALT: Stop was called on a running VMM.
+    ///     - VCPU_START_FAILURE: Failed to start the primary VCPU.
+    ///     - VCPU_RUNTIME_FAILURE: A VCPU encountered a fatal error while running the guest.
+    strict Run() -> () error GuestError;
+
+    /// Stop a running VMM. Returns once the dispatch loops have stopped. After Stop returns,
+    /// Create and then Run can be called again.
+    strict Stop() -> ();
+};
+
+/// The guest client API providing high level access to guest features. When the guest terminates,
+/// this channel will contain a ZX_OK epitaph on a clean shutdown, a ZX_ERR_INTERNAL epitaph on
+/// an unexpected shutdown, and no epitaph if the component crashed.
+@discoverable
+closed protocol Guest {
+    /// Get a guest console.
+    ///
+    /// The details regarding what output is produced and what input is accepted
+    /// are determined by each guest, but will typically be a read/write socket
+    /// with a shell.
+    ///
+    /// Returns error DEVICE_NOT_PRESENT if the guest was started without a console device.
+    strict GetConsole() -> (resource struct {
+        socket zx.Handle:SOCKET;
+    }) error GuestError;
+
+    /// Get the socket for low-level guest debug logs.
+    ///
+    /// The details regarding what output is produced and what input is accepted
+    /// are determined by each guest, but will typically be a read-only socket
+    /// with the guest kernel's serial logs.
+    strict GetSerial() -> (resource struct {
+        socket zx.Handle:SOCKET;
+    });
+
+    /// Get the vsock endpoint for the guest.
+    ///
+    /// This endpoint can be used to register listeners for guest initiated connections, and
+    /// to initiate connections from a client. If listeners need to be registered before the guest
+    /// starts so that they are immediately available, set them via the guest config instead of
+    /// using this endpoint.
+    ///
+    /// Returns error DEVICE_NOT_PRESENT if the guest was started without a vsock device.
+    strict GetHostVsockEndpoint(resource struct {
+        endpoint server_end:HostVsockEndpoint;
+    }) -> () error GuestError;
+
+    /// Get the balloon controller endpoint for the guest.
+    ///
+    /// Returns error DEVICE_NOT_PRESENT if the guest was started without a balloon device.
+    strict GetBalloonController(resource struct {
+        controller server_end:BalloonController;
+    }) -> () error GuestError;
+
+    /// Get the mem controller endpoint for the guest.
+    ///
+    /// Returns error DEVICE_NOT_PRESENT if the guest was started without a mem device.
+    strict GetMemController(resource struct {
+        controller server_end:MemController;
+    }) -> () error GuestError;
+};

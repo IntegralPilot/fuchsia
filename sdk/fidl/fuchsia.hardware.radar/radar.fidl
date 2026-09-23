@@ -1,0 +1,287 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=7)
+library fuchsia.hardware.radar;
+using zx;
+
+/// Arbitrary limit on the number of VMOs in one call to `RegisterVmos()` or
+/// `UnregisterVmos()`; enough for ten seconds of radar data for the existing
+/// driver.
+const VMO_VECTOR_MAX_COUNT uint32 = 300;
+
+@strict_audit(bug="https://fxbug.dev/467128430", state="PENDING_REVIEW")
+type StatusCode = strict enum {
+    /// An unspecified error occurred (generally should not be used).
+    UNSPECIFIED = 0;
+
+    /// The request completed successfully.
+    SUCCESS = 1;
+
+    /// `Connect()` was called but the driver is busy handling another client.
+    /// The other client will have to close its channel for the driver to become
+    /// available again.
+    ALREADY_BOUND = 2;
+
+    /// `Connect()` encountered an error trying to bind to the provided server
+    /// channel.
+    BIND_ERROR = 3;
+
+    /// The vectors passed to `RegisterVmos()` did not have the same size.
+    INVALID_ARGS = 4;
+
+    /// A VMO handle was invalid.
+    VMO_BAD_HANDLE = 5;
+
+    /// A VMO was already registered with this ID.
+    VMO_ALREADY_REGISTERED = 6;
+
+    /// No registered VMO was found for the given ID.
+    VMO_NOT_FOUND = 7;
+
+    /// A client VMO could not be written to or mapped due to insufficient
+    /// permissions.
+    VMO_ACCESS_DENIED = 8;
+
+    /// A client VMO was smaller than the burst size (see `GetBurstSize()`).
+    VMO_TOO_SMALL = 9;
+
+    /// A burst was received, but no unlocked VMOs are available.
+    OUT_OF_VMOS = 10;
+
+    /// A burst was not received within the expected window.
+    SENSOR_TIMEOUT = 11;
+
+    /// An unspecified driver or sensor error was encountered.
+    SENSOR_ERROR = 12;
+
+    /// The radar driver or proxy was not in the correct state for this call.
+    BAD_STATE = 13;
+};
+
+type Burst = struct {
+    vmo_id uint32;
+    timestamp zx.Time;
+};
+
+closed protocol RadarBurstReader {
+    strict GetBurstProperties() -> (struct {
+        size uint32;
+        period zx.Duration;
+    });
+
+    /// Registers the VMOs for future use and associates them with vmo_ids,
+    /// which can be used with `UnregisterVmos()` and `OnBurst()`. vmos will be
+    /// mapped by the driver using `ZX_VM_PERM_WRITE`. The client should only
+    /// read registered VMOs that are sent via `OnBurst()`. The size of vmo is
+    /// assumed to be at least the burst size, and the sizes of `vmo_ids` and
+    /// `vmos` must be the same.
+    ///
+    /// + request `vmo_ids` the ID numbers to associate with each VMO.
+    /// + request `vmos` the VMO handles corresponding to each ID.
+    /// * error one of the following `StatusCode` values:
+    /// *     `INVALID_ARGS`: `vmo_ids` and `vmos` were of different sizes.
+    /// *     `VMO_BAD_HANDLE`: A handle in `vmos` was invalid.
+    /// *     `VMO_ALREADY_REGISTERED`: An ID in `vmo_ids` was already
+    /// *         registered.
+    /// *     `VMO_ACCESS_DENIED`: A VMO in `vmos` could not be mapped due to
+    /// *         insufficient permissions.
+    /// *     `VMO_TOO_SMALL`: A VMO in `vmos` was smaller than the burst size.
+    strict RegisterVmos(resource struct {
+        vmo_ids vector<uint32>:VMO_VECTOR_MAX_COUNT;
+        vmos vector<zx.Handle:VMO>:VMO_VECTOR_MAX_COUNT;
+    }) -> () error StatusCode;
+
+    /// Removes the associations with the given VMO IDs and returns the VMOs to
+    /// the client. The driver will not send any more `OnBurst()` events with
+    /// these VMO IDs after replying, however the client may still receive
+    /// bursts with these IDs if they were in flight during this call. The
+    /// driver must return all of the requested VMOs, or return an error. In
+    /// case of an error, the driver may have unregistered some or all of the
+    /// requested VMOs.
+    ///
+    /// + request `vmo_ids` the IDs of the VMOs to unregister and return.
+    /// - response `vmos` the VMO handles corresponding to `vmo_ids`.
+    /// * error one of the following `StatusCode` values:
+    /// *     `INVALID_ARGS`: `vmo_ids` was too big.
+    /// *     `VMO_NOT_FOUND`: An ID in `vmo_ids` was not registered.
+    strict UnregisterVmos(struct {
+        vmo_ids vector<uint32>:VMO_VECTOR_MAX_COUNT;
+    }) -> (resource struct {
+        vmos vector<zx.Handle:VMO>:VMO_VECTOR_MAX_COUNT;
+    }) error StatusCode;
+
+    /// Tells the driver to start sending bursts via `OnBurst()`.
+    strict StartBursts();
+
+    /// Tells the driver to stop sending bursts via `OnBurst()`. If all clients
+    /// call `StopBursts()` then the driver may choose to stop its worker thread.
+    /// The driver may wait for a single burst read to complete, but will not
+    /// access any of the client’s VMOs or call its observer after replying.
+    ///
+    /// Note that already inflight `OnBurst()` bursts may still be received by
+    /// the client.
+    strict StopBursts() -> ();
+
+    /// Returns the ID of a VMO containing a single burst, the time the burst
+    /// was received. Ownership of the VMO must be returned to the driver by
+    /// calling `UnlockVmo()`, and won't be written by the driver until then.
+    /// See the doc for the burst format specification.
+    ///
+    /// The driver will drop bursts if there are no unlocked VMOs. This also
+    /// provides flow control for the number of events in flight. When a burst
+    /// is received and no VMOs are unlocked, `OnBurst()` will be called with
+    /// `OUT_OF_VMOS` set as the error. `OnBurst` will not be called again until
+    /// at least one VMO has been unlocked.
+    ///
+    /// + request `burst` the ID of a VMO containing the burst, as well as the
+    ///     time the burst was received.
+    /// * error one of the following `StatusCode` values:
+    /// *     `OUT_OF_VMOS`: No unlocked VMOs were available to hold the burst.
+    /// *         The driver will wait for at least one VMO to become available
+    /// *         before sending more events to this client.
+    /// *     `SENSOR_TIMEOUT`: The driver could not drain the sensor FIFO
+    /// *         quickly enough.
+    /// *     `SENSOR_ERROR`: An unspecified driver or sensor error occurred
+    /// *         when trying to read the burst.
+    @available(added=14)
+    strict -> OnBurst(flexible union {
+        1: burst Burst;
+        2: error StatusCode;
+    });
+
+    @available(removed=16)
+    strict -> OnBurst2(flexible union {
+        1: burst Burst;
+        2: error StatusCode;
+    });
+
+    /// Signals to the driver that the client is no longer reading the VMO. The
+    /// client must not access the VMO after calling this.
+    ///
+    /// + request `vmo_id` the ID of the VMO to return to the driver.
+    strict UnlockVmo(struct {
+        vmo_id uint32;
+    });
+};
+
+/// The main protocol implemented by radar drivers. Clients use this protocol to
+/// establish a `RadarBurstReader` connection with the driver.
+@discoverable
+closed protocol RadarBurstReaderProvider {
+    /// + request `server` the `RadarBurstReader` server end for the driver to
+    ///     bind to.
+    /// * error one of the following `StatusCode` values:
+    ///     `BIND_ERROR`: An error was encountered while trying to bind to the
+    ///         provided server channel.
+    ///     `ALREADY_BOUND`: Another client has already established a
+    ///         `RadarBurstReader` connection with the driver.
+    strict Connect(resource struct {
+        server server_end:RadarBurstReader;
+    }) -> () error StatusCode;
+};
+
+closed protocol RadarSensorInfo {
+    /// Returns the size and period of bursts reported by the sensor.
+    ///
+    /// - response `size` the size of each radar burst in bytes.
+    /// - response `period` the time between bursts in nanoseconds.
+    strict GetBurstProperties() -> (struct {
+        size uint32;
+        period zx.Duration;
+    });
+};
+
+type BurstData = resource struct {
+    /// A VMO holding zero or more radar bursts of the size reported by
+    /// `GetBurstProperties()`. Bursts are stored contiguously with no padding
+    /// between them.
+    vmo zx.Handle:<VMO, zx.Rights.READ | zx.Rights.MAP>;
+    /// The number of bursts stored in `vmo`.
+    burst_count uint32;
+};
+
+/// Test clients may use this protocol to inject burst data to radar clients
+/// through a virtual radar driver. Only one client of this protocol can be
+/// connected at a time. radar-proxy will send epitaph status code
+/// `ZX_ERR_ALREADY_BOUND` to and close channels from any additional clients
+/// that attempt to connect.
+@discoverable
+closed protocol RadarBurstInjector {
+    compose RadarSensorInfo;
+
+    /// Enqueues the given VMO with burst data to be injected. After all bursts
+    /// from this VMO have been injected, radar-proxy will move on to the next
+    /// VMO in the queue. The caller must not write to the VMO until it has been
+    /// returned by `OnBurstsDelivered()`. The VMO will be closed and unmapped
+    /// if the injector client unexpectedly disconnects.
+    ///
+    /// Bursts are injected by radar-proxy at the rate reported by the
+    /// underlying driver's `GetBurstProperties()` method. If no VMOs are in the
+    /// queue at the time that a burst is to be delivered, radar-proxy will stop
+    /// sending bursts until either `EnqueueBursts()` or `StopBurstInjection()`
+    /// is called.
+    ///
+    /// + request `bursts` the `BurstData` struct containing bursts to inject.
+    /// - response `bursts_id` the ID to be passed back through
+    ///     `OnBurstsDelivered()` after the final burst from this buffer has
+    ///     been injected.
+    /// * error one of the following `StatusCode` values:
+    /// *   `VMO_BAD_HANDLE`: The VMO handle was invalid.
+    /// *   `VMO_ACCESS_DENIED`: The VMO had insufficient rights.
+    /// *   `VMO_TOO_SMALL`: The VMO was too small to hold the indicated number
+    /// *     of bursts.
+    /// *   `INVALID_ARGS`: The number of bursts was zero.
+    /// *   `BAD_STATE`: A previous call to `StopBurstInjection()` is still
+    /// *     pending.
+    strict EnqueueBursts(resource struct {
+        bursts BurstData;
+    }) -> (struct {
+        bursts_id uint32;
+    }) error StatusCode;
+
+    /// Returns an ID corresponding to a `BurstData` struct previously passed to
+    /// `EnqueueBursts()`. Upon receiving this event the client is free to write
+    /// to the VMO, and if desired, pass it back to radar-proxy for injection.
+    ///
+    /// + request `bursts_id` the ID returned by a previous call to
+    ///     `EnqueueBursts()`.
+    strict -> OnBurstsDelivered(struct {
+        bursts_id uint32;
+    });
+
+    /// Tells radar-proxy to read future bursts from enqueued VMOs rather than
+    /// from the real radar driver. radar-proxy will attempt to deliver the
+    /// first injected burst at the time that the radar driver would have done
+    /// so. If the queue is or becomes empty then sending of bursts will stop
+    /// until more bursts are available in the queue. See `EnqueueBursts()`
+    /// above.
+    ///
+    /// radar-proxy will call `StopBursts()` on the real radar driver before
+    /// it starts to deliver the enqueued bursts.
+    ///
+    /// * error one of the following `StatusCode` values:
+    /// *   `BAD_STATE`: Injection has already been started, or a previous call
+    /// *     to `StopBurstInjection()` is still pending.
+    strict StartBurstInjection() -> () error StatusCode;
+
+    /// Tells radar-proxy to finish injecting bursts from VMOs currently on the
+    /// queue then switch back to delivering bursts from the real radar driver.
+    /// The reply to this call will not be sent until `OnBurstsDelivered()` has
+    /// been called for the final VMO to be injected, and any other calls made
+    /// in that time will return errors.
+    ///
+    /// radar-proxy will call `StartBursts()` on the real radar driver as part
+    /// of this call. There may be a delay before RadarBurstReader clients start
+    /// to receive bursts from the driver again.
+    ///
+    /// * error one of the following `StatusCode` values:
+    /// *   `BAD_STATE`: Injection has already been stopped, or a call to this
+    /// *     method is still pending.
+    strict StopBurstInjection() -> () error StatusCode;
+};
+
+// Added to allow service connection to replace devfs
+service Service {
+    device client_end:RadarBurstReaderProvider;
+};

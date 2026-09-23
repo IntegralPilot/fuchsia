@@ -1,0 +1,199 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/cipd.gni")
+import("//build/components.gni")
+import("//build/fidl/toolchain.gni")
+import("//build/testing/cc_test_executable.gni")
+import("//src/camera/bin/camera-gym/assets/convert_image.gni")
+import("//src/camera/debug.gni")
+
+declare_args() {
+  camera_gym_configuration_cycle_interval_ms = 10000
+}
+
+group("camera-gym") {
+  public_deps = [
+    ":camera_gym_pkg",
+    "fidl:controller($fidl_toolchain)",
+  ]
+  deps = [
+    # Camera-gym is for testing and shouldn't be in production builds.
+    "//build/validate:non_production_tag",
+  ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":camera_gym_test",
+    ":stream_cycler_test",
+    "controller_error:tests",
+    "controller_parser:tests",
+  ]
+}
+
+source_set("lib") {
+  sources = [
+    "buffer_collage_flatland.cc",
+    "buffer_collage_flatland.h",
+    "controller_receiver.cc",
+    "controller_receiver.h",
+    "frame_capture.cc",
+    "frame_capture.h",
+    "lifecycle_impl.cc",
+    "lifecycle_impl.h",
+    "moving_window.cc",
+    "moving_window.h",
+    "screen_util.cc",
+    "screen_util.h",
+    "stream_cycler.cc",
+    "stream_cycler.h",
+  ]
+
+  public_deps = [
+    "fidl:controller_hlcpp",
+    "//sdk/fidl/fuchsia.camera3:fuchsia.camera3_hlcpp",
+    "//sdk/fidl/fuchsia.element:fuchsia.element_cpp",
+    "//sdk/fidl/fuchsia.math:fuchsia.math_hlcpp",
+    "//sdk/fidl/fuchsia.process.lifecycle:fuchsia.process.lifecycle_hlcpp",
+    "//sdk/fidl/fuchsia.sysmem:fuchsia.sysmem_cpp_hlcpp_conversion",
+    "//sdk/fidl/fuchsia.sysmem:fuchsia.sysmem_hlcpp",
+    "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_hlcpp",
+    "//sdk/fidl/fuchsia.ui.composition:fuchsia.ui.composition_cpp",
+    "//sdk/fidl/fuchsia.ui.views:fuchsia.ui.views_cpp",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/component/incoming/cpp",
+    "//sdk/lib/fit",
+    "//sdk/lib/fit-promise",
+    "//sdk/lib/sys/cpp",
+    "//sdk/lib/syslog/cpp",
+    "//sdk/lib/ui/scenic/cpp",
+    "//src/lib/fsl",
+    "//src/lib/fxl:fxl_cli",
+    "//src/lib/ui/flatland-frame-scheduling:simple_present",
+    "//third_party/googletest:gtest_prod",
+    "//zircon/system/ulib/fzl",
+    "//zircon/system/ulib/sysmem-version",
+    "//zircon/system/ulib/trace",
+  ]
+
+  defines = [ camera_debug_define ]
+}
+
+executable("camera_gym_bin") {
+  sources = [ "main.cc" ]
+  deps = [
+    ":lib",
+    "//zircon/system/ulib/trace-provider",
+  ]
+  defines = [
+    camera_debug_define,
+    "CONFIGURATION_CYCLE_INTERVAL_MS=($camera_gym_configuration_cycle_interval_ms)",
+  ]
+}
+
+convert_image("mute_icon") {
+  input = "assets/mute.bin"
+  output = "$target_out_dir/mute.bin"
+}
+
+resource("mute_resource") {
+  sources = get_target_outputs(":mute_icon")
+  outputs = [ "data/mute.bin" ]
+  deps = [ ":mute_icon" ]
+}
+
+converted_resources = []
+
+if (internal_access) {
+  stream_title_files = [
+    "c0s0.data",
+    "c0s1.data",
+    "c0s2.data",
+    "c1s0.data",
+    "c1s1.data",
+    "c2s0.data",
+    "c2s1.data",
+  ]
+  foreach(file, stream_title_files) {
+    convert_image(file) {
+      input = "//prebuilt/camera/camera_gym_assets/$file"
+      output = "$target_out_dir/${file}"
+    }
+    resource("${file}_resource") {
+      sources = get_target_outputs(":$file")
+      outputs = [ "data/$file" ]
+      deps = [ ":$file" ]
+    }
+    converted_resources += [ ":${file}_resource" ]
+  }
+}
+
+group("converted_stream_title_files") {
+  deps = converted_resources
+}
+
+template("camera_gym_component") {
+  fuchsia_component("camera_gym_$target_name") {
+    forward_variables_from(invoker,
+                           [
+                             "component_name",
+                             "manifest",
+                           ])
+    deps = [
+      ":camera_gym_bin",
+      ":converted_stream_title_files",
+      ":mute_resource",
+    ]
+  }
+}
+
+camera_gym_component("auto") {
+  component_name = "camera-gym"
+  manifest = "meta/camera-gym.cml"
+}
+
+fuchsia_package("camera_gym_pkg") {
+  package_name = "camera-gym"
+  deps = [
+    ":camera_gym_auto",
+    "controller_client:bin",
+  ]
+}
+
+cc_test_executable("camera_gym_test_bin") {
+  testonly = true
+  sources = [ "camera_gym_test.cc" ]
+  deps = [
+    "//sdk/lib/sys/cpp/testing:unit",
+    "//src/camera/bin/camera-gym:lib",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/loop_fixture:gtest",
+  ]
+}
+
+fuchsia_unittest_package("camera_gym_test") {
+  manifest = "meta/camera_gym_test.cml"
+  deps = [ ":camera_gym_test_bin" ]
+  test_type = "system"
+}
+
+cc_test_executable("stream_cycler_test_bin") {
+  testonly = true
+  sources = [ "stream_cycler_test.cc" ]
+  deps = [
+    "//sdk/lib/sys/cpp/testing:unit",
+    "//src/camera/bin/camera-gym:lib",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/loop_fixture:gtest",
+  ]
+}
+
+fuchsia_unittest_package("stream_cycler_test") {
+  manifest = "meta/stream_cycler_test.cml"
+  deps = [ ":stream_cycler_test_bin" ]
+  test_type = "system"
+}

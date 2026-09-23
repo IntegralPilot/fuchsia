@@ -1,0 +1,327 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/info/info.gni")
+import("//build/python/python_action.gni")
+import("//build/sdk/product_bundle_transfer_manifest.gni")
+import("//build/zircon/tools.gni")
+import("//sdk/config.gni")
+import("//src/developer/ffx/build/ffx_action.gni")
+
+# The name of the main product bundle produced by a build.
+main_product_bundle_name = "${build_info_product}.${build_info_board}"
+
+# Generate a product bundle that can be used to flash, emulate, or update a
+# product onto a Fuchsia target.
+#
+# Arguments
+#   name (required)
+#     [string] The name of the product bundle.
+#
+#   system_a (optional)
+#     [path] The path to the images manifest that describes images intended
+#     for slot A.
+#
+#   system_b (optional)
+#     [path] The path to the images manifest that describes images intended
+#     for slot B.
+#
+#   system_r (optional)
+#     [path] The path to the images manifest that describes images intended
+#     for slot R.
+#
+#   update (optional)
+#     [scope] If provided, an update package will be built. The scope has
+#     a couple required fields.
+#
+#       epoch (required)
+#         [int] A 64-bit integer that sets an anti-rollback epoch for the
+#         update package. See:
+#         https://fuchsia.dev/fuchsia-src/concepts/packages/ota?hl=en#verify-epoch
+#
+#   virtual_devices (optional; default=[])
+#     [list] A list of virtual device spec files. If not specified, a set of virtual devices
+#     are added if the configured board supports the emulator.
+#
+#   default_virtual_device (optional)
+#     [string] The name of the default virtual device.
+#
+#   delivery_blob_type (optional)
+#     [int] The type of delivery blob the product needs.
+#
+#   skip_transfer_manifest           (optional; default=false)
+#     [bool] Whether to skip creating transfer manifest
+#
+#   emit_metadata (optional; default=true)
+#     [bool] Whether to emit GN metadata that will cause the product bundle to
+#     appear in product_bundles.json.
+#
+template("product_bundle") {
+  assert(defined(invoker.name),
+         "product_bundle(${target_name}) must define `name`")
+
+  product_name = invoker.name
+
+  targets = {
+    hermetic_inputs = "${target_name}_hermetic_inputs"
+    product_bundle = "${target_name}_product_bundle"
+    transfer_manifest = "${target_name}_transfer_manifest"
+  }
+
+  files = {
+    hermetic_inputs = "${target_out_dir}/${target_name}_hermetic_inputs"
+    hermetic_inputs_depfile =
+        "${target_out_dir}/${target_name}_hermetic_inputs.d"
+    outdir = "$target_out_dir/$target_name"
+    target_out_dir = target_out_dir
+    product_bundle_manifest = "${outdir}/product_bundle.json"
+    vd_dir = "${outdir}/virtual_devices"
+    transfer_manifest = "$target_out_dir/${product_name}.transfer.json"
+    tuf_keys = "//src/sys/pkg/repositories/devhost/keys"
+    image_size_report = "$target_out_dir/$target_name.size_report.json"
+  }
+
+  bundle_deps = []
+  if (defined(invoker.deps)) {
+    bundle_deps += invoker.deps
+  }
+
+  virtual_devices = []
+  default_virtual_device = ""
+  if (defined(invoker.virtual_devices)) {
+    virtual_devices += invoker.virtual_devices
+    if (defined(invoker.default_virtual_device)) {
+      default_virtual_device = invoker.default_virtual_device
+    }
+
+    # If virtual devices were not specified by the invoker, add
+    # the "default" devices if the board type supports the emulator.
+  } else if (board_is_emu) {
+    virtual_devices = []
+    foreach(virtual_device,
+            [
+              "${board_name}-emu-recommended",
+              "${board_name}-emu-min",
+              "${board_name}-emu-large",
+            ]) {
+      virtual_devices += [ "${root_build_dir}/${virtual_device}.json" ]
+      bundle_deps += [ "//build/virtual-devices:${virtual_device}" ]
+    }
+    default_virtual_device = "${board_name}-emu-recommended"
+  }
+
+  skip_transfer_manifest = false
+  if (defined(invoker.skip_transfer_manifest)) {
+    skip_transfer_manifest = invoker.skip_transfer_manifest
+  }
+
+  python_action(targets.hermetic_inputs) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = bundle_deps
+    binary_label =
+        "//build/assembly/scripts:hermetic_inputs_from_assembly_outputs"
+
+    depfile = files.hermetic_inputs_depfile
+    outputs = [ files.hermetic_inputs ]
+
+    args = [
+      "--output",
+      rebase_path(files.hermetic_inputs, root_build_dir),
+      "--depfile",
+      rebase_path(files.hermetic_inputs_depfile, root_build_dir),
+    ]
+
+    if (defined(invoker.system_a) || defined(invoker.system_b) ||
+        defined(invoker.system_r)) {
+      args += [ "--system" ]
+      if (defined(invoker.system_a)) {
+        args += [ rebase_path(invoker.system_a, root_build_dir) ]
+      }
+      if (defined(invoker.system_b)) {
+        args += [ rebase_path(invoker.system_b, root_build_dir) ]
+      }
+      if (defined(invoker.system_r)) {
+        args += [ rebase_path(invoker.system_r, root_build_dir) ]
+      }
+    }
+  }
+
+  ffx_action(targets.product_bundle) {
+    check_for_output_dir_leaks = false
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = bundle_deps
+    outputs = []
+
+    hermetic_inputs_target = ":${targets.hermetic_inputs}"
+    hermetic_inputs_file = files.hermetic_inputs
+    hermetic_action_ignored_prefixes = [ "${files.outdir}" ]
+
+    # The target below is generated as a part of the `ffx_tool` action at
+    # `//src/developer/ffx/plugins/product:ffx_product_tool`. See there
+    # for more information.
+    ffx_tool = "//src/developer/ffx/plugins/product:ffx_product_tool"
+    ffx_tool_output_name = "ffx-product"
+
+    args = [
+      "--config",
+      "product.experimental=true",
+      "product",
+      "create-old",
+      "--product-name",
+      product_name,
+      "--out-dir",
+      rebase_path(files.outdir, root_build_dir),
+      "--tuf-keys",
+      rebase_path(files.tuf_keys, root_build_dir),
+      "--gerrit-size-report",
+      rebase_path(files.image_size_report, root_build_dir),
+    ]
+
+    outputs += [ files.product_bundle_manifest ]
+    inputs = [
+      "${files.tuf_keys}/root.json",
+      "${files.tuf_keys}/snapshot.json",
+      "${files.tuf_keys}/targets.json",
+      "${files.tuf_keys}/timestamp.json",
+    ]
+    outputs += [
+      "${files.outdir}/keys/root.json",
+      "${files.outdir}/keys/targets.json",
+      "${files.outdir}/keys/snapshot.json",
+      "${files.outdir}/keys/timestamp.json",
+      files.image_size_report,
+    ]
+
+    # Used by create-update for size checks. Needed because product bundle
+    # creation also creates an update package
+    deps += [ blobfs_tool_target ]
+    inputs += [ blobfs_tool_path ]
+
+    if (defined(invoker.update)) {
+      update = invoker.update
+      assert(defined(update.epoch), "Need to define update.epoch")
+
+      args += [
+        "--update-package-epoch",
+        update.epoch,
+      ]
+    }
+
+    if (defined(invoker.system_a)) {
+      args += [
+        "--system-a",
+        rebase_path(invoker.system_a, root_build_dir),
+      ]
+      hermetic_action_ignored_prefixes += [ invoker.system_a ]
+    }
+
+    if (defined(invoker.system_b)) {
+      args += [
+        "--system-b",
+        rebase_path(invoker.system_b, root_build_dir),
+      ]
+      hermetic_action_ignored_prefixes += [ invoker.system_b ]
+    }
+
+    if (defined(invoker.system_r)) {
+      args += [
+        "--system-r",
+        rebase_path(invoker.system_r, root_build_dir),
+      ]
+      hermetic_action_ignored_prefixes += [ invoker.system_r ]
+    }
+
+    if (virtual_devices != []) {
+      outputs += [ "${files.vd_dir}/manifest.json" ]
+    }
+    foreach(virtual_device, virtual_devices) {
+      args += [
+        "--virtual-device",
+        rebase_path(virtual_device, root_build_dir),
+      ]
+      inputs += [ virtual_device ]
+      vd_filename = get_path_info(virtual_device, "file")
+      outputs += [ "${files.vd_dir}/${vd_filename}" ]
+    }
+
+    if (default_virtual_device != "") {
+      args += [
+        "--recommended-device",
+        default_virtual_device,
+      ]
+    }
+
+    if (defined(invoker.delivery_blob_type) &&
+        invoker.delivery_blob_type != false) {
+      args += [
+        "--delivery-blob-type",
+        "${invoker.delivery_blob_type}",
+      ]
+    }
+  }
+
+  if (!skip_transfer_manifest) {
+    product_bundle_transfer_manifest(targets.transfer_manifest) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      product_bundle_target = ":${targets.product_bundle}"
+
+      product_bundle_dir = files.outdir
+      outputs = [ files.transfer_manifest ]
+    }
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    public_deps = [ ":${targets.product_bundle}" ]
+    if (!skip_transfer_manifest) {
+      public_deps += [ ":${targets.transfer_manifest}" ]
+    }
+
+    # This value can be set (e.g. for testing) with `--args sdk_id=1234` on the
+    # `fx set` call.
+    # In the future, the product bundles should be versioned independently of
+    # the sdk version. So far they have been the same value.
+    product_version = sdk_id
+    assert(product_version != "")
+
+    if (!defined(invoker.emit_metadata) || invoker.emit_metadata) {
+      # A json file will be created by '//build/config/build_api_modules.gni'.
+      metadata = {
+        product_bundles = [
+          {
+            label = get_label_info(":$target_name", "label_with_toolchain")
+            path = rebase_path(files.outdir, root_build_dir)
+            name = product_name
+            cpu = current_cpu
+            product_version = product_version
+            if (!skip_transfer_manifest) {
+              transfer_manifest_path =
+                  rebase_path(files.transfer_manifest, root_build_dir)
+              transfer_manifest_url = "file://" + transfer_manifest_path
+            }
+            json = rebase_path(files.product_bundle_manifest, root_build_dir)
+          },
+        ]
+      }
+    }
+  }
+}

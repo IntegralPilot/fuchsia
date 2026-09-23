@@ -1,0 +1,267 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.power.statecontrol;
+
+using zx;
+
+/// The maxium number of seconds the server will wait for responses from all RebootMethodsWatchers
+/// before changing the system power state.
+// TODO(https://fxbug.dev/42129558): Track how long it takes to persist the reboot reason and adjust this value.
+@available(deprecated=29, removed=31, note="renamed to MAX_SHUTDOWN_WATCHER_RESPONSE_TIME_SECONDS")
+const MAX_REBOOT_WATCHER_RESPONSE_TIME_SECONDS uint32 = 5;
+
+/// The maximum number of seconds the server will wait for responses from all ShutdownWatchers
+/// before changing the system power state.
+@available(added=29)
+const MAX_SHUTDOWN_WATCHER_RESPONSE_TIME_SECONDS uint32 = 5;
+
+/// The maximum number of seconds the server will wait for responses from all TerminalStateWatchers
+/// before changing the system power state.
+@available(added=HEAD)
+const MAX_TERMINAL_STATE_WATCHER_RESPONSE_TIME_SECONDS uint32 = 5;
+
+/// Provides methods to request that the system be transitioned into a supported power state.
+///
+/// Note (see https://fxbug.dev/42136295):
+/// These methods do not return until after the state transition has been completed. In most cases
+/// (e.g. Reboot), a successful transition means that the caller does not actually observe the
+/// completion because the system will be rebooted before the call is completed. The implication is
+/// that using a synchronous FIDL client with these methods will result in a blocked thread for the
+/// duration of the call, or even for the remainder of the component's life (in the case of Reboot).
+/// Therefore, if a synchronous FIDL client is to be used with this protocol then care should be
+/// taken to avoid handling any shutdown-induced callbacks on the same thread that was used to
+/// initiate the transition. Example callbacks include [`fuchsia.process.lifecycle/Lifecycle.Stop`]
+/// and [`fuchsia.hardware.power.statecontrol/RebootMethodsWatcher.OnReboot`].
+/// Alternatively, the caller could choose to use an asynchronous FIDL client with this protocol to
+/// avoid blocking their calling thread.
+@discoverable(server="platform")
+closed protocol Admin {
+    /// Asks the device to enter a fully on state.
+    @available(deprecated=29, removed=31, note="not used or supported")
+    strict PowerFullyOn() -> () error zx.Status;
+
+    /// Asks the device to enter the state specified by `options.action`.
+    ///
+    /// Arguments:
+    ///   - options: The options with which to perform this request.
+    ///              `ZX_ERR_INVALID_ARGS` is returned if `action` is absent.
+    ///              `reasons` may be omitted, but adding a new enum value
+    ///              instead is strongly encouraged.
+    @available(added=29)
+    strict Shutdown(struct {
+        options ShutdownOptions;
+    }) -> () error zx.Status;
+
+    /// Asks the device to reboot.
+    ///
+    /// Arguments:
+    ///   - options: The options with which to perform this requests.
+    ///              `ZX_ERR_INVALID_ARGS` is returned if the options are
+    ///              malformed (i.e. `reasons` is absent or empty).
+    ///
+    /// # Deprecation
+    ///
+    /// Use Shutdown, which allows callers to specify the intended action and reasons for the
+    /// action.
+    @available(added=26, deprecated=29, removed=31, note="use Shutdown")
+    strict PerformReboot(struct {
+        options RebootOptions;
+    }) -> () error zx.Status;
+
+    /// Asks the device to reboot into the bootloader.
+    ///
+    /// # Deprecation
+    ///
+    /// Use Shutdown, which allows callers to specify reasons why they are requesting a reboot to
+    /// bootloader.
+    @available(deprecated=29, removed=31, note="use Shutdown")
+    strict RebootToBootloader() -> () error zx.Status;
+
+    /// Asks the device to reboot into the recovery partition.
+    ///
+    /// # Deprecation
+    ///
+    /// Use Shutdown, which allows callers to specify reasons why they are requesting a reboot to
+    /// recovery.
+    @available(deprecated=29, removed=31, note="use Shutdown")
+    strict RebootToRecovery() -> () error zx.Status;
+
+    /// Asks all devices to enter a powered off state.
+    ///
+    /// # Deprecation
+    ///
+    /// Use Shutdown, which allows callers to specify reasons why they are requesting a poweroff.
+    @available(deprecated=29, removed=31, note="use Shutdown")
+    strict Poweroff() -> () error zx.Status;
+
+    /// Performs a kernel mexec.
+    ///
+    /// It is expected that the ZBI items specified by
+    /// `zx_system_mexec_payload_get()` have not yet been appended to the
+    /// provided data ZBI.
+    strict Mexec(resource struct {
+        kernel_zbi zx.Handle:VMO;
+        data_zbi zx.Handle:VMO;
+    }) -> () error zx.Status;
+
+    /// Asks the device to enter the suspend to RAM (S3) power state. Currently only supported on
+    /// x64. If a system state transition is already in progress then ZX_ERR_ALREADY_EXISTS is
+    /// returned. If the device fails to reach the suspend power state then ZX_ERR_INTERNAL is
+    /// returned. If the device successfully suspends, ZX_OK is returned when the device resumes.
+    strict SuspendToRam() -> () error zx.Status;
+};
+
+/// The maximum number of reboot reasons that can be attributed to a single
+/// reboot request.
+@available(added=26, deprecated=29, removed=31, note="use MAX_SHUTDOWN_REASONS")
+const MAX_REBOOT_REASONS uint8 = 100;
+
+/// The maximum number of shutdown reasons that can be attributed to a single
+/// shutdown request.
+@available(added=29)
+const MAX_SHUTDOWN_REASONS uint8 = 100;
+
+/// The options specified when a reboot is requested.
+@available(added=26, deprecated=29, removed=31, note="use ShutdownOptions")
+type RebootOptions = table {
+    /// The set of reboot reasons that are responsible for this reboot request.
+    // When calling `Admin.PerformReboot`, the majority of clients need only
+    // specify a single reason. Contact OWNERS if you believe your use case
+    // warrants providing multiple reasons.
+    1: reasons vector<RebootReason2>:MAX_REBOOT_REASONS;
+};
+
+@available(added=29)
+type ShutdownAction = flexible enum {
+    POWEROFF = 1;
+    REBOOT = 2;
+    REBOOT_TO_RECOVERY = 3;
+    REBOOT_TO_BOOTLOADER = 4;
+};
+
+/// The options specified when a shutdown is requested.
+@available(added=29)
+type ShutdownOptions = table {
+    1: action ShutdownAction;
+
+    /// The set of shutdown reasons that are responsible for this shutdown request.
+    // When calling `Admin.Shutdown`, the majority of clients need only
+    // specify a single reason. Contact OWNERS if you believe your use case
+    // warrants providing multiple reasons.
+    2: reasons vector<ShutdownReason>:MAX_SHUTDOWN_REASONS;
+};
+
+/// Allows components to register a callback that will be executed when a Reboot
+/// method is called. The main purpose of this protocol is to be able to track
+/// reboot reasons. Consider relying on Component Framework's orderly shutdown
+/// if you're looking at using this protocol.
+@discoverable(server="platform")
+@available(deprecated=29, removed=31, note="use ShutdownWatcherRegister")
+closed protocol RebootMethodsWatcherRegister {
+    /// Registers a watcher to be notified when a Reboot method is called.
+    ///
+    /// Once the watcher has been successfully registered with the server, then
+    /// the request will be completed and the RebootMethodsWatcherRegister
+    /// channel will be left open (though a client is free to close it at this
+    /// time).
+    ///
+    /// If there is an error in registering the watcher, then the
+    /// RebootMethodsWatcherRegister channel will be closed without completing
+    /// the request.
+    ///
+    /// The provided `watcher` channel will be used at most once to notify the
+    /// watcher of an impending reboot and allow it the chance to respond.
+    ///
+    /// Watchers can unregister by closing their `RebootWatcher` channel.
+    @available(added=26)
+    strict RegisterWatcher(resource struct {
+        watcher client_end:RebootWatcher;
+    }) -> ();
+};
+
+/// Allows components to register a callback that will be executed when reboots or shutdowns occur.
+/// The main purpose of this protocol is to be able to track shutdown reasons and provide signals
+/// to critical platform components that cannot rely on Component Framework's orderly shutdown.
+/// Before relying on this protocol, consider using Component Framework's orderly shutdown
+/// pattern or component lifecycle hooks.
+@discoverable(server="platform")
+@available(added=29)
+open protocol ShutdownWatcherRegister {
+    /// Registers a watcher to be notified when the `Admin.Shutdown` method is called.
+    ///
+    /// Once the watcher has been successfully registered with the server, then
+    /// the request will be completed and the ShutdownWatcherRegister
+    /// channel will be left open (though a client is free to close it at this
+    /// time).
+    ///
+    /// If there is an error in registering the watcher, then the
+    /// ShutdownWatcherRegister channel will be closed without completing
+    /// the request.
+    ///
+    /// The provided `watcher` channel will be used at most once to notify the
+    /// watcher of an impending shutdown and allow it the chance to respond.
+    ///
+    /// Watchers can unregister by closing their `ShutdownWatcher` channel.
+    flexible RegisterWatcher(resource struct {
+        watcher client_end:ShutdownWatcher;
+    }) -> ();
+
+    /// Registers a watcher to be notified when the system begins a transition to a terminal state
+    /// regardless of the trigger.
+    ///
+    /// The [`TerminalStateWatcher`] is notified for all reboots, power-offs, and kernel-initiated
+    /// shutdowns. It does not provide reasons or options.
+    ///
+    /// Once the watcher has been successfully registered with the server, then
+    /// the request will be completed and the ShutdownWatcherRegister
+    /// channel will be left open (though a client is free to close it at this
+    /// time).
+    ///
+    /// If there is an error in registering the watcher, then the
+    /// ShutdownWatcherRegister channel will be closed without completing
+    /// the request.
+    ///
+    /// The provided `watcher` channel will be used at most once to notify the
+    /// watcher of an impending shutdown and allow it the chance to respond.
+    ///
+    /// Watchers can unregister by closing their `TerminalStateWatcher` channel.
+    @available(added=HEAD)
+    flexible RegisterTerminalStateWatcher(resource struct {
+        watcher client_end:TerminalStateWatcher;
+    }) -> ();
+};
+
+/// Allows components to be notified when Reboot related methods are called.
+/// Watchers will be given 'MAX_REBOOT_WATCHER_RESPONSE_TIME_SECONDS' to return
+/// before the system power state is changed. The channel will be used once to
+/// send a notification to the watcher. Once the watcher responds or the timeout
+/// expires, the channel will be closed by the client of RebootWatcher.
+@available(added=26, deprecated=29, removed=31, note="Use ShutdownWatcher")
+closed protocol RebootWatcher {
+    strict OnReboot(struct {
+        options RebootOptions;
+    }) -> ();
+};
+
+/// Allows components to be notified when the Shutdown method is called.
+/// Watchers will be given 'MAX_SHUTDOWN_WATCHER_RESPONSE_TIME_SECONDS' to return
+/// before the system power state is changed. The channel will be used once to
+/// send a notification to the watcher. Once the watcher responds or the timeout
+/// expires, the channel will be closed by the client of ShutdownWatcher.
+@available(added=29)
+open protocol ShutdownWatcher {
+    flexible OnShutdown(struct {
+        options ShutdownOptions;
+    }) -> ();
+};
+
+/// Allows components to be notified when a transition to a terminal state begins.
+/// Watchers will be given 'MAX_TERMINAL_STATE_WATCHER_RESPONSE_TIME_SECONDS' to return
+/// before the system power state is changed. The channel will be used once to
+/// send a notification to the watcher. Once the watcher responds or the timeout
+/// expires, the channel will be closed by the client of TerminalStateWatcher.
+@available(added=HEAD)
+open protocol TerminalStateWatcher {
+    flexible OnTerminalStateTransitionStarted() -> ();
+};

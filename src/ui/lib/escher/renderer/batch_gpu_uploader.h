@@ -1,0 +1,228 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_UI_LIB_ESCHER_RENDERER_BATCH_GPU_UPLOADER_H_
+#define SRC_UI_LIB_ESCHER_RENDERER_BATCH_GPU_UPLOADER_H_
+
+#include <lib/fit/function.h>
+
+#include <algorithm>
+#include <variant>
+
+#include "src/ui/lib/escher/escher.h"
+#include "src/ui/lib/escher/renderer/buffer_cache.h"
+#include "src/ui/lib/escher/renderer/frame.h"
+#include "src/ui/lib/escher/vk/buffer.h"
+#include "src/ui/lib/escher/vk/command_buffer.h"
+
+#include <vulkan/vulkan.hpp>
+
+namespace escher {
+
+// Provides host-accessible GPU memory for clients to upload Images and Buffers
+// to the GPU. Offers the ability to batch uploads into consolidated submissions
+// to the GPU driver.
+//
+// About synchronization:
+// We use semaphores for synchronization between BatchGpuDownloader/Uploader
+// and other gfx components, so we only need the barrier to synchronize all
+// transfer-related commands.
+//
+// Currently users of BatchGpuUploader should manually enforce that the
+// BatchGpuUploader waits on other BatchGpuUploader or gfx::Engine if they write
+// to the images / buffers the BatchGpuUploader reads from, by using
+// AddWaitSemaphore() function. Also, Submit() function will return a semaphore
+// being signaled when command buffer finishes execution, which can be used for
+// synchronization.
+//
+// TODO(https://fxbug.dev/42098594) Add memory barriers so the BatchGpuUploader and
+// BatchGpuDownloader can handle synchronization of reads and writes on the same
+// Resource.
+//
+class BatchGpuUploader {
+ public:
+  static std::unique_ptr<BatchGpuUploader> New(EscherWeakPtr weak_escher,
+                                               uint64_t frame_trace_number = 0);
+
+  BatchGpuUploader(EscherWeakPtr weak_escher, uint64_t frame_trace_number = 0);
+  ~BatchGpuUploader();
+
+  // Returns true if the BatchGPUUploader has content to upload on the GPU.
+  bool HasContentToUpload() const { return copy_info_records_.size() > 0; }
+
+  // Returns true if BatchGpuUploader needs a command buffer, i.e. it needs to
+  // uploading images/buffers, or it needs to wait on/signal semaphores.
+  bool NeedsCommandBuffer() const {
+    return HasContentToUpload() || !wait_semaphores_.empty() || !signal_semaphores_.empty();
+  }
+
+  // Callers of ScheduleWriteImage() and ScheduleWriteBuffer() may use
+  // DataProviderCallback to defer writing if callers need to write to the
+  // host-visible Vulkan buffers directly without copying data.
+  using DataProviderCallback = std::function<void(uint8_t* host_buffer_ptr, size_t copy_size)>;
+
+  // Schedule a buffer-to-buffer copy that will be submitted when Submit()
+  // is called.  Reference will be retained in |resources_| until we call
+  // Submit(), where we keep the resources alive until submitted CommandBuffer
+  // is retired.
+  //
+  // |target_offset| is the starting offset in bytes from the start of the
+  //   target buffer.
+  // |copy_size| is the size to be copied to the buffer.
+  //
+  // These arguments are used to build VkBufferCopy struct.  See the Vulkan specs
+  // VkBufferCopy for more details.
+  //
+  // |write_function| is a callback function which will be called at
+  // GenerateCommands(), where we copy our data to the host-visible buffer.
+  void ScheduleWriteBuffer(const BufferPtr& target, DataProviderCallback write_function,
+                           vk::DeviceSize target_offset, vk::DeviceSize copy_size);
+
+  // Schedule a buffer-to-buffer copy that will be submitted when Submit()
+  // is called.  Reference will be retained in |resources_| until we call
+  // Submit(), where we keep the resources alive until submitted CommandBuffer
+  // is retired.
+  //
+  // |target_offset| is the starting offset in bytes from the start of the
+  //   target buffer.
+  // |copy_size| is the size to be copied to the buffer.
+  // This argument is used to build VkBufferCopy struct.  See the Vulkan specs
+  // VkBufferCopy for more details.
+  //
+  // |host_data| will be kept until GenerateCommands() where we copy the data
+  // to the host-visible buffer.
+  template <class T>
+  void ScheduleWriteBuffer(const BufferPtr& target, std::vector<T> host_data,
+                           vk::DeviceSize target_offset = 0U, vk::DeviceSize copy_size = 0U) {
+    vk::DeviceSize real_copy_size = copy_size == 0U ? host_data.size() * sizeof(T) : copy_size;
+    // The lambda needs to be mutable so that |host_data| can be moved out.
+    ScheduleWriteBuffer(
+        target,
+        [host_data = std::move(host_data), real_copy_size](uint8_t* host_buffer_ptr,
+                                                           size_t copy_size) mutable {
+          size_t requested_size = real_copy_size;
+          FX_DCHECK(copy_size >= requested_size);
+          memcpy(static_cast<void*>(host_buffer_ptr), host_data.data(),
+                 std::min(copy_size, requested_size));
+        },
+        target_offset, real_copy_size);
+  }
+
+  // Schedule a buffer-to-image copy that will be submitted when Submit()
+  // is called.  Reference will be retained in |resources_| until we call
+  // Submit(), where we keep the resources alive until submitted CommandBuffer
+  // is retired.
+  //
+  // |region| specifies the buffer region which will be copied to the target
+  // image.
+  //   |region.bufferOffset| should be set to zero since the src buffer is
+  //   managed internally by the uploader; currently |imageOffset| requires to
+  //   be zero and |imageExtent| requires to be the whole image.
+  // The default value of |region| is vk::BufferImageCopy(), in which case we
+  // create a default copy region which writes to the color data of an image
+  // of one mipmap layer.
+  //
+  // |write_function| is a callback function which will be called at
+  // GenerateCommands(), where we copy our data to the host-visible buffer.
+  void ScheduleWriteImage(const ImagePtr& target, DataProviderCallback write_function,
+                          vk::ImageLayout final_layout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                          vk::BufferImageCopy region = vk::BufferImageCopy());
+
+  // Schedule a buffer-to-image copy that will be submitted when Submit()
+  // is called.  Reference will be retained in |resources_| until we call
+  // Submit(), where we keep the resources alive until submitted CommandBuffer
+  // is retired.
+  //
+  // |region| specifies the buffer region which will be copied to the target
+  // image.
+  //   |region.bufferOffset| should be set to zero since the src buffer is
+  //   managed internally by the uploader; currently |imageOffset| requires to
+  //   be zero and |imageExtent| requires to be the whole image.
+  // The default value of |region| is vk::BufferImageCopy(), in which case we
+  // create a default copy region which writes to the color data of an image
+  // of one mipmap layer.
+  //
+  // |host_data| will be kept until GenerateCommands() where we copy the data
+  // to the host-visible buffer.
+  template <class T>
+  void ScheduleWriteImage(const ImagePtr& target, std::vector<T> host_data,
+                          vk::ImageLayout final_layout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                          vk::BufferImageCopy region = vk::BufferImageCopy()) {
+    ScheduleWriteImage(
+        target,
+        [host_data = std::move(host_data)](uint8_t* host_buffer_ptr, size_t copy_size) mutable {
+          size_t requested_size = host_data.size() * sizeof(T);
+          FX_DCHECK(copy_size >= requested_size);
+          memcpy(static_cast<void*>(host_buffer_ptr), host_data.data(),
+                 std::min(copy_size, requested_size));
+        },
+        final_layout, std::move(region));
+  }
+
+  // Submits all pending work to the given CommandBuffer. Users need to call
+  // cmds->Submit() after calling this function.
+  //
+  // CommandBuffer cannot be empty if there is any pending work, including
+  // writing to buffer/images, waiting on/signaling semaphores.
+  void GenerateCommands(CommandBuffer* cmds);
+
+  // Submits all pending work to the given CommandBuffer.
+  // Callback function will be called after all work is done.
+  //
+  // Note that Submit must be called on all BatchGpuUploaders, even if no work was scheduled.
+  // TODO(https://fxbug.dev/42151479): Remove this restriction.
+  void Submit(fit::function<void()> callback = nullptr);
+
+  // Submit() and GenerateCommands() will wait on all semaphores added by
+  // AddWaitSemaphore().
+  void AddWaitSemaphore(SemaphorePtr sema, vk::PipelineStageFlags flags);
+
+  // Submit() and GenerateCommands() will signal all semaphores added by
+  // AddSignalSemaphore().
+  void AddSignalSemaphore(SemaphorePtr sema);
+
+ private:
+  enum class CopyType { COPY_IMAGE = 0, COPY_BUFFER = 1 };
+  struct ImageCopyInfo {
+    ImagePtr target;
+    vk::BufferImageCopy region;
+    vk::ImageLayout final_layout;
+  };
+  struct BufferCopyInfo {
+    BufferPtr target;
+    vk::BufferCopy region;
+  };
+  using CopyInfoVariant = std::variant<ImageCopyInfo, BufferCopyInfo>;
+
+  struct CopyInfo {
+    CopyType type;
+    vk::DeviceSize offset;
+    vk::DeviceSize size;
+    DataProviderCallback write_function;
+    // copy_info can either be a ImageCopyInfo or a BufferCopyInfo.
+    CopyInfoVariant copy_info;
+  };
+
+  BufferPtr CreateBufferFromRecords();
+
+  EscherWeakPtr escher_;
+
+  // The trace number for the frame. Cached to support lazy frame creation.
+  const uint64_t frame_trace_number_;
+  BufferCacheWeakPtr buffer_cache_;
+
+  vk::DeviceSize current_offset_ = 0U;
+
+  std::vector<CopyInfo> copy_info_records_;
+  std::vector<ResourcePtr> resources_;
+
+  std::vector<std::pair<SemaphorePtr, vk::PipelineStageFlags>> wait_semaphores_;
+  std::vector<SemaphorePtr> signal_semaphores_;
+
+  FXL_DISALLOW_COPY_AND_ASSIGN(BatchGpuUploader);
+};
+
+}  // namespace escher
+
+#endif  // SRC_UI_LIB_ESCHER_RENDERER_BATCH_GPU_UPLOADER_H_

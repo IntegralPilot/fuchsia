@@ -1,0 +1,616 @@
+#!/bin/bash
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Capture the start_time as early as possible to best reflect the user
+# experienced start time.
+declare -r start_time="${EPOCHREALTIME/./}"
+
+function help_options {
+  cat <<END
+
+fx help flags: fx help [OPTION]
+  --no-contrib      Hide contrib commands (see //tools/devshell/README.md)
+  --deprecated      Do not hide deprecated commands
+END
+}
+
+function help_global_options {
+  cat <<END
+
+Global fx options: fx [OPTION] ${cmd} ...
+  --dir=BUILD_DIR                  Path to the build directory to use when running COMMAND.
+  -t|--target DEVICE[:SSH_PORT]    Target a specific device.
+                                   DEVICE may be a Fuchsia device name to be resolved using
+                                   ffx or an IP address.
+                                   An IPv4 address must be specified directly, while an IPv6
+                                   need to be surrounded by brackets.
+                                   SSH_PORT, if specified, will be used for all commands
+                                   that rely on SSH to connect to the device instead of the
+                                   default SSH port (22).
+                                   Note: See "fx help set-device" for more help and to set
+                                   the default device for a BUILD_DIR.
+  -i                               Iterative mode. Repeat the command whenever a file is
+                                   modified under your Fuchsia directory, not including
+                                   out/.
+  -x                               Print commands and their arguments as they are executed.
+  -xx                              Print extra logging of the fx tool itself (implies -x)
+END
+  if [[ -n "$(list_optional_features)" ]]; then
+    echo "  --enable|disable=FEATURE  Enable or disable a feature (non-persistent). Valid features:"
+    help_optional_features
+  fi
+}
+
+function help_list_commands {
+  local hide_contrib=0
+  local show_deprecated=0
+  while [[ $# -ne 0 ]]; do
+    if [[ "$1" == "--deprecated" ]]; then
+      show_deprecated=1
+    elif [[ "$1" == "--no-contrib" ]]; then
+      hide_contrib=1
+    fi
+    shift
+  done
+
+  # list all subcommands with summaries, grouped by categories
+  commands | xargs awk \
+    -v hide_contrib=${hide_contrib} \
+    -v show_deprecated=${show_deprecated} \
+    -f "${fuchsia_dir}/scripts/fx-help.awk"
+
+  # list host tools build artifacts without corresponding metadata
+  host_tools="$(find_host_tools)"
+  if [[ -n "${host_tools}" ]]; then
+    echo "Host binaries produced by the build with no metadata (more info at //tools/devshell/README.md):"
+    for i in ${host_tools}; do
+      echo -n "  "
+      basename "$i"
+    done
+  fi
+
+  help_options
+  help_global_options
+}
+
+function help_command {
+  local cmd="$*"
+  local cmd_path
+  cmd_path="$(commands "${cmd}" | head -1)"
+  if [[ -z "${cmd_path}" ]]; then
+    local cmd_path
+    cmd_path="$(find_host_tools "${cmd}" | head -1)"
+    if [[ -z "${cmd_path}" ]]; then
+      echo "Command ${cmd} not found. Try \`fx help\`"
+    else
+      echo "'$(_relative "${cmd_path}")' is a host tool and no metadata" \
+        "was found. Try running \`fx ${cmd} -h\`"
+    fi
+  elif [[ $(file -b --mime "${cmd_path}" | cut -d / -f 1) == "text" ]]; then
+    fx-print-command-help "${cmd_path}"
+    help_global_options
+  else
+    echo "No help found. Try \`fx ${cmd} -h\`"
+  fi
+}
+
+function helpheader {
+  cat <<END
+Run Fuchsia development commands. Must be run from a directory
+that is contained in a Platform Source Tree.
+
+  For full help, use \`fx help --full\`.
+
+  For detailed help on any command, use \`fx help <command>\`.
+
+
+host shell extensions: (requires "source scripts/fx-env.sh")
+  fx-update-path            Add useful tools to the PATH
+  fx-set-prompt             Display the current configuration in the shell prompt
+END
+}
+
+function shorthelp {
+  helpheader
+  cat <<END
+
+configure and build
+  set <product>.<board>     Set the product and board that will be built
+  list-products             List available products
+  list-boards               List available  boards
+  status                    Show the current target configuration
+  build                     Build the currently set configuration
+  clean                     Clean the build artifacts
+
+use the emulator
+  ffx emu start             Emulate a device and interact with it
+  ffx emu start --headless  Run without a graphic terminal
+  shell power shutdown      Shut down Fuchsia on the emulator
+  ffx emu --help            Show emu help
+
+test
+  test <component>          Run a test
+  test --info [<pattern>]   List tests in the current build
+  help test                 Detailed help for the test command
+
+preparing a fuchsia target and device
+  list-devices              List all reachable Fuchsia targets
+  set-device                Set the default target for the build
+  unset-device              Unset the default target
+  flash                     Install Fuchsia from fastboot
+  ota                       Send incremental over-the-air update to the device
+  serve                     Start the package server and attach to a
+                            running Fuchsia target
+
+start a remote shell on a Fuchsia target
+  shell                     Initiate an interactive SSH session
+  shell <cmd>               Run a command
+
+other
+  format-code               Format code, usually to prepare for review
+  rfc                       Scaffold RFCs from the template and automatically fills metadata files
+
+example basic workflow using an emulator
+  $ fx set core.x64 --with //examples/hello_world
+  $ fx build
+  $ fx ffx emu start --headless --net tap  # headless with tun/tap-based networking
+  $ fx serve                               # [Start in a new window]
+  $ fx test hello-world-cpp-unittests      # [Start in a new window] Run test
+  $ fx ffx emu stop                        # Shut down the emulator
+
+online documentation
+  Fuchsia development:    https://fuchsia.dev/fuchsia-src/development
+  Fuchsia workflows:      https://fuchsia.dev/fuchsia-src/development/build/fx
+END
+}
+
+function usage {
+  cat <<END
+usage: fx [--dir BUILD_DIR] [-t DEVICE_NAME] [-i] [-x] COMMAND [...]
+END
+  shorthelp
+}
+
+function fullhelp {
+  helpheader
+  help_list_commands "$@"
+}
+
+function check_running_on_supported_platform {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    fx-error "This tool is no longer supported on macOS per go/fuchsia-on-mac."
+    exit 1
+  fi
+}
+
+function check_running_in_agent_sandbox {
+  if [[ "${ANTIGRAVITY_AGENT:-}" == "1" ]] && \
+     grep -q -E '^Seccomp:[[:space:]]*[1-9]' \
+       "${_FX_PROC_STATUS:-/proc/self/status}" 2>/dev/null; then
+    fx-error "Running fx in a sandboxed environment is not supported."
+    fx-error "Please re-run the command with 'BypassSandbox: true'."
+    exit 1
+  fi
+}
+
+# LINT.IfChange
+function find_tree_root {
+  local parent="$1"
+  if [[ ! -d "$parent" ]]; then
+    return 1
+  fi
+  while [[ ! -f "${parent}/.fx-root" ]]; do
+    if [[ "$parent" == "/" ]]; then
+      return 1
+    fi
+    parent="$(dirname "${parent}")"
+  done
+  echo "$parent"
+}
+
+# We walk the parent directories looking for //.fx-root rather than using
+# BASH_SOURCE so that we find the fuchsia_dir enclosing the current working
+# directory instead of the one containing this file in case the user has
+# multiple source trees and is picking up this file from another one.
+#
+# NOTE: The FUCHSIA_DIR environment variable is ignored here because it
+# could point to a different Fuchsia checkout in some developer setups.
+if ! fuchsia_dir="$(find_tree_root "$(pwd)")"; then
+  echo >&2 "ERROR: Cannot find the Platform Source Tree in a parent of the current directory: $(pwd)"
+  exit 1
+fi
+
+script_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
+# NOTE: This check MUST be executed immediately after `fuchsia_dir` is set.
+# Do NOT add any metric gathering or other setup before this block, as this
+# `fx` instance may be run in a foreign fuchsia checkout.
+if [[ "${script_dir}/" != "${fuchsia_dir}/"* && "${script_dir}/" != "$(realpath "${fuchsia_dir}")/"* ]]; then
+  # When running `fx` from `$PATH` within a foreign fuchsia checkout
+  # that is owned by the current user, run the version of `fx` from
+  # the foreign checkout instead.
+  if [[ "$0" == *"/.jiri_root/bin/"* ]] && \
+     [[ -O "${fuchsia_dir}" ]] && \
+     [[ -x "${fuchsia_dir}/scripts/fx" ]]; then
+    exec "${fuchsia_dir}/scripts/fx" "$@"
+  fi
+
+  echo >&2 "ERROR: You are executing fx from outside of the current source tree"
+  echo >&2 "ERROR: This is not supported as fx does not have a stable internal API"
+  echo >&2
+  echo >&2 "    'fx' was executed from: ${BASH_SOURCE[0]}"
+  echo >&2 "    'fuchsia directory' resolved to: ${fuchsia_dir}"
+  echo >&2 "    'script_dir' resolved to: ${script_dir}"
+  echo >&2
+  echo >&2 "To run a command in the current Fuchsia directory, run fx from:"
+  echo >&2 "  ${fuchsia_dir}/scripts/fx"
+  echo >&2 "Or, if you use fx-env.sh, source fx-env from the current fuchsia dir:"
+  echo >&2 "  source ${fuchsia_dir}/scripts/fx-env.sh"
+  echo >&2 "To change your current environment, update your 'PATH':"
+  echo >&2 "  source ${fuchsia_dir}/scripts/fx-env.sh && fx-update-path"
+  exit 1
+fi
+# LINT.ThenChange(
+#   //scripts/hermetic-env,
+#   //scripts/zsh-completion/_fx,
+#   //src/developer/ffx/scripts/ffx,
+# )
+
+# IFF `fx` is run within a Cog workspace:
+# 1. Sync local changes from Cog to CartFS
+# 2. Redirect invocation to `fx` from within the CartFS workspace
+# 3. Sync changes back from CartFS to Cog
+if [[ "$fuchsia_dir" == "${_FX_COG_PATH_PREFIX:-/google/cog/cloud/}"* ]]; then
+  set -e
+
+  # Step 1: Sync changes from Cog => CartFS.
+  declare -r sync_workspace_script="${fuchsia_dir}/scripts/cog/sync_workspace.py"
+  sync_result_file="$(mktemp)"
+  declare -r sync_result_file
+  trap 'rm -f "${sync_result_file}"' EXIT
+  "${sync_workspace_script}" --from-cog-to-cartfs --report "${sync_result_file}"
+
+  # Obtain $CARTFS_CWD and $CARTFS_FUCHSIA_DIR.
+  source "${sync_result_file}"
+  if [[ -z "${CARTFS_CWD:-}" || -z "${CARTFS_FUCHSIA_DIR:-}" ]]; then
+    echo >&2 "Error: Cog sync did not provide the required CartFS paths."
+    exit 1
+  fi
+
+  # Register cleanup for Step 3: Sync changes from CartFS => Cog.
+  cleanup() {
+    local status=$?
+    trap - EXIT SIGINT SIGTERM
+    rm -f "${sync_result_file}" || true
+    "${sync_workspace_script}" --from-cartfs-to-cog || true
+    exit "$status"
+  }
+  trap cleanup EXIT SIGINT SIGTERM
+
+  # Step 2: Redirect `fx` invocation to CartFS.
+  (
+    # We need to run this here to make sure that the PATH is updated with the
+    # prebuilts in the CartFS. If we do not do this then we will pick up the wrong
+    # hermetic-env.
+    source "${CARTFS_FUCHSIA_DIR}/scripts/fx-env.sh"
+    fx-update-path
+    cd "${CARTFS_CWD}" || exit 1
+    exec "${CARTFS_FUCHSIA_DIR}/scripts/fx" "$@"
+  )
+  exit $?
+fi
+
+# This line allows commands to find other scripts even if they have not
+# run `source scripts/fx-env.sh`
+export PATH="$PATH:${script_dir}"
+
+declare -r vars_sh="${fuchsia_dir}/tools/devshell/lib/vars.sh"
+# shellcheck disable=SC1090
+source "${vars_sh}" || exit $?
+
+declare -r metrics_sh="${fuchsia_dir}/tools/devshell/lib/metrics.sh"
+# shellcheck disable=SC1090
+source "${metrics_sh}" || exit $?
+
+declare -r cmd_locator_sh="${fuchsia_dir}/tools/devshell/lib/fx-cmd-locator.sh"
+# shellcheck disable=SC1090
+source "${cmd_locator_sh}" || exit $?
+
+declare -r features_sh="${fuchsia_dir}/tools/devshell/lib/fx-optional-features.sh"
+# shellcheck disable=SC1090
+source "${features_sh}" || exit $?
+
+declare -r suggest_py="${fuchsia_dir}/tools/devshell/lib/fx-cmd-suggestions.py"
+
+while [[ $# -ne 0 ]]; do
+  case $1 in
+    --dir=*|-t=*|--target=*|--disable=*|--enable=*|--invoker=*)
+      # Turn --switch=value into --switch value.
+      arg="$1"
+      shift
+      set -- "${arg%%=*}" "${arg#*=}" "$@"
+      continue
+      ;;
+    --dir)
+      if [[ $# -lt 2 ]]; then
+        usage
+        fx-error "Missing path to build directory for --dir argument"
+        exit 1
+      fi
+      shift # Removes --dir.
+      # Check that the path to build directory is a subdirectory of $FUCHSIA_DIR/out.
+      regex='(out\/)|(^out$)'
+      if [[ ! "$1" =~ $regex ]]
+      then
+        error_message="Build directory (--dir BUILD_DIR) must be a subdirectory of $fuchsia_dir/out.\nExamples: fx --dir out/<folder> ..., fx --dir ~/fuchsia/out/<folder> ..."
+        fx-error "$error_message"
+        exit 1
+      fi
+      # Remove trailing slash, as it can impede other checks elsewhere in the code.
+      export _FX_BUILD_DIR="${1%/}"
+      if [[ "$_FX_BUILD_DIR" == //* ]]; then
+        _FX_BUILD_DIR="${fuchsia_dir}/${_FX_BUILD_DIR#//}"
+      else
+        export FUCHSIA_BUILD_DIR_FROM_FX="${_FX_BUILD_DIR}"
+      fi
+      ;;
+    --disable)
+      if [[ $# -lt 2 ]]; then
+        usage
+        fx-error "Missing argument to --disable"
+        exit 1
+      fi
+      shift # Removes --disable.
+      feature="$1"
+      if ! is_valid_feature "${feature}"; then
+        fx-error "Unknown feature \"${feature}\". Valid values are: $(list_optional_features)"
+        exit 1
+      fi
+      env_name="$(get_disable_feature_env_name "${feature}")"
+      export "${env_name}"=1
+      ;;
+    --enable)
+      if [[ $# -lt 2 ]]; then
+        usage
+        fx-error "Missing argument to --enable"
+        exit 1
+      fi
+      shift # Removes --enable.
+      feature="$1"
+      if ! is_valid_feature "${feature}"; then
+        fx-error "Unknown feature \"${feature}\". Valid values are: $(list_optional_features)"
+        exit 1
+      fi
+      env_name="$(get_disable_feature_env_name "${feature}")"
+      export "${env_name}"=0
+      ;;
+    -t|--target)
+      if [[ $# -lt 2 ]]; then
+        usage
+        fx-error "Missing device name for $1 argument"
+        exit 1
+      fi
+      shift # removes -t|--target
+      if ! is-valid-device "$1"; then
+        fx-error "Invalid device: $1. See valid values in 'fx help set-device'"
+        exit 1
+      fi
+      # $FUCHSIA_DEVICE_ADDR can shadow $FUCHSIA_NODENAME which we use to
+      # effectuate `-t|--target`, so we unset it here.
+      # The precedence of these environment variables is defined by
+      # //src/developer/ffx/data/config.json
+      unset FUCHSIA_DEVICE_ADDR
+      unset FUCHSIA_NODENAME_IS_FROM_FILE
+      # This name needs to be coordinated with ffx default configuration
+      # LINT.IfChange
+      export FUCHSIA_NODENAME="$1"
+      # LINT.ThenChange(/src/developer/ffx/data/config.json)
+      # Set this flag so downstream scripts can check it.
+      # LINT.IfChange
+      export FUCHSIA_NODENAME_SET_BY_FX_FLAG="FUCHSIA_NODENAME_SET_BY_FX_FLAG"
+      # LINT.ThenChange(//tools/devshell/lib/vars.sh)
+      ;;
+    --invoker)
+      shift # removes --invoker
+      export FUCHSIA_FX_INVOKER="$1"
+      ;;
+    -i)
+      declare iterative=1
+      export FUCHSIA_FX_ITERATIVE=1
+      ;;
+    -x)
+      export FUCHSIA_DEVSHELL_VERBOSITY=1
+      ;;
+    -xx)
+      set -x
+      export FUCHSIA_DEVSHELL_VERBOSITY=1
+      ;;
+    --)
+      shift
+      break
+      ;;
+    help|--help)
+      if [[ "$2" =~ ^\-\-full ]]; then
+        shift
+        fullhelp "$@"
+      elif [[ $# -lt 2 || "$2" =~ ^\-\-.* ]]; then
+        shift
+        usage "$@"
+      else
+        shift
+        help_command "$@"
+      fi
+      exit 0
+      ;;
+    -*)
+      usage
+      fx-error "Unknown global argument $1"
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
+# Check if we are running on a supported platform. We currently do not support macOS
+# so this will fail if run on a macOS system.
+check_running_on_supported_platform
+
+# Some antigravity agent harnesses run subprocesses under a restrictive sandbox
+# by default, which can interfere with build and ffx functionality.
+# See https://fxbug.dev/544810279 for more context.
+check_running_in_agent_sandbox
+
+if [[ $# -lt 1 ]]; then
+  usage
+  fx-error "Missing command name"
+  exit 1
+fi
+
+# Check if we're running in an agent
+if is_invoked_by_agent; then
+  if [[ "${FUCHSIA_DEVSHELL_VERBOSITY}" -ne 1 ]]; then
+    # quiet the build to save on tokens
+    export FX_BUILD_QUIET=1
+  fi
+
+  # if FUCHSIA_FX_INVOKER has not yet been defined, override it with antigravity
+  if [[ -z "${FUCHSIA_FX_INVOKER}" ]]; then
+    export FUCHSIA_FX_INVOKER="antigravity"
+  fi
+fi
+
+command_name="$1"
+read -r -a command_path <<< "$(find_executable "${command_name}")"
+
+if [[ $? -ne 0 || ! -x "${command_path[0]}" ]]; then
+  if [[ -n "${command_path[*]}" ]]; then
+    _path_message=" in the expected location $(_relative "${command_path[0]}")"
+  fi
+
+  _commands=$(commands)
+  _host_tools=$(find_host_tools)
+
+  # If the command is not found look for suggestions to help direct to the correct command.
+  _suggestion=$(printf "%b\n%b" "${_commands}" "${_host_tools}" | "${suggest_py}" "${command_name}")
+
+  # If no suggestions are found fall back to the old error message.
+  if [ -z "$_suggestion" ]; then
+    fx-error "Cannot find executable for ${command_name}${_path_message}."\
+    "If this is a tool produced by the build, make sure your"\
+    "\`fx set\` config produces it in the $(_relative "$(get_host_tools_dir)") directory."
+  else
+    fx-error "${_suggestion}"
+  fi
+
+  exit 1
+fi
+
+metrics-init "${command_name}" "$*"
+
+# For each optional feature, force the existence of the FUCHSIA_DISABLE_* env
+# variable. This is needed so that non-bash code can reliably use this
+# to check for optional features that have default values.
+for f in $(list_optional_features); do
+  _disabled_env_name="$(get_disable_feature_env_name "${f}")"
+  is_feature_enabled "$f"
+  export "${_disabled_env_name}"=$?
+  track-feature-status "${f}" "${_disabled_env_name}" &
+done
+
+export FX_ENTRY_CMD="$command_name"
+
+declare -r cmd_and_args="$*"
+shift # Removes the command name.
+
+if [[ "${command_name}" != "vendor" || $# -lt 2 ]]; then
+  metric_name="${command_name}"
+else
+  metric_name="vendor/$1/$2"
+fi
+
+mkdir -p "${FX_CACHE_DIR}"
+
+track-command-execution "${metric_name}" "$@" &
+export PATH="${PREBUILT_ALL_PATHS}:${PATH}"
+"${command_path[@]}" "$@"
+declare -r retval=$?
+
+if [ -z "${iterative}" ]; then
+  # is-remote-workflow-device returns 0 for true and 1 for false
+  # analytics requires it to be the opposite
+  declare is_remote=0
+  if is-remote-workflow-device; then
+    is_remote=1
+  fi
+
+  # Capture the end_time as late as possible to best reflect the user
+  # experienced end time.
+  declare -r end_time="${EPOCHREALTIME/./}"
+  track-command-finished "${start_time}" "${end_time}" "${retval}" "${command_name}" "${is_remote}" "$@" &
+  exit ${retval}
+elif which inotifywait >/dev/null; then
+  monitor_source_changes() {
+    # Watch everything except out/ and files/directories beginning with "."
+    # such as lock files, swap files, .git, etc'.
+    inotifywait -qrme modify \
+      --exclude "/(\.|lock|compile_commands.json|lcov.info)" \
+      "${fuchsia_dir}" \
+      @"${fuchsia_dir}"/out \
+      @"${fuchsia_dir}"/zircon/public
+  }
+elif which apt-get >/dev/null; then
+  echo "Missing inotifywait"
+  echo "Try: sudo apt-get install inotify-tools"
+  exit 1
+elif which fswatch >/dev/null; then
+  monitor_source_changes() {
+    fswatch --one-per-batch --event=Updated \
+      -e "${fuchsia_dir}"/out/ \
+      -e "${fuchsia_dir}"/zircon/public/ \
+      -e "/\." \
+      -e "/lock" \
+      -e "/compile_commands.json" \
+      .
+  }
+else
+  echo "Missing fswatch"
+  echo "Try: brew install fswatch"
+  exit 1
+fi
+
+monitor_and_run() {
+  local -r event_pipe="$1"
+  local -r display_name="$2"
+  shift 2
+
+  # Explicitly bind $event_pipe to a numbered FD so read behaves consistently
+  # on Linux and Mac shells ("read <$event_pipe" closes $event_pipe after the
+  # first read on Mac bash).
+  exec 3<"${event_pipe}"
+
+  while read -r -u 3; do
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+      # Drain all subsequent events in a batch.
+      # Otherwise when multiple files are changes at once we'd run multiple
+      # times.
+      read -r -u 3 -d "" -t .01
+    fi
+    # Allow at most one fx -i invocation per Fuchsia dir at a time.
+    # Otherwise multiple concurrent fx -i invocations can trigger each other
+    # and cause a storm.
+    echo "---------------------------------- fx -i ${display_name} ---------------------------------------"
+    local start
+    start=$(date +%s)
+    "$@"
+    local end
+    end=$(date +%s)
+    echo "--- Done in $((end-start)) seconds"
+  done
+}
+
+monitor_and_run <(monitor_source_changes) "${cmd_and_args}" "${command_path}" "$@"

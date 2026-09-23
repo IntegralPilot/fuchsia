@@ -1,0 +1,380 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components/fuchsia_unittest_package.gni")
+import("//build/config/zircon/levels.gni")
+import("//build/test.gni")
+import("//build/testing/boot_tests/kernel_zbi_test.gni")
+import("//build/testing/boot_tests/zbi_test_executable.gni")
+import("//build/testing/bootfs_test.gni")
+import("//build/testing/environments.gni")
+import("//build/toolchain/concurrent_jobs.gni")
+import("//build/toolchain/rbe.gni")
+import("//zircon/kernel/params.gni")
+
+# Each subdirectory just provides an eponymous source_set().
+core_tests = [
+  "assert",
+  "bad-segsel",
+  "c11-condvar",
+  "c11-mutex",
+  "c11-thread",
+  "channel-call-etc",
+  "channel-iovec",
+  "channel-write-etc",
+  "clock",
+  "counter",
+  "cpu-features",
+  "elf-tls",
+  "event-pair",
+  "exceptions",
+  "fifo",
+  "futex",
+  "handle-close",
+  "handle-dup",
+  "handle-info",
+  "handle-transfer",
+  "handle-wait",
+  "membarrier",
+  "object-child",
+  "object-wait",
+  "page-size",
+  "property",
+  "pthread",
+  "pthread-barrier",
+  "pthread-tls",
+  "register-context-switch",
+  "socket",
+  "stack",
+  "standalone-elf-load",
+  "stream",
+  "sync-completion",
+  "sync-condition",
+  "sync-mutex",
+  "syscall-generation",
+  "thread-initial-state",
+  "time",
+  "version",
+]
+
+# Requires use_next_vdso in the manifest. Build as a package and unified bootfs
+# test, but not a standalone bootfs test.
+# TODO(https://fxbug.dev/42170954): Remove this once standalone bootfs tests can access the next vDSO.
+requires_next_vdso = [
+  "iob",
+  "rseq",
+
+  # Requires ZX_POL_NEW_PROCESS, ZX_POL_AMBIENT_MARK_VMO_EXEC, and next vDSO.
+  "process-shared",
+]
+
+# The restricted mode test does not work in asan.
+# https://fxbug.dev/382971270 enable lower mem allocations when under asan
+if (!is_asan) {
+  requires_next_vdso += [ "restricted-mode" ]
+}
+
+# These tests require custom component manifests to execute as components.
+core_tests_with_custom_manifests =
+    [
+      # Some tests require ZX_POL_NEW_PROCESS.
+      "channel",
+      "memory-mapping",
+      "port",
+
+      # Some tests require ZX_POL_AMBIENT_MARK_VMO_EXEC.
+      "vmo",
+    ] + requires_next_vdso
+
+# These tests need to run in a bootfs environment and can't run as a Fuchsia
+# component even with additional configuration.
+bootfs_only = [
+  # These tests require ZX_POL_NEW_PROCESS for many tests.
+  "address-tagging",
+  "job",
+  "object-info",
+  "pager-process",
+  "process",
+  "vmar",
+
+  # Some tests new ZX_POL_NEW_PROCESS, and the DebugRegisterState tests on
+  # x86_64 fail when run as a component due to DR6 containing unexpected values.
+  "threads",
+
+  # The pager tests rely on being able to check for test threads blocking on
+  # user pagers created by the test. They do this by verifying that the thread
+  # state is ZX_THREAD_STATE_BLOCKED_PAGER which only captures that the thread
+  # is blocked against *some* user pager, not any specific one. So they cannot
+  # run in an environment where test threads can block on pagers created outside
+  # of the test, e.g. when the test is run as a component.
+  "pager",
+
+  # TODO(https://fxbug.dev/42170954): pager-writeback should be moved here too once standalone bootfs tests
+  # can access the next vDSO.
+  #"pager-writeback",
+]
+
+# These tests need to run in the unified core-tests binary because
+# they either call standalone::Get*Resource() or they need to run in a job
+# tree without any exception handler.
+unified_only = [
+  "bad-syscall",
+  "bti",
+  "channel-call-mutex",
+  "default-exception-handler",  # needs job tree w/o exception handler.
+  "debuglog:unified-only",
+  "hotplug",
+  "interrupt",
+  "next-vdso",
+  "pager-writeback",
+  "profile",
+  "resource",
+  "system-event",
+  "system-cpu",
+  "system-suspend",
+  "thread-sampler",
+  "timer",
+]
+assert(core_tests + core_tests_with_custom_manifests -
+           core_tests_with_custom_manifests == core_tests,
+       "core_tests and core_tests_with_custom_manifests must be disjoint")
+assert(core_tests + bootfs_only - bootfs_only == core_tests,
+       "core_tests and bootfs_only must be disjoint")
+assert(bootfs_only + core_tests_with_custom_manifests -
+           core_tests_with_custom_manifests == bootfs_only,
+       "bootfs_only and core_tests_with_custom_manifests must be disjoint")
+assert(core_tests + unified_only - unified_only == core_tests,
+       "core_tests and unified_only must be disjoint")
+
+all_test_executables = core_tests + core_tests_with_custom_manifests +
+                       bootfs_only + unified_only - unified_only
+
+all_bootfs_tests = all_test_executables + requires_next_vdso -
+                   requires_next_vdso + unified_only - unified_only
+
+# Build each test as a standalone binary meant to be run by runtests.
+foreach(test_name, all_test_executables) {
+  test(test_name) {
+    output_name = "core-$test_name"
+    deps = [ test_name ] + [ ":standalone-hosted" ]
+  }
+}
+
+foreach(test_name, all_bootfs_tests) {
+  bootfs_test("core-$test_name-bootfs-test") {
+    name = "core-$test_name"
+    deps = [ ":$test_name" ]
+  }
+}
+
+group("bootfs-tests") {
+  testonly = true
+  deps = []
+  foreach(test_name, all_bootfs_tests) {
+    deps += [ ":core-$test_name-bootfs-test" ]
+  }
+}
+
+# Build Fuchsia components and packages for tests that can run by
+# fx test.
+core_test_packages = []
+
+# These tests can use an autogenerated manifest.
+foreach(test_name, core_tests) {
+  fuchsia_test_package_name = "core-${test_name}-test-package"
+  core_test_packages += [ ":${fuchsia_test_package_name}" ]
+
+  fuchsia_unittest_package(fuchsia_test_package_name) {
+    deps = [ ":${test_name}" ]
+  }
+}
+
+# These tests specify a custom component manifest.
+foreach(test_name, core_tests_with_custom_manifests) {
+  fuchsia_test_package_name = "core-${test_name}-test-package"
+  core_test_packages += [ ":${fuchsia_test_package_name}" ]
+
+  fuchsia_unittest_package(fuchsia_test_package_name) {
+    deps = [ ":${test_name}" ]
+    manifest = "${test_name}/meta/${test_name}_test.cml"
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = core_test_packages
+}
+
+kernel_cmdline("core-tests-default.args") {
+  args = [ "kernel.power.boot-boost=false" ]
+}
+
+template("core_tests") {
+  kernel_zbi_test(target_name) {
+    assert_no_deps = [
+      "//zircon/system/core/*",
+      "//zircon/system/dev/*",
+    ]
+    deps = [
+      ":core-tests-default.args",
+      ":core-tests-standalone",
+    ]
+    forward_variables_from(invoker,
+                           [
+                             "args",
+                             "disabled",
+                             "environments",
+                             "timeout",
+                             "generate_cuckoo",
+                           ])
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    if (!defined(timeout)) {
+      # We've observed the ASAN variant of core-tests take as long as 701
+      # seconds when booted via firmware on certain types of hardware.  Leave a
+      # little buffer for growth.
+      timeout = 840
+    }
+  }
+}
+
+if (is_fuchsia) {
+  # Now build all of those (and more) together into the core-tests
+  # binary.  This can and must be run directly from userboot because
+  # some of the tests require the root resource handle or no system
+  # services whatsoever.
+  zbi_test_executable("core-tests-standalone") {
+    sources = [ "needs-next-standalone.cc" ]
+    deps = [
+      ":needs-next",
+      "//src/zircon/testing/standalone-test",
+      "//zircon/kernel/lib/boot-options",
+      "//zircon/system/ulib/zxtest",
+    ]
+
+    deps += all_bootfs_tests + unified_only
+
+    # LTO for this target requires a massive amount of memory.
+    # Remotely: run on a bigger RBE worker
+    # Locally: run in a lower-concurrency pool
+    # See https://fxbug.dev/338504187 for context.
+    if (is_lto_variant || optimize == "size_lto" ||
+        optimize == "size_thinlto") {
+      _concurrent_jobs = concurrent_jobs.link_highmem
+      configs += _concurrent_jobs.configs
+      forward_variables_from(_concurrent_jobs.vars, "*")
+    }
+  }
+
+  # This is used by tests using @next syscalls.  The implementation is provided
+  # in two separate forms for the different incarnations of the tests.
+  source_set("needs-next") {
+    testonly = true
+    visibility = [ "./*" ]
+
+    public = [ "needs-next.h" ]
+    public_deps = [ "//zircon/system/ulib/zxtest" ]
+  }
+
+  static_library("standalone-hosted") {
+    testonly = true
+    visibility = [ ":*" ]
+
+    sources = [
+      "get-vmos-hosted.cc",
+      "needs-next-hosted.cc",
+    ]
+    deps = [
+      ":needs-next",
+      "//sdk/lib/fdio",
+      "//src/zircon/testing/standalone-test:headers",
+      "//zircon/system/ulib/fbl",
+    ]
+  }
+}
+
+boot_tests = [ ":core-tests" ]
+
+core_tests("core-tests") {
+  environments = kernel_test_environments
+}
+
+kernel_cmdline("stable-vdso.args") {
+  args = [ "kernel.vdso.always_use_next=false" ]
+}
+
+core_tests("core-tests-stable-vdso") {
+  deps = [ ":stable-vdso.args" ]
+  environments = kernel_test_environments
+}
+boot_tests += [ ":core-tests-stable-vdso" ]
+
+core_tests("core-tests-ticks_get_force_syscall") {
+  deps = [ ":stable-vdso.args" ]
+  args = [ "vdso.ticks_get_force_syscall=true" ]
+  environments = kernel_test_environments
+}
+boot_tests += [ ":core-tests-ticks_get_force_syscall" ]
+
+# If we are building for x64, make sure to run the core tests on a system which
+# has been configured to force selection of HPET as the timing source instead
+# of choosing TSC if possible.
+if (current_cpu == "x64") {
+  core_tests("core-tests-hpet") {
+    args = [ "kernel.wallclock=hpet" ]
+
+    # NUC11 HPET is unreliable, do not include it, see https://chat.google.com/room/AAAAOlfJ3J8/S_Law3cxzwQ
+    environments = [ nuc7_env ]
+
+    # core-hpet test is taking longer than 14mins. Bump the timeout to 16mins
+    # as a mitigation.
+    timeout = 960
+  }
+
+  boot_tests += [ ":core-tests-hpet" ]
+}
+
+if (current_cpu == "arm64") {
+  _smccc11_environments = [
+    aemu_env,
+    astro_env,
+    qemu_env,
+    sherlock_env,
+  ]
+  foreach(alternate,
+          [
+            {
+              option = "auto"
+              environments = kernel_test_environments
+            },
+            {
+              option = "arch3"
+              environments = _smccc11_environments
+            },
+            {
+              option = "arch1"
+              environments = _smccc11_environments
+            },
+            {
+              option = "psci"
+              environments = _smccc11_environments
+            },
+            {
+              option = "smccc10"
+              environments = kernel_test_environments
+            },
+          ]) {
+    core_tests("core-tests-workaround-${alternate.option}") {
+      args = [ "kernel.arm64.alternate-vbar=${alternate.option}" ]
+      environments = alternate.environments
+    }
+    boot_tests += [ ":core-tests-workaround-${alternate.option}" ]
+  }
+}
+
+group("boot_tests") {
+  testonly = true
+  deps = boot_tests
+}

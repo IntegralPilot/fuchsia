@@ -1,0 +1,106 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/assembly/bazel_product_bundle.gni")
+import("//build/components.gni")
+import("//build/info/info.gni")
+import("//build/python/python_binary.gni")
+import("//build/testing/host_test.gni")
+import("//build/testing/host_test_data.gni")
+import("//src/developer/ffx/config.gni")
+import("//src/storage/fshost/generated_fshost_config.gni")
+import("//zircon/kernel/phys/qemu.gni")
+
+if (is_fuchsia) {
+  bazel_product_bundle("product_bundle") {
+    testonly = true
+    product_bundle_name = "scrutiny-failed-route-verify-test"
+    bazel_product_bundle_target = ":product_bundle"
+    bazel_product_image_target = ":main_image"
+    bazel_product_config_target = ":product_config"
+    bazel_product_config_name = "product_config"
+    image_has_fxfs_blob = false
+    image_has_fvm = false
+    image_use_vbmeta = false
+    image_has_recovery = false
+    bazel_inputs_from_gn = []
+  }
+}
+
+if (is_host) {
+  group("host_tests") {
+    testonly = true
+    deps = [ ":test_route_verification" ]
+  }
+
+  labels = {
+    image_assembler = ":assembly.image_assembler($target_toolchain)"
+    product_bundle = ":product_bundle($target_toolchain)"
+    update_package = ":update($target_toolchain)"
+  }
+
+  files = {
+    ffx = "$ffx_test_host_tools_out_dir/ffx-scrutiny"
+
+    component_tree_config = "//src/security/lib/scrutiny/tests/route_verification/component_tree_config.json5"
+
+    product_bundle_target_out_dir =
+        get_label_info(labels.product_bundle, "target_out_dir")
+    product_bundle_target_name = get_label_info(labels.product_bundle, "name")
+
+    product_bundle_dir = "$product_bundle_target_out_dir/$product_bundle_target_name/product_bundle"
+  }
+
+  python_binary("test_route_verification_bin") {
+    main_source = "test_route_verification.py"
+  }
+
+  host_test_data("failed_route_verify_test_data") {
+    sources = get_target_outputs(":test_route_verification_bin")
+    sources += [
+      files.component_tree_config,
+      files.product_bundle_dir,
+    ]
+    deps = [
+      ":test_route_verification_bin",
+      labels.product_bundle,
+    ]
+  }
+
+  test_route_verification_binary =
+      get_target_outputs(":test_route_verification_bin")
+  test_route_verification_binary = test_route_verification_binary[0]
+
+  host_test("test_route_verification") {
+    binary_path = python_exe_src
+
+    depfile = "$target_out_dir/test_route_verification.d"
+    args = [
+      rebase_path(test_route_verification_binary, root_build_dir),
+      "--ffx-bin",
+      rebase_path(files.ffx, root_build_dir),
+      "--fail-protocol",
+      "fuchsia.foo.bar",
+      "--fail-moniker",
+      "core/session-manager/session:session/component_with_broken_use",
+      "--fail-dynamic-moniker",
+      "core/session-manager/session:session/component_with_collection/coll:component_with_broken_use",
+      "--success-protocol",
+      "fuchsia.logger.LogSink",
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+      "--product-bundle",
+      rebase_path(files.product_bundle_dir, root_build_dir),
+      "--component-tree-config",
+      rebase_path(files.component_tree_config, root_build_dir),
+    ]
+    depfile = [ depfile ]
+
+    deps = [
+      ":failed_route_verify_test_data",
+      "//build/python:interpreter",
+      "//src/developer/ffx/plugins/scrutiny:ffx_scrutiny_tool_test_data",
+    ]
+  }
+}

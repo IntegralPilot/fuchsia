@@ -1,0 +1,292 @@
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// Protocols and types for socket diagnostics.
+@available(added=HEAD)
+library fuchsia.net.sockets;
+
+using fuchsia.net;
+using fuchsia.net.tcp;
+using fuchsia.net.udp;
+using fuchsia.net.matchers;
+
+type Empty = struct {};
+
+/// The top-level socket matcher for use in diagnostics protocols.
+type IpSocketMatcher = flexible union {
+    /// Matches only a specific IP version.
+    1: family fuchsia.net.IpVersion;
+    /// Matches the source address of the socket.
+    2: src_addr fuchsia.net.matchers.BoundAddress;
+    /// Matches the address of the socket.
+    3: dst_addr fuchsia.net.matchers.BoundAddress;
+    /// Matches transport-level information for the socket.
+    4: proto fuchsia.net.matchers.SocketTransportProtocol;
+    /// Matches the network interface the socket was bound to (e.g. using
+    /// `SetBindToDevice`).
+    5: bound_interface fuchsia.net.matchers.BoundInterface;
+    /// Matches the cookie of the socket.
+    6: cookie fuchsia.net.matchers.SocketCookie;
+    /// Matches a single mark on the socket.
+    7: mark fuchsia.net.matchers.MarkInDomain;
+};
+
+/// The maximum number of `IpSocketMatcher`s that can be specified in a request.
+///
+/// The theoretical maximum imposed by the 64 KiB Zircon channel message limit
+/// is 629 (64 bytes of fixed overhead and 104 bytes per `IpSocketMatcher`).
+/// However, as a practical limit to avoid unreasonable numbers of matchers.
+const MAX_IP_SOCKET_MATCHERS uint32 = 128;
+
+/// Provides diagnostic information IP sockets.
+@discoverable
+closed protocol Diagnostics {
+    /// Populates an iterator over all IP sockets that match the provided
+    /// matchers.
+    ///
+    /// Unbound sockets are not returned.
+    strict IterateIp(resource struct {
+        /// The `IpIterator` for streaming sockets back to the caller.
+        s server_end:IpIterator;
+        /// The types of extended information to request. Information is
+        /// only returned for qualifying sockets. For example, the `TCP_INFO`
+        /// extension has no effect on returned UDP sockets.
+        extensions flexible bits {
+            /// Populates the `tcp_info` field on returned TCP sockets.
+            TCP_INFO = 0b1;
+        };
+        /// Matchers are ANDed together and applied to all sockets on the
+        /// system. Put another way, only sockets matched by all matchers are
+        /// returned through the `IpIterator` protocol.
+        ///
+        /// For example, if you want to match all IPv4 TCP sockets with a local
+        /// port of 22, but not on loopback, you could use the following
+        /// (pseudocode) query:
+        ///
+        /// [
+        ///   {
+        ///     family: Ipv4,
+        ///   },
+        ///   {
+        ///     proto: tcp {
+        ///       src_port: {
+        ///         start:  22,
+        ///         end:    22,
+        ///         invert: false,
+        ///       }
+        ///     },
+        ///   },
+        ///   {
+        ///     src_addr: {
+        ///       range: {
+        ///         start: "127.0.0.1"
+        ///         end:   "127.0.0.1"
+        ///       },
+        ///       invert: true
+        ///     },
+        ///   },
+        /// ]
+        matchers vector<IpSocketMatcher>:MAX_IP_SOCKET_MATCHERS;
+    }) -> (@generated_name("IterateIpResult") flexible union {
+        /// The request was valid.
+        1: ok Empty;
+        /// A matcher in the request was invalid.
+        ///
+        /// NOTE: Only the first matcher error encountered is returned.
+        2: invalid_matcher InvalidMatcher;
+    });
+
+    /// Creates a watcher for recently destroyed sockets.
+    ///
+    /// The watcher is guaranteed to be registered by the time the call returns.
+    strict GetDestructionWatcher(resource struct {
+        watcher server_end:DestructionWatcher;
+    }) -> ();
+};
+
+/// Protocol for watching socket destruction events.
+open protocol DestructionWatcher {
+    /// Hanging get for destroyed sockets.
+    ///
+    /// Returns sockets destroyed since the last call to this method. Blocks
+    /// until at least one event is available.
+    ///
+    /// A "destroyed" socket is one that no longer has any references inside the
+    /// Netstack. Especially for TCP sockets (because of TIME-WAIT), this may
+    /// happen long after `close` has returned.
+    ///
+    /// Sockets destroyed before the watcher was created are not returned.
+    /// Unbound sockets are not returned.
+    ///
+    /// Only one call to `Watch` may be active at a time. Concurrency is not
+    /// allowed and will result in the channel being closed with
+    /// `ALREADY_EXISTS`.
+    ///
+    /// If the client doesn't read events fast enough, some may be dropped. The
+    /// client can detect this by looking at `dropped_events`.
+    strict Watch() -> (struct {
+        sockets vector<IpSocketState>:MAX_IP_SOCKET_BATCH_SIZE;
+        /// The number of events dropped since the last call.
+        dropped_events uint64;
+    });
+};
+
+/// The largest number of results that can be returned in one call to
+/// `IpIterator.Next` or `DestructionWatcher.Watch`.
+///
+/// This limit is calculated to fit the maximum number of items into a single
+/// 64 KiB Zircon channel message. In the current FIDL wire format, the fixed
+/// overhead of the `IpIterator.Next()` response is 40 bytes, and the worst-case
+/// size of a single `IpSocketState` is 706 bytes, so we selected the maximum N
+/// where 40 + N * 706 <= 65535.
+const MAX_IP_SOCKET_BATCH_SIZE uint32 = 92;
+
+/// The state for each individual socket returned from `IpIterator.Next()`.
+type IpSocketState = table {
+    /// The address family of the socket's addresses. This, `src_addr`, and
+    /// `dst_addr` are guaranteed to be the same address family.
+    ///
+    /// Required.
+    1: family fuchsia.net.IpVersion;
+    /// The source address of the socket.
+    ///
+    /// Present if the socket is bound to a local address.
+    2: src_addr fuchsia.net.IpAddress;
+    /// The destination address of the socket.
+    ///
+    /// Present if the socket is connected.
+    3: dst_addr fuchsia.net.IpAddress;
+    /// The cookie of the socket, which is unique during this boot. May be
+    /// used in subsequent requests in addition to the tuple to identify this
+    /// particular socket, even if the tuple is reused.
+    ///
+    /// Required.
+    5: cookie uint64;
+    /// All of the marks on the socket.
+    ///
+    /// Required.
+    6: marks fuchsia.net.Marks;
+    /// Transport protocol-level information about the socket.
+    ///
+    /// Required.
+    7: transport @generated_name("IpSocketTransportState") flexible union {
+        1: tcp @generated_name("IpSocketTcpState") table {
+            /// The source port of the TCP socket.
+            ///
+            /// Present if the socket is bound to a local port.
+            1: src_port uint16;
+            /// The destination port of the TCP socket.
+            ///
+            /// Present if the socket is connected.
+            2: dst_port uint16;
+            /// The current TCP state machine state of the socket.
+            ///
+            /// Required.
+            3: state fuchsia.net.tcp.State;
+            /// Extended TCP state.
+            ///
+            /// Present if the `TCP_INFO` extension is specified in the request.
+            4: tcp_info fuchsia.net.tcp.Info;
+        };
+        2: udp @generated_name("IpSocketUdpState") table {
+            /// The source port of the UDP socket.
+            ///
+            /// Present if the socket is bound to a local port.
+            1: src_port uint16;
+            /// The destination port of the UDP socket.
+            ///
+            /// Present if the socket is connected.
+            2: dst_port uint16;
+            /// Pseudo-state machine state for the UDP socket.
+            ///
+            /// Required.
+            3: state fuchsia.net.udp.State;
+        };
+    };
+};
+
+/// Provides sockets as a response to a call to `Diagnostics.IterateIp`.
+open protocol IpIterator {
+    /// Call repeatedly to stream results for a previous request to
+    /// `Diagnostics.IterateIp`.
+    ///
+    /// A caller must make sure to retrieve sockets in a timely manner, or the
+    /// connection may be closed with `TIMED_OUT`.
+    ///
+    /// NOTE: The returned sockets do not provide a consistent snapshot of the
+    /// system. For example, you should never use the state of one socket to
+    /// infer what the state of another socket will be, since modifications
+    /// could have occurred in between results for each socket being
+    /// materialized.
+    strict Next() -> (struct {
+        /// The sockets for this batch.
+        ///
+        /// Empty iff has_more is false.
+        sockets vector<IpSocketState>:MAX_IP_SOCKET_BATCH_SIZE;
+
+        /// Whether there are more results available. the server immediately
+        /// closes its end of the channel after yielding a response with
+        /// `has_more = false`.
+        has_more bool;
+    });
+};
+
+/// Error information for a matcher in a request.
+type InvalidMatcher = struct {
+    /// The index of the matcher in the request that caused the error.
+    index uint32;
+};
+
+/// Provides control operations on sockets.
+@discoverable
+closed protocol Control {
+    /// Disconnect the socket matched by the provided matchers. See
+    /// `Diagnostics.IterateIp` for matcher semantics.
+    ///
+    /// Disconnecting a socket depends on the transport protocol. In all cases,
+    /// the next read or write operation will see `ECONNABORTED`.
+    ///
+    /// - UDP: the behavior is equivalent to calling
+    ///   `fuchsia.posix.socket/*.Disconnect`. Any destination port and address,
+    ///   and bound device are removed. The socket may be reused.
+    /// - TCP LISTEN state: TCP moves to state CLOSE. All non-accepted sockets
+    ///   are closed and an RST is sent to the peer. The socket may be reused.
+    /// - TCP all other states: The TCP connection is put in state CLOSE and an
+    ///   RST is sent to the remote peer, if required. The socket may not be
+    ///   reused.
+    ///
+    /// If no matchers are specified, or the provided matchers match all sockets,
+    /// an error is returned and no action is taken.
+    ///
+    /// NOTE: This operation is asynchronous. While the internal state of the
+    /// socket is updated before this call returns, propagation of the error to
+    /// an application is unsynchronized. Subsequent operations (such as TCP
+    /// reads and writes) may not immediately see the error.
+    ///
+    /// NOTE: For UDP sockets, the receive buffer is not cleared, so it's
+    /// possible for a socket to be interrupted, but still read pending
+    /// datagrams. This is in order to maintain compatibility with Linux.
+    strict DisconnectIp(table {
+        /// Sockets matching all matchers will be disconnected (see above).
+        ///
+        /// More information on the semantics of the matchers can be found in
+        /// [`fuchsia.net.sockets.IpSocketMatcher`].
+        ///
+        /// Required.
+        1: matchers vector<IpSocketMatcher>:MAX_IP_SOCKET_MATCHERS;
+    }) -> (@generated_name("DisconnectIpResult") flexible union {
+        /// The request was valid.
+        1: ok @generated_name("DisconnectIpResponse") struct {
+            /// The number of disconnected sockets.
+            disconnected uint32;
+        };
+        /// A matcher in the request was invalid.
+        ///
+        /// NOTE: Only the first matcher error encountered is returned.
+        2: invalid_matcher InvalidMatcher;
+        /// The specified set of matchers would disconnect all sockets. This
+        /// indicates a bug in the request.
+        3: unconstrained_matchers Empty;
+    });
+};

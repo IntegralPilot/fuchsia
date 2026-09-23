@@ -1,0 +1,172 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/compiler.gni")
+import("//build/subbuild.gni")
+import("//sdk/config.gni")
+
+# Calling this template generates a set of action() targets, each one building
+# the atoms of a given sdk_collection() for a specific CPU architecture and API
+# level. This is used by the idk() template.
+#
+# The generated actions are named as follows:
+#
+#    ${target_name}-${cpu}
+#        For the default API level, and each supported ${cpu}
+#        Uses ${root_build_dir}/${subbuild_prefix}-${cpu} as its build directory.
+#
+#    ${target_name}-api${api_level}-${cpu}
+#        For individual API levels and cpu values.
+#        Uses ${root_build_dir}/${subbuild_prefix}-api${api_level}-${cpu} as
+#        its build directory.
+#
+#    target_name
+#        A group depending on all of the actions above.
+#        This is convenient when building an IDK matching `target_cpus` and
+#        `api_levels` but may build more targets than needed in other cases.
+#
+# Each action will depend on sdk_collection_label as well as
+# //sdk:idk_build_tools.
+#
+# Note that this does not define a top-level group() target that depends on all
+# of them. Instead, users like the idk() template should pick the sub-build
+# targets they need directly.
+#
+# Args:
+#    target_cpus (required)
+#      List of target CPU architectures for which to generate sub-builds.
+#      This must include the default target_cpu value for the current build
+#      configuration.
+#
+#    api_levels (required)
+#      List of API levels, as strings, for which to generate sub-builds.
+#
+#    sdk_collection_label (required)
+#      [GN Label] Label of sdk_collection() target to generate sub-builds for.
+#
+#    subbuild_prefix (required)
+#      [string] A name prefix for all sub-build directories.
+#          This is useful to differentiate idk_subbuilds() instances that
+#          reference collections with the same name, but different directories
+#          (e.g. `//sdk:partner` and `//vendor/acme/sdk:partner`).
+#
+#   sdk_collection_name (required)
+#     The name of the collection for which sub-builds are being generated.
+#     This is the name of the directory under `sdk/exported/` and might not
+#     match the name of `sdk_collection_label`.
+#
+template("idk_subbuilds") {
+  assert(defined(invoker.target_cpus),
+         "target_cpus must be defined for $target_name")
+  assert(defined(invoker.api_levels),
+         "api_levels must be defined for $target_name")
+  assert(defined(invoker.sdk_collection_label),
+         "sdk_collection_label must be defined for $target_name")
+  assert(defined(invoker.subbuild_prefix),
+         "subbuild_prefix must be defined for $target_name")
+  assert(defined(invoker.sdk_collection_name),
+         "sdk_collection_name must be defined for $target_name")
+
+  main_target_name = target_name
+
+  _target_cpus = invoker.target_cpus
+  _api_levels = invoker.api_levels
+
+  subbuild_prefix = invoker.subbuild_prefix
+  _sdk_collection_dir_path = "/sdk/exported/${invoker.sdk_collection_name}"
+
+  # Include the main collection build.
+  all_subbuild_targets = [ invoker.sdk_collection_label ]
+
+  # First, define subbuild targets for the default API level.
+  # Do not define a subbuild for the current CPU because we can use the
+  # artifacts from the main build. The collection in the main build has been
+  # added to `all_subbuild_targets` above.
+  # The current CPU must be in `target_cpus`.
+  foreach(target_cpu, _target_cpus - [ current_cpu ]) {
+    _subbuild_target = "${main_target_name}-${target_cpu}"
+    _subbuild_dir_name = "${subbuild_prefix}-${target_cpu}"
+
+    subbuild(_subbuild_target) {
+      target = invoker.sdk_collection_label
+      use_idk_tools_only = true
+
+      _collection_dir_manifest =
+          "${_sdk_collection_dir_path}/meta/manifest.json"
+      outputs = [ _collection_dir_manifest ]
+
+      api_level_path = "${_sdk_collection_dir_path}/api_level"
+
+      target_cpu = target_cpu
+      api_level = "PLATFORM"
+      subbuild_dir_name = _subbuild_dir_name
+
+      # Each subbuild depends on the `sdk_collection` in the main build, so
+      # that when a change happens that would cause the `sdk_collection` to be
+      # rebuilt, that also triggers the subbuilds to be rerun.
+      extra_deps = [ invoker.sdk_collection_label ]
+
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      if (defined(visibility)) {
+        visibility += [ ":${main_target_name}" ]
+      }
+    }
+
+    all_subbuild_targets +=
+        [ get_label_info(":${_subbuild_target}", "label_no_toolchain") ]
+  }
+
+  # Now, define subbuild targets for all individual API levels and CPUs.
+  foreach(api_level, _api_levels) {
+    foreach(target_cpu, _target_cpus) {
+      _subbuild_target = "${main_target_name}-api${api_level}-${target_cpu}"
+      _subbuild_dir_name = "${subbuild_prefix}-api${api_level}-${target_cpu}"
+
+      subbuild(_subbuild_target) {
+        target = invoker.sdk_collection_label
+        use_idk_tools_only = true
+
+        _collection_dir_manifest =
+            "${_sdk_collection_dir_path}/meta/manifest.json"
+        outputs = [ _collection_dir_manifest ]
+
+        api_level_path = "${_sdk_collection_dir_path}/api_level"
+
+        target_cpu = target_cpu
+        api_level = "$api_level"
+        subbuild_dir_name = _subbuild_dir_name
+
+        # Each subbuild depends on the `sdk_collection` in the main build, so
+        # that when a change happens that would cause the `sdk_collection` to be
+        # rebuilt, that also triggers the subbuilds to be rerun.
+        extra_deps = [ invoker.sdk_collection_label ]
+
+        forward_variables_from(invoker,
+                               [
+                                 "testonly",
+                                 "visibility",
+                               ])
+        if (defined(visibility)) {
+          visibility += [ ":${main_target_name}" ]
+        }
+      }
+
+      all_subbuild_targets +=
+          [ get_label_info(":${_subbuild_target}", "label_no_toolchain") ]
+    }
+  }
+
+  group(main_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = all_subbuild_targets
+  }
+}

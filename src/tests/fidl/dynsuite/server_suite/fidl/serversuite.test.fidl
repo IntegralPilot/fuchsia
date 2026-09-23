@@ -1,0 +1,362 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fidl.serversuite;
+
+using zx;
+
+// An incrementing integer used to coordinate breaking changes across repositories.
+const SERVER_SUITE_VERSION uint64 = 1;
+
+// The Runner is used by the harness to coordinate with the runner component.
+// It's for communication *about* tests, not under test itself like the Target.
+//
+// For each test, the harness performs these steps:
+//
+// 1. Connect to the Runner server.
+// 2. Call GetVersion().
+//    - If the version is too old for the test to work, skip the test.
+// 3. Call Start(), passing a Target server end.
+//    - If it returns TEST_DISABLED, skip the test.
+// 4. Interact with the Target server and assert on its behavior. Optionally:
+//    - Call a Runner method telling it to do something to the Target.
+//    - Wait for a Runner event saying that something happened to the Target.
+// 5. (If normal termination is expected) Close the Target channel.
+// 6. Wait for OnTeardown() and assert on the teardown reason.
+// 7. Call CheckAlive() to make sure the runner hasn't crashed.
+// 8. Close the Runner channel.
+//
+@discoverable
+closed protocol Runner {
+    // Returns SERVER_SUITE_VERSION. This allows the harness to determine if the
+    // Runner is up to date, or is speaking an earlier version of the protocol.
+    strict GetVersion() -> (struct {
+        version uint64;
+    });
+
+    // A two-way method to test that the Runner is still responding.
+    strict CheckAlive() -> ();
+
+    // Start the test, binding the given endpoint to a Target server.
+    strict Start(resource struct {
+        test Test;
+        any_target strict resource union {
+            1: closed server_end:ClosedTarget;
+            2: ajar server_end:AjarTarget;
+            3: open server_end:OpenTarget;
+        };
+    }) -> () error @generated_name("StartError") strict enum {
+        TEST_DISABLED = 1;
+    };
+
+    // Report that the Target server was torn down. This must be sent once. For
+    // most tests, the reason is PEER_CLOSED because the harness closed its end.
+    // If the reason has multiple bits set, it means the bindings are unable to
+    // differentiate between those reasons and it could be any of them.
+    strict -> OnTeardown(struct {
+        reason @generated_name("TeardownReason") strict bits : uint32 {
+            // The Target channel was closed by the peer (the harness).
+            // This is normal termination, not an error.
+            PEER_CLOSED = 0x1;
+            // The Target server voluntarily shut itself down,
+            // e.g. when instructed to do so via ShutdownWithEpitaph().
+            VOLUNTARY_SHUTDOWN = 0x2;
+            // The Target server received a message that, based on its magic
+            // number or at-rest flags, is incompatible and cannot be decoded.
+            INCOMPATIBLE_FORMAT = 0x4;
+            // The Target server received a message that, based on its txid,
+            // dynamic flags, or ordinal, was unexpected.
+            UNEXPECTED_MESSAGE = 0x8;
+            // The Target server failed to encode an outgoing message.
+            // Note: Use WRITE_FAILURE instead for zx_channel_write_etc errors,
+            // even if they are checked preemptively during encoding.
+            ENCODE_FAILURE = 0x10;
+            // The Target server failed to decode an incoming message.
+            // This includes the header, but header decoding only fails when
+            // there are less than 16 bytes. When the *value* of header fields
+            // is the problem, use INCOMPATIBLE_FORMAT or UNEXPECTED_MESSAGE.
+            DECODE_FAILURE = 0x20;
+            // The Target server encoded an outgoing message successfully, but
+            // failed to write it to the channel. This happens when the message
+            // is too large or when handle dispositions are incorrect.
+            WRITE_FAILURE = 0x40;
+        };
+    });
+
+    // Report that the Target server ran the unknown method handler.
+    strict -> OnReceivedUnknownMethod(@generated_name("UnknownMethodInfo") struct {
+        ordinal uint64;
+        unknown_method_type @generated_name("UnknownMethodType") strict enum {
+            ONE_WAY = 1;
+            TWO_WAY = 2;
+        };
+    });
+
+    // Shut down the Target server with an epitaph.
+    strict ShutdownWithEpitaph(struct {
+        epitaph_status int32;
+    }) -> ();
+
+    // Send an event from the Target server.
+    strict SendOpenTargetStrictEvent() -> ();
+    strict SendOpenTargetFlexibleEvent() -> ();
+
+    // Report that the Target server received a one-way call.
+    strict -> OnReceivedClosedTargetOneWayNoPayload();
+    strict -> OnReceivedOpenTargetStrictOneWay();
+    strict -> OnReceivedOpenTargetFlexibleOneWay();
+};
+
+// The Target is the protocol under test. The harness tests the behavior of the
+// Target's generated server bindings. It does so using raw channel operations,
+// *not* using the Target's generated client bindings.
+//
+// ClosedTarget is a closed protocol; there are also ajar and open Targets.
+// Prefer using ClosedTarget unless specifically testing ajar or open behavior.
+closed protocol ClosedTarget {
+    strict OneWayNoPayload();
+
+    strict TwoWayNoPayload() -> ();
+
+    strict TwoWayStructPayload(struct {
+        v int8;
+    }) -> (struct {
+        v int8;
+    });
+
+    strict TwoWayTablePayload(table {
+        1: v int8;
+    }) -> (table {
+        1: v int8;
+    });
+
+    strict TwoWayUnionPayload(union {
+        1: v int8;
+    }) -> (union {
+        1: v int8;
+    });
+
+    strict TwoWayResult(strict union {
+        1: payload string:MAX;
+        2: error uint32;
+    }) -> (struct {
+        payload string:MAX;
+    }) error uint32;
+
+    strict GetHandleRights(resource struct {
+        // Plain handle, there should be no rights or type checking.
+        handle zx.Handle;
+    }) -> (struct {
+            // Rights should be obtained by calling zx_object_get_info on `handle`
+            // with topic ZX_INFO_HANDLE_BASIC.
+        rights zx.Rights;
+    });
+
+    strict GetSignalableEventRights(resource struct {
+        handle zx.Handle:<EVENT, zx.Rights.SIGNAL>;
+    }) -> (struct {
+        // Rights should be obtained by calling zx_object_get_info on `handle`
+        // with topic ZX_INFO_HANDLE_BASIC.
+        rights zx.Rights;
+    });
+
+    strict EchoAsTransferableSignalableEvent(resource struct {
+        handle zx.Handle;
+    }) -> (resource struct {
+        // The response handle should be the same as the request handle.
+        handle zx.Handle:<EVENT, zx.Rights.TRANSFER | zx.Rights.SIGNAL>;
+    });
+
+    strict ByteVectorSize(struct {
+        vec vector<uint8>;
+    }) -> (struct {
+        n uint32;
+    });
+
+    strict HandleVectorSize(resource struct {
+        vec vector<zx.Handle:EVENT>;
+    }) -> (struct {
+        n uint32;
+    });
+
+    strict CreateNByteVector(struct {
+        n uint32;
+    }) -> (struct {
+        vec vector<uint8>;
+    });
+
+    strict CreateNHandleVector(resource struct {
+        n uint32;
+    }) -> (resource struct {
+        vec vector<zx.Handle:EVENT>;
+    });
+};
+
+// Like ClosedTarget, but ajar. This is used to test unknown interactions.
+ajar protocol AjarTarget {};
+
+// Like ClosedTarget, but open. This is used to test unknown interactions.
+open protocol OpenTarget {
+    strict -> StrictEvent();
+    flexible -> FlexibleEvent();
+
+    strict StrictOneWay();
+    flexible FlexibleOneWay();
+
+    strict StrictTwoWay() -> ();
+    strict StrictTwoWayFields(struct {
+        reply_with int32;
+    }) -> (struct {
+        some_field int32;
+    });
+    strict StrictTwoWayErr(strict union {
+        1: reply_success Empty;
+        2: reply_error int32;
+    }) -> () error int32;
+    strict StrictTwoWayFieldsErr(strict union {
+        1: reply_success int32;
+        2: reply_error int32;
+    }) -> (struct {
+        some_field int32;
+    }) error int32;
+
+    flexible FlexibleTwoWay() -> ();
+    flexible FlexibleTwoWayFields(struct {
+        reply_with int32;
+    }) -> (struct {
+        some_field int32;
+    });
+    flexible FlexibleTwoWayErr(strict union {
+        1: reply_success Empty;
+        2: reply_error int32;
+    }) -> () error int32;
+    flexible FlexibleTwoWayFieldsErr(strict union {
+        1: reply_success int32;
+        2: reply_error int32;
+    }) -> (struct {
+        some_field int32;
+    }) error int32;
+};
+
+// TODO(https://fxbug.dev/42159332): Add a built-in unit type to FIDL.
+type Empty = struct {};
+
+type Test = flexible enum : uint32 {
+    // ////////////////////////////////////////////////////////////////////////
+    // basic_tests.cc
+    // ////////////////////////////////////////////////////////////////////////
+
+    SETUP = 1;
+    IGNORE_DISABLED = 107;
+    ONE_WAY_NO_PAYLOAD = 2;
+    TWO_WAY_NO_PAYLOAD = 3;
+    TWO_WAY_RESULT_WITH_PAYLOAD = 4;
+    TWO_WAY_RESULT_WITH_ERROR = 5;
+    TWO_WAY_STRUCT_PAYLOAD = 6;
+    TWO_WAY_TABLE_PAYLOAD = 7;
+    TWO_WAY_UNION_PAYLOAD = 8;
+
+    // ////////////////////////////////////////////////////////////////////////
+    // message_header_tests.cc
+    // ////////////////////////////////////////////////////////////////////////
+
+    ONE_WAY_WITH_NON_ZERO_TXID = 9;
+    TWO_WAY_NO_PAYLOAD_WITH_ZERO_TXID = 10;
+    UNKNOWN_ORDINAL_CAUSES_CLOSE = 11;
+    BAD_MAGIC_NUMBER_CAUSES_CLOSE = 12;
+
+    IGNORES_UNRECOGNIZED_AT_REST_FLAGS = 13;
+    IGNORES_UNRECOGNIZED_DYNAMIC_FLAGS = 14;
+
+    // ////////////////////////////////////////////////////////////////////////
+    // coding_tests.cc
+    // ////////////////////////////////////////////////////////////////////////
+
+    BAD_PAYLOAD_ENCODING = 15;
+    V1_TWO_WAY_NO_PAYLOAD = 105;
+    V1_TWO_WAY_STRUCT_PAYLOAD = 106;
+
+    // ////////////////////////////////////////////////////////////////////////
+    // peer_closed_tests.cc
+    // ////////////////////////////////////////////////////////////////////////
+
+    EVENT_SENDING_DO_NOT_REPORT_PEER_CLOSED = 109;
+    REPLY_SENDING_DO_NOT_REPORT_PEER_CLOSED = 110;
+    RECEIVE_ONE_WAY_NO_PAYLOAD_FROM_PEER_CLOSED_CHANNEL = 111;
+    SERVER_TEARS_DOWN_WHEN_PEER_CLOSED = 113;
+
+    // ////////////////////////////////////////////////////////////////////////
+    // handle_rights_tests.cc
+    // ////////////////////////////////////////////////////////////////////////
+
+    CLIENT_SENDS_TOO_FEW_HANDLES = 16;
+    CLIENT_SENDS_WRONG_HANDLE_TYPE = 17;
+    CLIENT_SENDS_TOO_MANY_RIGHTS = 18;
+    CLIENT_SENDS_TOO_FEW_RIGHTS = 19;
+    CLIENT_SENDS_OBJECT_OVER_PLAIN_HANDLE = 20;
+    SERVER_SENDS_WRONG_HANDLE_TYPE = 21;
+    SERVER_SENDS_TOO_MANY_RIGHTS = 22;
+    SERVER_SENDS_TOO_FEW_RIGHTS = 23;
+
+    // ////////////////////////////////////////////////////////////////////////
+    // epitaph_tests.cc
+    // ////////////////////////////////////////////////////////////////////////
+
+    SERVER_SENDS_EPITAPH = 24;
+    SERVER_RECEIVES_EPITAPH_INVALID = 25;
+
+    // ////////////////////////////////////////////////////////////////////////
+    // limit_tests.cc
+    // ////////////////////////////////////////////////////////////////////////
+
+    REQUEST_MATCHES_BYTE_LIMIT = 26;
+    REQUEST_MATCHES_HANDLE_LIMIT = 27;
+    RESPONSE_MATCHES_BYTE_LIMIT = 28;
+    RESPONSE_MATCHES_HANDLE_LIMIT = 29;
+    RESPONSE_EXCEEDS_BYTE_LIMIT = 30;
+    RESPONSE_EXCEEDS_HANDLE_LIMIT = 31;
+
+    // ////////////////////////////////////////////////////////////////////////
+    // unknown_interactions_tests.cc
+    // ////////////////////////////////////////////////////////////////////////
+
+    SEND_STRICT_EVENT = 32;
+    SEND_FLEXIBLE_EVENT = 33;
+
+    RECEIVE_STRICT_ONE_WAY = 34;
+    RECEIVE_STRICT_ONE_WAY_MISMATCHED_STRICTNESS = 35;
+    RECEIVE_FLEXIBLE_ONE_WAY = 36;
+    RECEIVE_FLEXIBLE_ONE_WAY_MISMATCHED_STRICTNESS = 37;
+
+    STRICT_TWO_WAY_RESPONSE = 38;
+    STRICT_TWO_WAY_RESPONSE_MISMATCHED_STRICTNESS = 39;
+    STRICT_TWO_WAY_NON_EMPTY_RESPONSE = 63;
+    STRICT_TWO_WAY_ERROR_SYNTAX_RESPONSE = 40;
+    STRICT_TWO_WAY_ERROR_SYNTAX_RESPONSE_MISMATCHED_STRICTNESS = 41;
+    STRICT_TWO_WAY_ERROR_SYNTAX_NON_EMPTY_RESPONSE = 64;
+    FLEXIBLE_TWO_WAY_RESPONSE = 42;
+    FLEXIBLE_TWO_WAY_RESPONSE_MISMATCHED_STRICTNESS = 43;
+    FLEXIBLE_TWO_WAY_NON_EMPTY_RESPONSE = 44;
+    FLEXIBLE_TWO_WAY_ERROR_SYNTAX_RESPONSE_SUCCESS_RESULT = 45;
+    FLEXIBLE_TWO_WAY_ERROR_SYNTAX_RESPONSE_ERROR_RESULT = 46;
+    FLEXIBLE_TWO_WAY_ERROR_SYNTAX_NON_EMPTY_RESPONSE_SUCCESS_RESULT = 47;
+    FLEXIBLE_TWO_WAY_ERROR_SYNTAX_NON_EMPTY_RESPONSE_ERROR_RESULT = 48;
+
+    UNKNOWN_STRICT_ONE_WAY_OPEN_PROTOCOL = 49;
+    UNKNOWN_FLEXIBLE_ONE_WAY_OPEN_PROTOCOL = 50;
+    UNKNOWN_FLEXIBLE_ONE_WAY_HANDLE_OPEN_PROTOCOL = 51;
+    UNKNOWN_STRICT_TWO_WAY_OPEN_PROTOCOL = 52;
+    UNKNOWN_FLEXIBLE_TWO_WAY_OPEN_PROTOCOL = 53;
+    UNKNOWN_FLEXIBLE_TWO_WAY_HANDLE_OPEN_PROTOCOL = 54;
+    UNKNOWN_STRICT_ONE_WAY_AJAR_PROTOCOL = 55;
+    UNKNOWN_FLEXIBLE_ONE_WAY_AJAR_PROTOCOL = 56;
+    UNKNOWN_STRICT_TWO_WAY_AJAR_PROTOCOL = 57;
+    UNKNOWN_FLEXIBLE_TWO_WAY_AJAR_PROTOCOL = 58;
+    UNKNOWN_STRICT_ONE_WAY_CLOSED_PROTOCOL = 59;
+    UNKNOWN_FLEXIBLE_ONE_WAY_CLOSED_PROTOCOL = 60;
+    UNKNOWN_STRICT_TWO_WAY_CLOSED_PROTOCOL = 61;
+    UNKNOWN_FLEXIBLE_TWO_WAY_CLOSED_PROTOCOL = 62;
+
+    // Next available: 114
+};

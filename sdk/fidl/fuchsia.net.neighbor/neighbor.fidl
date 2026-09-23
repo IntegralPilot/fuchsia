@@ -1,0 +1,191 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+/// The neighbor table helps decide where to send IP packets. It allows for the
+/// translation between IP addresses and MAC addresses.
+///
+/// With current implementations, the neighbor table uses the ARP or NDP
+/// protocol to dynamically discover new neighbor entries for IPv4 or IPv6
+/// addresses, respectively.
+///
+/// This library enables inspection and manipulation of the neighbor table.
+///  * See [`fuchsia.net.neighbor/View`] for viewing neighbor table entries.
+///  * See [`fuchsia.net.neighbor/Controller`] for adding static neighbor table
+///    entries, and removing entries.
+///
+/// # Important Concepts
+///
+/// [`Entry`] represents a neighboring device and is stored in the neighbor
+/// table, which is also managed by the networking stack.
+///
+/// # Privacy Considerations
+///
+/// The Neighbor API deals with MAC addresses, which are device identifiers and
+/// should not be exposed to most applications. There are separate protocols for
+/// inspecting and modifying the neighbor table; this is done to protect
+/// sensitive data.
+///
+/// # Security Considerations
+///
+/// The Neighbor API enables clients to view and manipulate the neighbor table,
+/// which should both be privileged actions and granted only to trusted
+/// applications. Additionally, not all clients will need both read and write
+/// access. This has been addressed by splitting methods into two protocols:
+/// Viewer for read methods and Controller for write methods.
+///
+/// This API is not concerned with throttling consumption of ARP or NDP
+/// messages. If a DoS of ARP/NDP packets reaches this API, the damage had
+/// already been done. Once the packets reach the control plane, they are
+/// processed by the networking stack where the DoS would first manifest.
+library fuchsia.net.neighbor;
+
+using fuchsia.net;
+
+/// Returns entries and events from the neighbor table. Clients can open an
+/// iterator using the [`fuchsia.net.neighbor/View.EntryIterator`] method.
+///
+/// An atomic snapshot of the neighbor table is queued for clients upon opening
+/// an EntryIterator. This snapshot consists of `existing` entries followed by
+/// an [`IdleEvent`]. No other types of events will be sent before an
+/// [`IdleEvent`].
+closed protocol EntryIterator {
+    /// Take items from the iterator. If no items are available, block until one
+    /// is; otherwise, return immediately with items queued since the last
+    /// invocation.
+    ///
+    /// This does not guarantee that, when blocking, only one item will be
+    /// returned; implementations may debounce or batch events.
+    ///
+    /// Clients should only have one call of this method at a time; a second
+    /// call to this method while a call is already pending will cause the
+    /// server end of the protocol to be closed.
+    ///
+    /// - response `events` a list of events that occurred since the last
+    ///     invocation of this method.
+    strict GetNext() -> (struct {
+        events vector<@generated_name("EntryIteratorItem") strict union {
+            /// An existing entry in the neighbor table. Does not indicate that
+            /// an event occurred.
+            1: existing Entry;
+
+            /// Empty event for indicating there are no more
+            /// [`EntryIteratorItem.existing`] items to yield.
+            2: idle @generated_name("IdleEvent") struct {};
+
+            /// Event indicating a new entry has been added to the neighbor
+            /// table.
+            3: added Entry;
+
+            /// Event indicating an entry has changed.
+            4: changed Entry;
+
+            /// Event indicating an entry has been removed from the neighbor
+            /// table.
+            5: removed Entry;
+        }>:MAX_ITEM_BATCH_SIZE;
+    });
+};
+
+/// The maximum number of [`EntryIteratorItem`] returned in a
+/// [`EntryIterator.GetNext`] response.
+//
+// This has been calculated with the following function:
+//   MAX_EVENT_BATCH_SIZE = floor_pow2(
+//     (ZX_CHANNEL_MAX_MSG_BYTES - RESPONSE_BYTES) / MAX_EVENT_BYTES
+//   )
+// where,
+//   ZX_CHANNEL_MAX_MSG_BYTES = 65536 bytes
+//   RESPONSE_BYTES = size of [`EntryIterator.GetNext`] response = 32 bytes
+//   MAX_ITEM_BYTES = max size of [`EntryIteratorItem`] = 208 bytes
+//
+// It's rounded down to the next power of two for aesthetics and decreased
+// sensitivity to changes to the underlying data structures.
+// This value will need to be recomputed if any of the above numbers change.
+const MAX_ITEM_BATCH_SIZE uint64 = 256;
+
+/// Inspect the neighbor table.
+@discoverable
+closed protocol View {
+    /// Open a connection to an [`EntryIterator`] for listing existing entries
+    /// and optionally watching for state changes.
+    ///
+    /// + request `it` grants access to the [`EntryIterator`].
+    /// + request `options` specifies the behavior of the [`EntryIterator`].
+    strict OpenEntryIterator(resource struct {
+        it server_end:EntryIterator;
+        /// Options for modifying the behavior of an [`EntryIterator`].
+        options @generated_name("EntryIteratorOptions") table {};
+    });
+};
+
+/// Errors associated with the neighbor table `Controller` protocol.
+type ControllerError = flexible enum {
+    /// The specified interface does not exist.
+    INTERFACE_NOT_FOUND = 1;
+    /// The specified interface does not keep a neighbor table (e.g.
+    /// point-to-point links).
+    INTERFACE_NOT_SUPPORTED = 2;
+    /// The specified neighbor does not exist in the provided interface's
+    /// neighbor table.
+    NEIGHBOR_NOT_FOUND = 3;
+    /// The provided IP address is not a valid neighbor address.
+    INVALID_IP_ADDRESS = 4;
+    /// The provided MAC address is not a unicast MAC address.
+    MAC_ADDRESS_NOT_UNICAST = 5;
+    /// A probe cannot be manually triggered against the specified neighbor
+    /// because its link address is not known.
+    LINK_ADDRESS_UNKNOWN = 6;
+    /// The neighbor table is full.
+    TOO_MANY_ENTRIES = 7;
+};
+
+/// Modify the neighbor table.
+@discoverable
+closed protocol Controller {
+    /// Create a static entry. If a conflict is found, overwrite the existing
+    /// entry. Conflicts occur when two entries have the same interface
+    /// identifier and IP address.
+    ///
+    /// + request `interface` identifier for the interface used for
+    ///     communicating with the neighbor.
+    /// + request `neighbor` IP address of the neighbor.
+    /// + request `mac` MAC address of the neighbor.
+    strict AddEntry(struct {
+        interface fuchsia.net.InterfaceId;
+        neighbor fuchsia.net.IpAddress;
+        mac fuchsia.net.MacAddress;
+    }) -> () error ControllerError;
+
+    /// Probe the reachability of an entry in the neighbor table.
+    ///
+    /// If the entry is static it will be converted into a dynamic entry and may
+    /// eventually be discarded if no longer in active use.
+    ///
+    /// + request `interface` identifier for the interface used for
+    ///     communicating with the neighbor.
+    /// + request `neighbor` IP address of the neighbor.
+    strict ProbeEntry(struct {
+        interface fuchsia.net.InterfaceId;
+        neighbor fuchsia.net.IpAddress;
+    }) -> () error ControllerError;
+
+    /// Delete a dynamic or static entry.
+    ///
+    /// + request `interface` identifier for the interface associated with the
+    ///     entry to be deleted.
+    /// + request `neighbor` IP address of the entry to be deleted.
+    strict RemoveEntry(struct {
+        interface fuchsia.net.InterfaceId;
+        neighbor fuchsia.net.IpAddress;
+    }) -> () error ControllerError;
+
+    /// Delete all dynamic and static entries belonging to an interface.
+    ///
+    /// + request `interface` identifier for the interface associated with the
+    ///     entries to be deleted.
+    /// + request `ip_version` the IP version to clear entries from.
+    strict ClearEntries(struct {
+        interface fuchsia.net.InterfaceId;
+        ip_version fuchsia.net.IpVersion;
+    }) -> () error ControllerError;
+};

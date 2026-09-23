@@ -1,0 +1,345 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_test_suite.gni")
+import("//build/host.gni")
+import("//build/images/paths.gni")
+import("//build/sdk/sdk_host_tool.gni")
+import("//build/testing/host_test.gni")
+import("//build/testing/host_test_data.gni")
+import("//build/tools/json_merge/json_merge.gni")
+import("//src/storage/fshost/generated_fshost_config.gni")
+import("config.gni")
+
+group("ffx") {
+  testonly = true
+
+  public_deps = [
+    ":ffx-defaults.json($host_toolchain)",
+    ":ffx_tool($host_toolchain)",
+    "lib($host_toolchain)",
+  ]
+}
+
+if (current_toolchain == default_toolchain) {
+  _ffx_build_dir_config_data_file = "${target_gen_dir}/ffx-config-data.json"
+
+  action("ffx_build_dir_config_file") {
+    script = "write_ffx_config.py"
+    inputs = [ _ffx_build_dir_config_data_file ]
+
+    # The output path matches the code in ffx to look for
+    # $BUILD_DIR/ffx-config.json.
+    outputs = [ "${root_build_dir}/ffx-config.json" ]
+
+    args = [
+      "--dollar-placeholder",
+      "!!",
+      "--data",
+      rebase_path(_ffx_build_dir_config_data_file, root_build_dir),
+      "--build-dir",
+      rebase_path(root_build_dir, root_build_dir),
+      "--output",
+      rebase_path("${root_out_dir}/ffx-config.json", root_build_dir),
+    ]
+
+    deps = [ ":ffx-build-config.metadata" ]
+  }
+
+  # Builds the build directory level configuration file for ffx.
+  generated_file("ffx-build-config.metadata") {
+    # The output directory should be in the root build dir, so the path can be
+    # correctly computed.
+    outputs = [ _ffx_build_dir_config_data_file ]
+    data_keys = [ "ffx" ]
+    deps = [
+      ":default_ffx_config",
+      ":host($host_toolchain)",
+      "frontends/ffx:ffx_bin($host_toolchain)",
+      "tools($host_toolchain)",
+    ]
+    output_conversion = "json"
+  }
+
+  group("default_ffx_config") {
+    #
+    # NOTE: There is a long standing issue with using $ in the value of string
+    # variables in scopes. To work around this, !! is used as a placeholder for
+    # $ and replaced before writing out the configuration file.
+    #
+    # Don't use absolute paths since they risk poisoning the build cache across
+    # machines.
+    #
+    metadata = {
+      # The "ffx" metadata is collected and written into the build-dir level ffx
+      # config file.
+      ffx = [
+        {
+          # FIDL IR root is the location of all FIDL IR files
+          fidl = {
+            ir = {
+              path = "!!BUILD_DIR/fidling/gen/ir_root"
+            }
+          }
+
+          # Some prebuilt tools in the IDK need to be specified in-tree
+          sdk = {
+            overrides = {
+              aemu_internal = rebase_path(
+                      "//prebuilt/third_party/android/aemu/release/linux-x64/emulator")
+              crosvm_internal =
+                  rebase_path("//prebuilt/third_party/crosvm/linux-x64/crosvm")
+              qemu_internal = rebase_path(
+                      "//prebuilt/third_party/qemu/linux-x64/bin/qemu-system-x86_64")
+              uefi_internal_x64 = rebase_path(
+                      "//prebuilt/third_party/edk2/qemu-x64/OVMF_CODE.fd")
+              uefi_internal_arm64 = rebase_path(
+                      "//prebuilt/third_party/edk2/qemu-arm64/QEMU_EFI.fd")
+              secure_bootloader_arm64 = rebase_path(
+                      "//prebuilt/firmware/arm-trusted-firmware-qemu-bios/qemu_fw.bios")
+            }
+          }
+
+          pbms = {
+            base_urls = [
+              "file://!!BUILD_DIR",
+              "gs://fuchsia/development",
+            ]
+          }
+
+          # The "main" product bundle. Only define it if the variable exists
+          # since there are builds, such as SDK only, that do not build any
+          # product bundles. In those builds, there is no product, so it is OK
+          # to not set this value.
+          if (defined(files.product_bundle_dir)) {
+            product = {
+              path = "!!BUILD_DIR/" +
+                     rebase_path(files.product_bundle_dir, root_out_dir)
+            }
+          }
+
+          # package repository
+          repository = {
+            # the repo name cannot have _, so they are replaced with -.
+            default =
+                string_replace(get_path_info(root_build_dir, "name"), "_", "-")
+          }
+        },
+      ]
+    }
+  }
+}
+
+if (is_host) {
+  group("ffx_tool") {
+    deps = [
+      ":ffx_build_dir_config_file($default_toolchain)",
+      ":host",
+      ":tool_manifest",
+      "frontends/ffx:ffx_bin($host_toolchain)",
+      "tools($host_toolchain)",
+    ]
+  }
+
+  # Generates  the list of tools that are not compiled into the main ffx.
+  # This is used via configuration to make ffx hermetic vs. scanning and reading
+  # files.
+  generated_file("tool_manifest") {
+    deps = [ "tools:bins($host_toolchain)" ]
+    outputs = [ "$root_build_dir/ffx_tools.json" ]
+    data_keys = [ "ffx_tool" ]
+    output_conversion = "json"
+  }
+
+  install_host_tools("host") {
+    deps = [ "frontends/ffx:ffx_bin" ]
+    outputs = [ "ffx" ]
+  }
+
+  group("runtime") {
+    deps = [
+      # The tool
+      ":host",
+    ]
+  }
+
+  group("ffx_bin") {
+    public_deps = [ "frontends/ffx:ffx_bin" ]
+
+    # Please prefer to use the appropriate host_test_data target defined below
+    # rather than directly depending on the ffx binary.
+    #
+    # The targets to use instead are:
+    # - ffx itself (`//src/developer/ffx:test_data`) if only using core
+    #   functionality of ffx (no plugins not listed in `config.gni`'s
+    #   `required_ffx_plugins` or `included_ffx_plugins` lists). This should be
+    #   the rare case.
+    # - the whole "suite" of tools (`//src/developer/ffx:suite_test_data`) if
+    #   a many subtools are used, or the subtools used aren't really usefully
+    #   constrained.
+    # - a specific subtool's test data (eg.
+    #   `//src/developer/ffx/plugins/tool:test_data`) if only one subtool is
+    #   used and it's reasonable to write the test to call it directly (as
+    #   `ffx-tool tool <args>` through fho's compatibility mode).
+    # - the SDK as a whole (See the `host_test_data("sdk_exported")`, for example:
+    #   ```
+    #   host_test_data("sdk_exported") {
+    #     _sdk_label = "//sdk:exported_idk_for_ffx_tests($default_toolchain)"
+    #     sources = [ get_label_info(_sdk_label, "root_out_dir") + "/sdk/exported/core" ]
+    #     deps = [ _sdk_label ]
+    #   }
+    #   ```
+    #
+    # If you find yourself hitting this on something new, please try to use
+    # one of the above instead and if you're unsure reach out to the tools
+    # team for advice.
+    #
+    # TODO(b/296236928): change sdk description above to a reference to a
+    # normalized host_test_data.
+    visibility = [
+      # These are well-defined users of the direct binary dependency and do not
+      # need to change.
+      "//bundles/infra/*",
+      "//src/developer/ffx/*",
+
+      # Dart tests require special handling for their own kind of isolation, so
+      # these are 'allowed' to use this directly so they can copy it in where
+      # it's needed.
+      "//src/tests/end_to_end/package_manager:*",
+
+      # TODO(b/295921890): The following are dependencies that existed at the
+      # time this visibility list was established, and they should eventually be
+      # moved to use the appropriate shared host_test_data.
+      "//build/assembly/update_package:*",
+      "//sdk/ctf/tests/examples/host_tool:*",
+      "//src/devices/bin/driver_tools/tests:*",
+      "//src/tests/end_to_end/*",
+    ]
+  }
+
+  sdk_host_tool("bin_sdk") {
+    category = "partner"
+    output_name = "ffx"
+
+    deps = [ ":ffx_bin" ]
+  }
+
+  host_test_data("test_data") {
+    # Needed for SDK inclusion
+    #
+    # TODO(b/330934833): Remove when IDK allows for `testonly` targets in dep
+    # tree or when we can separate the concept of data_dep from host_test_data.
+    testonly = false
+    deps = [ ":host" ]
+    sources = [ "${host_tools_dir}/ffx" ]
+  }
+
+  group("suite_test_data") {
+    testonly = true
+    public_deps = [ ":test_data" ]
+    if (ffx_build_dual_mode_plugins_as_subtools) {
+      public_deps += dual_mode_subtool_test_data
+    }
+  }
+
+  json_merge("ffx-defaults.json") {
+    # the "DEFAULT" config level will be made up of a json merge of the
+    # following source json, some of which may be generated. Anything that's
+    # part of an ffx_plugin() definition included under the main ffx binary will
+    # automatically be merged in by that machinery, but if it comes from an
+    # external subtool or a library it has to be manually added to this list.
+    sources = [
+      "//src/developer/ffx/data/config.json",
+      "//src/developer/ffx/lib/pbms/data/config.json",
+    ]
+
+    # Merge the values, not just the top level.
+    deep_merge = true
+
+    # Add in the 'dual-mode' config default files if we're doing dual mode
+    if (ffx_build_dual_mode_plugins_as_subtools) {
+      sources += dual_mode_defaults
+    }
+
+    # Add any dynamically generated config.json files (ie. from ffx plugin
+    # roots) here.
+    deps = [
+      # This will bring in all built-in subtool config.json files.
+      "//src/developer/ffx/frontends/ffx:config.json($host_toolchain)",
+
+      # These are separate subtools with plugin-generated config.json
+      "//src/developer/ffx/plugins/log:config.json($host_toolchain)",
+      "//src/developer/ffx/plugins/test:config.json($host_toolchain)",
+      "//src/developer/ffx/plugins/trace:config.json($host_toolchain)",
+    ]
+
+    foreach(dep, deps) {
+      sources += [ get_label_info(dep, "target_out_dir") + "/config.json" ]
+    }
+  }
+}
+
+# NOTE: this group is included in `//src/developer:tests` and `//src:tests`
+# which get added as dependencies of the system image in infra builds. Tests
+# which need to depend on a system image should be added to `host_tests` below.
+# TODO(https://fxbug.dev/409023538): Rename this group and all group deps.
+group("tests") {
+  testonly = true
+  deps = [
+    ":bazel_tests",
+
+    # Driver tests
+    "frontends/ffx:tests($host_toolchain)",
+
+    # Subtool tests
+    "tools:tests($host_toolchain)",
+
+    # Individual library tests, for libraries that are not plugins.
+    "command:tests($host_toolchain)",
+    "config:tests($host_toolchain)",
+    "core:tests($host_toolchain)",
+    "lib:tests($host_toolchain)",
+    "playground:tests($host_toolchain)",
+    "plugins/package:tests($host_toolchain)",
+    "plugins/target:tests($host_toolchain)",
+    "plugins/trace:tests($host_toolchain)",
+    "tests($host_toolchain)",
+  ]
+}
+
+# NOTE: this group is for tests which need to transitively depend on a Fuchsia
+# system image for "e2e" testing of ffx behavior. These are included in
+# `//bundles/buildbot/host` in order to prevent dep cycles.
+# TODO(https://fxbug.dev/409023538): Rename this group and all group deps.
+if (is_host) {
+  group("host_tests") {
+    testonly = true
+    deps = [ "frontends/ffx:host_tests($host_toolchain)" ]
+
+    # ffx e2e host tests have a few constraints:
+    #
+    # 1. the assembly targets don't build correctly on mac bots
+    # 3. the minfs-no_hardware bot doesn't launch the emulator correctly
+    if (is_linux && data_filesystem_format != "minfs") {
+      deps += [
+        "lib:host_tests",
+        "plugins:host_tests",
+        "tools:host_tests",
+      ]
+    }
+  }
+}
+
+# Tests that are end to end, and should be part of the e2e test suite.
+group("e2e_tests") {
+  testonly = true
+  deps = [
+    "frontends/ffx:e2e_tests($host_toolchain)",
+    "tests:e2e_tests($host_toolchain)",
+  ]
+}
+
+bazel_test_suite("bazel_tests") {
+  host_tests = [ "//src/developer/ffx:tests" ]
+}

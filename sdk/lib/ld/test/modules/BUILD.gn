@@ -1,0 +1,2199 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/lto/config.gni")
+import("//build/dist/distribution_manifest_copy.gni")
+import("//build/dist/resource.gni")
+import("//build/testing/host_test_data.gni")
+import("//build/toolchain/generated_ifs_file.gni")
+import("//build/toolchain/ifs_shared_library.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//sdk/lib/c/libc_toolchain.gni")
+import("//sdk/lib/ld/distribution_manifest_prefix.gni")
+import("//sdk/lib/ld/testing/test_elf_object.gni")
+
+# Musl's dlclose does not unload the module, which prevents being able to reuse
+# the same test module in multiple dlopen tests that do not expect the module
+# or its deps to already be loaded. Therefore tests must use uniquely named
+# test files. `per_test_modules` and `per_test_executables` includes targets
+# that will have copies generated with each suffix in `per_test_suffices`.
+# `per_test_suffices` include test names in //sdk/lib/c/dlfcn/dl/test/* files.
+per_test_modules = [
+  ":multiple-foo-deps",
+  ":transitive-foo-dep",
+  ":root-precedence-in-dep-resolution",
+  ":precedence-in-dep-resolution",
+  ":soname-filename-loaded-dep",
+  ":soname-filename-dep",
+]
+
+per_test_executables = [
+  ":ret17",
+  ":ret23",
+  ":relative-reloc",
+  ":symbolic-reloc",
+  ":basic-dep",
+  ":indirect-deps",
+  ":many-deps",
+  ":relro",
+  ":missing-sym",
+  ":missing-dep",
+  ":missing-transitive-dep",
+  ":cyclic-dep-parent",
+  ":one-weak-symbol",
+  ":all-weak-symbols",
+]
+
+per_test_shlibs = [ ":multiple-transitive-foo-deps" ]
+
+per_test_suffices = [
+  "NotFound",
+  "InvalidMode",
+  "Basic",
+  "Relative",
+  "Symbolic",
+  "OneWeakSymbol",
+  "AllWeakSymbols",
+  "BasicDep",
+  "IndirectDeps",
+  "ManyDeps",
+  "Relro",
+  "MissingSymbol",
+  "GlobalSatisfiesMissingSymbol",
+  "MissingDependency",
+  "MissingTransitiveDependency",
+  "BasicModuleReuse",
+  "UniqueModules",
+  "SonameFilenameMatch",
+  "SonameFilenameDep",
+  "SonameFilenameLoadedDep",
+  "DepOrder",
+  "TransitiveDepOrder",
+  "CyclicalDependency",
+  "LoadedTransitiveDepOrder",
+  "OpenDepDirectly",
+  "LocalPrecedence",
+  "LocalPrecedenceTransitiveDeps",
+  "GlobalDep",
+  "GlobalPrecedence",
+  "GlobalPrecedenceDeps",
+  "UpdateModeToGlobal",
+  "GlobalModuleOrdering",
+  "GlobalModuleOrderingMultiDlopen",
+  "GlobalModuleOrderingOfDeps",
+  "GlobalPromotionOfDep",
+  "GlobalPersistence",
+  "RelativeRelocPrecedence",
+  "RootPrecedenceInDepResolution",
+  "PrecedenceInDepResolution",
+  "StartupModulesBasic",
+  "StartupModulesPriorityOverGlobal",
+  "StartupModulesDep",
+  "StartupModulesDepOrder",
+  "RtldNoLoadBasic",
+  "RtldNoDeleteBasic",
+  "RtldNoDeletePromotion",
+  "RtldNoDeleteDep",
+  "RtldNoDeleteDepPromotion",
+  "DlIteratePhdrBasic",
+  "ModuleNameOwnership",
+  "DlInfoBadFlag",
+  "DlInfoRtldDiLinkMap",
+  "DlInfoRtldDiTlsModidNoTls",
+  "DlInfoRtldDiTlsDataNoTls",
+  "DlInfoRtldDiPhdrs",
+  "DlErrorDlOpen",
+  "DlErrorDlSym",
+  "DlErrorDlInfo",
+  "DlErrorMultiple",
+  "DlErrorEphemeral",
+]
+
+# This reaches all the runtime deps of //sdk/lib/c/dlfcn/dl/test:dl-unittests.
+# Packaging is handled by "dl-test-data" and related targets below.
+group("dl-test-data.deps") {
+  visibility = [ ":*" ]
+  testonly = true
+  deps = [
+    ":init-fini-array",
+    ":init-fini-array-with-deps",
+    ":init-fini-array-with-legacy",
+    ":init-fini-array-with-loaded-deps",
+    ":init-fini-legacy",
+    ":static-tls-desc-module",
+    ":static-tls-module",
+    ":tls-dep-module",
+    ":tls-desc-dep-module",
+    ":tls-desc-initial-dep-module",
+    ":tls-desc-ld-dep-module",
+    ":tls-get-addr-global-dynamic-reloc",
+    ":tls-get-addr-local-dynamic-reloc",
+    ":tls-initial-dep-module",
+    ":tls-ld-dep-module",
+  ]
+  foreach(suffix, per_test_suffices) {
+    foreach(test, per_test_shlibs) {
+      deps += [ "$test.$suffix" ]
+    }
+    foreach(test, per_test_modules + per_test_executables) {
+      # Note this isn't the .test-data subtarget, it's just the main target.
+      # The .test-data subtarget places the module and its runtime deps into a
+      # sandbox directory in the package.  But the //sdk/lib/c/dlfcn/dl/test
+      # tests will use dlopen to get them directly from the normal place in the
+      # package /lib.
+      #
+      # See dl-test-data below for the host test data case.
+      deps += [ "$test.$suffix.module" ]
+    }
+  }
+}
+
+# These are the shared_library() targets to be included as startup modules for
+# //sdk/lib/c/dlfcn/dl/test:dl-unittests.
+group("dl-unittest.deps") {
+  visibility = [ "//sdk/lib/c/*" ]
+  testonly = true
+  deps = [
+    ":has-foo-v1.StartupModulesDep",
+    ":has-foo-v1.StartupModulesPriorityOverGlobal",
+    ":init-fini-var",
+    ":ld-dep-foo-v1.StartupModulesBasic",
+    ":ld-dep-foo-v2.StartupModulesBasic",
+    ":multiple-transitive-foo-deps.StartupModulesDepOrder",
+    ":static-tls-var",
+  ]
+}
+
+# Produce host_test_data() from a distribution_manifest() target.
+#
+# See distribution_manifest_copy().  Parameters are the same except that
+# $testonly is always implied.  This also provides metadata like a
+# host_test_data() target for the output directory, which should be a
+# subdirectory of $host_out_dir.
+#
+template("distribution_manifest_host_test_data") {
+  distribution_manifest_copy(target_name) {
+    testonly = true
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "metadata",
+                             "testonly",
+                           ])
+    metadata = {
+      test_runtime_deps = []
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*", [ "outputs" ])
+      }
+      test_runtime_deps += outputs
+    }
+  }
+}
+
+# The test("dl-unittests") target has deps on this to get its test data.
+# It must also use the config("dl-test-data.config") below.
+group("dl-test-data") {
+  visibility = [ "//sdk/lib/c/*" ]
+  testonly = true
+  if (is_fuchsia) {
+    # The modules and their deps just go in their usual /lib places.
+    data_deps = [ ":dl-test-data.deps" ]
+  } else {
+    # The modules and deps will be rolled up into a single $host_test_data_dir
+    # with host_test_data() metadata via data_deps.
+    data_deps = [ ":dl-test-data.host-test-data" ]
+  }
+}
+
+target_path = rebase_path(target_gen_dir, root_gen_dir)
+host_test_data_dir = "$host_out_dir/test_data/elfldltl/$target_path"
+dl_test_data_dir = "$host_test_data_dir/dl-tests"
+
+# This doesn't apply a prefix, it just collects the manifest from each
+# _test_link() as is: plain file names with no directory prefix at all.
+distribution_manifest_prefix("dl-test-data.manifest") {
+  visibility = [ ":*" ]
+  testonly = true
+  deps = [ ":dl-test-data.deps" ]
+}
+
+# Those files are all linked into $dl_test_data_dir for runtime use.
+distribution_manifest_host_test_data("dl-test-data.host-test-data") {
+  visibility = [ ":*" ]
+  deps = [ ":dl-test-data.manifest" ]
+  outputs = [ dl_test_data_dir ]
+}
+
+# The executable with this in configs (via public_configs) will be linked such
+# that its dlopen will find unadorned names in $host_test_data_dir at runtime.
+config("dl-test-data.config") {
+  visibility = [ "//sdk/lib/c/*" ]
+  ldflags = [ "-Wl,--enable-new-dtags,-rpath,\$ORIGIN/" +
+              rebase_path(dl_test_data_dir, host_out_dir) ]
+}
+
+# The DT_RUNPATH in the executable only makes its dlopen calls find their
+# root modules.  It won't be used for their DT_NEEDED names.  But if each
+# module has its own DT_RUNPATH, that will be used for its DT_NEEDED and
+# $ORIGIN there means the location of that module, not the executable.
+config("runpath-origin") {
+  visibility = [ ":*" ]
+  ldflags = [ "-Wl,--enable-new-dtags,-rpath,\$ORIGIN" ]
+}
+
+# Collect the main module and its deps / data_deps into a manifest prefixed
+# by the main module name.
+#
+# For Fuchsia, this is `lib/test/$name/...` and goes into the package under
+# that path.  Within that subdirectory are `bin/$name` or `lib/$name.so` and
+# various `lib/...` dependencies.
+#
+# For host test data, this populates a `test_data/elfldltl/.../$name` build
+# subdirectory with hard links.  That subdirectory is flat containing just
+# executable and shared object files with no subdirectories underneath it.
+# The `...` is the source directory path like `sdk/lib/ld/test/modules`.
+template("_test_data") {
+  main_target = target_name
+
+  if (is_fuchsia) {
+    manifest_target = "$main_target.test-data"
+  } else {
+    manifest_target = "$main_target.manifest"
+  }
+
+  distribution_manifest_prefix(manifest_target) {
+    testonly = true
+
+    # This will collect the files from deps that would go into /pkg/... and
+    # rewrite their manifest entries to use /pkg/lib/test/$name/... instead.
+    #
+    # For the host test data, the .test-data action below instead populates
+    # a $host_out_dir/test_data/... subdirectory.
+    if (is_fuchsia) {
+      prefix = "lib/test/$main_target"
+    }
+
+    deps = invoker.deps
+  }
+  if (!is_fuchsia) {
+    distribution_manifest_host_test_data("$main_target.test-data") {
+      testonly = true
+      deps = [ ":$manifest_target" ]
+      outputs = [ "$host_test_data_dir/$main_target" ]
+    }
+
+    # This is used for symbol-filter-elf32.  It provides metadata for putting
+    # these non-Fuchsia binaries in the usual place in a Fuchsia test package.
+    # Each binary target has metadata for its flat name with no subdirectory.
+    # This places them all inside the lib/ subdirectory for this root module;
+    # LdLoadZirconLdsvcTestsBase::GetLibVmo will find them there.
+    distribution_manifest_prefix("$main_target.fuchsia-test-data") {
+      testonly = true
+      prefix = "lib/test/$main_target/lib"
+      deps = invoker.deps
+    }
+  }
+}
+
+# For a terminal target (executable or loadable_module), define also
+# `.load-set` and `.test-data` subtargets for using the objects in this link
+# deps graph.  Test code will depend on `.test-data` to make the code
+# accessible for loading via the test harness, `.load-set` if it uses
+# `ld::testing::TestElfLoadSet::Get("$target_name")`.
+template("_test_link") {
+  main_target = target_name
+  link_target = "$main_target.${invoker.target_type}"
+
+  # This reaches the actual target, but also collects metadata to roll up into
+  # test_elf_load_set() targets.  The test_elf_object() target itself is enough
+  # to reach the real target as deps (for linking and packaging).  But if the
+  # real target has any public{,_deps,_configs} those need to be propagated as
+  # public_deps, so the group keeps the real target's public persona but also
+  # reaches the test_elf_object() without creating a circularity.
+  group(main_target) {
+    testonly = true
+    public_deps = [ ":$link_target" ]
+    deps = [ ":$main_target.test-elf-object" ]
+    forward_variables_from(invoker, [ "data_deps" ])
+    if (defined(invoker.verify_abi)) {
+      if (!defined(data_deps)) {
+        data_deps = []
+      }
+      data_deps += [ ":$main_target.verify-abi" ]
+    }
+  }
+
+  target(invoker.target_type, link_target) {
+    visibility = [ ":*" ]
+    testonly = true
+
+    output_name = main_target
+    deps = []
+    public_deps = []
+    ldflags = []
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "configs",
+                             "data_deps",
+                             "install_dir",
+                             "output_file",
+                             "output_name",
+                             "remove_configs",
+                             "target_type",
+                             "verify_abi",
+                           ])
+
+    if (toolchain_environment != "user") {
+      public_deps += [ "//sdk/lib/ld:standalone" ]
+    }
+
+    deps += [ ":test-module.deps" ]
+
+    if (is_linux) {
+      configs += [ "//build/config/linux:implicit-host-libs" ]
+      configs -= [ "//build/config/linux:implicit-host-libs" ]
+    }
+    configs += [ ":nostdlibs" ]
+
+    if (invoker.target_type == "executable") {
+      # This is implicitly added first so invoker.configs override it and/or
+      # invoker.remove_configs can remove it.
+      configs += [ "//sdk/lib/ld:abi-interp" ]
+
+      # This is needed in the non-Zircon (host/Linux) toolchains to avoid
+      # having any implicit deps injected.
+      disable_syslog_backend = true
+    }
+
+    if (defined(invoker.configs)) {
+      # De-duplicate with defaults, and rotate duplicates to last (overriding).
+      configs += invoker.configs
+      configs -= invoker.configs
+      configs += invoker.configs
+    }
+
+    if (!is_fuchsia) {
+      # Make sure a system dlopen loading the shared library as a dependency of
+      # another module will look for its own dependencies adjacent to it.
+      configs += [ ":runpath-origin" ]
+    }
+
+    if (defined(invoker.remove_configs)) {
+      configs += invoker.remove_configs
+      configs -= invoker.remove_configs
+    }
+
+    metadata = {
+      distribution_entries = [
+        {
+          source = rebase_path("$root_out_dir/${invoker.output_file}",
+                               root_build_dir)
+          if (is_fuchsia) {
+            # This is the normal install location.  It will get further
+            # prefixed in the .test-data target.
+            destination = "${invoker.install_dir}/${invoker.output_file}"
+          } else {
+            not_needed(invoker, [ "install_dir" ])
+            destination = invoker.output_file
+          }
+          label = get_label_info(":$main_target", "label_with_toolchain")
+        },
+      ]
+    }
+  }
+
+  test_elf_object("$main_target.test-elf-object") {
+    visibility = [ ":*" ]
+    testonly = true
+    deps = [ ":$link_target" ]
+  }
+
+  if (defined(invoker.verify_abi)) {
+    abi_outputs = get_target_outputs("${invoker.verify_abi}.ifs")
+    ifs_file = "$target_gen_dir/$main_target.ifs"
+    extract_target = "$main_target.ifs"
+    ifs_extract(extract_target) {
+      visibility = [ ":*" ]
+      testonly = true
+      deps = [ ":$link_target" ]
+      outputs = [ ifs_file ]
+    }
+    verify_public_symbols("$main_target.verify-abi") {
+      visibility = [ ":*" ]
+      testonly = true
+      deps = [ ":$extract_target" ]
+      current = ifs_file
+      reference = abi_outputs[0]
+      library_name = get_label_info(":$main_target", "label_with_toolchain")
+    }
+  }
+
+  if (invoker.target_type != "shared_library") {
+    test_elf_load_set("$main_target.load-set") {
+      output_name = main_target
+      deps = [ ":$main_target.test-elf-object" ]
+    }
+
+    _test_data(main_target) {
+      deps = [ ":$link_target" ]
+      if (defined(invoker.data_deps)) {
+        deps += invoker.data_deps
+      }
+    }
+  }
+}
+
+template("test_shared_library") {
+  _test_link(target_name) {
+    target_type = "shared_library"
+    if (is_fuchsia) {
+      install_dir =
+          get_path_info("lib/${toolchain_variant.libprefix}libfoo.so", "dir")
+    } else {
+      install_dir = "lib"
+    }
+    output_file = "lib$target_name.so"
+    forward_variables_from(invoker, "*", [ "target_type" ])
+  }
+}
+
+template("test_ifs_shared_library") {
+  generated_ifs_file("${target_name}.ifs") {
+    visibility = [ ":*" ]
+    testonly = true
+
+    forward_variables_from(invoker,
+                           [
+                             "soname",
+                             "symbols",
+                             "needed_libs",
+                           ])
+  }
+  ifs_shared_library(target_name) {
+    visibility = [ ":*" ]
+    testonly = true
+    deps = []
+
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "abi",
+                             "soname",
+                             "symbols",
+                             "needed_libs",
+                           ])
+
+    gen_outputs = get_target_outputs(":${target_name}.ifs")
+    abi = gen_outputs[0]
+
+    deps += [ ":${target_name}.ifs" ]
+  }
+}
+
+template("test_loadable_module") {
+  _test_link(target_name) {
+    target_type = "loadable_module"
+    install_dir = "lib"
+    output_file = "$target_name.so"
+    exclude_toolchain_tags = []
+    forward_variables_from(invoker, "*", [ "target_type" ])
+    exclude_toolchain_tags += [ "instrumentation-runtime" ]
+  }
+}
+
+template("test_executable") {
+  suffices = [
+    "",
+    ".module",
+  ]
+  if (defined(invoker.can_be_in_process) && invoker.can_be_in_process) {
+    suffices += [ ".in-process" ]
+  }
+  foreach(suffix, suffices) {
+    _test_link(target_name + suffix) {
+      if (suffix == ".module") {
+        target_type = "loadable_module"
+        install_dir = "lib"
+        output_file = "$target_name.so"
+      } else {
+        target_type = "executable"
+        install_dir = "bin"
+        output_file = target_name
+      }
+      deps = []
+      exclude_toolchain_tags = []
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "install_dir",
+                               "output_file",
+                               "target_type",
+                             ])
+      deps += [ ":test-executable$suffix" ]
+      exclude_toolchain_tags += [ "instrumentation-runtime" ]
+    }
+  }
+}
+
+# The test executables declare an `extern "C" ... TestStart(...)` entry point.
+#
+# When built for in-process tests, the ELF entry point will be called directly
+# by the test code.  For Fuchsia, link the test executables with -e TestStart.
+# For POSIX, link with an assembly implementation of _start that tail-calls
+# TestStart.
+#
+# When built for separate-process tests, the ELF entry point cannot return.
+# Instead, it's defined to call TestStart and exit with its value.
+foreach(in_process,
+        [
+          "",
+          ".in-process",
+          ".module",
+        ]) {
+  static_library("test-executable$in_process") {
+    visibility = [ ":*" ]
+    testonly = true
+
+    if (in_process != "") {
+      defines = [ "IN_PROCESS_TEST" ]
+    }
+
+    public = [
+      "ensure-test-thread-pointer.h",
+      "test-start.h",
+    ]
+    public_deps = [ "//sdk/lib/ld:standalone" ]
+    public_configs = [
+      ":semantic-interposition",
+      "//build/config:frame_pointers",
+    ]
+    sources = [ "ensure-test-thread-pointer.cc" ]
+    deps = [
+      ":test-module.deps",
+      "//zircon/system/public",
+    ]
+
+    if (in_process != ".module") {
+      deps += [ "//sdk/lib/ld:ld-startup.user" ]
+      if (is_fuchsia) {
+        if (in_process == "") {
+          sources += [ "zircon-test-start.cc" ]
+          deps += [ "//src/zircon/lib/zircon" ]
+        } else {
+          public_configs += [ ":test-executable.in-process.config" ]
+        }
+      } else {
+        sources += [ "posix-test-start.S" ]
+        deps += [ "//zircon/kernel/lib/arch" ]
+      }
+    }
+  }
+}
+
+# These are things that every test module of all target types implicitly
+# depends on.
+group("test-module.deps") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  deps = [ ":test-ubsan" ]
+
+  # When llvm-profdata instrumentation is in use, it may generate calls to
+  # functions that are supplied by the runtime.  Even though the modules aren't
+  # actually using the runtime to extract their data (yet, anyway), they link
+  # in the runtime to make sure any such references are satisfied at link time.
+  if (toolchain_variant.tags + [ "llvm-profdata" ] - [ "llvm-profdata" ] !=
+      toolchain_variant.tags) {
+    deps += [ "//src/lib/llvm-profdata" ]
+  }
+}
+
+source_set("test-ubsan") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  if (is_ubsan && toolchain_environment != "user") {
+    sources = [
+      "test-ubsan.cc",
+      "test-ubsan.h",
+    ]
+    deps = [
+      "//sdk/lib/c/stdio/printf_core:wrapper",
+      "//src/lib/ubsan-custom:handlers",
+    ]
+    if (is_fuchsia) {
+      sources += [ "test-ubsan-zircon.cc" ]
+    } else {
+      sources += [ "test-ubsan-posix.cc" ]
+    }
+  }
+}
+
+# clang++ will add -lc++ and -lm, which we don't want for these tests. Note
+# there are differences between the Fuchsia and GNU toolchains in clang. The
+# GNU toolchain will unconditionally add -lm regardless of -nostdlib++ though
+# the Fuchsia driver doesn't. -nodefaultlibs will stop the driver from adding
+# -lm, but we get unused -nolibc warning because the arg is never read when
+# -nodefaultlibs is specified, so just ignore the warning.
+config("nostdlibs") {
+  if (is_fuchsia) {
+    ldflags = [ "-nostdlib++" ]
+  } else {
+    ldflags = [
+      "-nodefaultlibs",
+      "-Wno-unused-command-line-argument",
+    ]
+  }
+}
+
+config("semantic-interposition") {
+  visibility = [ ":*" ]
+
+  # TODO(https://fxbug.dev/42069056): clang will still perform interprocedural
+  # optimization in a PIC, this flag disallows that and requires the PLT call
+  # always be made so we can properly test applying plt relocations.
+  if (!is_gcc) {
+    cflags = [ "-fsemantic-interposition" ]
+  }
+}
+
+template("test_dep") {
+  test_shared_library("ld-dep-$target_name") {
+    deps = []
+    dep_symbols = []
+    forward_variables_from(invoker, "*")
+
+    decls = ""
+    syms = ""
+    foreach(dep, dep_symbols) {
+      decls += "extern \"C\" int64_t $dep();"
+      syms += "$dep, "
+    }
+
+    defines = [
+      # This is the int64_t value of the symbol defined in this file.
+      "VALUE=$value",
+
+      # This is the symbol name of the symbol defined in this file.
+      "SYM=$symbol_name",
+
+      # These are the declarations of symbols from dependencies.
+      "DECLS=$decls",
+
+      # This is the list of symbol names used from dependencies.
+      "DEP_SYMS=$syms",
+    ]
+
+    sources = [ "dep-template.cc" ]
+    deps += [ "//zircon/system/public" ]
+  }
+}
+
+config("test-executable.in-process.config") {
+  visibility = [ ":*" ]
+  defines = [ "IN_PROCESS_TEST" ]
+  ldflags = [ "-Wl,-e,TestStart" ]
+}
+
+test_executable("partial-page-bss") {
+  can_be_in_process = true
+  sources = [ "partial-page-bss.cc" ]
+
+  # Instrumentation that emits extra data/bss contents interferes.
+  exclude_toolchain_tags = [ "needs-writable-globals" ]
+}
+
+# With --strip-sections, the file will usually end at the end of the last
+# segment's p_offset + p_filesz anyway, so there won't be any data in the
+# partial page needing zeroing and it will actually just be zero already in the
+# mapped file.  So gin up a version of the partial-page-bss executable that has
+# some nonzero garbage appended to the file so that the partial page will
+# certainly be nonzero and the logic for zeroing it will really get tested.
+foreach(suffix,
+        [
+          "",
+          ".in-process",
+          ".module",
+        ]) {
+  if (current_toolchain != shlib_toolchain || suffix == ".module") {
+    action("gen-partial-page-bss-garbage-at-eof$suffix") {
+      visibility = [ ":*" ]
+      testonly = true
+      script = "garbage-at-eof.sh"
+      if (suffix == ".module") {
+        deps = [ ":partial-page-bss$suffix.loadable_module" ]
+        suffix += ".so"
+      } else {
+        deps = [ ":partial-page-bss$suffix.executable" ]
+      }
+      sources = [ "$root_out_dir/partial-page-bss$suffix" ]
+      outputs = [ "$root_out_dir/partial-page-bss-garbage-at-eof$suffix" ]
+      args = rebase_path(sources + outputs, root_build_dir)
+    }
+    resource("partial-page-bss-garbage-at-eof$suffix") {
+      testonly = true
+      deps = [ ":gen-partial-page-bss-garbage-at-eof$suffix" ]
+      sources = get_target_outputs(deps[0])
+      allow_binary_output_dir = true
+      if (is_fuchsia) {
+        outputs = [ "bin/{{source_file_part}}" ]
+      } else {
+        outputs = [ "{{source_file_part}}" ]
+      }
+
+      # Bring along the original just as a way of getting its deps.
+      data_deps = [ ":partial-page-bss$suffix" ]
+    }
+    _test_data("partial-page-bss-garbage-at-eof$suffix") {
+      deps = [ ":partial-page-bss-garbage-at-eof$suffix" ]
+    }
+  }
+}
+
+config("temporarily-build-as-shared") {
+  visibility = [ ":*" ]
+
+  cflags = [
+    "-fPIC",
+    "-Wno-unused-command-line-argument",
+    "-Wno-option-ignored",
+  ]
+  ldflags = cflags
+  ldflags += [ "-shared" ]
+}
+
+test_executable("ld-dep") {
+  can_be_in_process = true
+  sources = [ "ld-dep.cc" ]
+  deps = [ "../.." ]
+}
+
+test_executable("passive-abi-basic") {
+  can_be_in_process = true
+  sources = [ "passive-abi-basic.cc" ]
+  deps = [ "../.." ]
+}
+
+test_executable("passive-abi-rdebug") {
+  can_be_in_process = true
+  sources = [ "passive-abi-rdebug.cc" ]
+  deps = [ "../.." ]
+}
+
+test_executable("passive-abi-preinit-array") {
+  can_be_in_process = true
+  sources = [ "passive-abi-preinit-array.cc" ]
+  deps = [ "../.." ]
+}
+
+test_executable("passive-abi-stack-size") {
+  can_be_in_process = true
+  sources = [ "passive-abi-stack-size.cc" ]
+  deps = [ "../.." ]
+
+  stack_size = 123456
+  defines = [ "TEST_STACK_SIZE=$stack_size" ]
+  ldflags = [ "-Wl,-z,stack-size=$stack_size" ]
+}
+
+test_executable("symbolic-namespace") {
+  can_be_in_process = true
+  sources = [ "symbolic-namespace.cc" ]
+  deps = [
+    ":ld-dep-a",
+    "../..",
+  ]
+}
+
+# The version of many-deps depends on _ld_abi.
+test_executable("passive-abi-many-deps") {
+  can_be_in_process = true
+  sources = [ "passive-abi-many-deps.cc" ]
+
+  deps = [
+    ":ld-dep-a",
+    ":ld-dep-b",
+    ":ld-dep-f",
+    "../..",
+  ]
+}
+
+test_executable("init-fini") {
+  can_be_in_process = true
+  sources = [ "init-fini.cc" ]
+  deps = [ "../.." ]
+}
+
+test_executable("tls-exec-only") {
+  can_be_in_process = true
+  sources = [ "tls-exec-only.cc" ]
+  deps = [
+    "../..",
+    "//src/lib/elfldltl",
+  ]
+
+  # workaround for b/349448459 to remote-link successfully
+  configs = [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+}
+
+test_executable("tls-shlib-only") {
+  can_be_in_process = true
+  sources = [ "tls-shlib-only.cc" ]
+  deps = [
+    ":tls-dep",
+    "../..",
+  ]
+}
+
+# TODO(https://fxbug.dev/396520084): Put tls-dep sources into a souce_set that
+# can be shared by targets.
+test_shared_library("tls-dep") {
+  public = [ "tls-dep.h" ]
+  sources = [ "tls-dep.cc" ]
+  configs = [ "//build/config:no-tlsdesc" ]
+  deps = [
+    "//sdk/lib/ld:static-tls-get-addr",
+    "//zircon/system/public",
+  ]
+
+  # TODO(https://fxbug.dev/442036680): LTO insists on using IE accesses here. Remove this
+  # when the LLVM bug gets fixed and the fixed toolchain rolled into Fuchsia.
+  remove_configs = [ "//build/config/lto" ]
+  configs += [ "//build/config/lto:no-lto" ]
+}
+
+# This is the same as tls-dep, but without the dep on static-tls-get-addr, so
+# that it's possible to test various libc implementations of TLS and avoid the
+# transitive dep on ld.so.1.
+test_loadable_module("tls-dep-module") {
+  public = [ "tls-dep.h" ]
+  sources = [ "tls-dep.cc" ]
+  configs = [ "//build/config:no-tlsdesc" ]
+  deps = [ "//zircon/system/public" ]
+
+  # We need to allow undefined symbols, since __tls_get_addr will not be defined
+  # by this module or any link-time dependency, but will be supplied by libc.
+  remove_configs = [ "//build/config:symbol_no_undefined" ]
+}
+
+# This is the same as tls-dep but using TLSDESC, with no __tls_get_addr.
+test_shared_library("tls-desc-dep") {
+  visibility = [
+    ":*",
+    "//sdk/lib/c/*",
+  ]
+
+  public = [ "tls-dep.h" ]
+  sources = [ "tls-dep.cc" ]
+  configs = [ "//build/config:tlsdesc" ]
+  deps = [ "//zircon/system/public" ]
+}
+
+# This is the same as tls-dep-module but using TLSDESC, with no __tls_get_addr.
+test_loadable_module("tls-desc-dep-module") {
+  public = [ "tls-dep.h" ]
+  sources = [ "tls-dep.cc" ]
+  configs = [ "//build/config:tlsdesc" ]
+  deps = [ "//zircon/system/public" ]
+}
+
+test_loadable_module("tls-initial-dep-module") {
+  public = [ "tls-initial-dep.h" ]
+  sources = [ "tls-initial-dep.cc" ]
+  configs = [ "//build/config:no-tlsdesc" ]
+  deps = [ "//zircon/system/public" ]
+
+  # We need to allow undefined symbols, since __tls_get_addr will not be defined
+  # by this module or any link-time dependency, but will be supplied by libc.
+  remove_configs = [ "//build/config:symbol_no_undefined" ]
+}
+
+# This is the same as tls-initial-dep-module but using TLSDESC, with no
+# __tls_get_addr.
+test_loadable_module("tls-desc-initial-dep-module") {
+  public = [ "tls-initial-dep.h" ]
+  sources = [ "tls-initial-dep.cc" ]
+  configs = [ "//build/config:tlsdesc" ]
+  deps = [ "//zircon/system/public" ]
+}
+
+test_loadable_module("tls-ld-dep-module") {
+  sources = [
+    "tls-ld-dep-symbol.cc",
+    "tls-ld-dep.cc",
+    "tls-ld-dep.h",
+  ]
+  deps = [ "//zircon/system/public" ]
+
+  configs = [ "//build/config:no-tlsdesc" ]
+
+  # We need to allow undefined symbols, since __tls_get_addr will not be defined
+  # by this module or any link-time dependency, but will be supplied by libc.
+  remove_configs = [ "//build/config:symbol_no_undefined" ]
+}
+
+# This is the same as tls-dep-ld-module but using TLSDESC, with no
+# __tls_get_addr.
+test_loadable_module("tls-desc-ld-dep-module") {
+  public = [ "tls-ld-dep.h" ]
+  sources = [
+    "tls-ld-dep-symbol.cc",
+    "tls-ld-dep.cc",
+  ]
+  configs = [ "//build/config:tlsdesc" ]
+  deps = [ "//zircon/system/public" ]
+}
+
+test_executable("tls-exec-shlib") {
+  can_be_in_process = true
+  sources = [ "tls-exec-shlib.cc" ]
+  deps = [
+    ":tls-dep",
+    "../..",
+  ]
+}
+
+test_executable("tls-ie") {
+  can_be_in_process = true
+  sources = [ "tls-ie.cc" ]
+  deps = [
+    ":tls-ie-dep",
+    "../..",
+  ]
+}
+
+test_ifs_shared_library("tls-ie-dep-weak") {
+  soname = "libtls-ie.so"
+  symbols = [
+    {
+      name = "tls_ie_data"
+      type = "Func"
+    },
+    {
+      name = "tls_ie_bss"
+      type = "Func"
+    },
+    {
+      # This is not actually defined in the runtime DSO.
+      name = "tls_ie_weak"
+      type = "TLS"
+      size = 4
+    },
+  ]
+
+  public = [ "tls-ie-dep.h" ]
+
+  data_deps = [ ":tls-ie-dep" ]
+}
+
+# The actual tls-ie is an empty library that doesn't define all the symbols
+# seen at link time in the IFS-generated link stub.
+test_shared_library("tls-ie-dep") {
+  public = [ "tls-ie-dep.h" ]
+  sources = [ "tls-ie-dep.cc" ]
+  deps = [ "//zircon/system/public" ]
+}
+
+test_executable("tls-gd") {
+  can_be_in_process = true
+  sources = [ "tls-gd.cc" ]
+  configs = [ "//build/config:no-tlsdesc" ]
+  deps = [
+    ":tls-dep",
+    "../..",
+  ]
+}
+
+# This is the same as tls-gd, but using TLSDESC.
+test_executable("tls-desc") {
+  can_be_in_process = true
+  sources = [ "tls-gd.cc" ]
+  configs = [ "//build/config:tlsdesc" ]
+  deps = [
+    ":tls-desc-dep",
+    "../..",
+  ]
+}
+
+test_executable("tls-ld") {
+  can_be_in_process = true
+  sources = [ "tls-ld.cc" ]
+  configs = [ "//build/config:no-tlsdesc" ]
+  deps = [
+    ":tls-ld-dep",
+    "../..",
+  ]
+}
+
+test_shared_library("tls-ld-dep") {
+  public = [ "tls-ld-dep.h" ]
+  sources = [
+    "tls-ld-dep-symbol.cc",
+    "tls-ld-dep.cc",
+  ]
+  configs = [ "//build/config:no-tlsdesc" ]
+  deps = [
+    "//sdk/lib/ld:static-tls-get-addr",
+    "//zircon/system/public",
+  ]
+
+  # Don't build this module with LTO, so that the TLS access stays unoptimized.
+  remove_configs = [ "//build/config/lto" ]
+  configs += [ "//build/config/lto:no-lto" ]
+}
+
+test_executable("fixed-load-address") {
+  sources = [ "fixed-load-address.cc" ]
+  deps = [ "//src/lib/elfldltl" ]
+
+  # workaround for b/349448459 to remote-link successfully
+  configs = [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+}
+
+test_executable("second-session") {
+  # second-session.cc does not use suffixed-symbols from indirect-deps.h.
+  defines = [ "TEST_SYMBOL_SUFFIX=" ]
+  sources = [ "second-session.cc" ]
+
+  # Though this is an executable, it has a DT_SONAME and the linker is told to
+  # export all its STV_DEFAULT symbols as a shared_library() would by default.
+  ldflags = [
+    "-Wl,-soname,libsecond-session-test.so.1",
+    "-rdynamic",
+  ]
+
+  deps = [
+    ":indirect-deps-a",
+    "//src/zircon/lib/zircon",
+    "//zircon/system/public",
+    "//zircon/system/ulib/zx",
+
+    # This isn't really necessary as a link-time dependency, though it doesn't
+    # hurt (a DT_NEEDED for its own DT_SONAME won't try to add any new module
+    # at runtime).  `gn check` requires it because second-session.lib owns the
+    # header file.
+    ":second-session.lib",
+  ]
+}
+
+# This is the link-time dependency necessary for the second-session test's
+# secondary dynamic linking domain.
+test_ifs_shared_library("second-session.lib") {
+  soname = "libsecond-session-test.so.1"
+  symbols = [
+    {
+      name = "defined_in_main_executable"
+      type = "Func"
+    },
+  ]
+  public = [ "second-session.h" ]
+}
+
+test_loadable_module("second-session-module") {
+  # second-session-module.cc does not use suffixed-symbols from indirect-deps.h.
+  defines = [ "TEST_SYMBOL_SUFFIX=" ]
+  sources = [ "second-session-module.cc" ]
+  deps = [
+    ":second-session-module-deps-a",
+    ":second-session.lib",
+    ":test-executable.module",
+  ]
+}
+
+test_shared_library("second-session-module-deps-a") {
+  # second-session-module-deps-a.cc does not use suffixed-symbols from
+  # indirect-deps.h.
+  defines = [ "TEST_SYMBOL_SUFFIX=" ]
+  sources = [ "second-session-module-deps-a.cc" ]
+  deps = [ "//zircon/system/public" ]
+}
+
+test_executable("zygote") {
+  can_be_in_process = true
+  ldflags = [
+    "-Wl,-soname,libzygote-test.so.1",
+    "-rdynamic",
+  ]
+  sources = [ "zygote.cc" ]
+  deps = [
+    ":zygote-dep",
+
+    # This creates a DT_NEEDED on the executable's own SONAME, which should
+    # have no effect.  It also grants `gn check` access to the zygote.h header.
+    ":zygote.lib",
+    "//zircon/system/public",
+  ]
+}
+
+test_ifs_shared_library("zygote.lib") {
+  soname = "libzygote-test.so.1"
+  symbols = [
+    {
+      name = "called_by_zygote_dep"
+      type = "Func"
+    },
+    {
+      name = "initialized_data"
+      type = "Object"
+      size = 8
+    },
+    {
+      name = "zygote_test_main"
+      type = "Func"
+    },
+  ]
+
+  public = [ "zygote.h" ]
+}
+
+test_shared_library("zygote-dep") {
+  sources = [ "zygote-dep.cc" ]
+  deps = [
+    ":zygote.lib",
+    "//zircon/system/public",
+  ]
+}
+
+test_executable("zygote-secondary") {
+  can_be_in_process = true
+  sources = [ "zygote-secondary.cc" ]
+  deps = [
+    ":zygote-dep",
+    ":zygote.lib",
+    "//zircon/system/public",
+  ]
+}
+
+# This loop generates a copy of each target with each suffix in
+# `per_test_suffices` appended to the target name.
+foreach(test, [ "" ] + per_test_suffices) {
+  # Add appropriate delimiters to suffices used for filenames and symbols
+  suffix = ""
+  sym_suffix = ""
+  if (test != "") {
+    suffix = ".$test"
+    sym_suffix = "_$test"
+  }
+
+  test_executable("ret17$suffix") {
+    can_be_in_process = true
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "ret17.cc" ]
+  }
+
+  test_executable("ret23$suffix") {
+    can_be_in_process = true
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "ret23.cc" ]
+  }
+
+  test_executable("relative-reloc$suffix") {
+    can_be_in_process = true
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "relative-reloc.cc" ]
+  }
+
+  test_executable("symbolic-reloc$suffix") {
+    can_be_in_process = true
+    sources = [ "symbolic-reloc.cc" ]
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    deps = [ "//zircon/system/public" ]
+
+    configs = [ ":temporarily-build-as-shared" ]
+    sources += [ "interp.S" ]
+    if (is_fuchsia) {
+      libprefix = toolchain_variant.libprefix
+    } else {
+      libprefix = ""
+    }
+    defines += [ "DYNAMIC_LINKER_PATH=\"${libprefix}ld.so.1\"" ]
+  }
+
+  test_executable("basic-dep$suffix") {
+    can_be_in_process = true
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "basic-dep.cc" ]
+    deps = [ ":ld-dep-a$suffix" ]
+  }
+
+  test_executable("indirect-deps$suffix") {
+    can_be_in_process = true
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "basic-dep.cc" ]
+    deps = [ ":indirect-deps-a$suffix" ]
+  }
+
+  test_shared_library("indirect-deps-a$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "indirect-deps-a.cc" ]
+    deps = [
+      ":indirect-deps-b$suffix",
+      ":indirect-deps-c$suffix",
+      "//zircon/system/public",
+    ]
+  }
+
+  test_shared_library("indirect-deps-b$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "indirect-deps-b.cc" ]
+    deps = [ "//zircon/system/public" ]
+  }
+
+  test_shared_library("indirect-deps-c$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "indirect-deps-c.cc" ]
+    deps = [ "//zircon/system/public" ]
+  }
+
+  # These show the dependency graph of the test and the expected return value of
+  # each dependency's only symbol.
+  #
+  # many-deps -> (13 + -8 + 3 + 9 = 17)
+  #   a -> 13
+  #   b -> -2 (-2 + 2 + 13 + -21 = -8)
+  #     c -> 2
+  #     a -> 13
+  #     d -> -5 (-5 + -16 = -21)
+  #       c -> 2
+  #       e -> -18
+  #   f -> 3
+  #   _ld_abi -> 9 (the number of total modules including vdso which may not be
+  #                 depended on: this is only applicable for many-deps-passive-abi)
+
+  test_dep("a$suffix") {
+    symbol_name = "a$sym_suffix"
+    value = 13
+  }
+
+  test_dep("b$suffix") {
+    symbol_name = "b$sym_suffix"
+    value = -2
+    dep_symbols = [
+      "a$sym_suffix",
+      "c$sym_suffix",
+      "d$sym_suffix",
+    ]
+    deps = [
+      ":ld-dep-a$suffix",
+      ":ld-dep-c$suffix",
+      ":ld-dep-d$suffix",
+    ]
+  }
+
+  test_dep("c$suffix") {
+    symbol_name = "c$sym_suffix"
+    value = 2
+  }
+
+  test_dep("d$suffix") {
+    symbol_name = "d$sym_suffix"
+    value = -5
+    dep_symbols = [
+      "c$sym_suffix",
+      "e$sym_suffix",
+    ]
+    deps = [
+      ":ld-dep-c$suffix",
+      ":ld-dep-e$suffix",
+    ]
+  }
+
+  test_dep("e$suffix") {
+    symbol_name = "e$sym_suffix"
+    value = -18
+  }
+
+  test_dep("f$suffix") {
+    symbol_name = "f$sym_suffix"
+    value = 3
+  }
+
+  # This version of many-deps uses a constant number (9) in its return value
+  # instead of _ld_abi to represent the total number of loaded modules.
+  test_executable("many-deps$suffix") {
+    can_be_in_process = true
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "many-deps.cc" ]
+
+    deps = [
+      ":ld-dep-a$suffix",
+      ":ld-dep-b$suffix",
+      ":ld-dep-f$suffix",
+    ]
+  }
+
+  test_executable("relro$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "relro.cc" ]
+    deps = [ "//zircon/system/public" ]
+  }
+
+  # This test shlib will generate build artifacts for :missing-sym-dep.ifs, but
+  # is not used directly in tests.
+  test_dep("missing-sym-dep$suffix") {
+    symbol_name = "this_symbol_is_not_used"
+    value = 0
+  }
+
+  test_dep("defines-missing-sym$suffix") {
+    symbol_name = "missing_sym$sym_suffix"
+    value = 2
+  }
+
+  # missing-sym: calls missing()
+  #   - libld-dep-missing-dep -> does not define missing_sym()
+  test_executable("missing-sym$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "missing-sym.cc" ]
+
+    deps = [ ":missing-sym-dep$suffix.ifs" ]
+    data_deps = [ ":ld-dep-defines-missing-sym$suffix" ]
+  }
+
+  # This is a stub for libld-dep-missing-sym-dep for :missing-sym
+  test_ifs_shared_library("missing-sym-dep$suffix.ifs") {
+    soname = "libld-dep-missing-sym-dep$suffix.so"
+    symbols = [
+      {
+        name = "missing_sym$sym_suffix"
+        type = "Func"
+      },
+    ]
+    data_deps = [ ":ld-dep-missing-sym-dep$suffix" ]
+  }
+
+  # Includes a symbol provided by a DT_NEEDED (missing-dep-dep) that cannot be
+  # found:
+  # missing-dep -> (x) missing-dep-dep
+  test_executable("missing-dep$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "missing-dep.cc" ]
+    deps = [ ":missing-dep-dep$suffix.ifs" ]
+  }
+
+  test_ifs_shared_library("missing-dep-dep$suffix.ifs") {
+    soname = "libmissing-dep-dep$suffix.so"
+    symbols = [
+      {
+        name = "missing_dep_sym$sym_suffix"
+        type = "Func"
+      },
+    ]
+  }
+
+  # Includes a symbol that is provided by a dependency of a DT_NEEDED, but that
+  # dependency cannot be found:
+  # missing-transitive-dep -> has-missing-dep -> (x) missing-dep-dep
+  test_executable("missing-transitive-dep$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "missing-transitive-dep.cc" ]
+    deps = [ ":has-missing-dep$suffix" ]
+  }
+
+  # This shared library exports a symbol with a definition that includes another
+  # symbol provided by a DT_NEEDED (missing-dep-dep) that cannot be found.
+  test_shared_library("has-missing-dep$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "has-missing-dep.cc" ]
+    deps = [
+      ":missing-dep-dep$suffix.ifs",
+      "//zircon/system/public",
+    ]
+  }
+
+  test_shared_library("ld-dep-foo-v1$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo-v1.cc" ]
+  }
+
+  test_shared_library("ld-dep-foo-v1-weak$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo-v1-weak.cc" ]
+  }
+
+  test_shared_library("ld-dep-foo-v2$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo-v2.cc" ]
+  }
+
+  test_shared_library("ld-dep-foo-v2-weak$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo-v2-weak.cc" ]
+  }
+
+  test_shared_library("has-foo-v1$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "call-foo-v1.cc" ]
+    deps = [ ":ld-dep-foo-v1$suffix" ]
+  }
+
+  test_shared_library("has-foo-v2$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "call-foo-v2.cc" ]
+    deps = [ ":ld-dep-foo-v2$suffix" ]
+  }
+
+  # bar-v1: bar_v1() calls foo()
+  #   - foo-v1 -> foo() returns 2
+  test_shared_library("bar-v1$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "bar-v1.cc" ]
+    deps = [ ":ld-dep-foo-v1$suffix" ]
+  }
+
+  # bar-v2: bar_v2() calls foo()
+  #   - foo-v1 -> foo() returns 7
+  test_shared_library("bar-v2$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "bar-v2.cc" ]
+    deps = [ ":ld-dep-foo-v2$suffix" ]
+  }
+
+  # multiple-foo-deps:
+  #  - foo-v1 -> foo() returns 2
+  #  - foo-v2 -> foo() returns 7
+  test_loadable_module("multiple-foo-deps$suffix.module") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo.cc" ]
+    deps = [
+      ":ld-dep-foo-v1$suffix",
+      ":ld-dep-foo-v2$suffix",
+    ]
+  }
+
+  # one-weak-symbol:
+  #  - foo-v1 -> [[gnu::weak]] foo() returns 2
+  #  - foo-v2 -> foo() returns 7
+  test_executable("one-weak-symbol$suffix") {
+    can_be_in_process = true
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo.cc" ]
+    deps = [
+      ":ld-dep-foo-v1-weak$suffix",
+      ":ld-dep-foo-v2$suffix",
+    ]
+  }
+
+  # all-weak-symbols:
+  #  - foo-v1 -> [[gnu::weak]] foo() returns 2
+  #  - foo-v2 -> [[gnu::weak]] foo() returns 7
+  test_executable("all-weak-symbols$suffix") {
+    can_be_in_process = true
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo.cc" ]
+    deps = [
+      ":ld-dep-foo-v1-weak$suffix",
+      ":ld-dep-foo-v2-weak$suffix",
+    ]
+  }
+
+  # transitive-foo-dep:
+  #   - has-foo-v1:
+  #     - foo-v1 -> foo() returns 2
+  #   - foo-v2 -> foo() returns 7
+  test_loadable_module("transitive-foo-dep$suffix.module") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo.cc" ]
+    deps = [
+      ":has-foo-v1$suffix",
+      ":ld-dep-foo-v2$suffix",
+    ]
+  }
+
+  # multiple-transitive-foo-deps:
+  #   - has-foo-v1:
+  #     - foo-v1 -> foo() returns 2
+  #   - has-foo-v2:
+  #    - foo-v2 -> foo() returns 7
+  test_shared_library("multiple-transitive-foo-deps$suffix") {
+    deps = [
+      ":has-foo-v1$suffix",
+      ":has-foo-v2$suffix",
+    ]
+  }
+
+  # root-precedence-in-dep-resolution: foo() returns 17
+  #   - bar-v1: bar_v1() calls foo()
+  #    - foo-v1 -> foo() returns 2
+  #   - bar-v2: bar_v2() calls foo()
+  #    - foo-v2 -> foo() returns 7
+  test_loadable_module("root-precedence-in-dep-resolution$suffix.module") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo-ret-17.cc" ]
+    deps = [
+      ":bar-v1$suffix",
+      ":bar-v2$suffix",
+    ]
+  }
+
+  # precedence-in-dep-resolution:
+  #   - bar-v1: bar_v1() calls foo()
+  #    - foo-v1 -> foo() returns 2
+  #   - bar-v2: bar_v2() calls foo()
+  #    - foo-v2 -> foo() returns 7
+  test_loadable_module("precedence-in-dep-resolution$suffix.module") {
+    # This module does not have a source because it's only used to test the
+    # resolution order for its dependencies.
+    deps = [
+      ":bar-v1$suffix",
+      ":bar-v2$suffix",
+    ]
+  }
+
+  # cyclic dependency with the root module:
+  # - cyclic-dep-parent: foo() returns 2.
+  #   - has-cyclic-dep:
+  #     - cyclic-dep-parent
+  #     - foo-v1: foo() returns 2.
+  test_loadable_module("cyclic-dep-parent$suffix.module") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo.cc" ]
+    deps = [ ":has-cyclic-dep.ifs$suffix" ]
+  }
+
+  # This shlib stub depends on the parent module (cyclic-dep-parent)
+  test_ifs_shared_library("has-cyclic-dep.ifs$suffix") {
+    soname = "libhas-cyclic-dep$suffix.so"
+    symbols = [
+      {
+        name = "foo$sym_suffix"
+        type = "Func"
+      },
+    ]
+    needed_libs = [
+      "cylic-dep-parent$suffix.module.so",
+      "libld-dep-foo-v1$suffix.so",
+    ]
+    data_deps = [ ":has-cyclic-dep$suffix" ]
+  }
+
+  # This test shlib will generate build artifacts for :has-cyclic-dep.ifs, but
+  # is not used directly in tests.
+  test_shared_library("has-cyclic-dep$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "foo.cc" ]
+    deps = [ ":ld-dep-foo-v1$suffix" ]
+  }
+
+  # soname-filename-match:
+  #   - libbar-soname
+  test_shared_library("soname-filename-match$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "ret17.cc" ]
+    deps = [ ":bar-soname$suffix" ]
+  }
+
+  test_shared_library("bar-soname$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "ret17.cc" ]
+  }
+
+  test_shared_library("foo-filename$suffix") {
+    defines = [ "TEST_SYMBOL_SUFFIX=$sym_suffix" ]
+    sources = [ "ret17.cc" ]
+    ldflags = [ "-Wl,-soname=libbar-soname$suffix.so" ]
+  }
+
+  # A stub for foo-filename, to guarantee that GN will insert libfoo-filename as
+  # a DT_NEEDED.
+  test_ifs_shared_library("foo-filename$suffix.ifs") {
+    soname = "libfoo-filename$suffix.so"
+    symbols = []
+
+    # Pull in the actual target so that it can be loaded by tests directly.
+    data_deps = [ ":foo-filename$suffix" ]
+  }
+
+  # soname-filename-dep:
+  #  - soname-filename-match
+  #    - libbar-soname
+  #  - libfoo-filename (with DT_SONAME libbar-soname)
+  test_loadable_module("soname-filename-dep$suffix.module") {
+    deps = [
+      # This inserts a DT_NEEDED entry for "foo-filename". When the test looks
+      # for this file, it will fetch the shlib belonging to :foo-filename.
+      ":soname-filename-match$suffix",
+    ]
+
+    # Prevent formatting from re-ordering deps, this dependency must come second
+    # in this list.
+    deps += [ ":foo-filename$suffix.ifs" ]
+  }
+
+  # soname-filename-loaded-dep:
+  #  - libfoo-filename (with DT_SONAME libbar-soname)
+  #  - soname-filename-match
+  #    - libbar-soname
+  test_loadable_module("soname-filename-loaded-dep$suffix.module") {
+    deps = [
+      # This inserts a DT_NEEDED entry for "foo-filename". When the test looks
+      # for this file, it will fetch the shlib belonging to :foo-filename.
+      ":foo-filename$suffix.ifs",
+
+      # This dependency must come second in this list.
+      ":soname-filename-match$suffix",
+    ]
+  }
+}
+
+# A collection of DT_INIT_ARRAY/DT_FINI_ARRAY tests. Each entry corresponds to
+# a generated file in the loop below.
+init_fini_array_tests = [
+  # A basic module with multiple ctor and dtor entries.
+  {
+    name = "init-fini-array"
+    type = "test_loadable_module"
+    ctors = [
+      {
+        prio = 101
+        value = 0
+      },
+      {
+        prio = 102
+        value = 1
+      },
+      {
+        prio = 103
+        value = 2
+      },
+    ]
+    dtors = [
+      {
+        prio = 103
+        value = 3
+      },
+      {
+        prio = 102
+        value = 4
+      },
+      {
+        prio = 101
+        value = 5
+      },
+    ]
+    shlib_deps = []
+  },
+
+  # An init-fini-array module with dependencies:
+  # - init-fini-array-root:
+  #   - init-fini-array-a:
+  #     - init-fini-array-a-dep
+  #   - init-fini-array-b:
+  #     - init-fini-array-b-dep
+  #   - init-fini-array-c
+  {
+    name = "init-fini-array-with-deps"
+    type = "test_loadable_module"
+    ctors = [
+      {
+        prio = false
+        value = 5
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 6
+      },
+    ]
+    shlib_deps = [
+      ":init-fini-array-a",
+      ":init-fini-array-b",
+      ":init-fini-array-c",
+    ]
+  },
+  {
+    name = "init-fini-array-a"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 4
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 7
+      },
+    ]
+    shlib_deps = [ ":init-fini-array-a-dep" ]
+  },
+  {
+    name = "init-fini-array-a-dep"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 1
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 10
+      },
+    ]
+    shlib_deps = []
+  },
+  {
+    name = "init-fini-array-b"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 3
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 8
+      },
+    ]
+    shlib_deps = [ ":init-fini-array-b-dep" ]
+  },
+  {
+    name = "init-fini-array-b-dep"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 0
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 11
+      },
+    ]
+    shlib_deps = []
+  },
+  {
+    name = "init-fini-array-c"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 2
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 9
+      },
+    ]
+    shlib_deps = []
+  },
+
+  # An init-fini-array module with an already-loaded dep. These modules will
+  # have different expected `value`s than the above test modules.
+  # - init-fini-array-with-loaded-deps (loaded third):
+  #   - init-fini-array-with-loaded-deps-a (loaded first):
+  #     - init-fini-array-with-loaded-deps-a-dep
+  #   - init-fini-array-with-loaded-deps-b:
+  #     - init-fini-array-with-loaded-deps-b-dep
+  #   - init-fini-array-with-loaded-deps-c (loaded second)
+  {
+    name = "init-fini-array-with-loaded-deps"
+    type = "test_loadable_module"
+    ctors = [
+      {
+        prio = false
+        value = 5
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 6
+      },
+    ]
+    shlib_deps = [
+      ":init-fini-array-with-loaded-deps-a",
+      ":init-fini-array-with-loaded-deps-b",
+      ":init-fini-array-with-loaded-deps-c",
+    ]
+  },
+
+  {
+    name = "init-fini-array-with-loaded-deps-a"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 1
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 7
+      },
+    ]
+    shlib_deps = [ ":init-fini-array-with-loaded-deps-a-dep" ]
+  },
+  {
+    name = "init-fini-array-with-loaded-deps-a-dep"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 0
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 8
+      },
+    ]
+    shlib_deps = []
+  },
+  {
+    name = "init-fini-array-with-loaded-deps-b"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 4
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 10
+      },
+    ]
+    shlib_deps = [ ":init-fini-array-with-loaded-deps-b-dep" ]
+  },
+  {
+    name = "init-fini-array-with-loaded-deps-b-dep"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 3
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 11
+      },
+    ]
+    shlib_deps = []
+  },
+  {
+    name = "init-fini-array-with-loaded-deps-c"
+    type = "test_shared_library"
+    ctors = [
+      {
+        prio = false
+        value = 2
+      },
+    ]
+    dtors = [
+      {
+        prio = false
+        value = 9
+      },
+    ]
+    shlib_deps = []
+  },
+]
+
+# This will generate files and targets for each entry in
+# `init_fini_array_tests`.
+foreach(case, init_fini_array_tests) {
+  generated_file("${case.name}.cc") {
+    outputs = [ "$target_gen_dir/$target_name" ]
+    label = get_label_info(":$target_name", "label_with_toolchain")
+    contents = [
+      "// Generated by $label. DO NOT EDIT!",
+      "#include \"init-fini-test.h\"",
+    ]
+    foreach(ctor, case.ctors) {
+      if (ctor.prio == false) {
+        prio_attr = ""
+        prio_suffix = ""
+      } else {
+        prio_attr = "(${ctor.prio})"
+        prio_suffix = "_${ctor.prio}"
+      }
+      contents += [ "[[gnu::constructor$prio_attr]] void ctor${prio_suffix}_${ctor.value}() { Callback(${ctor.value}); }" ]
+    }
+    foreach(dtor, case.dtors) {
+      if (dtor.prio == false) {
+        prio_attr = ""
+        prio_suffix = ""
+      } else {
+        prio_attr = "(${dtor.prio})"
+        prio_suffix = "_${dtor.prio}"
+      }
+      contents += [ "[[gnu::destructor$prio_attr]] void dtor${prio_suffix}_${dtor.value}() { Callback(${dtor.value}); }" ]
+    }
+  }
+  target(case.type, case.name) {
+    deps = [ ":$target_name.cc" ]
+    sources = get_target_outputs(deps[0])
+    include_dirs = [ "//sdk/lib/ld/test/modules" ]
+
+    deps += case.shlib_deps + [ ":init-fini-var" ]
+  }
+}
+
+# A basic module that will run DT_INIT/DT_FINI functions when it is dlopened.
+test_loadable_module("init-fini-legacy") {
+  sources = [ "init-fini-legacy.cc" ]
+  deps = [ ":init-fini-var" ]
+}
+
+# An module that contains both DT_INIT/DT_FINI and DT_INIT_ARRAY/DT_FINI_ARRAY
+test_loadable_module("init-fini-array-with-legacy") {
+  sources = [ "init-fini-array-with-legacy.cc" ]
+  deps = [ ":init-fini-var" ]
+}
+
+# This is a startup module that exports a global variable that gets modified by
+# other targets (e.g :init-fini-legacy, :init-fini-array). This does not need to
+# be suffixed, since its loaded only once at startup.
+test_shared_library("init-fini-var") {
+  sources = [ "init-fini-var.cc" ]
+}
+
+test_shared_library("static-tls-var") {
+  sources = [ "static-tls-var.cc" ]
+
+  # workaround for b/349448459 to remote-link successfully
+  configs = [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+}
+
+# This resolves a static TLS symbol with tls-desc.
+test_loadable_module("static-tls-desc-module") {
+  sources = [ "static-tls-desc-module.cc" ]
+  configs = [ "//build/config:tlsdesc" ]
+  deps = [ ":static-tls-var" ]
+}
+
+# This is the same as :static-tls-desc-module, except it uses __tls_get_addr.
+test_loadable_module("static-tls-module") {
+  sources = [ "static-tls-module.cc" ]
+  configs = [ "//build/config:no-tlsdesc" ]
+
+  deps = [
+    ":static-tls-var",
+    "//src/lib/elfldltl",
+  ]
+
+  # We need to allow undefined symbols, since __tls_get_addr will not be defined
+  # by this module or any link-time dependency, but will be supplied by libc.
+  remove_configs = [ "//build/config:symbol_no_undefined" ]
+
+  # workaround for b/349448459 to remote-link successfully
+  configs += [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+}
+
+source_set("mock-tls-get-addr") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [ "mock-tls-get-addr.cc" ]
+  deps = [
+    "//sdk/lib/ld:abi-headers",
+    "//src/lib/elfldltl",
+  ]
+}
+
+test_loadable_module("tls-get-addr-global-dynamic-reloc") {
+  public = [ "tls-dep.h" ]
+  sources = [ "tls-dep.cc" ]
+  deps = [
+    ":mock-tls-get-addr",
+    "//zircon/system/public",
+  ]
+
+  # TODO(https://fxbug.dev/442036680): LTO insists on using IE accesses here. Remove this
+  # when the LLVM bug gets fixed and the fixed toolchain rolled into Fuchsia.
+  remove_configs = [ "//build/config/lto" ]
+  configs = [ "//build/config/lto:no-lto" ]
+
+  configs += [ "//build/config:no-tlsdesc" ]
+
+  # workaround for b/349448459 to remote-link successfully
+  configs += [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+}
+
+test_loadable_module("tls-get-addr-local-dynamic-reloc") {
+  public = [ "tls-ld-dep.h" ]
+  sources = [
+    "tls-ld-dep-symbol.cc",
+    "tls-ld-dep.cc",
+  ]
+  deps = [
+    ":mock-tls-get-addr",
+    "//zircon/system/public",
+  ]
+
+  configs = [ "//build/config:no-tlsdesc" ]
+
+  # Don't build this module with LTO, so that the TLS access stays unoptimized.
+  remove_configs = [ "//build/config/lto" ]
+  configs += [ "//build/config/lto:no-lto" ]
+
+  # workaround for b/349448459 to remote-link successfully
+  configs += [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+}
+
+test_executable("llvm-profdata") {
+  can_be_in_process = true
+  sources = [ "llvm-profdata.cc" ]
+  deps = [
+    "//src/lib/llvm-profdata",
+    "//zircon/system/ulib/zx",
+  ]
+
+  # workaround for b/349448459 to remote-link successfully
+  configs = [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+}
+
+test_executable("backtrace") {
+  sources = [ "backtrace.cc" ]
+  deps = [
+    "//zircon/kernel/lib/arch",
+    "//zircon/system/public",
+  ]
+}
+
+# Each dep module exports first(), second(), and third() return that multiplier
+# of its value.  TestStart returns first() + second() + third().  So without
+# filtering, the first dep would define them all.  The SymbolFilter test tells
+# relocation to ignore second in dep17 and dep23; and third in dep23.  So the
+# test should get dep17's first, dep23's second, and dep42's third.
+symbol_filter_values = [
+  17,
+  23,
+  42,
+]
+
+# The symbol-filter and symbol-filter-elf32 targets are actually identical, but
+# they will be instantiated in different build environments.  The -elf32
+# version is really only used for one of its dependencies, but this is the
+# simple way to get that packaged in the test under a different name.
+foreach(suffix,
+        [
+          "",
+          "-elf32",
+        ]) {
+  test_executable("symbol-filter$suffix") {
+    sources = [ "symbol-filter.cc" ]
+    deps = []
+    foreach(value, symbol_filter_values) {
+      deps += [ ":symbol-filter-dep$value" ]
+    }
+  }
+}
+
+foreach(value, symbol_filter_values) {
+  test_shared_library("symbol-filter-dep$value") {
+    sources = [ "symbol-filter-dep.cc" ]
+    defines = [ "VALUE=$value" ]
+    deps = [ "//zircon/system/public" ]
+  }
+}
+
+test_executable("ldsvc-config") {
+  can_be_in_process = true
+  defines = [ "TEST_SYMBOL_SUFFIX=" ]
+  sources = [ "basic-dep.cc" ]
+  deps = [ ":ld-dep-a" ]
+
+  # This executable is totally boring (same as :basic-dep), except it uses a
+  # different PT_INTERP string to elicit a Config() message.
+  remove_configs = [ "//sdk/lib/ld:abi-interp" ]
+  configs = [ ":ldsvc-config.libprefix" ]
+}
+
+config("ldsvc-config.libprefix") {
+  visibility = [ ":*" ]
+  ldflags = [ "-Wl,-dynamic-linker=test-libprefix/ld.so.1" ]
+}
+
+source_set("startup-symbols") {
+  visibility = [
+    ":*",
+    "//sdk/lib/c/*",
+  ]
+  public = [ "startup-symbols.h" ]
+  public_configs = [ ":headers.config" ]
+}
+
+# This lets test code outside this directory that's reusing these test modules
+# use plain `#include "foo.h"` like the test code here does for the local test
+# headers.
+config("headers.config") {
+  visibility = [ ":*" ]
+  include_dirs = [ "." ]
+}
+
+template("libc_test_executable") {
+  _test_link(target_name) {
+    target_type = "executable"
+    install_dir = "bin"
+    output_file = target_name
+
+    deps = []
+    configs = []
+    remove_configs = []
+    exclude_toolchain_tags = []
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "install_dir",
+                             "output_file",
+                             "target_type",
+                           ])
+
+    deps += [ "//sdk/lib/c:new-libc-test" ]
+    configs += [
+      "//build/config/zircon:user-executable",
+      "//build/config/fuchsia:no_cpp_standard_library",
+    ]
+    remove_configs += [
+      "//build/config/fuchsia:fdio_config",
+
+      # Remove it so that it's not _before_ user-executable, which passes
+      # --no-dynamic-linker.  The deps to //sdk/lib/ld:startup will reach this
+      # again later, where its --dynamic-linker=... can override.
+      "//sdk/lib/ld:abi-interp",
+    ]
+
+    # Sanitizer support not ready yet for new libc.
+    exclude_toolchain_tags = [ "uses-shadow" ]
+
+    # TODO(https://fxbug.dev/483475945): Work around RBE linking bug.
+    configs += [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+  }
+}
+
+libc_test_executable("libc-start-main") {
+  sources = [ "libc-start-main.cc" ]
+}
+
+libc_test_executable("libc-hello-world") {
+  sources = [ "libc-hello-world.cc" ]
+  deps = [ "//sdk/lib/fdio" ]
+}
+
+libc_test_executable("libcxx-hello-world") {
+  sources = [ "libcxx-hello-world.cc" ]
+  remove_configs = [
+    "//build/config/fuchsia:no_cpp_standard_library",
+    ":nostdlibs",
+  ]
+  deps = [ "//sdk/lib/fdio" ]
+}

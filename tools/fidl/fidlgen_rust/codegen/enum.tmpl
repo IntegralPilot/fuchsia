@@ -1,0 +1,157 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "EnumDeclaration" }}
+{{- range .DocComments }}
+///{{ . }}
+{{- end }}
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+{{- if .IsStrict }}
+#[repr({{ .UnderlyingType }})]
+{{- end }}
+pub enum {{ .Name }} {
+    {{- range .Members }}
+    {{- range .DocComments }}
+    ///{{ . }}
+    {{- end }}
+    {{ .Name }}{{ if $.IsStrict }} = {{ .Value }}{{ end }},
+    {{- end }}
+    {{- if .IsFlexible }}
+    #[doc(hidden)]
+    __SourceBreaking { unknown_ordinal: {{ .UnderlyingType }} },
+    {{- end }}
+}
+
+{{- if .IsFlexible }}
+{{ "" }}
+/// Pattern that matches an unknown `{{ .Name }}` member.
+#[macro_export]
+macro_rules! {{ .Name }}Unknown {
+    () => { _ };
+}
+{{- end }}
+
+impl {{ .Name }} {
+    #[inline]
+    pub fn from_primitive(prim: {{ .UnderlyingType }}) -> Option<Self> {
+        match prim {
+            {{- range .Members }}
+            {{ .Value }} => Some(Self::{{ .Name }}),
+            {{- end }}
+            _ => None,
+        }
+    }
+    {{ "" }}
+    {{- if .IsStrict }}
+    #[inline]
+    pub const fn into_primitive(self) -> {{ .UnderlyingType }} {
+        self as {{ .UnderlyingType }}
+    }
+
+    {{- else }}
+    #[inline]
+    pub fn from_primitive_allow_unknown(prim: {{ .UnderlyingType }}) -> Self {
+        match prim {
+            {{- range .Members }}
+            {{ .Value }} => Self::{{ .Name }},
+            {{- end }}
+            unknown_ordinal => Self::__SourceBreaking { unknown_ordinal },
+        }
+    }
+
+    #[inline]
+    pub fn unknown() -> Self {
+        Self::__SourceBreaking { unknown_ordinal: {{ .UnknownValueForTmpl | printf "%#x" }} }
+    }
+
+    #[inline]
+    pub const fn into_primitive(self) -> {{ .UnderlyingType }} {
+        match self {
+            {{- range .Members }}
+            Self::{{ .Name }} => {{ .Value }},
+            {{- end }}
+            Self::__SourceBreaking { unknown_ordinal } => unknown_ordinal,
+        }
+    }
+
+    #[inline]
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::__SourceBreaking { unknown_ordinal: _ } => true,
+            {{- if .Members }}
+            _ => false,
+            {{- end }}
+        }
+    }
+    {{- end }}
+}
+{{ end }}
+
+{{- define "EnumInternal" -}}
+unsafe impl fidl::encoding::TypeMarker for {{ .Name }} {
+    type Owned = Self;
+
+    #[inline(always)]
+    fn inline_align(_context: fidl::encoding::Context) -> usize {
+        std::mem::align_of::<{{ .UnderlyingType }}>()
+    }
+
+    #[inline(always)]
+    fn inline_size(_context: fidl::encoding::Context) -> usize {
+        std::mem::size_of::<{{ .UnderlyingType }}>()
+    }
+
+    #[inline(always)]
+    fn encode_is_copy() -> bool {
+        {{ .IsStrict }}
+    }
+
+    #[inline(always)]
+    fn decode_is_copy() -> bool {
+        false
+    }
+}
+
+impl fidl::encoding::ValueTypeMarker for {{ .Name }} {
+    type Borrowed<'a> = Self;
+    #[inline(always)]
+    fn borrow(value: &<Self as fidl::encoding::TypeMarker>::Owned) -> Self::Borrowed<'_> {
+        *value
+    }
+}
+
+unsafe impl<D: fidl::encoding::ResourceDialect> fidl::encoding::Encode<Self, D> for {{ .Name }} {
+    #[inline]
+    unsafe fn encode(self, encoder: &mut fidl::encoding::Encoder<'_, D>, offset: usize, _depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        encoder.debug_check_bounds::<Self>(offset);
+        encoder.write_num(self.into_primitive(), offset);
+        Ok(())
+    }
+}
+
+impl<D: fidl::encoding::ResourceDialect> fidl::encoding::Decode<Self, D> for {{ .Name }} {
+    #[inline(always)]
+    fn new_empty() -> Self {
+        {{- if .IsStrict }}
+        Self::{{ .MinMember }}
+        {{- else }}
+        Self::unknown()
+        {{- end }}
+    }
+
+    #[inline]
+    unsafe fn decode(&mut self, decoder: &mut fidl::encoding::Decoder<'_, D>, offset: usize, _depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        decoder.debug_check_bounds::<Self>(offset);
+        let prim = decoder.read_num::<{{ .UnderlyingType }}>(offset);
+        {{ if .IsStrict }}
+        *self = Self::from_primitive(prim).ok_or(fidl::Error::InvalidEnumValue)?;
+        {{- else }}
+        *self = Self::from_primitive_allow_unknown(prim);
+        {{- end }}
+        Ok(())
+    }
+}
+{{- end }}

@@ -1,0 +1,141 @@
+#!/bin/bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Build
+### set which product bundle to build in a multi-product environment
+
+## usage: fx set-main-pb <product-bundle-name>
+##
+## fx set-main-pb with `ffx.ui.mode = tui` set will prompt you to choose a product bundle.
+## ffx.ui.mode can be set using `ffx config set ffx.ui.mode tui`
+## The UI mode for just fx use can be set with e.g.
+## `ffx config set ffx.ui.overrides.fx-set-main-pb text`
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+source "$SCRIPT_DIR/lib/vars.sh" || exit $?
+
+fx-config-read
+
+set -e
+
+function check_has_product_bundles() {
+  if [[ $# -eq 0 ]]; then
+    echo "product_bundles.json does not contain ANY products"
+    echo "Try adding some to 'product_bundle_labels'"
+    exit 1
+  fi
+}
+
+function print_available {
+  check_has_product_bundles "$@"
+  echo "Available product bundles:"
+  printf '  %s\n' "$@" | sort
+
+  echo ""
+  echo "Tip: Try zsh-completion with //scripts/zsh-completion/README.md"
+
+  exit 1
+}
+
+function main {
+  local product_bundle="$1"
+
+  case "${product_bundle}" in
+  -h | --help)
+    fx-command-help
+    return 0
+    ;;
+  esac
+
+  mapfile -t AVAILABLE < <(fx-command-run jq -r ".[].name" "$FUCHSIA_BUILD_DIR/product_bundles.json")
+
+  if [[ -z "${product_bundle}" ]]; then
+    use_tui=$(fx-get-ui-mode "fx-set-main-pb")
+    if [[ "$use_tui" == "tui" ]]; then
+      # TUI picker
+      check_has_product_bundles "${AVAILABLE[@]}"
+
+      chosen_pb="$(fx-filter-tui "${AVAILABLE[@]}" --select-if-one --header="Select a product bundle:")"
+      # strip off any trailing spaces and the '(current)' string
+      local suffix=" (current)"
+      if [[ "${chosen_pb}" == *"${suffix}" ]]; then
+        product_bundle="${chosen_pb%$suffix}"
+      else
+        product_bundle="${chosen_pb}"
+      fi
+
+      if [[ -z "${product_bundle}" ]]; then
+        # This can happen if users close out of the picker without selecting anything
+        fx-error "No product bundle picked. If you still want to change product bundles,\nrun this command again and select a product bundle."
+        return 1
+      fi
+    else
+      # Non-TUI default
+      fx-command-help
+      if [[ "${#AVAILABLE[@]}" -gt 0 ]]; then
+        echo ""
+        print_available "${AVAILABLE[@]}"
+      fi
+    fi
+  fi
+
+  JQ_FILTER="first(.[] | select(((.label | split(\"(\"))[0] == \"$product_bundle\") or .name == \"$product_bundle\") | .label)"
+  LABEL=$(fx-command-run jq -r "$JQ_FILTER" "$FUCHSIA_BUILD_DIR/product_bundles.json")
+  LABEL=${LABEL%\(*}
+
+  if [[ -z $LABEL ]]; then
+    echo "product_bundles.json does not contain product: $1"
+    echo ""
+
+    print_available "${AVAILABLE[@]}"
+  fi
+
+  GN_ARGS_ENTRY="main_pb_label = \"${LABEL}\""
+
+  OUT="$FUCHSIA_BUILD_DIR/args.gn"
+  TMP="$OUT.tmp"
+  rm -f "$TMP"
+
+  PRETTY_OUT=${OUT#"$FUCHSIA_DIR"/}
+
+  # If args.gn already has `main_pb_label`, then we update it.
+  if grep -q "^[[:space:]]*main_pb_label" "$OUT"; then
+    # If args.gn already has the fully-correct line, then we exit early
+    if grep -oqPz "(^|\n)[[:space:]]*main_pb_label\s*=\s*\"$LABEL\"" "$OUT"; then
+      echo "main_pb_label already set to $LABEL."
+      echo "args.gn not changed."
+      rm -f "$TMP"
+      return 0
+
+    # args.gn has the wrong label, so update it.
+    else
+      echo "Adding to $PRETTY_OUT:"
+      echo "  $GN_ARGS_ENTRY"
+
+      # This prefix ensures that we match multiple lines in sed in case
+      # the GN has been formatted to wrap to a new line.
+      # FIND only matches on lines that start with main_pb_label so that we'll
+      # skip over inactive labels (e.g. reference comments starting with '#').
+      PREFIX=':a;N;$!ba;'
+      FIND='\(^\|\n\)[[:space:]]*main_pb_label[[:space:]]*=[[:space:]]*\(\n\?[[:space:]]*\)"[^"]*"'
+      REPLACE='\1'"${GN_ARGS_ENTRY}"
+      cat "$OUT" | sed "${PREFIX}s#${FIND}#${REPLACE}#g" > "$TMP"
+      mv "$TMP" "$OUT"
+    fi
+
+  # If we didn't find an existing main PB, then we add it to the end.
+  else
+    echo "Adding to $PRETTY_OUT:"
+    echo "  $GN_ARGS_ENTRY"
+    echo "$GN_ARGS_ENTRY" >> "$OUT"
+  fi
+
+  echo ""
+  echo "Running 'fx gen'"
+  echo "..."
+  fx-gen
+}
+
+main "$@"

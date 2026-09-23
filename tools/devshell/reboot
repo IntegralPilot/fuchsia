@@ -1,0 +1,90 @@
+#!/bin/bash
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Device management
+### reboot a target fuchsia system
+
+## usage: fx reboot [-r|--recovery] [-b|--bootloader]
+##   -r|--recovery   Reboot into recovery image
+##   -b|--bootloader Reboot into bootloader
+##
+## This will reboot the device specified with `fx set-device`; otherwise
+## one of the devices on the link-local network.
+
+set -e
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+fx-config-read
+
+function usage() {
+    fx-command-help
+}
+
+reboot_type="reboot"
+while [[ "$1" =~ ^- ]]; do
+  case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  -r|--recovery)
+    reboot_type="reboot-recovery"
+    ;;
+  -b|--bootloader)
+    reboot_type="reboot-bootloader"
+    ;;
+  *)
+    break
+  esac
+  shift
+done
+
+if [[ $# -gt 1 ]]; then
+  usage
+  exit 1
+fi
+
+device="$(get-device-name)" || exit $?
+
+if [[ -z "$(get-fuchsia-device-addr)" ]]; then
+  echo >&2 "Could not find ${device} in Fuchsia, attempting to reboot using netboot (Zedboot)"
+  exec "${FUCHSIA_BUILD_DIR}/host-tools/netruncmd" "--nowait" "${device}" "dm ${reboot_type}"
+fi
+
+echo "Rebooting ${device}..."
+
+# Check that the device is reachable over SSH, otherwise let the user know.
+# This establishes a ControlMaster.
+monotime=$(fx-command-run shell clock --monotonic)
+if [[ $? -ne 0 ]]; then
+  fx-error "Could not reach ${device} over SSH"
+  exit 1
+fi
+
+# The following command reboots the device using `dm` over SSH. This
+# command can often fail since the connection races with the device
+# shutdown. To ensure we correctly shelled into the device and
+# issued a reboot, we use the loop following this line to verify.
+fx-command-run shell "dm \"${reboot_type}\" &" || true
+
+# Wait for the SSH connection to go down. As we use ControlMaster, we can
+# observe this using the control master check.
+i=0
+while fx-command-run shell -O check > /dev/null 2>&1; do
+  if [[ "$monotime" -gt $(fx-command-run shell clock --monotonic) ]]; then
+    # If we get here, then we raced between reboot and check, the device
+    # rebooted so fast that someone reconnected our SSH ControlMaster before we
+    # observed it going down (this generally only happens if the `dm` command
+    # is backgrounded before being issued and another command happens to shell
+    # into the device (usually package serving causes this)).
+    exit 0
+  fi
+
+  sleep 0.5
+  if [[ "$((i++))" -gt "10" ]]; then
+    fx-error "SSH still connected after $((i/2))s, reboot may have failed"
+    exit 1
+  fi
+done

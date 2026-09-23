@@ -1,0 +1,182 @@
+# Copyright 2019 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/zircon/standard.gni")
+import("//build/dist/generated_resource.gni")
+import("//build/git/git_revisions.gni")
+import("//build/testing/boot_tests/kernel_zbi_test.gni")
+import("//build/zircon/zircon_cpu.gni")
+import("kernel_shell_script.gni")
+import("params.gni")
+
+declare_args() {
+  # Version string embedded in the kernel for `zx_system_get_version_string`.
+  # If set to the default "", a string is generated based on the
+  # status of the fuchsia git repository.
+  kernel_version_string = ""
+
+  # Cause //zircon/kernel:boot_tests to generate the phys boot tests
+  # for all supported CPUs, not just $target_cpu.
+  all_cpu_kernel_boot_tests = false
+}
+
+# Any resource() targets in data_deps would roll up into the kernel's ELF
+# image like the code-patches files do.  But version-string.txt should appear
+# directly in the kernel package next to the ELF image subdirectory, so it
+# must have a direct dependency from the kernel package target.
+if (kernel_version_string != "") {
+  generated_resource("version-string.txt") {
+    visibility = [ "./*" ]
+    outputs = [ "version-string.txt" ]
+    contents = kernel_version_string  # Not a list so no newline added.
+  }
+} else {
+  action("version-string.txt") {
+    visibility = [ "./*" ]
+    script = "git-version-string.sh"
+    inputs = [
+      # Add "-dirty" suffix as needed
+      git_paths.fuchsia_index,
+    ]
+
+    outputs = [ "$target_gen_dir/version-string.txt" ]
+    hermetic_deps = false
+
+    args = [
+      rebase_path(outputs[0], root_build_dir),
+      rebase_path("//", root_build_dir),
+      git_revisions.fuchsia_revision,
+    ]
+
+    metadata = {
+      # This is what resource() does.
+      distribution_entries = [
+        {
+          source = rebase_path(outputs[0], root_build_dir)
+          destination = "version-string.txt"
+          label = get_label_info(":$target_name", "label_with_toolchain")
+        },
+      ]
+    }
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    "arch/$zircon_cpu/user-copy:tests",
+    "dev/coresight/tests($host_toolchain)",
+    "dev/iommu/arm_smmu/tests",
+    "lib:tests",
+    "phys:tests",
+    "phys/lib:tests",
+    "tests",
+    "vm/phys:tests",
+  ]
+
+  if (current_cpu == "x64") {
+    deps += [ "lib/libc/string/arch/x86:tests" ]
+  }
+
+  # Don't let any test ZBIs roll up into the overall product image.
+  metadata = {
+    zbi_input_barrier = []
+  }
+}
+
+if (!is_efi_toolchain) {
+  group("boot_tests") {
+    testonly = true
+    deps = [
+      ":kernel-as-test",
+      ":kernel-unittests-boot-test",
+      ":kernel-unittests-boot-test-bypass-debuglog",
+      "lib:boot_tests",
+      "phys:boot_tests",
+      "tests:boot_tests",
+    ]
+    if (all_cpu_kernel_boot_tests) {
+      foreach(cpu, standard_fuchsia_cpus) {
+        deps += [ ":boot_tests.$cpu" ]
+      }
+    }
+  }
+
+  # This is just the kernel, so cmdline additions must set kernel.shell.script
+  # or something like that.  It's not run in automation.
+  kernel_zbi_test("kernel-as-test") {
+    disabled = true
+  }
+
+  template("kernel_unittests_boot_test") {
+    kernel_shell_script_test(target_name) {
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "environments",
+                               "script",
+                             ])
+      environments = kernel_test_environments
+      script = [
+        "ut all",
+        "and ut -r 10 timer",
+        "and ut -r 10 pi",
+        "boot-test-success",
+        {
+          cuckoo = false
+          lines = [ "graceful-shutdown" ]
+        },
+      ]
+    }
+  }
+
+  kernel_unittests_boot_test("kernel-unittests-boot-test") {
+  }
+
+  # In strange failure modes, the bypass-debuglog version may get more useful
+  # logging out than the normal one, though it may also greatly perturb the
+  # timing and hardware interactions of the test. Running both versions in
+  # automation gives the best chance of logs from one of them being helpful.
+  #
+  # TODO(b/520448230): Consider whether maintaining this separate
+  # bypass-debuglog test is still necessary or the best approach going forward.
+  kernel_unittests_boot_test("kernel-unittests-boot-test-bypass-debuglog") {
+    timeout = 1800
+    deps = [ ":bypass-debuglog" ]
+  }
+}
+
+kernel_cmdline("bypass-debuglog") {
+  testonly = true
+  args = [ "kernel.bypass-debuglog" ]
+}
+
+foreach(cpu, standard_fuchsia_cpus) {
+  group("boot_tests.$cpu") {
+    testonly = true
+    switchset = "switch/set/$default_test_kernel_switchset:kernel_$cpu.$default_test_kernel_switchset"
+    deps = [
+      ":kernel-unittests-boot-test($switchset)",
+      "phys/test:$cpu",
+    ]
+  }
+
+  group("static-checks.$cpu") {
+    validations = [ "bin:vmzircon.with-tests(switch/set/static-checks:kernel_$cpu.static-checks)" ]
+  }
+}
+
+group("static-checks") {
+  deps = [ ":static-checks.$current_cpu" ]
+}
+
+group("static-checks-all-cpus") {
+  testonly = true
+  deps = []
+  foreach(cpu, standard_fuchsia_cpus) {
+    deps += [ ":static-checks.$cpu" ]
+  }
+}

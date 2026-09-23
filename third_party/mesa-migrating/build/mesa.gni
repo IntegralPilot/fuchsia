@@ -1,0 +1,191 @@
+# Copyright 2018 Google, LLC
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice (including the next
+# paragraph) shall be included in all copies or substantial portions of the
+# Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+
+import("//build/python/python_binary.gni")
+import("//third_party/mako/py_srcs.gni")
+
+mesa_source_root = "//third_party/mesa-migrating/src"
+mesa_build_root = "//third_party/mesa-migrating/build"
+
+template("mesa_source_set") {
+  source_set(target_name) {
+    # Can't forward configs because doing so overwrites the default
+    # configs specified by the build system.
+    forward_variables_from(invoker, "*", [ "configs" ])
+    if (!defined(public_configs)) {
+      public_configs = []
+    }
+    public_configs += [ "$mesa_build_root/src:common_config" ]
+    if (defined(invoker.configs)) {
+      configs += invoker.configs
+    }
+  }
+}
+
+# Executes a python script and writes its output to a file.
+#
+# Example
+#
+#   mesa_python_stdout_to_file_action("opcodes.c") {
+#     output = "opcodes.c"
+#     script = "opcodes_c.py"
+#     sources = [ "opcodes_lib.py" ]
+#     libraries = [ "//third_party/mako" ]
+#   }
+#
+# Parameters
+#
+#   script (required)
+#     The .py file that will be interpreted.
+#     Type: path
+#
+#   output (required)
+#     Path to the output file. Assumed to be relative to ${target_gen_dir}.
+#     Type: path
+#
+#   sources (optional)
+#     Extra .py source files script imports.
+#     Type: list(path)
+#     Default: empty list
+#
+#   libraries (optional)
+#     Paths to python_libraries script imports.
+#     Type: list(string)
+#     Default: empty list
+#
+#   args (optional)
+#     Arguments to pass to the script.
+#     Type: list(str)
+#     Default: empty list
+#
+#   deps
+#   inputs
+#   testonly
+#   visibility
+template("mesa_python_stdout_to_file_action") {
+  assert(defined(invoker.script), "script is required")
+  assert(defined(invoker.output), "output is required")
+
+  py_binary_target = "${target_name}_py_binary"
+  python_binary(py_binary_target) {
+    enable_mypy = false
+    forward_variables_from(invoker,
+                           [
+                             "sources",
+                             "testonly",
+                           ])
+    main_source = invoker.script
+    if (defined(invoker.libraries)) {
+      deps = invoker.libraries
+    }
+    visibility = [ ":*" ]
+  }
+
+  action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "inputs",
+                           ])
+
+    script = "${mesa_build_root}/scripts/gn_script_wrapper.sh"
+    outputs = [ "${target_gen_dir}/${invoker.output}" ]
+
+    py_binary = get_target_outputs(":${py_binary_target}")
+    assert(py_binary == [ py_binary[0] ],
+           "${py_binary_target} should only have one output")
+    py_binary = py_binary[0]
+    sources = [ py_binary ]
+    if (defined(invoker.sources)) {
+      # invoker.sources needed here for scripts that import at runtime
+      # (eg brw_nir_trig_workarounds.py)
+      sources += invoker.sources
+    }
+
+    # Ensure scripts can import other scripts in the same directory
+    # Note - I'm not sure why the ../ is necessary.
+    python_path =
+        rebase_path(get_label_info(target_name, "dir") + "/..", root_build_dir)
+
+    args = [
+      rebase_path(python_exe_src, root_build_dir),
+
+      # TODO(jayzhuang): remove this arg after migrating mesa_python_action.
+      python_path,
+      rebase_path(outputs[0], root_build_dir),
+      rebase_path(py_binary, root_build_dir),
+    ]
+    if (defined(invoker.args)) {
+      args += invoker.args
+    }
+
+    deps = [ ":${py_binary_target}" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+}
+
+mako_python_path = rebase_path("//third_party/mako")
+
+# Executes a python script with PYTHONPATH=${mako_python_path}
+#
+# Parameters
+# Same as for action().
+
+template("mesa_python_action") {
+  action(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "args",
+                             "inputs",
+                             "script",
+                           ])
+
+    script = "${mesa_build_root}/scripts/gn_script_wrapper.sh"
+
+    args = [
+      rebase_path(python_exe_src, root_build_dir),
+      mako_python_path,
+
+      # path to write stdout to, which we don't need.
+      "/dev/stdout",
+      rebase_path(invoker.script, root_build_dir),
+    ]
+    if (defined(invoker.args)) {
+      args += invoker.args
+    }
+
+    inputs = [
+               invoker.script,
+
+               # Some file that we can use as a signal that the other files
+               # in mako_python_path have changed.
+               "${mako_python_path}/doc/build/changelog.rst",
+             ] + third_party_mako_srcs
+
+    if (defined(invoker.inputs)) {
+      inputs += invoker.inputs
+    }
+  }
+}

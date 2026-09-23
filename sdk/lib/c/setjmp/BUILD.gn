@@ -1,0 +1,104 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/test.gni")
+import("../libc.gni")
+
+llvm_libc_source_set("setjmp") {
+  functions = [
+    "longjmp",
+    "setjmp",
+  ]
+  cpu_functions = functions
+  no_test_functions = [ "longjmp" ]  # setjmp_test.cpp tests both
+
+  # The Fuchsia versions are implemented locally in assembly and have
+  # internal preempt headers to use LIBC_ASM_LINKAGE.
+  if (is_fuchsia) {
+    asm_functions = functions
+    os_functions = functions
+
+    local_sources = [ "fuchsia/manglers.cc" ]
+    local_deps = [
+      ":jmp_buf",
+      "../startup:startup-random",
+      "//zircon/kernel/lib/arch",
+    ]
+    non_test_deps = [ ":longjmp-corrupted" ]
+    test_deps = [ ":mock-corrupted" ]
+
+    # The llvm-libc internal headers for the LIBC_NAMESPACE_DECL declarations
+    # need to be preempted with wrappers that apply LIBC_ASM_LINKAGE.  There is
+    # a preempting "src/setjmp/setjmp.h" following the usual schema too just
+    # for uniformity, but llvm-libc actually uses "setjmp_impl.h" so list that
+    # wrapper header separately.  Listing the original headers in local_sources
+    # rather than public "claims" them so `gn check` will catch anything using
+    # them directly rather than the wrappers listed in public.  Without the
+    # wrappers, the normal C++ names in LIBC_NAMESPACE will be mangled for
+    # linkage names; but the assembly implementations don't define those names,
+    # only the LIBC_ASM_LINKAGE names.
+    preempt_header_functions = functions
+    public_deps = [ "..:asm-linkage" ]
+    public = [
+      # Producing the //... path prevents adding in $llvm_libc/setjmp.
+      get_path_info("../include-preempt/src/setjmp/setjmp_impl.h", "abspath"),
+    ]
+    local_sources += [
+      "$llvm_libc/src/setjmp/longjmp.h",
+      "$llvm_libc/src/setjmp/setjmp_impl.h",
+    ]
+  }
+}
+
+source_set("jmp_buf") {
+  visibility = [ ":*" ]
+  public = [ "fuchsia/jmp_buf.h" ]
+  public_deps = [ "..:asm-linkage" ]
+}
+
+# The .testonly subtarget is never used, :mock-corrupted is used instead.
+libc_source_set("longjmp-corrupted") {
+  visibility = [ ":*" ]
+  sources = [ "fuchsia/longjmp-corrupted.cc" ]
+  deps = [ ":jmp_buf" ]
+}
+
+# This isn't libc_test() so it depends on neither zxtest nor gtest.
+source_set("mock-corrupted") {
+  visibility = [ ":*" ]
+  testonly = true
+  configs += libc_testonly_configs
+
+  public = [ "mock-corrupted.h" ]
+  public_deps = [ "//sdk/lib/fit" ]
+
+  sources = [ "mock-corrupted.cc" ]
+  deps = [ ":jmp_buf" ]
+}
+
+# TODO(https://fxbug.dev/345351373): This has to be a separate test binary
+# because it uses gtest, not zxtest.  When libc-unittests can use gtest, this
+# should be folded in.
+test("setjmp-tests") {
+  deps = [ ":longjmp-unwind-tests" ]
+}
+
+libc_test("longjmp-unwind-tests") {
+  visibility = [ ":*" ]
+  gtest = true
+  sources = [
+    "longjmp-unwind-tests.cc",
+    "unwind-all-regs.S",
+  ]
+  deps = [
+    ":jmp_buf",
+    ":mock-corrupted",
+    ":setjmp.testonly",
+    "..:asm-linkage",
+    "//src/lib/captive-thread/testing",
+    "//src/lib/unwinder",
+    "//third_party/googletest:gmock",
+    "//zircon/kernel/lib/arch",
+  ]
+}

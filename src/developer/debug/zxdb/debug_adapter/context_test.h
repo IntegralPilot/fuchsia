@@ -1,0 +1,126 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_DEVELOPER_DEBUG_ZXDB_DEBUG_ADAPTER_CONTEXT_TEST_H_
+#define SRC_DEVELOPER_DEBUG_ZXDB_DEBUG_ADAPTER_CONTEXT_TEST_H_
+
+#include <memory>
+
+#include "src/developer/debug/shared/test_stream_buffer.h"
+#include "src/developer/debug/zxdb/client/remote_api_test.h"
+#include "src/developer/debug/zxdb/client/session.h"
+#include "src/developer/debug/zxdb/console/mock_console.h"
+#include "src/developer/debug/zxdb/debug_adapter/context.h"
+
+namespace zxdb {
+
+class Process;
+class Thread;
+
+// Test class that uses two StreamBuffer to create a two-way pipe.
+class TestPipe {
+ public:
+  TestPipe() = default;
+  ~TestPipe() = default;
+
+  debug::StreamBuffer* end1() { return &end1_; }
+  const debug::StreamBuffer& end1() const { return end1_; }
+
+  debug::StreamBuffer* end2() { return &end2_; }
+  const debug::StreamBuffer& end2() const { return end2_; }
+
+  class PipeWriter : public debug::StreamBuffer::Writer {
+   public:
+    PipeWriter(debug::StreamBuffer& src, debug::StreamBuffer& sink) : src_(src), sink_(sink) {
+      src_.set_writer(this);
+    }
+
+   private:
+    // StreamBuffer::Writer implementation.
+    size_t ConsumeStreamBufferData(const char* data, size_t len) override {
+      sink_.AddReadData(std::vector<char>(data, data + len));
+      return len;
+    }
+    debug::StreamBuffer& src_;
+    debug::StreamBuffer& sink_;
+  };
+
+ private:
+  debug::StreamBuffer end1_;
+  debug::StreamBuffer end2_;
+  PipeWriter end1_to_2{end1_, end2_};
+  PipeWriter end2_to_1{end2_, end1_};
+
+  FXL_DISALLOW_COPY_AND_ASSIGN(TestPipe);
+};
+
+// Test harness that sets up a RemoteAPITest (mocked target by replacing IPC) with a
+// DebugAdapterContext and a debug adapter client session using the cppdap library.
+//
+// DebugAdapterContext is connected to the client via TestPipe.
+// Client session can be used to send requests to DebugAdapterContext:
+//
+//   auto response = client().send(dap::InitializeRequest{});
+//
+// And then invoke context() to process incoming request:
+//
+//   context().OnStreamReadable();
+//
+// Lastly invoke client() to receive the response:
+//
+//   RunClient();
+//   auto got = response.get();
+//
+class DebugAdapterContextTest : public RemoteAPITest {
+ public:
+  // The IDs associated with the process/thread that are set up by default.
+  static constexpr uint64_t kProcessKoid = 875123541;
+  static constexpr uint64_t kThreadKoid = 19028730;
+
+  DebugAdapterContext& context() { return *context_; }
+  dap::Session& client() { return *client_; }
+
+  void RunClient() {
+    if (auto payload = client_->getPayload()) {
+      payload();
+    }
+  }
+
+  void RunPendingClientCalls() {
+    while (HasPendingClientCalls()) {
+      RunClient();
+    }
+  }
+
+  bool HasPendingClientCalls() const { return pipe_.end2().IsAvailable(1); }
+
+  // Helper method to set up debug adapter session between client and server.
+  void InitializeDebugging();
+
+  // Disable the `DebugAdapterContext`'s `AsyncBacktraceSubscription` after `InitializeDebugging()`
+  // by default to reduce test noise, since leaving it in-place results in additional `dap::Event`s
+  // on thread events, requiring extra `RunClient()` calls.
+  //
+  // This is virtual to allow derived test classes to opt-in to testing async-backtrace behavior.
+  virtual void DeinitializeAsyncBacktraceSubscription() {
+    context_->DeinitializeAsyncBacktraceSubscriptionForTesting();
+  }
+
+  // testing::Test implementation.
+  void SetUp() override;
+  void TearDown() override;
+
+  // Sets up the context to appear to be connected to the debug target.
+  void SetUpConnectedContext();
+
+ private:
+  std::unique_ptr<DebugAdapterContext> context_;
+  std::unique_ptr<MockConsole> console_;
+  std::unique_ptr<dap::Session> client_;
+  TestPipe pipe_;
+};
+
+}  // namespace zxdb
+
+#endif  // SRC_DEVELOPER_DEBUG_ZXDB_DEBUG_ADAPTER_CONTEXT_TEST_H_

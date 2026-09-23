@@ -1,0 +1,132 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+
+# Most targets in this file are implementation details. Make them
+# inaccessible outside this file.
+visibility = [ ":*" ]
+
+###
+### Targets that are visible outside this file.
+###
+
+group("component") {
+  testonly = true
+  visibility += [ "*" ]
+  deps = [ ":debian_realm_component" ]
+}
+
+###
+### Targets related to linux tool to dump input events.
+###
+
+executable("input_dump_bin") {
+  testonly = true
+  sources = [
+    "../relay-api.h",
+    "input_dump.cc",
+  ]
+  output_name = "input_dump"
+
+  disable_syslog_backend = true
+
+  # Don't bother building, e.g., an ASAN variant of this binary.
+  # 1. Nothing would use that binary.
+  # 2. Trying to build variants for Linux code might fail.
+  exclude_toolchain_tags = [ "instrumented" ]
+}
+
+executable("launch_input_bin") {
+  testonly = true
+  sources = [ "launch_input.cc" ]
+  output_name = "launch_input"
+
+  disable_syslog_backend = true
+
+  # Don't bother building, e.g., an ASAN variant of this binary.
+  # 1. Nothing would use that binary.
+  # 2. Trying to build variants for Linux code might fail.
+  exclude_toolchain_tags = [ "instrumented" ]
+}
+
+# Pretend that the binary produced by the `:input_dump_bin` target is just
+# a piece of data.
+#
+# This is necessary because:
+# 1) We need to compile for Linux, which means that the proper target is
+#    `:input_dump_bin(<foreign_toolchain_name>)`.
+# 2) The `fuchsia_component` has special-case handling for targets with foreign
+#    toolchains, which causes the executable to be excluded from the component
+#    (see https://fxrev.dev/598463). Hence, we can't just place `:input_dump_bin`
+#    in the `deps` of `input_dump_component`.
+# 3) Within `bin_resource`, if we place the binary in some directory other than
+#    `data`, then `verify_manifest_elf_binary.py` complains that the binary is
+#    targeting the wrong architecture ("invalid or unsupported PT_INTERP value").
+resource("input_dump_resource") {
+  testonly = true
+  import("//src/starnix/kernel/starnix.gni")  # for `target_linux_toolchain`
+  bin_label = ":input_dump_bin($target_linux_toolchain)"
+  bin_out_dir = get_label_info(bin_label, "root_out_dir")
+  sources = [ "${bin_out_dir}/input_dump" ]
+  outputs = [ "data/linux_bin/input_dump" ]
+  deps = [ "${bin_label}" ]
+}
+
+fuchsia_component("input_dump_component") {
+  testonly = true
+  component_name = "input_dump"
+  manifest = "meta/input_dump.cml"
+  deps = [ ":input_dump_resource" ]  # See `input_dump_resource` comment for why
+                                     # `deps` can't reference `:input_dump_bin`
+}
+
+# See comment above `input_dump_resource` for an explanation of why we
+# pretend this binary is just a piece of data.
+resource("launch_input_resource") {
+  testonly = true
+  import("//src/starnix/kernel/starnix.gni")  # for `target_linux_toolchain`
+  bin_label = ":launch_input_bin($target_linux_toolchain)"
+  bin_out_dir = get_label_info(bin_label, "root_out_dir")
+  sources = [ "${bin_out_dir}/launch_input" ]
+  outputs = [ "data/linux_bin/launch_input" ]
+  deps = [ "${bin_label}" ]
+}
+
+fuchsia_component("launch_input_component") {
+  testonly = true
+  component_name = "launch_input"
+  manifest = "meta/launch_input.cml"
+  deps = [ ":launch_input_resource" ]  # See `launch_input_resource` comment for
+                                       # why `deps` can't reference
+                                       # `:launch_input_bin`
+}
+
+###
+### Targets related to the Debian container.
+###
+
+# The Starnix runner. This sets up Component Manager so that `debian_container`
+# can run.
+fuchsia_component("debian_realm_component") {
+  testonly = true
+  component_name = "debian_realm"
+  manifest = "meta/debian_realm.cml"
+  deps = [ ":debian_container_component" ]
+}
+
+# The Debian container. This is just a manifest file configuring Component
+# Manager and Starnix so that `input_dump` can run.
+fuchsia_component("debian_container_component") {
+  testonly = true
+  component_name = "debian_container"
+  manifest = "meta/debian_container.cml"
+  deps = [
+    ":input_dump_component",
+    ":launch_input_component",
+    "//src/starnix/containers/debian:container_resources",  # filesystem data
+                                                            # for
+                                                            # debian container
+  ]
+}

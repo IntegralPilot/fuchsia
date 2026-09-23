@@ -1,0 +1,92 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+use std::collections::HashMap;
+
+use super::{AssignedUuid, Uuid};
+
+#[rustfmt::skip]
+// Generated with a magic regexp: %s/ - uuid: \(......\)\n   name: \(.\+\)\n   id: \(.\+\)\n/(\1, "\2", "\3"),\r/g
+
+#[rustfmt::skip]
+pub static SERVICE_CLASS_UUIDS: std::sync::LazyLock<HashMap<Uuid, AssignedUuid>> = std::sync::LazyLock::new(|| {
+    assigned_uuid_map!(
+        (0x1000, "ServiceDiscoveryServerServiceClassID", "org.bluetooth.service_class.service_discovery_server"),
+        (0x1001, "BrowseGroupDescriptorServiceClassID", "org.bluetooth.service_class.browse_group_descriptor"),
+        (0x1101, "SerialPort", "org.bluetooth.profile.serial_port"),
+        (0x1102, "LANAccessUsingPPP", "org.bluetooth.profile.lan_access"),
+        (0x1103, "DialupNetworking", "org.bluetooth.profile.dial_up_networking"),
+        (0x1104, "IrMCSync", "org.bluetooth.profile.synchronization_profile"),
+        (0x1105, "OBEXObjectPush", "org.bluetooth.profile.object_push"),
+        (0x1106, "OBEXFileTransfer", "org.bluetooth.profile.file_transfer_profile"),
+        (0x1107, "IrMCSyncCommand", "org.bluetooth.profile.synchronization_command"),
+        (0x1108, "Headset", "org.bluetooth.profile.headset"),
+        (0x1109, "CordlessTelephony", "org.bluetooth.profile.cordless_telephony"),
+        (0x110A, "AudioSource", "org.bluetooth.profile.a2dp_audio_source"),
+        (0x110B, "AudioSink", "org.bluetooth.profile.a2dp_audio_sink"),
+        (0x110C, "A/V_RemoteControlTarget", "org.bluetooth.profile.avrcp_remote_control_target"),
+        (0x110D, "AdvancedAudioDistribution", "org.bluetooth.profile.a2dp"),
+        (0x110E, "A/V_RemoteControl", "org.bluetooth.profile.avrcp_remote_control_remote_control"),
+        (0x110F, "A/V_RemoteControlController", "org.bluetooth.profile.avrcp_remote_control_remote_control_controller"),
+        (0x1110, "Intercom", "org.bluetooth.profile.intercom"),
+        (0x1111, "Fax", "org.bluetooth.profile.fax"),
+        (0x1112, "Headset - Audio Gateway", "org.bluetooth.profile.headset_audio_gateway"),
+        (0x1113, "WAP", "org.bluetooth.profile.wap"),
+        (0x1114, "WAP_CLIENT", "org.bluetooth.profile.wap_client"),
+        (0x1115, "PANU", "org.bluetooth.profile.pan_user"),
+        (0x1116, "NAP", "org.bluetooth.profile.pan_network_access_point"),
+        (0x1117, "GN", "org.bluetooth.profile.pan_gn"),
+        (0x1118, "DirectPrinting", "org.bluetooth.profile.bpp_direct_printing"),
+        (0x1119, "ReferencePrinting", "org.bluetooth.profile.bpp_reference_printing"),
+        (0x111A, "Basic Imaging Profile", "org.bluetooth.profile.bip"),
+        (0x111B, "ImagingResponder", "org.bluetooth.profile.bip_imaging_responder"),
+        (0x111C, "ImagingAutomaticArchive", "org.bluetooth.profile.bip_imaging_automatic_archive"),
+        (0x111D, "ImagingReferencedObjects", "org.bluetooth.profile.bip_imaging_referenced_objects"),
+        (0x111E, "Handsfree", "org.bluetooth.profile.handsfree"),
+        (0x111F, "HandsfreeAudioGateway", "org.bluetooth.service_class.handsfree_audio_gateway"),
+        (0x1120, "DirectPrintingReferenceObjectsService", "org.bluetooth.service_class.bpp_direct_printing_reference_objects"),
+        (0x1121, "ReflectedUI", "org.bluetooth.service_class.bpp_reflected_ui"),
+        (0x1122, "BasicPrinting", "org.bluetooth.profile.bpp"),
+        (0x1123, "PrintingStatus", "org.bluetooth.service_class.bpp_printing_status"),
+        (0x1124, "HumanInterfaceDeviceService", "org.bluetooth.profile.hid"),
+        (0x1125, "HardcopyCableReplacement", "org.bluetooth.profile.hcrp"),
+        (0x1126, "HCR_Print", "org.bluetooth.service_class.hcr_print"),
+        (0x1127, "HCR_Scan", "org.bluetooth.service_class.hcr_scan"),
+        (0x1128, "Common_ISDN_Access", "org.bluetooth.service_class.isdn"),
+        (0x112D, "SIM_Access", "org.bluetooth.profile.sap"),
+        (0x112E, "Phonebook Access - PCE", "org.bluetooth.service_class.phone_book_access_pce"),
+        (0x112F, "Phonebook Access - PSE", "org.bluetooth.service_class.phone_book_access_pse"),
+        (0x1130, "Phonebook Access", "org.bluetooth.profile.phone_book_access"),
+        (0x1131, "Headset - HS", "org.bluetooth.service_class.headset_hs"),
+        (0x1132, "Message Access Server", "org.bluetooth.service_class.map_server"),
+        (0x1133, "Message Notification Server", "org.bluetooth.service_class.map_notification_server"),
+        (0x1134, "Message Access Profile", "org.bluetooth.profile.message_access_profile"),
+        (0x1135, "GNSS", "org.bluetooth.profile.global_navigiation_satellite_system"),
+        (0x1136, "GNSS_Server", "org.bluetooth.service_class.global_navigiation_satellite_system_server"),
+        (0x1137, "3D Display", "org.bluetooth.service_class.3d_display"),
+        (0x1138, "3D Glasses", "org.bluetooth.service_class.3d_glasses"),
+        (0x1139, "3D Synchronization", "org.bluetooth.profile.3d_synchronization"),
+        (0x113A, "MPS Profile", "org.bluetooth.profile.multi_profile"),
+        (0x113B, "MPS SC", "org.bluetooth.service_class.multi_profile_service"),
+        (0x113C, "CTN Access Service", "org.bluetooth.service_class.calendar_task_note_access"),
+        (0x113D, "CTN Notification Service", "org.bluetooth.service_class.calendar_task_note_notification"),
+        (0x113E, "CTN Profile", "org.bluetooth.profile.calendar_task_notes"),
+        (0x1200, "PnPInformation", "org.bluetooth.service_class.device_identification"),
+        (0x1201, "GenericNetworking", "org.bluetooth.service_class.generic_networking"),
+        (0x1202, "GenericFileTransfer", "org.bluetooth.service_class.generic_file_transfer"),
+        (0x1203, "GenericAudio", "org.bluetooth.service_class.generic_audio"),
+        (0x1204, "GenericTelephony", "org.bluetooth.service_class.generic_telephony"),
+        (0x1205, "UPNP_Service", "org.bluetooth.service_class.enhanced_service_discovery_service"),
+        (0x1206, "UPNP_IP_Service", "org.bluetooth.service_class.enhanced_service_discovery_ip_service"),
+        (0x1300, "ESDP_UPNP_IP_PAN", "org.bluetooth.service_class.enhanced_service_discovery_ip_pan_service"),
+        (0x1301, "ESDP_UPNP_IP_LAP", "org.bluetooth.service_class.enhanced_service_discovery_ip_lap_service"),
+        (0x1302, "ESDP_UPNP_L2CAP", "org.bluetooth.service_class.enhanced_service_discovery_l2cap_service"),
+        (0x1303, "VideoSource", "org.bluetooth.service_class.video_distribution_source"),
+        (0x1304, "VideoSink", "org.bluetooth.service_class.video_distribution_sink"),
+        (0x1305, "VideoDistribution", "org.bluetooth.profile.video_distribution"),
+        (0x1400, "HDP", "org.bluetooth.profile.health_device"),
+        (0x1401, "HDP Source", "org.bluetooth.service_class.health_device_source"),
+        (0x1402, "HDP Sink", "org.bluetooth.service_class.health_device_sink")
+    )
+});

@@ -1,0 +1,226 @@
+// Copyright 2026 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.net.debug;
+
+using fuchsia.io;
+using fuchsia.net;
+using fuchsia.ebpf;
+
+// TODO(https://fxbug.dev/42159332): Use built-in empty struct when available.
+type Empty = struct {};
+
+/// Specifies which interface(s) to capture packets on.
+type InterfaceSpecifier = flexible union {
+    /// Capture on all interfaces.
+    1: any Empty;
+    /// A list of interface IDs to capture on. Must be non-empty.
+    2: interface_ids vector<fuchsia.net.InterfaceId>:MAX;
+};
+
+/// The default snapshot length value large enough to hold one full packet on
+/// most links.
+///
+/// This is the same value as chosen by [libpcap].
+///
+/// [libpcap]: https://github.com/the-tcpdump-group/libpcap/blob/master/pcap-int.h#L156
+const DEFAULT_SNAP_LEN uint32 = 262144;
+
+/// Parameters common to all packet capturing modes.
+type CommonPacketCaptureParams = resource table {
+    /// Which interface(s) to capture on.
+    ///
+    /// Required.
+    1: interfaces InterfaceSpecifier;
+    /// eBPF program for deciding which packets are included in
+    /// the capture. The program must not make use of any eBPF-only
+    /// features not present in cBPF. The program must be of type
+    /// BPF_PROG_TYPE_SOCKET_FILTER and have been verified as such.
+    ///
+    /// Optional.
+    2: bpf_program fuchsia.ebpf.VerifiedProgram;
+    /// Number of bytes from the start of each packet to save in the capture.
+    /// Truncation only happens at the end of the packet, no headers are skipped.
+    ///
+    /// Optional, [`DEFAULT_SNAP_LEN`] is used if absent or 0 is passed.
+    3: snap_len uint32;
+};
+
+/// The minimum buffer size.
+const MIN_BUFFER_SIZE uint32 = DEFAULT_SNAP_LEN;
+
+/// Parameters specific to rolling packet captures.
+type RollingPacketCaptureParams = table {
+    /// The size in bytes the rolling capture should be. The value must be
+    /// between [`MIN_BUFFER_SIZE`] and the netstack configured maximum
+    /// `max_rolling_capture_buffer_size`.
+    ///
+    /// Optional, the netstack configured maximum
+    /// `max_rolling_capture_buffer_size` is used if absent or 0 is passed.
+    1: capture_size uint32;
+};
+
+/// Errors returned when starting a packet capture fails.
+type PacketCaptureStartError = flexible enum {
+    /// The quota for number of concurrent packet captures has been met.
+    QUOTA_EXCEEDED = 1;
+    /// One or more interface IDs passed is invalid.
+    INVALID_INTERFACE_IDS = 2;
+    /// The BPF filter must not use eBPF features.
+    INVALID_BPF_FILTER = 3;
+    /// Invalid buffer size.
+    INVALID_BUFFER_SIZE = 4;
+    /// Cannot allocate buffer.
+    CANNOT_ALLOCATE_BUFFER = 5;
+};
+
+/// Errors returned when reconnecting to a rolling packet capture fails.
+type PacketCaptureReconnectError = flexible enum {
+    /// No rolling packet capture with the provided name can be found.
+    NOT_FOUND = 1;
+};
+
+alias PacketCaptureName = string:64;
+
+// TODO(https://fxbug.dev/502636634): Add FIDL for streamed packet captures.
+/// Provides packet captures.
+///
+/// [`PacketCaptureProvider.StartRolling`] is recommended if:
+/// 1. You need resilience against network interruptions closing the channel
+///    tied to the packet capture’s lifetime.
+/// 2. You know when the packets of interest get captured, e.g. when a specific
+///    networking event you’re looking for occurs.
+/// 3. Not having to continuously read packet capture data from the Netstack
+///    is a benefit.
+///
+/// Note that in order to conserve memory, the server maintains a limit on the
+/// number of concurrent packet captures, and starting another packet capture
+/// when the quota has been met fails.
+///
+/// In all cases, the server sends the packet captures in [pcapng format],
+/// i.e. there is a Section Header Block at the start of each packet capture
+/// followed by one or more Interface Description Blocks, followed by Enhanced
+/// Packet Blocks containing packet data. Other blocks defined by the pcapng
+/// file standard may appear as well.
+///
+/// [pcapng format]: https://www.ietf.org/archive/id/draft-ietf-opsawg-pcapng-05.html
+@discoverable
+closed protocol PacketCaptureProvider {
+    /// Start a rolling packet capture.
+    ///
+    /// Lifetime of the packet capture is tied to the pipelined `channel` unless
+    /// [`RollingPacketCapture.Detach`] has been called.
+    ///
+    /// ## Error
+    ///
+    /// All variants of [`PacketCaptureStartError`] may be returned by this
+    /// method.
+    strict StartRolling(resource struct {
+        common_params CommonPacketCaptureParams;
+        params RollingPacketCaptureParams;
+    }) -> (resource struct {
+        channel client_end:RollingPacketCapture;
+    }) error PacketCaptureStartError;
+
+    /// Reconnects to a packet capture previously started with
+    /// [`PacketCaptureProvider/StartRolling`].
+    ///
+    /// If another channel is already connected to the packet capture, it will be
+    /// closed to make room for this connection.
+    ///
+    /// Note reconnecting does not reattach the lifetime of the packet capture to
+    /// `channel`.
+    strict ReconnectRolling(resource struct {
+        /// A name previously passed to [`RollingPacketCapture/Detach`]
+        /// that identifies this packet capture.
+        name PacketCaptureName;
+    }) -> (resource struct {
+        channel client_end:RollingPacketCapture;
+    }) error PacketCaptureReconnectError;
+};
+
+/// Reason for packet capture termination.
+type PacketCaptureEndReason = flexible enum {
+    /// An interface that the capture is on was removed. Note that
+    /// this is never returned if the packet capture was started
+    /// with [`InterfaceSpecifier.any`]. When capturing on multiple interfaces,
+    /// the packet capture ends when any interface has been removed.
+    INTERFACE_REMOVED = 1;
+    /// The packet capture was stopped due to user request.
+    USER_REQUEST = 2;
+};
+
+/// Rolling packet capture.
+///
+/// Once a rolling packet capture has stopped either because [`StopAndDownload`]
+/// has been called or the capture stopped for some other reason and the server
+/// has emitted [`OnEnded`], and there is no client connected to this protocol
+/// for some time, the server discards the contents of the packet capture.
+/// This timeout resets every time a client reconnects to this protocol, and
+/// exists to provide resilience against disconnections.
+closed protocol RollingPacketCapture {
+    /// Detaches the lifetime of this protocol from the underlying packet
+    /// capture.
+    ///
+    /// After calling `Detach`, closing the client end no longer results in
+    /// the packet capture from being terminated. The passed string names
+    /// this packet capture and can be used thereafter to reconnect via
+    /// [`PacketCaptureProvider.ReconnectRolling`]. The protocol is still
+    /// detached after reconnecting. This gives the client the option of
+    /// ensuring the packet capture is resilient against disconnections.
+    ///
+    /// Only the first call to `Detach` over the lifetime of the packet
+    /// capture (note this is different from the lifetime of this protocol
+    /// since it's possible to disconnect and reconnect) is valid. Subsequent
+    /// calls cannot change the name of this capture.
+    ///
+    /// Once this method returns, it is guaranteed that this rolling packet
+    /// capture is detached.
+    strict Detach(struct {
+        name PacketCaptureName;
+    }) -> () error flexible enum {
+        /// Detach has already been called.
+        ALREADY_DETACHED = 1;
+    };
+
+    /// Event emitted by the server when the packet capture ends.
+    ///
+    /// Once emitted, any future connections that are established via
+    /// [`PacketCaptureProvider.ReconnectRolling`] will immediately see the
+    /// `OnEnded` event.
+    strict -> OnEnded(struct {
+        /// The reason this packet capture ended.
+        reason PacketCaptureEndReason;
+    });
+
+    /// Stop and make this rolling packet capture downloadable.
+    ///
+    /// Calling this method stops the packet capture due to user request, and
+    /// emits the [`RollingPacketCapture.OnEnded`] event with reason
+    /// [`PacketCaptureEndReason.USER_REQUEST`].
+    ///
+    /// This method can be called multiple times, including across disconnects:
+    /// a client can call this method, disconnect, reconnect, and call this
+    /// method again.
+    ///
+    /// The server discards the contents of the packet capture once this
+    /// method has been called and there is no client connected to this protocol
+    /// for some time.
+    strict StopAndDownload(resource struct {
+        /// Channel over which the client can download the packet capture. The
+        /// file is always read-only.
+        channel server_end:fuchsia.io.File;
+    });
+
+    /// Discard this rolling packet capture.
+    ///
+    /// Clients should call this method when they have successfully downloaded
+    /// the packet capture, or if they no longer need it for any reason.
+    ///
+    /// The server closes all readers initialized via [`StopAndDownload`]
+    /// and all future interactions on this protocol are invalid. When this
+    /// method returns, it is guaranteed that the packet capture has been
+    /// discarded and the usage quota has been released.
+    strict Discard() -> ();
+};

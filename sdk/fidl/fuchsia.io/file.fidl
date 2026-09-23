@@ -1,0 +1,366 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.io;
+
+using zx;
+
+// TODO: We should run some experiments to see what's the optimum value, or
+// what's the point of diminishing marginal returns.
+/// The maximum I/O size that is allowed for read/write operations using
+/// byte vectors.
+const MAX_TRANSFER_SIZE uint64 = 8192;
+
+/// The byte vector type used for read/write operations.
+alias Transfer = vector<uint8>:MAX_TRANSFER_SIZE;
+
+/// Denotes which hash algorithm is used to build the merkle tree for
+/// fsverity-enabled files.
+@available(added=HEAD)
+type HashAlgorithm = flexible enum : uint8 {
+    SHA256 = 1;
+    SHA512 = 2;
+};
+
+/// Set of options used to enable verity on a file.
+@available(added=HEAD)
+type VerificationOptions = table {
+    1: hash_algorithm HashAlgorithm;
+    /// `salt` is prepended to each block before it is hashed.
+    2: salt vector<uint8>:32;
+};
+
+/// Auxiliary data for the file representation of a node.
+type FileInfo = resource table {
+    /// True if the file is opened in append mode.
+    /// In append mode, the seek offset is moved to the end before every
+    /// write, the two steps performed in an atomic manner.
+    1: is_append bool;
+
+    /// An optional event which transmits information about an object's
+    /// readability or writability. This event relays information about the
+    /// underlying object, not the capability granted to client: this event
+    /// may be signalled "readable" on a connection that does not have
+    /// the capability to read.
+    ///
+    /// This event will be present if the following conditions are met:
+    ///
+    /// - The `available_operations` on the file connection is not empty.
+    /// - The filesystem supports signalling readability/writability events.
+    ///
+    /// The [`FileSignal`] values may be observed on this event.
+    2: observer zx.Handle:EVENT;
+
+    /// An optional stream object, which can be used to read to and write from
+    /// the file more quickly than with fidl.
+    ///
+    /// The channel for the file *must* be held open while the stream is in use.
+    /// Using a stream object that has outlived the channel it came from may
+    /// result in failures or unexpected results.
+    3: stream zx.Handle:STREAM;
+
+    /// Requested attributes for the file. This is only populated if requested.
+    @available(added=18)
+    4: attributes NodeAttributes2;
+};
+
+// Legacy protocol identifier. Use generated discoverable protocol name instead.
+@available(removed=29)
+const FILE_PROTOCOL_NAME string = "fuchsia.io/File";
+
+/// A [`Node`] which contains a sequence of bytes of definite length.
+///
+/// NOTE: cloned connections do not share their seek offset with their source
+/// connection.
+@discoverable
+open protocol File {
+    compose AdvisoryLocking;
+    @available(added=18)
+    compose Linkable;
+    compose Node;
+    compose Readable;
+    compose Writable;
+
+    @selector("fuchsia.io/File.Describe")
+    strict Describe() -> (FileInfo);
+
+    /// Moves the offset at which the next invocation of [`Read`] or [`Write`]
+    /// will occur. The seek offset is specific to each file connection.
+    ///
+    /// + request `origin` the reference point where `offset` will be based on.
+    /// + request `offset` the number of bytes to seek.
+    /// - response `offset_from_start` the adjusted seek offset, from the start
+    ///   of the file.
+    ///
+    /// This method does not require any rights.
+    @selector("fuchsia.io/File.Seek")
+    strict Seek(struct {
+        origin SeekOrigin;
+        offset int64;
+    }) -> (struct {
+        offset_from_start uint64;
+    }) error zx.Status;
+
+    /// Reads up to 'count' bytes at the provided offset.
+    /// Does not affect the seek offset.
+    ///
+    /// ## Invariants
+    ///
+    /// * The returned `data.length` will never be greater than `count`.
+    /// * If `data.length` is less than `count`, it means that `ReadAt` has hit
+    ///   the end of file as part of this operation.
+    /// * If `data.length` is zero while `count` is not, it means that `offset`
+    ///   is at or past the end of file, and no data can be read.
+    /// * If `count` is zero, the server should perform all the checks ensuring
+    ///   read access without actually reading anything, and return an empty
+    ///   `data` vector.
+    ///
+    /// This method requires the [`Rights.READ_BYTES`] right.
+    ///
+    /// Returns `ZX_ERR_OUT_OF_RANGE` if `count` is greater than `MAX_TRANSFER_SIZE`.
+    @selector("fuchsia.io/File.ReadAt")
+    strict ReadAt(struct {
+        count uint64;
+        offset uint64;
+    }) -> (struct {
+        data Transfer;
+    }) error zx.Status;
+
+    /// Writes data at the provided offset.
+    /// Does not affect the seek offset.
+    ///
+    /// The file size may grow if `offset` plus `data.length` is past the
+    /// current end of file.
+    ///
+    /// + request `data` the byte buffer to write to the file.
+    /// + request `offset` the offset from start of the file to begin writing.
+    /// - response `actual_count` the number of bytes written.
+    ///
+    /// ## Invariants
+    ///
+    /// * The returned `actual_count` will never be greater than `data.length`.
+    /// * If the server is unable to write all the data due to e.g. not enough
+    ///   space, `actual_count` may be less than `data.length`.  If no bytes
+    ///   could be written, an error is returned.
+    /// * If `data.length` is zero, the server should perform all the checks
+    ///   ensuring write access without mutating the file, and will return a
+    ///   successful write of zero bytes.
+    ///
+    /// This method requires the [`Rights.WRITE_BYTES`] right.
+    @selector("fuchsia.io/File.WriteAt")
+    strict WriteAt(struct {
+        data Transfer;
+        offset uint64;
+    }) -> (struct {
+        actual_count uint64;
+    }) error zx.Status;
+
+    /// Shrinks or grows the file size to 'length' bytes.
+    ///
+    /// If file size is reduced by this operation, the extra trailing data'
+    /// is discarded.
+    /// If file size is increased by this operation, the extended area appears
+    /// as if it was zeroed.
+    ///
+    /// This method requires the [`Rights.WRITE_BYTES`] right.
+    @selector("fuchsia.io/File.Resize")
+    strict Resize(struct {
+        length uint64;
+    }) -> () error zx.Status;
+
+    /// Acquires a [`zx.Handle:VMO`] representing this file, if there is one,
+    /// with the requested access rights.
+    ///
+    /// Implementations are not required to implement files backed by VMOs so
+    /// this request may fail. Additionally, implementations may only support
+    /// a certain subset of the flags. Clients should be prepared with fallback
+    /// behavior if this request fails.
+    ///
+    /// If a client specifies neither `PRIVATE_CLONE` nor `SHARED_BUFFER`, the
+    /// implementation is free to choose the semantics of the returned VMO.
+    ///
+    /// + request `flags` a [`VmoFlags`] indicating the desired mode of access.
+    /// - response `vmo` the requested [`zx.Handle:VMO`].
+    /// * error a [`zx.Status`] value indicating the failure.
+    ///
+    /// This method requires the following rights:
+    ///
+    /// * [`Rights.READ_BYTES`] if `flags` includes [`VmoFlags.READ`].
+    /// * [`Rights.WRITE_BYTES`] if `flags` includes [`VmoFlags.WRITE`].
+    /// * [`Rights.EXECUTE`] if `flags` includes [`VmoFlags.EXECUTE`].
+    @selector("fuchsia.io/File.GetBackingMemory")
+    strict GetBackingMemory(struct {
+        flags
+                @generated_name("VmoFlags")
+                @strict_audit(bug="https://fxbug.dev/467128288", state="PENDING_REVIEW")
+                strict bits : uint32 {
+            /// Requests that the VMO be readable.
+            READ = 0x00000001;
+
+            /// Requests that the VMO be writable.
+            WRITE = 0x00000002;
+
+            /// Request that the VMO be executable.
+            EXECUTE = 0x00000004;
+
+            /// Require a copy-on-write clone of the underlying VMO. The request
+            /// should fail if the VMO cannot be cloned. May not be supplied
+            /// with `SHARED_BUFFER`.
+            ///
+            /// A private clone uses at least the guarantees of the
+            /// `ZX_VMO_CHILD_SNAPSHOT_AT_LEAST_ON_WRITE` flag to
+            /// `zx_vmo_create_child()`. This means that the returned VMO will
+            /// be copy-on-write (if `WRITE` is requested) but that it may or
+            /// may not reflect subsequent content changes to the underlying
+            /// file. The returned VMO will not reflect size changes to the
+            /// file. These semantics match those of the POSIX `mmap()`
+            /// `MAP_PRIVATE` flag.
+            ///
+            /// In some cases, clients requiring a guaranteed snapshot of the
+            /// file can use `SHARED_BUFFER` and then use
+            /// `zx_vmo_create_child()` with `ZX_VMO_CHILD_SNAPSHOT`. However,
+            /// in addition to cases where the implementation can't return a
+            /// `SHARED_BUFFER`, creating a full snapshot will fail if the VMO
+            /// is attached to the pager. Since most filesystems will use the
+            /// paging system, the full snapshot approach should only be used in
+            /// specific cases where the client is talking to a known server.
+            PRIVATE_CLONE = 0x00010000;
+
+            /// Require a VMO that provides direct access to the contents of the
+            /// file's underlying VMO. The request should fail if such a VMO
+            /// cannot be provided. May not be supplied with `PRIVATE_CLONE`.
+            ///
+            /// The returned VMO may not be resizable even when `WRITE` access is
+            /// requested. In this case, [`File.Resize`] should be used to resize
+            /// the file.
+            SHARED_BUFFER = 0x00020000;
+        };
+    }) -> (resource struct {
+        vmo zx.Handle:VMO;
+    }) error zx.Status;
+
+    /// Pre-allocate on-disk space for this file.
+    @available(added=HEAD)
+    @selector("fuchsia.io/File.Allocate")
+    flexible Allocate(resource struct {
+        offset uint64;
+        length uint64;
+
+        /// If an empty bits is passed for mode, the default behavior is used. Otherwise the
+        /// behavior is modified as described for each mode bit. If the backing filesystem doesn't
+        /// support a particular provided mode bit, or combination of mode bits, an error is
+        /// returned.
+        mode @generated_name("AllocateMode") flexible bits : uint32 {
+            KEEP_SIZE = 0x00000001;
+            UNSHARE_RANGE = 0x00000002;
+            PUNCH_HOLE = 0x00000004;
+            COLLAPSE_RANGE = 0x00000008;
+            ZERO_RANGE = 0x00000010;
+            INSERT_RANGE = 0x00000020;
+        };
+    }) -> () error zx.Status;
+
+    /// Enables verification for the file (permanently) which involves computing a merkle tree for
+    /// the file. Forces a flush prior to building the merkle tree to ensure cached data is
+    /// captured. Future reads will be verified against the computed merkle tree and writes will be
+    /// rejected. This method can take some time to complete as it depends on the size of the file.
+    /// This method can be aborted by closing the connection that this method was issued on.
+    ///
+    /// This method requires the [`Rights.UPDATE_ATTRIBUTES`] right.
+    /// Returns `ZX_ERR_NOT_SUPPORTED` if the filesystem does not support verity.
+    /// Returns `ZX_ERR_ALREADY_EXISTS` if the file was already fsverity-enabled.
+    /// Also returns any error that might arise from reading the file, or from flushing the file,
+    /// such as `ZX_ERR_IO`.
+    @selector("fuchsia.io/File.EnableVerity")
+    @available(added=HEAD)
+    flexible EnableVerity(resource struct {
+        options VerificationOptions;
+    }) -> () error zx.Status;
+};
+
+closed protocol Readable {
+    /// Reads up to 'count' bytes at the seek offset.
+    /// The seek offset is moved forward by the number of bytes read.
+    ///
+    /// ## Invariants
+    ///
+    /// * The returned `data.length` will never be greater than `count`.
+    /// * If `data.length` is less than `count`, it means that the seek offset
+    ///   has reached the end of file as part of this operation.
+    /// * If `data.length` is zero while `count` is not, it means that the
+    ///   seek offset is already at or beyond the end of file, and no data could
+    ///   be read.
+    /// * If `count` is zero, the server should perform all the checks ensuring
+    ///   read access without actually read anything, and return an empty
+    ///   `data` vector.
+    ///
+    /// This method requires the [`Rights.READ_BYTES`] right.
+    ///
+    /// Returns `ZX_ERR_OUT_OF_RANGE` if `count` is greater than `MAX_TRANSFER_SIZE`.
+    @selector("fuchsia.io/File.Read")
+    strict Read(struct {
+        count uint64;
+    }) -> (struct {
+        data Transfer;
+    }) error zx.Status;
+};
+
+closed protocol Writable {
+    /// Writes data at the seek offset.
+    /// The seek offset is moved forward by the number of bytes written.
+    /// If the file is in append mode, the seek offset is first set to the end
+    /// of the file, followed by the write, in one atomic step.
+    ///
+    /// The file size may grow if the seek offset plus `data.length` is beyond
+    /// the current end of file.
+    ///
+    /// + request `data` the byte buffer to write to the file.
+    /// - response `actual_count` the number of bytes written.
+    ///
+    /// ## Invariants
+    ///
+    /// * The returned `actual_count` will never be greater than `data.length`.
+    /// * If the server is unable to write all the data due to e.g. not enough
+    ///   space, `actual_count` may be less than `data.length`.  If no bytes
+    ///   could be written, an error is returned.
+    /// * If `data.length` is zero, the server should perform all the checks
+    ///   ensuring write access without mutating the file and return a
+    ///   successful write of zero bytes.  The seek offset is still updated if
+    ///   in append mode.
+    ///
+    /// This method requires the [`Rights.WRITE_BYTES`] right.
+    @selector("fuchsia.io/File.Write")
+    strict Write(struct {
+        data Transfer;
+    }) -> (struct {
+        actual_count uint64;
+    }) error zx.Status;
+};
+
+/// The reference point for updating the seek offset. See [`File.Seek`].
+///
+/// This enum matches the `zx_stream_seek_origin_t` enum.
+@strict_audit(bug="https://fxbug.dev/467128288", state="PENDING_REVIEW")
+type SeekOrigin = strict enum : uint32 {
+    /// Seek from the start of the file.
+    /// The seek offset will be set to `offset` bytes.
+    /// The seek offset cannot be negative in this case.
+    START = 0;
+
+    /// Seek from the current position in the file.
+    /// The seek offset will be the current seek offset plus `offset` bytes.
+    CURRENT = 1;
+
+    /// Seek from the end of the file.
+    /// The seek offset will be the file size plus `offset` bytes.
+    END = 2;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128288", state="PENDING_REVIEW")
+type FileSignal = strict bits : uint32 {
+    /// Indicates the file is ready for reading.
+    READABLE = 0x01000000; // ZX_USER_SIGNAL_0
+
+    /// Indicates the file is ready for writing.
+    WRITABLE = 0x02000000; // ZX_USER_SIGNAL_1
+};

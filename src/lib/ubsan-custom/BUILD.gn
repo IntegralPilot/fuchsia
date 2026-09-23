@@ -1,0 +1,84 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This enables both the ubsan checking that happens in normal application code,
+# and also some non-default checks that are a good idea for the kind of
+# low-level and highly sensitive code likely to need a custom runtime.
+_ubsan_sanitizers = [
+  "undefined",
+
+  # Checks whether an implicit truncation caused data loss. It's not
+  # undefined behavior but most of the time it is unintentional.
+  "implicit-integer-truncation",
+
+  # The kernel has some _Nonnull annotations, this would check
+  # them at runtime.
+  "nullability",
+]
+
+config("ubsan") {
+  cflags = []
+  foreach(sanitizer, _ubsan_sanitizers) {
+    cflags += [ "-fsanitize=$sanitizer" ]
+  }
+
+  # The ubsan variant adds rtti, but that is not used by the kernel variant.
+  configs = [ "//build/config:no_rtti" ]
+}
+
+# This disables all those, and can be appended to a configs list that has the
+# "ubsan" config earlier in its list, or to one that doesn't.
+config("no-ubsan") {
+  cflags = []
+  foreach(sanitizer, _ubsan_sanitizers) {
+    cflags += [ "-fno-sanitize=$sanitizer" ]
+  }
+}
+
+# Not all code compiled in sensitive places is as fastidious with explicit
+# casts for intended integer truncattion cases as the Fuchsia codebase.
+config("allow-implicit-integer-truncation") {
+  if (!is_gcc) {
+    cflags = [ "-fno-sanitize=implicit-integer-truncation" ]
+  }
+}
+
+# This should only be in the deps of a source_set() for the single source file
+# that does `#include <lib/ubsan-custom/handlers.h>`.
+source_set("handlers") {
+  public = [ "handlers.h" ]
+  public_deps = [ ":types" ]
+
+  # The handlers themselves shouldn't be compiled with instrumentation, so
+  # apply a config to the dependent source_set() to disable it.  Disabling it
+  # on the command-line not only saves adding NO_UBSAN annotations to each
+  # function, but covers inline functions from shared header files that
+  # shouldn't all be annotated for their other callers.  The former could be
+  # addressed via `#pragma clang attribute`, but the latter cannot be.
+  public_configs = [ ":no-ubsan" ]
+
+  # This is meant to be read by authors depending on this target, but not
+  # `#include`d in their code; they use only `<lib/ubsan-custom/handlers.h>`.
+  # Since it contains `inline` declarations for functions not defined, it's
+  # meant to generate warnings if it's included in any translation unit other
+  # than the single one that should define those functions.
+  sources = [ "report.h" ]
+}
+
+# This can be used freely, for example if a custom ubsan::Report implementation
+# wants to pass ubsan::SourceLocation to other code outside the single-file
+# source_set() that includes <lib/ubsan-commit/handlers.h>.
+source_set("types") {
+  public = [ "types.h" ]
+  public_configs = [ ":includes" ]
+}
+
+config("includes") {
+  visibility = [ ":*" ]
+  include_dirs = [ "//src" ]
+}
+
+group("tests") {
+  testonly = true
+}

@@ -1,0 +1,513 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "src/devices/lib/goldfish/pipe_io/pipe_io.h"
+
+#include <fidl/fuchsia.hardware.goldfish/cpp/wire.h>
+#include <lib/dma-buffer/buffer.h>
+#include <lib/fit/defer.h>
+#include <lib/fzl/pinned-vmo.h>
+#include <lib/stdcompat/span.h>
+#include <lib/zx/result.h>
+#include <lib/zx/time.h>
+#include <zircon/assert.h>
+
+#include <cinttypes>
+#include <cstdlib>
+#include <cstring>
+#include <variant>
+
+#include <fbl/auto_lock.h>
+
+#include "src/devices/lib/goldfish/pipe_headers/include/base.h"
+#include "src/graphics/display/lib/driver-framework-migration-utils/logging/zxlogf.h"
+#include "src/lib/fxl/strings/string_number_conversions.h"
+
+namespace goldfish {
+
+PipeIo::PipeIo(fidl::WireSyncClient<fuchsia_hardware_goldfish_pipe::Bus> pipe_bus,
+               const char* pipe_name) {
+  pipe_bus_ = std::move(pipe_bus);
+
+  auto status = Init(pipe_name);
+  if (status == ZX_OK) {
+    valid_ = true;
+  }
+}
+
+zx_status_t PipeIo::SetupPipe() {
+  fbl::AutoLock lock(&lock_);
+
+  if (!pipe_bus_.is_valid()) {
+    zxlogf(ERROR, "%s: no pipe protocol", __func__);
+    return ZX_ERR_NOT_SUPPORTED;
+  }
+
+  auto result = pipe_bus_->GetBti();
+  if (!result.ok()) {
+    zxlogf(ERROR, "%s: GetBti failed: %s", __func__, result.status_string());
+    return result.status();
+  }
+  bti_ = std::move(result->value()->bti);
+
+  std::unique_ptr<dma_buffer::BufferFactory> buffer_factory = dma_buffer::CreateBufferFactory();
+
+  zx_status_t status = buffer_factory->CreateContiguous(
+      bti_, /*size=*/zx_system_get_page_size(), /*alignment_log2=*/0,
+      dma_buffer::CacheOptions::kEnabled, &io_buffer_);
+  if (status != ZX_OK) {
+    zxlogf(ERROR, "Failed to create contiguous IO buffer: %s", zx_status_get_string(status));
+    return status;
+  }
+  io_buffer_size_ = io_buffer_->size();
+
+  ZX_DEBUG_ASSERT(!pipe_event_.is_valid());
+  status = zx::event::create(0u, &pipe_event_);
+  if (status != ZX_OK) {
+    zxlogf(ERROR, "%s: zx_event_create failed: %s", __func__, zx_status_get_string(status));
+    return status;
+  }
+
+  zx::event pipe_event_dup;
+  status = pipe_event_.duplicate(ZX_RIGHT_SAME_RIGHTS, &pipe_event_dup);
+  if (status != ZX_OK) {
+    zxlogf(ERROR, "%s: zx_handle_duplicate failed: %s", __func__, zx_status_get_string(status));
+    return status;
+  }
+
+  auto create_result = pipe_bus_->Create();
+  if (!create_result.ok()) {
+    zxlogf(ERROR, "%s: Create pipe failed: %s", __func__, create_result.status_string());
+    return create_result.status();
+  }
+  id_ = create_result->value()->id;
+  zx::vmo vmo = std::move(create_result->value()->vmo);
+
+  auto set_event_result = pipe_bus_->SetEvent(id_, std::move(pipe_event_dup));
+  if (!set_event_result.ok()) {
+    zxlogf(ERROR, "%s: SetEvent failed: %s", __func__, set_event_result.status_string());
+    return set_event_result.status();
+  }
+
+  status = cmd_buffer_.Map(std::move(vmo), 0, 0, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE);
+  if (status != ZX_OK) {
+    zxlogf(ERROR, "Failed to map the command buffer VMO: %s", zx_status_get_string(status));
+    return status;
+  }
+
+  auto buffer = static_cast<PipeCmdBuffer*>(cmd_buffer_.start());
+  buffer->id = id_;
+  buffer->cmd = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kOpen);
+  buffer->status = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kInval);
+
+  auto open_result = pipe_bus_->Open(id_);
+  if (!open_result.ok()) {
+    zxlogf(ERROR, "%s: Open failed: %s", __func__, open_result.status_string());
+    return ZX_ERR_INTERNAL;
+  }
+
+  if (buffer->status) {
+    zxlogf(ERROR, "%s: Open failed: %s", __func__, zx_status_get_string(buffer->status));
+    return ZX_ERR_INTERNAL;
+  }
+
+  return ZX_OK;
+}
+
+zx_status_t PipeIo::Init(const char* pipe_name) {
+  zx_status_t status = SetupPipe();
+  if (status != ZX_OK) {
+    return status;
+  }
+
+  size_t length = strlen(pipe_name) + 1;
+  std::vector<uint8_t> payload(length, 0u);
+  std::copy(pipe_name, pipe_name + length, payload.begin());
+
+  auto write_status = Write(payload);
+  if (write_status != ZX_OK) {
+    return write_status;
+  }
+
+  valid_ = true;
+  return ZX_OK;
+}
+
+PipeIo::~PipeIo() {
+  fbl::AutoLock lock(&lock_);
+  if (id_) {
+    if (cmd_buffer_.start() != nullptr) {
+      auto buffer = static_cast<PipeCmdBuffer*>(cmd_buffer_.start());
+      buffer->id = id_;
+      buffer->cmd = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kClose);
+      buffer->status = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kInval);
+
+      [[maybe_unused]] auto result = pipe_bus_->Exec(id_);
+    }
+    [[maybe_unused]] auto destroy_result = pipe_bus_->Destroy(id_);
+    // We don't check the return status as the pipe is destroyed on a
+    // best-effort basis.
+  }
+}
+
+zx::result<uint32_t> PipeIo::TransferLocked(const TransferOp& op) {
+  auto buffer = static_cast<PipeCmdBuffer*>(cmd_buffer_.start());
+
+  buffer->rw_params.consumed_size = 0;
+  buffer->rw_params.buffers_count = 1;
+  buffer->rw_params.ptrs[0] = std::visit(
+      [base_addr = io_buffer_->phys()](const auto& data) -> zx_paddr_t {
+        using T = std::decay_t<decltype(data)>;
+        if constexpr (std::is_same_v<T, TransferOp::IoBuffer>) {
+          return base_addr + data.offset;
+        } else if constexpr (std::is_same_v<T, TransferOp::PinnedVmo>) {
+          return data.paddr;
+        }
+        ZX_PANIC("Unreachable");
+      },
+      op.data);
+  buffer->rw_params.sizes[0] = op.size;
+  buffer->rw_params.read_index = 0;
+
+  return ExecTransferCommandLocked(op.type == TransferOp::Type::kWrite,
+                                   op.type == TransferOp::Type::kRead);
+}
+
+zx::result<uint32_t> PipeIo::TransferLocked(cpp20::span<const TransferOp> ops) {
+  ZX_DEBUG_ASSERT(!ops.empty());
+  auto buffer = static_cast<PipeCmdBuffer*>(cmd_buffer_.start());
+
+  bool has_read = false;
+  bool has_write = false;
+  buffer->rw_params.consumed_size = 0;
+  buffer->rw_params.buffers_count = ops.size();
+  for (size_t i = 0; i < ops.size(); i++) {
+    switch (ops[i].type) {
+      case TransferOp::Type::kWrite:
+        if (has_read) {
+          zxlogf(ERROR, "Read (idx=%lu) must occur after all writes", i);
+          return zx::error(ZX_ERR_INVALID_ARGS);
+        }
+        has_write = true;
+        break;
+      case TransferOp::Type::kRead:
+        if (!has_read) {
+          buffer->rw_params.read_index = i;
+        }
+        has_read = true;
+        break;
+    }
+
+    buffer->rw_params.ptrs[i] = std::visit(
+        [base_addr = io_buffer_->phys()](const auto& data) -> zx_paddr_t {
+          using T = std::decay_t<decltype(data)>;
+          if constexpr (std::is_same_v<T, TransferOp::IoBuffer>) {
+            return base_addr + data.offset;
+          } else if constexpr (std::is_same_v<T, TransferOp::PinnedVmo>) {
+            return data.paddr;
+          }
+          ZX_PANIC("Unreachable");
+        },
+        ops[i].data);
+
+    buffer->rw_params.sizes[i] = ops[i].size;
+  }
+
+  return ExecTransferCommandLocked(has_write, has_read);
+}
+
+zx::result<uint32_t> PipeIo::ExecTransferCommandLocked(bool has_write, bool has_read) {
+  ZX_DEBUG_ASSERT(has_write || has_read);
+  auto buffer = static_cast<PipeCmdBuffer*>(cmd_buffer_.start());
+  buffer->id = id_;
+  buffer->cmd =
+      has_read
+          ? (has_write ? static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kCall)
+                       : static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kRead))
+          : static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWrite);
+  buffer->status = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kInval);
+  auto result = pipe_bus_->Exec(id_);
+  if (!result.ok()) {
+    zxlogf(ERROR, "[%s] Exec failed: %s", __func__, result.status_string());
+    return zx::error_result(result.status());
+  }
+
+  // Positive consumed size always indicate a successful transfer.
+  if (buffer->rw_params.consumed_size) {
+    return zx::ok(buffer->rw_params.consumed_size);
+  }
+
+  // Early out if error is not because of back-pressure.
+  if (buffer->status != static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kAgain)) {
+    zxlogf(ERROR, "[%s] Pipe::Transfer() transfer failed: %" PRId32, __func__, buffer->status);
+    return zx::error_result(ZX_ERR_INTERNAL);
+  }
+
+  uint32_t clear_events = 0u;
+  if (has_read) {
+    clear_events |= fuchsia_hardware_goldfish::wire::kSignalReadable;
+  }
+  if (has_write) {
+    clear_events |= fuchsia_hardware_goldfish::wire::kSignalWritable;
+  }
+  pipe_event_.signal(clear_events, 0u);
+
+  buffer->id = id_;
+  buffer->cmd =
+      has_write ? static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWakeOnWrite)
+                : static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWakeOnRead);
+  buffer->status = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kInval);
+  auto result2 = pipe_bus_->Exec(id_);
+  if (!result2.ok()) {
+    zxlogf(ERROR, "[%s] Pipe::Exec() failed: %s", __func__, result2.status_string());
+    return zx::error_result(result2.status());
+  }
+
+  if (buffer->status) {
+    zxlogf(ERROR, "Pipe::Transfer() failed to request interrupt: %" PRId32, buffer->status);
+    return zx::error_result(ZX_ERR_INTERNAL);
+  }
+
+  return zx::error_result(ZX_ERR_SHOULD_WAIT);
+}
+
+PipeIo::ReadResult<char> PipeIo::ReadWithHeader(bool blocking) {
+  constexpr size_t kHeaderSize = 4u;
+
+  auto header_result = Read<char>(kHeaderSize, blocking);
+  if (!header_result.is_ok()) {
+    return header_result;
+  }
+
+  uint32_t msg_size = 0u;
+  bool convert_result =
+      fxl::StringToNumberWithError<uint32_t>(header_result.value(), &msg_size, fxl::Base::k16);
+  ZX_DEBUG_ASSERT(convert_result);
+  return Read<char>(msg_size, blocking);
+}
+
+zx::result<size_t> PipeIo::ReadOnceLocked(void* buf, size_t size) {
+  auto status = TransferLocked(TransferOp{
+      .type = TransferOp::Type::kRead,
+      .data = TransferOp::IoBuffer{.offset = 0u},
+      .size = size,
+  });
+
+  if (status.is_ok()) {
+    if (auto read_status = io_buffer_->Read(0, status.value(), buf); read_status.is_error()) {
+      zxlogf(ERROR, "Failed to read from io_buffer: %s", read_status.status_string());
+      return read_status.take_error();
+    }
+  }
+  return status;
+}
+
+// Synchronous read.
+zx_status_t PipeIo::ReadTo(void* dst, size_t size, bool blocking) {
+  fbl::AutoLock lock(&lock_);
+
+  size_t bytes_to_read = size;
+
+  while (bytes_to_read > 0) {
+    auto status = ReadOnceLocked(dst, bytes_to_read);
+
+    switch (status.status_value()) {
+      case ZX_OK:
+        dst = reinterpret_cast<uint8_t*>(dst) + status.value();
+        bytes_to_read -= status.value();
+        break;
+      case ZX_ERR_SHOULD_WAIT: {
+        if (!blocking) {
+          return status.error_value();
+        }
+        auto wait_status =
+            pipe_event_.wait_one(fuchsia_hardware_goldfish::wire::kSignalHangup |
+                                     fuchsia_hardware_goldfish::wire::kSignalReadable,
+                                 zx::time::infinite(), nullptr);
+        if (wait_status != ZX_OK) {
+          return status.error_value();
+        }
+        break;
+      }
+      default:
+        return status.error_value();
+    }
+  }
+  return ZX_OK;
+}
+
+zx_status_t PipeIo::CallTo(cpp20::span<const WriteSrc> sources, void* read_dst, size_t read_size,
+                           bool blocking) {
+  fbl::AutoLock lock(&lock_);
+
+  std::vector<TransferOp> transfer_ops;
+  size_t io_buffer_offset = 0u;
+  for (const auto& src : sources) {
+    if (auto str = std::get_if<WriteSrc::Str>(&src.data); str != nullptr) {
+      if (io_buffer_offset + str->length() + 1 > io_buffer_size_) {
+        zxlogf(ERROR, "payload size (%lu) exceeded limit (%lu)",
+               io_buffer_offset + str->length() + 1, io_buffer_size_);
+        return ZX_ERR_INVALID_ARGS;
+      }
+
+      char* target_buf = reinterpret_cast<char*>(io_buffer_->virt()) + io_buffer_offset;
+      std::copy(str->begin(), str->end(), target_buf);
+      target_buf[str->length()] = '\0';
+
+      transfer_ops.push_back(TransferOp{
+          .type = TransferOp::Type::kWrite,
+          .data = TransferOp::IoBuffer{.offset = io_buffer_offset},
+          .size = str->length() + 1,
+      });
+      io_buffer_offset += str->length() + 1;
+    } else if (auto span = std::get_if<WriteSrc::Span>(&src.data); span != nullptr) {
+      if (io_buffer_offset + span->size() > io_buffer_size_) {
+        zxlogf(ERROR, "payload size (%lu) exceeded limit (%lu)", io_buffer_offset + span->size(),
+               io_buffer_size_);
+        return ZX_ERR_INVALID_ARGS;
+      }
+
+      std::copy(span->begin(), span->end(),
+                reinterpret_cast<uint8_t*>(io_buffer_->virt()) + io_buffer_offset);
+      transfer_ops.push_back(TransferOp{
+          .type = TransferOp::Type::kWrite,
+          .data = TransferOp::IoBuffer{.offset = io_buffer_offset},
+          .size = span->size(),
+      });
+      io_buffer_offset += span->size();
+    } else if (auto pinned_vmo = std::get_if<WriteSrc::PinnedVmo>(&src.data);
+               pinned_vmo != nullptr) {
+      ZX_DEBUG_ASSERT(pinned_vmo->vmo && pinned_vmo->vmo->region_count() == 1 &&
+                      pinned_vmo->size <= pinned_vmo->vmo->region(0).size);
+
+      transfer_ops.push_back(TransferOp{
+          .type = TransferOp::Type::kWrite,
+          .data = TransferOp::PinnedVmo{.paddr = pinned_vmo->vmo->region(0).phys_addr +
+                                                 pinned_vmo->offset},
+          .size = pinned_vmo->size,
+      });
+    } else {
+      ZX_PANIC("Unreachable");
+    }
+  }
+
+  if (read_size > 0) {
+    transfer_ops.push_back(TransferOp{
+        .type = TransferOp::Type::kRead,
+        .data =
+            TransferOp::IoBuffer{
+                .offset = 0u,
+            },
+        .size = read_size,
+    });
+  }
+
+  auto current_op = transfer_ops.begin();
+  while (current_op != transfer_ops.end()) {
+    auto status = TransferLocked({current_op, transfer_ops.end()});
+
+    switch (status.status_value()) {
+      case ZX_OK: {
+        auto actual = status.value();
+        while (current_op != transfer_ops.end()) {
+          if (current_op->size <= actual) {
+            actual -= current_op->size;
+            current_op++;
+          } else {
+            current_op->size -= actual;
+            break;
+          }
+        }
+        break;
+      }
+      case ZX_ERR_SHOULD_WAIT: {
+        if (!blocking) {
+          return status.status_value();
+        }
+        bool is_reading = current_op->type == TransferOp::Type::kRead;
+        zx_signals_t wait_signals = fuchsia_hardware_goldfish::wire::kSignalHangup |
+                                    (is_reading ? fuchsia_hardware_goldfish::wire::kSignalReadable
+                                                : fuchsia_hardware_goldfish::wire::kSignalWritable);
+        auto wait_status = ZX_OK;
+        pipe_event_.wait_one(wait_signals, zx::time::infinite(), nullptr);
+        if (wait_status != ZX_OK) {
+          zxlogf(ERROR, "zx_object_wait_one error (status=%d)", wait_status);
+          return status.status_value();
+        }
+        break;
+      }
+      default:
+        zxlogf(ERROR, "TransferLocked error (status=%d)", status.status_value());
+        return status.status_value();
+    }
+  }
+
+  if (read_size > 0) {
+    if (auto status = io_buffer_->Read(0, read_size, read_dst); status.is_error()) {
+      zxlogf(ERROR, "Failed to read from io_buffer: %s", status.status_string());
+      return status.error_value();
+    }
+  }
+
+  return ZX_OK;
+}
+
+zx_status_t PipeIo::Write(cpp20::span<const WriteSrc> sources, bool blocking) {
+  auto result = Call<char>(sources, 0u, blocking);
+  if (result.is_error()) {
+    return result.error_value();
+  }
+  return ZX_OK;
+}
+
+zx_status_t PipeIo::Write(const char* payload, bool blocking) {
+  WriteSrc sources[] = {{.data = payload}};
+  return Write(sources, blocking);
+}
+
+zx_status_t PipeIo::Write(const std::vector<uint8_t>& payload, bool blocking) {
+  WriteSrc sources[] = {{.data = payload}};
+  return Write(sources, blocking);
+}
+
+zx_status_t PipeIo::WriteWithHeader(const char* payload, bool blocking) {
+  size_t len = strlen(payload);
+  std::vector<uint8_t> payload_v(payload, payload + len);
+  return WriteWithHeader(payload_v, blocking);
+}
+
+zx_status_t PipeIo::WriteWithHeader(const std::vector<uint8_t>& payload, bool blocking) {
+  constexpr size_t kHeaderSize = 4u;
+  if (payload.size() > 0xffffu) {
+    zxlogf(ERROR, "payload size (%lu) too large, cannot be expressed in header", payload.size());
+    return ZX_ERR_INVALID_ARGS;
+  }
+
+  char size[5];
+  snprintf(size, sizeof(size), "%04lx", payload.size());
+
+  std::vector<uint8_t> payload_with_header(payload.size() + kHeaderSize);
+  memcpy(payload_with_header.data(), size, kHeaderSize);
+  memcpy(payload_with_header.data() + kHeaderSize, payload.data(), payload.size());
+
+  return Write(payload_with_header, blocking);
+}
+
+fzl::PinnedVmo PipeIo::PinVmo(zx::vmo& vmo, uint32_t options) {
+  fbl::AutoLock lock(&lock_);
+  fzl::PinnedVmo result;
+  auto status = result.Pin(vmo, bti_, options);
+  ZX_DEBUG_ASSERT(status == ZX_OK);
+  return result;
+}
+
+fzl::PinnedVmo PipeIo::PinVmo(zx::vmo& vmo, uint32_t options, size_t offset, size_t size) {
+  fbl::AutoLock lock(&lock_);
+  fzl::PinnedVmo result;
+  auto status = result.PinRange(offset, size, vmo, bti_, options);
+  ZX_DEBUG_ASSERT(status == ZX_OK);
+  return result;
+}
+
+}  // namespace goldfish

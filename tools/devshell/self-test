@@ -1,0 +1,180 @@
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Test
+### run tests of fx and subcommands
+
+## Usage:
+##     fx self-test --all
+##         Run all tests from all test scripts.
+##
+##     fx self-test TEST_SCRIPT|TEST_DIR [TEST_SCRIPT|TEST_DIR ...]
+##         Run all tests from the specified test script(s) or in the
+##         test scripts in the specified test subdirectory(ies), recursively.
+##
+##            TEST_SCRIPT  Name of a test script file containing tests.
+##                         Test script filenames end with "_test" and are
+##                         relative to //tools/devshell/tests.
+##                         See the existing test scripts below.
+##
+##            TEST_DIR     A subdirectory of //tools/devshell/tests.
+##
+##     fx self-test TEST_SCRIPT [--test TEST_NAME] [--help]
+##         Executes a single test script.
+##            --test TEST_NAME   Only run the specified test
+##            --help             List the tests and test options  in the test script
+##
+##
+## Examples:
+##    fx self-test --all   # run all tests from all tests scripts
+##    fx self-test subcommands    # run all tests scripts in //tools/devshell/tests/subcommands
+##    fx self-test subcommands/fx_set_test   # run all tests in //tools/devshell/tests/subcommands/fx_set_test
+##    fx self-test fx-internal/fx_test   # run all tests in //tools/devshell/tests/fx-internal/fx_test
+##    fx self-test fx-internal/fx_test --test TEST_fx-subcommand-run   # run a single test from fx-internal/fx_test
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh \
+    || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/style.sh \
+    || exit $?
+
+declare -r test_framework_dir="${FUCHSIA_DIR}/tools/devshell/tests/lib"
+
+
+
+usage() {
+  fx-command-help
+  echo
+  echo "Available test scripts:"
+  local has_not_in_cq=false
+  for script_name in $(list_tests | sort); do
+    local simple="${script_name#${FUCHSIA_DIR}/}"
+    echo -n "  //${simple}"
+    if ! is_in_buildgn "$simple"; then
+      echo "    $(style::echo --color red -n "(not in CQ)")"
+      has_not_in_cq=true
+    else
+      echo
+    fi
+  done
+  if $has_not_in_cq; then
+    fx-warn "Some tests are not configured to run in CQ."
+    fx-warn "If possible, add them to //tools/devshell/BUILD.gn or //vendor/*/scripts/devshell/BUILD.gn"
+  fi
+}
+
+is_in_buildgn() {
+  # for performance reasons, this method uses a regular expression
+  # to look up in the corresponding BUILD.gn file. The exact search would
+  # require a more extensive GN walk and some assumptions about infra
+  # setup. The current heuristics is sufficiently stable as long as the
+  # corresponding BUILD.gn files keep the same structure.
+  local n="$1"
+  local buildgn="tools/devshell/BUILD.gn"
+  if [[ "$1" =~ ^vendor/(.*)/scripts/devshell/tests ]]; then
+    v="${BASH_REMATCH[1]}"
+    buildgn="vendor/${v}/scripts/devshell/BUILD.gn"
+  fi
+  local p="$(dirname "$buildgn")"
+  n="${n#$p/}"
+  grep -q "^\\s*\"$n\"" $buildgn
+}
+
+# //<dir>
+# //<file>
+#if dir exists, use it. If file exists, use it
+#otherwise, prefix with tools/devshell/tests and test again
+# ./<dir>
+# ./<file>
+# <dir_or_file_inside_tools/devshell/tests/...>
+list_tests() {
+  local file=$1
+  # expand // to FUCHSIA_DIR:
+  if [[ "$file" =~ ^// ]]; then
+    file="${FUCHSIA_DIR}/${file#\//}"
+  fi
+  if [[ -f "$file" && "$file" =~ _test$ ]]; then
+    echo "$file"
+  else
+    file="/${file}"
+    list_tests_in_dir "${FUCHSIA_DIR}/tools/devshell/tests${file}"
+    list_tests_in_dir "${FUCHSIA_DIR}"/vendor/*/scripts/devshell/tests"${file}"
+  fi
+}
+
+list_tests_in_dir() {
+  # the old 'find' tool in MacOS does not handle trailing slashs correctly.
+  local d="${1%/}"
+  if [[ -d "$d" ]]; then
+    find "$d" -type f -path "*/devshell/*" -not -path "*/lib/*" -not -path "*/data/*" -name "*_test"
+  elif [[ -f "$d" ]]; then
+    echo "$d"
+  fi
+}
+
+launch_script() {
+  declare -r test_script_path="$1"
+  shift
+
+  if [[ ! -f "${test_script_path}" ]]; then
+    fx-error "Test script '${test_script_path}' not found. Aborting."
+    return 1
+  fi
+  # propagate certain bash flags if present
+  local shell_flags=()
+  if [[ $- == *x* ]]; then
+    shell_flags+=( -x )
+  fi
+
+  # Start a clean environment, load the bash_test_framework.sh,
+  # then start the test script.
+  local -r launch_script="$(cat << EOF
+source "${test_framework_dir}/bash_test_framework.sh" || exit \$?
+source "${test_script_path}" || exit \$?
+EOF
+)"
+
+  /usr/bin/env -i \
+      USER="${USER}" \
+      HOME="${HOME}" \
+      bash "${shell_flags[@]}" \
+      -c "${launch_script}" "${test_script_path}" "$@"
+}
+
+
+if [[ $# -eq 0 || "$1" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+all=0
+test_args=()
+if [[ "$1" == "--all" ]]; then
+  tests="$(list_tests)"
+else
+  tests_arr=()
+  while [[ $# -gt 0 && "$1" != "--"* ]]; do
+    arg="$1"
+
+
+    expanded_tests=( $(list_tests "$arg") )
+    if [[ "${#expanded_tests[@]}" -eq 0 ]]; then
+      fx-error "Invalid test name or directory '$arg'"
+      usage
+      exit 1
+    fi
+
+    tests_arr+=( "${expanded_tests[@]}" )
+    shift
+  done
+  tests="${tests_arr[@]}"
+  if [[ $# -gt 0 && "$1" == "--"* ]]; then
+    test_args+=( "$@" )
+  fi
+fi
+
+for script_name in ${tests}; do
+  echo "Running test script ${script_name}"
+  launch_script "${script_name}" "${test_args[@]}"
+done

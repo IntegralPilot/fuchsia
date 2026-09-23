@@ -1,0 +1,64 @@
+// Copyright 2016 The Fuchsia Authors
+//
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT
+
+#ifndef ZIRCON_KERNEL_INCLUDE_KERNEL_CPU_H_
+#define ZIRCON_KERNEL_INCLUDE_KERNEL_CPU_H_
+
+#include <stdint.h>
+
+#include <ktl/limits.h>
+
+// types and routines for dealing with lists of cpus and cpu masks
+
+using cpu_mask_t = uint32_t;
+using cpu_num_t = uint32_t;
+
+static_assert(SMP_MAX_CPUS <= sizeof(cpu_mask_t) * CHAR_BIT);
+
+constexpr cpu_num_t INVALID_CPU = -1;
+constexpr cpu_mask_t CPU_MASK_ALL = -1;
+
+constexpr bool is_valid_cpu_num(cpu_num_t num) { return (num < SMP_MAX_CPUS); }
+
+constexpr cpu_mask_t cpu_num_to_mask(cpu_num_t num) {
+  if (!is_valid_cpu_num(num)) {
+    return 0;
+  }
+
+  return (static_cast<cpu_mask_t>(1u) << num);
+}
+
+constexpr cpu_mask_t mask_all_but_one(cpu_num_t num) { return CPU_MASK_ALL ^ cpu_num_to_mask(num); }
+
+constexpr cpu_num_t highest_cpu_set(cpu_mask_t mask) {
+  if (mask == 0) {
+    return 0;
+  }
+
+  return static_cast<cpu_num_t>((sizeof(cpu_mask_t) * CHAR_BIT) - 1) - __builtin_clz(mask);
+}
+
+constexpr cpu_num_t lowest_cpu_set(cpu_mask_t mask) {
+  if (mask == 0) {
+    return 0;
+  }
+
+  return static_cast<cpu_num_t>(__builtin_ctz(mask));
+}
+
+// Removes one CPU from the mask and returns its ID.
+//
+// Returns INVALID_CPU if the mask is empty.
+constexpr cpu_num_t remove_cpu_from_mask(cpu_mask_t& mask) {
+  if (mask == 0) {
+    return INVALID_CPU;
+  }
+  cpu_num_t index_of_lowest_set_bit = __builtin_ffsl(mask) - 1;
+  mask &= ~cpu_num_to_mask(index_of_lowest_set_bit);
+  return index_of_lowest_set_bit;
+}
+
+#endif  // ZIRCON_KERNEL_INCLUDE_KERNEL_CPU_H_

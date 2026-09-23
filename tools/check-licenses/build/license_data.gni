@@ -1,0 +1,263 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/info/info.gni")
+
+# Invokes the check-licenses tool.
+#
+# Parameters
+#
+#   fuchsia_dir (optional)
+#     [string] Path to the fuchsia root directory. Defaults to "//".
+#
+#   out_dir (optional)
+#     [string] Directory where generated NOTICE files will be placed. Defaults
+#     to target_out_dir.
+#
+#   target (optional)
+#     [string] Target to analyze. Defaults to "//:default".
+#
+#   run_analysis (optional)
+#     [bool] Whether to analyze license texts and run tests. Default == true.
+#
+#   always_run_gn_desc (optional)
+#     [bool] Whether to (re)generate build graph using 'fx gn desc'. Default == true.
+#
+#   produce_spdx (optional)
+#     [bool] Whether to also produce an SPDX output. Default == false.
+#
+#   emit_metadata (optional)
+#     [bool] Whether to emit metadata for uploading artifacts to GCS. Default == true.
+#
+#   testonly, visibility, deps
+template("license_data") {
+  target = "//:default"
+  if (defined(invoker.target)) {
+    target = invoker.target
+  }
+
+  emit_metadata = true
+  if (defined(invoker.emit_metadata)) {
+    emit_metadata = invoker.emit_metadata
+  }
+
+  run_analysis = true
+  if (defined(invoker.run_analysis)) {
+    run_analysis = invoker.run_analysis
+  }
+
+  always_run_gn_desc = true
+  if (defined(invoker.always_run_gn_desc)) {
+    always_run_gn_desc = invoker.always_run_gn_desc
+  }
+
+  # TODO(https://fxbug.dev/42067990): Remove once SPDX generation is not flaky.
+  produce_spdx = defined(invoker.produce_spdx) && invoker.produce_spdx
+
+  out_dir = "$target_out_dir/check-licenses"
+  if (defined(invoker.out_dir)) {
+    out_dir = invoker.out_dir
+  }
+  temp_out_dir = "$out_dir/temp"
+  temp_out_licenses_dir = "$out_dir/temp_licenses"
+
+  check_licenses_target = "${target_name}_check-licenses"
+  copy_txt_notices_target = "${target_name}_txt_copy"
+
+  compliance_output = "compliance.csv"
+
+  if (produce_spdx) {
+    spdx_output = "results.spdx.json"
+    copy_spdx_target = "${target_name}_spdx_copy"
+  }
+
+  txt_notices_output = "license_texts_grouped_by_project_deduped.txt.gz"
+
+  license_outdir = "$target_out_dir/license/gen"
+
+  # Step 1: Generate $root_build_dir/project.json by running "fx gn gen". Copy
+  # the resulting project.json file to $root_build_dir/license/gen/project.json.
+  # This is done in //tools/check-licenses/util/cmd/gn/generate_project_json
+  generate_project_json = "//tools/check-licenses/build:generate_project_json"
+  generate_project_json_output = "$root_build_dir/license/gen/project.json"
+
+  if (always_run_gn_desc) {
+    generate_project_json =
+        "//tools/check-licenses/build:always_generate_project_json"
+    generate_project_json_output =
+        "$root_build_dir/license/always_gen/project.json"
+  }
+
+  generate_intermediate_json = "${target_name}_generate_intermediate_json"
+  generate_intermediate_json_output = "$license_outdir/${target_name}_all.json"
+
+  generate_target_json = "${target_name}_generate_target_json"
+  generate_target_json_output = "$license_outdir/${target_name}.json"
+
+  # Step 2: Generate intermediate data file. project.json is extremely large,
+  # and includes a lot of unrelated information. This step filters out all
+  # targets that are not in the build graph of //:default, and saves the
+  # resulting json file to a different location.
+  compiled_action(generate_intermediate_json) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    tool = "//tools/check-licenses/util/cmd/gn/generate_intermediate_json:generate_intermediate_json_cmd"
+
+    deps = [ generate_project_json ]
+
+    sources = [ generate_project_json_output ]
+    outputs = [ generate_intermediate_json_output ]
+
+    args = [
+      "--gen_input",
+      rebase_path(generate_project_json_output, root_build_dir),
+      "--gen_output",
+      rebase_path(outputs[0], root_build_dir),
+    ]
+
+    # output JSON names the build output directory
+    # TODO(https://fxbug.dev/42076225): fix tool to not leak the output directory
+    check_for_output_dir_leaks = false
+  }
+
+  # Step 3: Generate target data file.
+  # Load the step 2 output file, and filter out all targets that are not in the
+  # build graph of --gen_filter_target.
+  compiled_action(generate_target_json) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    tool = "//tools/check-licenses/util/cmd/gn/generate_intermediate_json:generate_intermediate_json_cmd"
+
+    deps = [ ":$generate_intermediate_json" ]
+    sources = [ generate_intermediate_json_output ]
+    outputs = [ generate_target_json_output ]
+
+    args = [
+      "--gen_input",
+      rebase_path(generate_intermediate_json_output, root_build_dir),
+      "--gen_output",
+      rebase_path(outputs[0], root_build_dir),
+      "--gen_filter_target",
+      target,
+    ]
+
+    # output JSON names the build output directory
+    # TODO(https://fxbug.dev/42076225): fix tool to not leak the output directory
+    check_for_output_dir_leaks = false
+  }
+
+  compiled_action(check_licenses_target) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    tool = "//tools/check-licenses"
+
+    # The license tool scans the whole source tree, so it cannot be hermetic.
+    # TODO(https://fxbug.dev/42165766): Improve the way notice files are generated.
+    hermetic_deps = false
+
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [ ":$generate_target_json" ]
+
+    sources = [
+      "//tools/check-licenses/cmd/_config.json",
+      generate_target_json_output,
+    ]
+
+    outputs = [
+      "$temp_out_dir/out/$txt_notices_output",
+      "$temp_out_dir/out/$compliance_output",
+    ]
+
+    if (produce_spdx) {
+      outputs += [ "$temp_out_dir/$spdx_output" ]
+    }
+
+    args = [
+      "--log_level",
+      "0",
+      "--fuchsia_dir",
+      rebase_path("//", root_build_dir),
+      "--out_dir",
+      rebase_path(temp_out_dir, root_build_dir),
+      "--licenses_out_dir",
+      rebase_path(temp_out_licenses_dir, root_build_dir),
+      "--run_analysis=$run_analysis",
+      "--gen_intermediate_file",
+      rebase_path(generate_target_json_output, root_build_dir),
+    ]
+
+    args += [ target ]
+
+    if (emit_metadata) {
+      metadata = {
+        licenses = [
+          {
+            license_files = rebase_path(temp_out_licenses_dir, root_build_dir)
+            compliance_file =
+                rebase_path("$temp_out_dir/out/$compliance_output",
+                            root_build_dir)
+          },
+        ]
+      }
+    }
+  }
+
+  copy(copy_txt_notices_target) {
+    forward_variables_from(invoker,
+                           [
+                             "fuchsia_dir",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    sources = [ "$temp_out_dir/out/$txt_notices_output" ]
+    outputs = [ "$out_dir/NOTICE.txt.gz" ]
+    deps = [ ":$check_licenses_target" ]
+  }
+
+  if (produce_spdx) {
+    copy(copy_spdx_target) {
+      forward_variables_from(invoker,
+                             [
+                               "fuchsia_dir",
+                               "testonly",
+                               "visibility",
+                             ])
+
+      sources = [ "$temp_out_dir/$spdx_output" ]
+      outputs = [ "$out_dir/results.spdx.json" ]
+      deps = [ ":$check_licenses_target" ]
+    }
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "fuchsia_dir",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    deps = [
+      ":$check_licenses_target",
+      ":$copy_txt_notices_target",
+    ]
+    if (produce_spdx) {
+      deps += [ ":$copy_spdx_target" ]
+    }
+  }
+}

@@ -1,0 +1,295 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/test.gni")
+import("//src/starnix/build/args.gni")
+import("//src/starnix/build/starnix_container_config_component.gni")
+import("//src/starnix/tests/build/starnix_linux_test_component.gni")
+
+template("resource_from_executables") {
+  _executables = invoker.executables
+  _toolchain = invoker.toolchain
+  _resources = []
+  foreach(_executable, _executables) {
+    _executable_out_dir =
+        get_label_info("${_executable}($_toolchain)", "root_out_dir")
+    _executable_name = get_label_info("${_executable}($_toolchain)", "name")
+    _resource_name = "${target_name}_${_executable_name}"
+    resource(_resource_name) {
+      testonly = true
+      sources = [ "${_executable_out_dir}/${_executable_name}" ]
+      outputs = [ "data/${_executable_name}" ]
+      deps = [ "${_executable}(${_toolchain})" ]
+    }
+    _resources += [ ":${_resource_name}" ]
+  }
+  not_needed([ _toolchain ])
+  group(target_name) {
+    testonly = true
+    deps = _resources
+  }
+}
+
+template("syscall_test") {
+  _test_name = target_name
+  if (defined(invoker.test_name)) {
+    _test_name = invoker.test_name
+  }
+
+  # If _test_name is not target_name, use target_name as a namespace for the
+  # binary name to ensure multiple tests can have the same test_name across
+  # different directories in the build.
+  _test_binary_name = "starnix_${target_name}_bin"
+  if (_test_name != target_name) {
+    _test_binary_name = "starnix_${target_name}_${_test_name}_bin"
+  }
+
+  _disable_sanitizers_on_host = false
+  if (defined(invoker.disable_sanitizers_on_host)) {
+    _disable_sanitizers_on_host = invoker.disable_sanitizers_on_host
+  }
+
+  _test_sources = []
+  if (defined(invoker.sources)) {
+    _test_sources = invoker.sources
+  } else {
+    _test_sources = [ "${_test_name}.cc" ]
+  }
+
+  _test_deps = []
+  if (defined(invoker.deps)) {
+    _test_deps = invoker.deps
+  } else {
+    _test_deps = []
+  }
+
+  _test_resources = []
+  if (defined(invoker.resources)) {
+    _test_resources = invoker.resources
+  } else {
+    _test_resources = []
+  }
+
+  _test_executables = []
+  if (defined(invoker.executables)) {
+    _test_executables = invoker.executables
+  } else {
+    _test_executables = []
+  }
+
+  _container_config = {
+  }
+  if (defined(invoker.container_config)) {
+    _container_config = invoker.container_config
+  }
+
+  _container_config_component = "${target_name}_config"
+  starnix_container_config_component(_container_config_component) {
+    config = _container_config
+  }
+
+  _container_config_shard_label = "${_container_config_component}_shard"
+  _container_config_shard = "${target_gen_dir}/${target_name}_config.shard.cml"
+  starnix_container_config_offers(_container_config_shard_label) {
+    output = _container_config_shard
+    offer_from = "#config"
+    offer_to = [
+      "#container",
+      "#timekeeper",
+      "#runner",
+    ]
+  }
+
+  # Generate the manifest
+  _manifest_label = "${target_name}.cml"
+  _manifest_file = "$target_gen_dir/${_manifest_label}"
+  generated_file(_manifest_label) {
+    outputs = [ _manifest_file ]
+    output_conversion = "json"
+    _program = {
+      binary = "data/tests/${_test_binary_name}"
+    }
+
+    # If we're targeting a different kernel, we'll add a field to the program to
+    # indicate the target kernel. This field will be consumed within the Starnix
+    # test runner to handle as appropriate.
+    if (defined(invoker.test_target_kernel)) {
+      _program.test_target_kernel = invoker.test_target_kernel
+    }
+
+    _includes = []
+    if (defined(invoker.includes)) {
+      _includes = invoker.includes
+    }
+    contents = {
+      include = [
+        rebase_path(_container_config_shard, root_build_dir),
+        "//src/starnix/tests/syscalls/cpp/meta/syscalls_gtest.cml",
+      ]
+      include += _includes
+      program = _program
+      children = [
+        {
+          name = "config"
+          url = "#meta/${_container_config_component}.cm"
+        },
+      ]
+    }
+
+    deps = [ ":${_container_config_shard_label}" ]
+  }
+
+  _host_test_label = "starnix_${target_name}_host"
+  if (is_linux) {
+    _test_deps += [
+      "//sdk/lib/fit",
+      "//src/lib/files",
+      "//src/lib/fxl",
+      "//src/lib/fxl/test:gtest_main",
+      "//src/starnix/tests/syscalls/cpp:test_utils",
+      "//third_party/googletest:gmock",
+      "//third_party/googletest:gtest",
+      "//zircon/system/ulib/fbl",
+    ]
+    if (current_cpu != "arm") {
+      _test_deps += [ "//sdk/fidl/fuchsia.fs:fuchsia.fs_cpp" ]
+    }
+    _test_configs = [
+      "//build/config:rtti",
+      "//build/config:thread_safety_annotations",
+
+      # TODO(https://fxbug.dev/42085293): delete the below and fix compiler warnings
+      "//build/config:Wno-vla-cxx-extension",
+
+      # TODO(b/307959737): Compile syscall test on target with the bionic
+      # toolchain and then move this to the bionic toolchain.
+      "//src/starnix/tests/syscalls/cpp:march",
+    ]
+
+    test(_test_binary_name) {
+      # TODO(https://fxbug.dev/297293167) enable ASan instrumentation for Linux binaries in Starnix
+      exclude_toolchain_tags = [ "instrumented" ]
+      sources = _test_sources
+      deps = _test_deps
+      configs += _test_configs
+    }
+
+    test(_host_test_label) {
+      if (_disable_sanitizers_on_host) {
+        exclude_toolchain_tags = [ "instrumented" ]
+      }
+      sources = _test_sources
+      deps = _test_deps
+      configs += _test_configs
+    }
+  } else {
+    not_needed([
+                 "_test_binary_name",
+                 "_host_test_label",
+                 "_disable_sanitizers_on_host",
+               ])
+  }
+
+  if (is_host) {
+    _host_test_runtime_deps_label = "starnix_${target_name}_host_test_data"
+    host_test_data(_host_test_runtime_deps_label) {
+      sources = []
+      deps = _test_resources
+      foreach(_test_executable, _test_executables) {
+        _executable_out_dir =
+            get_label_info("${_test_executable}($starnix_host_linux_toolchain)",
+                           "root_out_dir")
+        _executable_name =
+            get_label_info("${_test_executable}($starnix_host_linux_toolchain)",
+                           "name")
+        sources += [ "${_executable_out_dir}/${_executable_name}" ]
+        deps += [ "${_test_executable}(${starnix_host_linux_toolchain})" ]
+      }
+    }
+
+    host_test("starnix_${target_name}_baseline") {
+      binary_path =
+          get_label_info(":${_host_test_label}($starnix_host_linux_toolchain)",
+                         "root_out_dir") + "/${_host_test_label}"
+      deps = [
+        ":${_host_test_label}(${starnix_host_linux_toolchain})",
+        ":${_host_test_runtime_deps_label}",
+      ]
+    }
+  }
+
+  _is_machina = defined(invoker.test_target_kernel) &&
+                invoker.test_target_kernel == "linux"
+
+  if (!_is_machina) {
+    _resource_from_executables_target_name =
+        "${target_name}_resource_from_executables"
+    resource_from_executables(_resource_from_executables_target_name) {
+      executables = _test_executables
+      toolchain = target_linux_toolchain
+    }
+  }
+
+  starnix_linux_test_component(target_name) {
+    test_label = ":${_test_binary_name}"
+    test_binary = _test_binary_name
+    manifest = _manifest_file
+    deps = [ ":${_manifest_label}" ]
+    if (_is_machina) {
+      not_needed([
+                   "_test_executables",
+                   "_test_resources",
+                 ])
+
+      # Machina tests use the unified dependency target
+      deps += [ "//src/starnix/tests/syscalls:unified_syscall_deps" ]
+    } else {
+      # Starnix tests bundle only their granular per-test dependencies
+      deps += [ ":${_resource_from_executables_target_name}" ]
+      foreach(_resource, _test_resources) {
+        deps += [ "${_resource}($target_linux_toolchain)" ]
+      }
+    }
+    uses_expectations = true
+    generated_expectations = ":syscalls_cpp_test_expectations"
+    test_type = "starnix"
+
+    if (defined(invoker.custom_expectations)) {
+      generated_expectations =
+          "${invoker.custom_expectations}($target_linux_toolchain)"
+    }
+  }
+
+  if (current_cpu == "arm64" && !_is_machina) {
+    _resource_from_executables_target_name_arch32 =
+        "${target_name}_resource_from_executables_arch32"
+    resource_from_executables(_resource_from_executables_target_name_arch32) {
+      executables = _test_executables
+      toolchain = target_linux_arch32_toolchain
+    }
+
+    starnix_linux_test_component("${target_name}_arch32") {
+      test_toolchain = target_linux_arch32_toolchain
+      test_label = ":${_test_binary_name}"
+      test_binary = _test_binary_name
+      manifest = _manifest_file
+      deps = [
+        ":${_manifest_label}",
+        ":${_resource_from_executables_target_name_arch32}",
+      ]
+      foreach(_resource, _test_resources) {
+        deps += [ "${_resource}($target_linux_arch32_toolchain)" ]
+      }
+      uses_expectations = true
+      generated_expectations =
+          ":syscalls_cpp_test_expectations($target_linux_arch32_toolchain)"
+      test_type = "starnix"
+
+      if (defined(invoker.custom_expectations)) {
+        generated_expectations =
+            "${invoker.custom_expectations}($target_linux_arch32_toolchain)"
+      }
+    }
+  }
+}

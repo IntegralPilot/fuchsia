@@ -1,0 +1,181 @@
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.diagnostics;
+
+using zx;
+
+/// The maximum number of parameters that can be sent in one `Set` call.
+@available(added=HEAD)
+const MAX_SAMPLE_PARAMETERS_PER_SET uint64 = 100;
+
+/// `RuntimeError` indicates errors that manifest after the Sample server has
+/// begun periodically sampling data. Clients can ignore these errors, though
+/// they could potentially indicate that no `SampleReady` request will ever arrive,
+/// or that the batch iterator might behave in unexpected ways, such as hanging.
+@available(added=HEAD)
+type RuntimeError = flexible enum {
+    /// There was some error when starting a batch iterator server.
+    /// Check Archivist's logs for more information.
+    BATCH_ITERATOR_FAILED = 1;
+};
+
+/// `SampleReady` carries the data for a ready-to-consume sample.
+@available(added=HEAD)
+type SampleReady = resource table {
+    /// `batch_iter` is the `BatchIterator` over the set of data.
+    1: batch_iter client_end:BatchIterator;
+
+    /// `seconds_since_start` is `ticks * interval_secs` for the current
+    /// polling period.
+    ///
+    /// This can be used to check whether a value in the batch corresponds
+    /// to a `SampleDatum`, assuming you have not registered the same selector
+    /// with different `SampleStrategy` types. The procedure is:
+    ///
+    /// 1) Resolve `batch_iter` into a set of Inspect hierarchies.
+    /// 2) Filter the set of `SampleDatum`s committed to this server with
+    ///    the predicate `seconds_since_start % datum.interval_secs == 0`.
+    /// 3) Any selector from the filtered `SampleDatum`s that matches data
+    ///    in the resolved Inspect hierarchies is valid.
+    ///
+    /// If you DO have one selector registered twice with different strategies,
+    /// you must maintain a local cache and check the value yourself.
+    2: seconds_since_start zx.DurationMono;
+};
+
+@available(added=HEAD)
+type SampleSinkResult = flexible resource union {
+    /// `SampleReady` provides a `BatchIterator` for the client containing all
+    /// ready samples.
+    ///
+    /// This will include all `SampleStrategy::ALWAYS` samples and all
+    /// `SampleStrategy::ON_DIFF` for which there was a changed value.
+    1: ready SampleReady;
+
+    /// `error` provides an interface for receiving runtime errors from the
+    /// sample server.
+    2: error RuntimeError;
+};
+
+/// `SampleSink` is served by the client, in order to be notified when samples
+/// are ready.
+@discoverable(server="platform")
+@available(added=HEAD)
+open protocol SampleSink {
+    flexible OnSampleReadied(resource struct {
+        event SampleSinkResult;
+    });
+
+    /// `OnNowOrNever` initiates a final sample of all data in this server, and
+    /// exits after the next `OnSampleReadied` event is drained.
+    ///
+    /// It ignores polling periods but not diffing behavior.
+    -> OnNowOrNever();
+};
+
+/// `SampleStrategy` instructs Archivist on the circumstances under which you
+/// want to receive data for the given `SampleDatum`.
+@available(added=HEAD)
+type SampleStrategy = flexible enum : uint8 {
+    /// `ON_DIFF` causes the server to keep a cache of previous values.
+    /// At each sample period, it compares the new value to the old one
+    /// and only alerts if there is a change.
+    ON_DIFF = 1;
+
+    /// `ALWAYS` alerts at each sample period it finds data, whether it
+    /// has changed or not.
+    ///
+    /// Note: it does NOT alert if there is no data at all.
+    ALWAYS = 2;
+};
+
+@available(added=HEAD)
+type SampleDatum = table {
+    /// The selector to check.
+    1: selector SelectorArgument;
+
+    /// The strategy by which the server decides to notify the client.
+    2: strategy SampleStrategy;
+
+    /// The interval at which this datum should be sampled.
+    ///
+    /// Each `SampleDatum` has its own specified interval. It is preferred to send
+    /// as many selectors on one `Sample` connection as possible, to allow
+    /// Archivist to batch requests. However, Archivist will query at a period that
+    /// is the greatest common divisor of all intervals. So, balance the desire for
+    /// a small number of `Sample` connections with keeping the intervals compatible.
+    ///
+    /// Example: two data with intervals of 3 and 4 respectively would check for work
+    /// every second. Archivist won't actually sample if neither batch is ready, but
+    /// it will check.
+    ///
+    /// Example: two data with intervals of 10 and 5 respectively would only check for
+    /// work every 5 seconds.
+    ///
+    /// (In practice, the calculated sample period must be valid. See
+    /// MINIMUM_SAMPLE_PERIOD_SECONDS above.)
+    3: interval_secs zx.DurationMono;
+};
+
+/// The data for one Sample server.
+@available(added=HEAD)
+type SampleParameters = table {
+    /// The set of data to sample.
+    ///
+    /// These samples will be batched by the intervals in each SampleDatum.
+    /// You should use `MAX_SAMPLE_PARAMETERS_PER_SET` to paginate inputs; it should
+    /// generally be well-sized for most selectors.
+    1: data vector<SampleDatum>:MAX_SAMPLE_PARAMETERS_PER_SET;
+};
+
+/// ConfigurationError indicates a bad setting in `Sample::Set`. This value
+/// is returned before the first sample is taken.
+@available(added=HEAD)
+type ConfigurationError = flexible enum {
+    /// This indicates that when calculating the sample period, it was less than
+    /// `MINIMUM_SAMPLE_PERIOD_SECONDS`.
+    SAMPLE_PERIOD_TOO_SMALL = 1;
+
+    /// This indicates that there was an invalid setting in `SampleParameters`.
+    /// Check Archivist's logs for more information.
+    SAMPLE_PARAMETERS_INVALID = 2;
+
+    /// Indicates that an invalid selector was sent. Check Archivist's logs for more
+    /// information.
+    INVALID_SELECTORS = 3;
+};
+
+/// Configure Archivist to alert you periodically about the state of data
+/// provided via `SampleParameters`.
+///
+/// If the given configuration results in a hit, a `BatchIterator` is sent
+/// over the `sink` provided. That iterator may be drained, and then the
+/// `sink` will go quiet until the next hit.
+///
+/// Archivist does not inform the client which data result in a success,
+/// because it has not inherent advantaged ability to do so. Clients who
+/// need to know which data was queried should cache their selectors and
+/// use `selectors::select_from_hierarchy` (or similar in C++).
+@discoverable(server="platform")
+@available(added=HEAD)
+open protocol Sample {
+    /// Add sample parameters.
+    ///
+    /// Since this is limited by channel size, this API paginates at 300
+    /// items. That should fit in a channel unless a selector is particularly
+    /// gigantic.
+    ///
+    /// Use `Commit` to indicate that all samples are sent over.
+    flexible Set(resource struct {
+        /// The data configuration for this sample server.
+        sample_parameters SampleParameters;
+    });
+
+    /// `Commit` returns errors quickly, as all configuration is validated
+    /// before the first sample is taken.
+    flexible Commit(resource struct {
+        /// Where results are sent.
+        sink client_end:SampleSink;
+    }) -> () error ConfigurationError;
+};

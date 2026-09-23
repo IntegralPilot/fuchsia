@@ -1,0 +1,262 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+import("//build/group_with_inputs.gni")
+import("//build/python/python_validator.gni")
+
+# Defines a python library
+#
+# Example
+#
+# ```
+# python_library("lib") {
+#   library_name = "lib"
+#   sources = [
+#     "__init__.py",
+#     "lib.py",
+#   ]
+# }
+# ```
+#
+# Parameters
+#
+#   library_name (optional)
+#     Name of the library, Python scripts can import this library by this name.
+#     Type: string
+#     Default: ${target_name}
+#
+#   source_root (optional)
+#     Path to root of the package, where __init__.py is.
+#     Type: path
+#     Default: current directory
+#
+#   sources (required)
+#     List of sources for this python library, relative to source_root.
+#     Type: list(path)
+#
+#   data_sources (optional)
+#     List of data sources for this python library. The sources are accessible
+#     at runtime as below:
+#     ```python
+#     from importlib.resources import files
+#     from <library_name> import <data_package_name>
+#
+#     with files(<data_package_name>).joinpath(<source_name>).open("rb"):
+#       ...
+#     ```
+#     Type: list(path)
+#
+#   data_package_name (required if |data_sources| is provided, else optional)
+#     Name of the data package to store |data_sources| in.
+#     See "data_sources" above for more detail.
+#     Type: string
+#
+#   library_deps (optional)
+#    List of targets for other python_library()s that this library depends on
+#    Type: list(target)
+#
+#   enable_mypy (optional)
+#     If true, enable MyPy type checking on the target and respective deps.
+#     Type: boolean
+#     Default: true
+#
+#   stubs_root (optional)
+#     Base path for paths specified in `stubs`. This argument is required when `stubs` is
+#     provided.
+#     Type: path
+#
+#   stubs(optional)
+#     Paths to .pyi stub files relative to `stubs_root`. When providing this argument, `stubs_root`
+#     must be provided too. The stub files provided will be copied to the Python library generated
+#     by this template with the same directory structure relative to `stubs_root`.
+#     Type: list(path)
+#
+#   assert_no_deps (optional)
+#     GN usual
+#
+# Metadata
+#
+#   library_info
+#     Exactly one scope including name of this library, path to its root and all
+#     of its sources (relative to root) and data_sources.
+#
+#   library_info_barrier
+#     Empty for stopping metadata walks.
+template("python_library") {
+  assert(defined(invoker.sources), "sources is required")
+
+  _labels = {
+    main_target = target_name
+    input_group = "${target_name}_input_group"
+    mypy_checker = "${target_name}_mypy_checker"
+    library_infos = "${target_name}.library_infos"
+  }
+
+  _files = {
+    library_infos = "${target_gen_dir}/${target_name}_library_infos.json"
+  }
+
+  library_deps = []
+  if (defined(invoker.library_deps)) {
+    library_deps = invoker.library_deps
+  }
+
+  _data_sources = []
+  _data_package_name = ""
+  if (defined(invoker.data_sources)) {
+    assert(defined(invoker.data_package_name),
+           "data_package_name is required if data_sources are provided")
+    _data_sources = invoker.data_sources
+    _data_package_name = invoker.data_package_name
+  }
+
+  # Add the sources from the invoker
+  if (defined(invoker.source_root)) {
+    _source_root = invoker.source_root
+  } else {
+    _source_root = get_label_info(":$target_name", "dir")
+  }
+  _full_source_paths = []
+  foreach(source, invoker.sources) {
+    _full_source_paths += [ _source_root + "/" + source ]
+  }
+
+  _full_stub_paths = []
+  if (defined(invoker.stubs)) {
+    assert(defined(invoker.stubs_root),
+           "stubs_root must be provided with stubs")
+    foreach(stub, invoker.stubs) {
+      _full_stub_paths += [ invoker.stubs_root + "/" + stub ]
+    }
+  }
+
+  _full_data_source_paths = []
+  foreach(data_source, _data_sources) {
+    _full_data_source_paths += [ rebase_path(data_source, root_build_dir) ]
+  }
+
+  _enable_mypy = true
+  if (defined(invoker.enable_mypy)) {
+    _enable_mypy = invoker.enable_mypy
+  }
+
+  _library_name = target_name
+  if (defined(invoker.library_name)) {
+    _library_name = invoker.library_name
+  }
+  group_with_inputs(_labels.input_group) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    # Seed with the library_deps, and then add any other deps as well
+    deps = library_deps
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+
+    source_root = _source_root
+    metadata = {
+      library_info = [
+        {
+          library_name = _library_name
+          source_root = rebase_path(source_root, root_build_dir)
+          sources = invoker.sources
+          data_package_name = _data_package_name
+          data_sources = _full_data_source_paths
+          if (defined(invoker.shared_libs)) {
+            shared_libs = rebase_path(invoker.shared_libs, root_build_dir)
+          }
+
+          # Label a library as having mypy support if it includes stubs.
+          # When included as a dependency, the libraries stubs will be
+          # included in the type checking.
+          mypy_support = _enable_mypy || defined(invoker.stubs)
+          mypy_enable = _enable_mypy
+          if (defined(invoker.stubs)) {
+            stubs_root = rebase_path(invoker.stubs_root, root_build_dir)
+            stubs = invoker.stubs
+          }
+        },
+      ]
+
+      # List sources outside of //out as additional source roots for Python IDE
+      # tooling.
+      #
+      # The main case where sources inside //out are needed is for fidling,
+      # which is handled by fidl_python_output metadata keys in the FIDL build
+      # rules.
+      if (string_replace(source_root, "//out", "") == source_root) {
+        # Get the directory where the source_root exists.
+        extra_python_dirs = [ rebase_path(source_root + "/..", root_build_dir) ]
+      }
+
+      # Collect library_info from any libraries that are needed.
+      library_info_barrier = deps
+    }
+    sources = _full_source_paths + _full_stub_paths
+  }
+
+  # Generate library_info.json file with all the library dependencies info
+  generated_file(_labels.library_infos) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "testonly",
+                           ])
+    visibility = [ ":*" ]
+    public_deps = [ ":${_labels.input_group}" ]
+    outputs = [ _files.library_infos ]
+    output_conversion = "json"
+    data_keys = [ "library_info" ]
+    walk_keys = [ "library_info_barrier" ]
+
+    metadata = {
+      library_info_barrier = public_deps
+    }
+  }
+
+  validate_python_library(_labels.mypy_checker) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "testonly",
+                           ])
+    visibility = [ ":${_labels.main_target}" ]
+
+    library_infos = ":${_labels.library_infos}"
+
+    # This source list includes only direct library sources and stubs, excluding
+    # any dependencies.
+    sources = _full_source_paths + _full_stub_paths
+
+    # Required for generated sources like C extension wrappers.
+    deps = library_deps
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "testonly",
+                             "visibility",
+                             "data_deps",
+                           ])
+    deps = [ ":${_labels.input_group}" ]
+    if (_enable_mypy) {
+      # Run python type checks using Mypy if enable_mypy flag is set.
+      validations = [ ":${_labels.mypy_checker}" ]
+    }
+    metadata = {
+      # Ensure validation dependencies are excluded from metadata walk!
+      # TODO(https://fxbug.dev/517150685): Remove this once new GN binary has rolled
+      library_info_barrier = deps
+    }
+  }
+}

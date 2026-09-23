@@ -1,0 +1,250 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "StructDeclaration" }}
+{{- if EmitType .IsValueType }}
+{{- range .DocComments }}
+///{{ . }}
+{{- end }}
+{{- if .HasSensitive }}
+{{ .Derives.RemoveCustom "Debug" }}
+{{ else }}
+{{ .Derives }}
+{{- end }}
+{{- if .UseFidlStructCopy }}
+#[repr(C)]
+{{- end }}
+pub struct {{ .Name }}{{ if not .Members }};{{ else }}{
+    {{- range .Members }}
+    {{- range .DocComments }}
+    ///{{ . }}
+    {{- end }}
+    pub {{ .Name }}: {{ .Type.Owned }},
+    {{- end }}
+}
+{{- end }}
+
+impl fidl::{{ if .IsValueType }}Persistable{{ else }}Standalone<{{ ResourceDialect }}>{{ end }} for {{ .Name }} {}
+
+{{- if .Serializable.IsSerializable }}
+impl fidl::Serializable for {{ .Name }} {
+      const SERIALIZABLE_NAME: &'static str = "{{ .Serializable.Name }}";
+}
+{{- end }}
+
+{{- if .HasSensitive }}
+impl std::fmt::Debug for {{ .Name }} {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        {{- if .Sensitive }}
+        f.write_str("SENSITIVE{")?;
+        f.debug_struct("{{ .Name }}")
+        {{- range .Members }}
+            .field("{{ .Name }}", &self.{{ .Name }})
+        {{- end }}
+            .finish()?;
+        f.write_str("}")
+        {{- else }}
+        f.debug_struct("{{ .Name }}")
+        {{- range .Members }}
+        {{- if .Sensitive }}
+            {{- if .Type.Nullable }}
+            .field("{{ .Name }}", &self.{{ .Name }}.as_ref().map(fidl::marker::SensitiveDebug))
+            {{- else }}
+            .field("{{ .Name }}", &fidl::marker::SensitiveDebug(&self.{{ .Name }}))
+            {{- end }}
+        {{- else }}
+            .field("{{ .Name }}", &self.{{ .Name }})
+        {{- end }}
+        {{- end }}
+            .finish()
+        {{- end }}
+    }
+}
+{{- end }}
+
+{{- end }}
+{{- end }}
+
+{{- define "StructInternal" }}
+{{- if EmitType .IsValueType }}
+{{- $resourceDialectName := "D"}}
+{{- $resourceDialectGeneric := "<D: fidl::encoding::ResourceDialect>"}}
+{{- $resourceDialectGenericPart := "D: fidl::encoding::ResourceDialect, "}}
+{{- if .IsResourceType }}
+{{- $resourceDialectName = ResourceDialect}}
+{{- $resourceDialectGeneric = ""}}
+{{- $resourceDialectGenericPart = ""}}
+impl fidl::encoding::ResourceTypeMarker for {{ .Name }} {
+    type Borrowed<'a> = &'a mut Self;
+    fn take_or_borrow<'a>(value: &'a mut <Self as fidl::encoding::TypeMarker>::Owned) -> Self::Borrowed<'a> {
+        value
+    }
+}
+{{- else }}
+impl fidl::encoding::ValueTypeMarker for {{ .Name }} {
+    type Borrowed<'a> = &'a Self;
+    fn borrow(value: &<Self as fidl::encoding::TypeMarker>::Owned) -> Self::Borrowed<'_> {
+        value
+    }
+}
+{{- end }}
+
+unsafe impl fidl::encoding::TypeMarker for {{ .Name }} {
+    type Owned = Self;
+
+    #[inline(always)]
+    fn inline_align(_context: fidl::encoding::Context) -> usize {
+        {{ .AlignmentV2 }}
+    }
+
+    #[inline(always)]
+    fn inline_size(_context: fidl::encoding::Context) -> usize {
+        {{ .SizeV2 }}
+    }
+
+    {{- if and .UseFidlStructCopy (not .FlattenedPaddingMarkersV2) }}
+    #[inline(always)]
+    fn encode_is_copy() -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn decode_is_copy() -> bool {
+        true
+    }
+    {{- end }}
+}
+
+
+unsafe impl{{ $resourceDialectGeneric }} fidl::encoding::Encode<{{ .Name }}, {{ $resourceDialectName }}> for &{{ if .IsResourceType }}mut {{ end }}{{ .Name }} {
+    #[inline]
+    unsafe fn encode(self, encoder: &mut fidl::encoding::Encoder<'_, {{ $resourceDialectName }}>, offset: usize, _depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        encoder.debug_check_bounds::<{{ .Name }}>(offset);
+        {{- if not .Members }}
+            {{- /* Case #1: Empty struct */}}
+            encoder.write_num(0u8, offset);
+            Ok(())
+        {{- else if .UseFidlStructCopy }}
+            {{- /* Case #2: Encode/decode is copy */}}
+            unsafe {
+                // Copy the object into the buffer.
+                let buf_ptr = encoder.buf.as_mut_ptr().add(offset);
+                (buf_ptr as *mut {{ .Name }}).write_unaligned((self as *const {{ .Name }}).read());
+                // Zero out padding regions. Unlike `fidl_struct_impl_noncopy!`, this must be
+                // done second because the memcpy will write garbage to these bytes.
+                {{- range .FlattenedPaddingMarkersV2 }}
+                let padding_ptr = buf_ptr.offset({{ .Offset }}) as *mut u{{ .MaskBitWidth }};
+                let padding_mask = {{ .Mask | printf "%#x" }}u{{ .MaskBitWidth }};
+                padding_ptr.write_unaligned(padding_ptr.read_unaligned() & !padding_mask);
+                {{- end }}
+            }
+            Ok(())
+        {{- else }}
+            {{- /* Case #3: General case */}}
+            // Delegate to tuple encoding.
+            fidl::encoding::Encode::<{{ .Name }}, {{ $resourceDialectName }}>::encode(
+                (
+                    {{- range .Members }}
+                    {{- if .Type.IsResourceType }}
+                    <{{ .Type.Fidl $resourceDialectName }} as fidl::encoding::ResourceTypeMarker>::take_or_borrow(&mut self.{{ .Name }}),
+                    {{- else }}
+                    <{{ .Type.Fidl $resourceDialectName }} as fidl::encoding::ValueTypeMarker>::borrow(&self.{{ .Name }}),
+                    {{- end }}
+                    {{- end }}
+                ),
+                encoder, offset, _depth
+            )
+        {{- end }}
+    }
+}
+
+{{- if .Members }}
+unsafe impl<{{ $resourceDialectGenericPart }}{{ range $i, $member := .Members }} T{{ $i }}: fidl::encoding::Encode<{{ $member.Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}>,{{ end }}>
+    fidl::encoding::Encode<{{ .Name }}, {{ $resourceDialectName }}> for ({{ range $i, $member := .Members }} T{{ $i }},{{ end }})
+{
+    #[inline]
+    unsafe fn encode(self, encoder: &mut fidl::encoding::Encoder<'_, {{ $resourceDialectName }}>, offset: usize, depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        encoder.debug_check_bounds::<{{ .Name }}>(offset);
+        // Zero out padding regions. There's no need to apply masks
+        // because the unmasked parts will be overwritten by fields.
+        {{- range .PaddingMarkersV2 }}
+        unsafe {
+            let ptr = encoder.buf.as_mut_ptr().add(offset).offset({{ .Offset }});
+            (ptr as *mut u{{ .MaskBitWidth }}).write_unaligned(0);
+        }
+        {{- end }}
+        // Write the fields.
+        {{- range $i, $member := .Members }}
+        self.{{ $i }}.encode(encoder, offset + {{ $member.OffsetV2 }}, depth)?;
+        {{- end }}
+        Ok(())
+    }
+}
+{{- end }}
+
+impl{{ $resourceDialectGeneric }} fidl::encoding::Decode<Self, {{ $resourceDialectName }}> for {{ .Name }} {
+    #[inline(always)]
+    fn new_empty() -> Self {
+        Self {{ if .Members -}} {
+            {{- range .Members}}
+            {{ .Name }}: fidl::new_empty!({{ .Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}),
+            {{- end }}
+        }
+        {{- end }}
+    }
+
+    #[inline]
+    unsafe fn decode(&mut self, decoder: &mut fidl::encoding::Decoder<'_, {{ $resourceDialectName }}>, offset: usize, _depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        decoder.debug_check_bounds::<Self>(offset);
+        {{- if not .Members }}
+            {{- /* Case #1: Empty struct */}}
+            match decoder.read_num::<u8>(offset) {
+                0 => Ok(()),
+                _ => Err(fidl::Error::Invalid),
+            }
+        {{- else if .UseFidlStructCopy }}
+            {{- /* Case #2: Encode/decode is copy */}}
+            let buf_ptr = unsafe { decoder.buf.as_ptr().add(offset) };
+            // Verify that padding bytes are zero.
+            {{- range .FlattenedPaddingMarkersV2 }}
+            let ptr = unsafe { buf_ptr.offset({{ .Offset }}) };
+            let padval = unsafe { (ptr as *const u{{ .MaskBitWidth }}).read_unaligned() };
+            let mask = {{ .Mask | printf "%#x" }}u{{ .MaskBitWidth }};
+            let maskedval = padval & mask;
+            if maskedval != 0 {
+                return Err(fidl::Error::NonZeroPadding {
+                    padding_start: offset + {{ .Offset }} + ((mask as u64).trailing_zeros() / 8) as usize,
+                });
+            }
+            {{- end }}
+            // Copy from the buffer into the object.
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf_ptr, self as *mut Self as *mut u8, {{ .SizeV2 }});
+            }
+            Ok(())
+        {{- else }}
+        {{- /* Case #3: General case */}}
+            // Verify that padding bytes are zero.
+            {{- range .PaddingMarkersV2 }}
+            let ptr = unsafe { decoder.buf.as_ptr().add(offset).offset({{ .Offset }}) };
+            let padval = unsafe { (ptr as *const u{{ .MaskBitWidth }}).read_unaligned() };
+            let mask = {{ .Mask | printf "%#x" }}u{{ .MaskBitWidth }};
+            let maskedval = padval & mask;
+            if maskedval != 0 {
+                return Err(fidl::Error::NonZeroPadding {
+                    padding_start: offset + {{ .Offset }} + ((mask as u64).trailing_zeros() / 8) as usize,
+                });
+            }
+            {{- end }}
+            {{- range .Members }}
+            fidl::decode!({{ .Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}, &mut self.{{ .Name }}, decoder, offset + {{ .OffsetV2 }}, _depth)?;
+            {{- end }}
+            Ok(())
+        {{- end }}
+    }
+}
+{{- end }}
+{{- end }}

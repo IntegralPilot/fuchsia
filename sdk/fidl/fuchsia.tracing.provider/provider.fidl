@@ -1,0 +1,283 @@
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=7)
+library fuchsia.tracing.provider;
+
+using fuchsia.tracing;
+using zx;
+
+/// The provider interface which applications must implement and register
+/// with the `TraceRegistry` to participate in tracing.
+///
+/// See //zircon/system/ulib/trace-provider/ for a C++ implementation of
+/// this interface which can easily be configured by an application.
+@available(removed=31, note="Use ProviderV2")
+closed protocol Provider {
+    /// Initialize tracing and prepare for writing trace records for events in
+    /// the specified `categories` into `buffer` using `fifo` for signaling.
+    /// Tracing hasn't started yet, a `Start()` call is still required.
+    ///
+    ///
+    /// At most one trace can be active at a time. Subsequent `Initialize()`
+    /// requests received prior to a `Terminate()` call must be ignored.
+    strict Initialize(resource struct {
+        config ProviderConfig;
+    });
+
+    /// Begin tracing.
+    ///
+    /// If tracing has already started the provider must ignore the request.
+    ///
+    /// There is no result. The provider must send a `TRACE_PROVIDER_STARTED`
+    /// packet on `fifo` to indicate success/failure of starting.
+    strict Start(struct {
+        options StartOptions;
+    });
+
+    /// Stop tracing.
+    ///
+    /// If tracing has already stopped the provider must ignore the request.
+    ///
+    /// Once the provider has finished writing any final events to the trace
+    /// buffer, it must send a `TRACE_PROVIDER_STOPPED` packet on `fifo`.
+    /// Note that multiple `Start,Stop` requests can be received between
+    /// `Initialize,Terminate`.
+    strict Stop();
+
+    /// Terminate tracing.
+    ///
+    /// Tracing is stopped first if not already stopped.
+    /// After tracing has fully terminated the provider must close both
+    /// `buffer` and `fifo` to indicate to the trace manager that tracing is
+    /// finished.
+    strict Terminate();
+
+    /// Gets the trace categories that might be produced by this provider.
+    @available(added=11)
+    strict GetKnownCategories() -> (struct {
+        categories vector<fuchsia.tracing.KnownCategory>:fuchsia.tracing.MAX_NUM_KNOWN_CATEGORIES;
+    });
+};
+
+/// The maximum length of an alert name.
+@available(added=31)
+const MAX_ALERT_NAME_LENGTH uint32 = 14;
+
+/// The provider interface which applications must implement and register
+/// with the `TraceRegistry` to participate in tracing.
+@available(added=31)
+open protocol ProviderV2 {
+    /// Initialize tracing and prepare for writing trace records for events in
+    /// the specified `categories` into `buffer`.
+    /// Tracing hasn't started yet, a `Start()` call is still required.
+    ///
+    ///
+    /// At most one trace can be active at a time. Subsequent `Initialize()`
+    /// requests received prior to a `Terminate()` call must be ignored.
+    flexible Initialize(resource struct {
+        config ProviderConfigV2;
+    });
+
+    /// Begin tracing.
+    ///
+    /// If tracing has already started the provider must ignore the request.
+    flexible Start(struct {
+        options StartOptions;
+    }) -> ();
+
+    /// Stop tracing.
+    ///
+    /// If tracing has already stopped the provider must ignore the request.
+    ///
+    /// Once the provider has finished writing any final events to the trace
+    /// buffer, it must send an `OnStopped()` event.
+    /// Note that multiple `Start,Stop` requests can be received between
+    /// `Initialize,Terminate`.
+    flexible Stop() -> ();
+
+    /// Terminate tracing.
+    ///
+    /// Tracing is stopped first if not already stopped.
+    flexible Terminate() -> ();
+
+    /// Gets the trace categories that might be produced by this provider.
+    flexible GetKnownCategories() -> (struct {
+        categories vector<fuchsia.tracing.KnownCategory>:fuchsia.tracing.MAX_NUM_KNOWN_CATEGORIES;
+    });
+
+    /// A buffer is full and needs to be saved (streaming mode only).
+    flexible -> OnSaveBuffer(struct {
+        /// The "wrapped count", which is a count of the number of times
+        /// a buffer has filled.
+        wrapped_count uint32;
+        /// current offset in the durable buffer
+        durable_data_end uint64;
+    });
+
+    /// Sends an alert.
+    flexible -> OnAlert(struct {
+        name string:MAX_ALERT_NAME_LENGTH;
+    });
+
+    /// A buffer has been saved (streaming mode only).
+    flexible NotifyBufferSaved(struct {
+        /// The "wrapped count", which is a count of the number of times
+        /// a buffer has filled.
+        wrapped_count uint32;
+        /// current offset in the durable buffer
+        durable_data_end uint64;
+    });
+
+    /// Requests the provider its buffer to be read out, regardless of it is
+    /// full or not.
+    ///
+    /// Normally streaming mode only sends data once it has enough data to
+    /// require a buffer swap and data flush. This produces fewer, but larger
+    /// and bursty data transfers.
+    ///
+    /// Some clients may want more regular smaller data transfers. These clients
+    /// may instead manually invoke Flush whenever they are ready for
+    /// data.
+    flexible Flush();
+};
+
+/// The service which trace providers use to register themselves with
+/// the tracing system.
+/// Note that one property of this interface is that once registration is made
+/// the provider can drop this connection.
+@discoverable(server="platform")
+closed(removed=31) open(added=31) protocol Registry {
+    /// Registers the trace provider.
+    /// Note: Registration is asynchronous, it's only at some point after this
+    /// returns that the provider is actually registered.
+    /// To unregister, simply close the Provider pipe.
+    /// `pid` is the process id of the provider, `name` is the name of the
+    /// provider. Both of these are used in logging and diagnostic messages.
+    ///
+    /// # Deprecation
+    ///
+    /// Use "RegisterV2" instead to use the FIDL-based coordination protocol.
+    @available(removed=31, note="Use Registry.RegisterV2")
+    strict RegisterProvider(resource struct {
+        provider client_end:Provider;
+        pid zx.Koid;
+        @available(added=11)
+        name string:fuchsia.tracing.MAX_PROVIDER_NAME_LENGTH;
+    });
+
+    /// Registers the trace provider synchronously. The call doesn't return
+    /// until the provider is registered.
+    /// On return `s` is `ZX_OK` if registration was successful.
+    /// `started` is true if tracing has already started, which is a hint to
+    /// the provider to wait for the Start() message before continuing if it
+    /// wishes to not drop trace records before Start() is received.
+    /// To unregister, simply close the Provider pipe.
+    /// `pid` is the process id of the provider, `name` is the name of the
+    /// provider. Both of these are used in logging and diagnostic messages.
+    ///
+    /// # Deprecation
+    ///
+    /// Use "RegisterV2Synchronously" instead to use the FIDL-based coordination protocol.
+    @available(removed=31, note="Use Registry.RegisterV2Synchronously")
+    strict RegisterProviderSynchronously(resource struct {
+        provider client_end:Provider;
+        pid zx.Koid;
+        @available(added=11)
+        name string:fuchsia.tracing.MAX_PROVIDER_NAME_LENGTH;
+    }) -> (struct {
+        s zx.Status;
+        started bool;
+    });
+
+    /// Registers the trace provider using the V2 protocol.
+    ///
+    /// Note: Registration is asynchronous, it's only at some point after this
+    /// returns that the provider is actually registered.
+    ///
+    /// To unregister, close the `provider` connection.
+    @available(added=31)
+    flexible RegisterV2(resource struct {
+        provider client_end:ProviderV2;
+        /// The process id of the provider used for logging and diagnostics
+        pid zx.Koid;
+        /// The name of the provider used for logging and diagnostics
+        name string:fuchsia.tracing.MAX_PROVIDER_NAME_LENGTH;
+    });
+
+    /// Registers the trace provider synchronously using the V2 protocol.
+    ///
+    /// The call doesn't return until the provider is registered. Most callers
+    /// should use RegisterV2 unless they need to synchronize with they tracing
+    /// system to ensure that specific events are captured.
+    ///
+    /// To unregister, close the `provider` connection.
+    @available(added=31)
+    flexible RegisterV2Synchronously(resource struct {
+        provider client_end:ProviderV2;
+        /// The process id of the provider used for logging and diagnostics
+        pid zx.Koid;
+        /// The name of the provider used for logging and diagnostics
+        name string:fuchsia.tracing.MAX_PROVIDER_NAME_LENGTH;
+    }) -> (struct {
+        /// true if tracing has already started, which is a hint to the provider
+        /// to wait for the Start() message before continuing if it wishes to
+        /// not drop trace records before Start() is received.
+        started bool;
+    }) error zx.Status;
+};
+
+/// Trace provider configuration.
+// The configuration of a provider is split out into a struct so that we can
+// add configuration data without changing the method signature. Structs still
+// introduce ABI compatibility issues, this will be switched to a table when
+// tables are ready for use in zircon.
+@available(removed=31)
+type ProviderConfig = resource struct {
+    /// `buffering_mode` specifies what happens when the buffer fills.
+    @available(added=11)
+    buffering_mode fuchsia.tracing.BufferingMode;
+
+    /// The buffer to write trace records into.
+    buffer zx.Handle:VMO;
+
+    /// When the trace provider observes `ZX_FIFO_PEER_CLOSED` on `fifo`, it
+    /// must assume the trace manager has terminated abnormally (since `Stop`
+    /// was not received as usual) and stop tracing automatically, discarding
+    /// any in-flight trace data.
+    fifo zx.Handle:FIFO;
+
+    /// What trace categories to collect data for.
+    @available(added=11)
+    categories
+            vector<string:fuchsia.tracing.MAX_CATEGORY_NAME_LENGTH>:fuchsia.tracing.MAX_NUM_ENABLED_CATEGORIES;
+};
+
+/// Trace provider configuration.
+@available(added=31)
+type ProviderConfigV2 = resource table {
+    /// `buffering_mode` specifies what happens when the buffer fills.
+    1: buffering_mode fuchsia.tracing.BufferingMode;
+
+    /// The buffer to write trace records into.
+    2: buffer zx.Handle:VMO;
+
+    /// What trace categories to collect data for.
+    3: categories
+            vector<string:fuchsia.tracing.MAX_CATEGORY_NAME_LENGTH>:fuchsia.tracing.MAX_NUM_ENABLED_CATEGORIES;
+};
+
+/// Additional options to control tracing at start.
+type StartOptions = struct {
+    /// Whether and how to clear the buffer when starting data collection.
+    /// This allows, for example, multiple Start/Stop trace runs to be
+    /// collected in the same buffer.
+    @available(added=11)
+    buffer_disposition fuchsia.tracing.BufferDisposition;
+
+    /// The trace categories to add to the initial set provided in
+    /// `ProviderConfig`.
+    @available(added=11)
+    additional_categories
+            vector<string:fuchsia.tracing.MAX_CATEGORY_NAME_LENGTH>:fuchsia.tracing.MAX_NUM_ENABLED_CATEGORIES;
+};

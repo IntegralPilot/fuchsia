@@ -1,0 +1,146 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.fshost;
+
+using zx;
+using fuchsia.fxfs;
+using fuchsia.io;
+using fuchsia.storage.partitions;
+
+type MountOptions = resource table {
+    1: read_only bool;
+    /// [DEPRECATED] Metrics are always enabled now.
+    // TODO(https://fxbug.dev/42172184): Remove.
+    2: collect_metrics bool;
+    3: verbose bool;
+    4: write_compression_algorithm string:32;
+};
+
+/// Manages fshost lifecycle
+@discoverable
+closed protocol Admin {
+    /// Wipes the data volume which will get reinitialised upon next boot.  This is not
+    /// cryptographically secure; the caller should take care to reset hardware keys.
+    strict ShredDataVolume() -> () error zx.Status;
+};
+
+/// Special functionality that is only intended to be used in recovery and device bringup.
+///
+/// *WARNING*: The methods in this protocol are highly specialized and can result in unintended
+/// data loss if used improperly. Most methods in this protocol assume exclusive access to the
+/// underlying block device, and it is the responsibility of callers to mediate the use of this
+/// protocol across components.
+// TODO(https://fxbug.dev/444486641): Determine if we should add a way to synchronize clients that
+// use this protocol to unintended concurrent usage. Right now consumers of the protocol are
+// required to manage shared access to the underlying system container and unmount filesystems
+// manually.
+@discoverable
+closed protocol Recovery {
+    /// Wipes and re-initializes the system partition table.  This is a destructive operation!
+    strict InitSystemPartitionTable(struct {
+        partitions
+                vector<fuchsia.storage.partitions.PartitionEntry>:fuchsia.storage.partitions.MAX_PARTITIONS;
+    }) -> () error zx.Status;
+
+    /// Writes `filename` into the data partition with contents from `payload`, formatting the data
+    /// partition if it isn't already formatted.  Overwrites file if it already exists.
+    ///
+    /// This can only be called while the data partition isn't already mounted, which is typically
+    /// in recovery builds where fshost is running with the `ramdisk_image` flag set.
+    strict WriteDataFile(resource struct {
+        filename fuchsia.io.Path;
+        payload zx.Handle:VMO;
+    }) -> () error zx.Status;
+
+    /// Formats the blob volume in the system container. If the system container does not have a
+    /// blob volume, a new one will be created. All existing blobs will be deleted. If the system
+    /// container is corrupt or unmountable, this function will have no effect and will leave the
+    /// disk intact.
+    ///
+    /// **WARNING**: This can cause irreversible data loss and can render a device unbootable.
+    strict FormatSystemBlobVolume() -> () error zx.Status;
+
+    /// Mounts the system container's blob volume, and returns a handle to the blob volume's
+    /// exposed directory to facilitate writing a new system. The system container will remain
+    /// mounted as long as `blob_exposed_dir` is kept open. Only the blob volume will be mounted.
+    strict MountSystemBlobVolume(resource struct {
+        blob_exposed_dir server_end:<fuchsia.io.Directory>;
+    }) -> () error zx.Status;
+
+    /// Obtains a handle to a file where a new system blob volume can be written. The contents of
+    /// the file must be a valid fxfs partition image containing a blob volume. The existing blob
+    /// volume will remain unmodified until the system is rebooted, or `InstallBlobImage` is
+    /// called. The system container will remain mounted as long as `mount_token` is kept open.
+    /// *NOTE*: This method will delete any existing image data cached on disk. Callers are
+    /// responsible for keeping the returned `image_file` and `mount_token` alive until the system
+    /// image has been fully written and flushed to disk.
+    ///
+    /// # Errors
+    ///
+    /// * `ZX_ERR_IO_DATA_INTEGRITY`: An existing filesystem was found on the device, but it could
+    ///   not be mounted. This indicates that the filesystem is possibly corrupt, or has a newer
+    ///   on-disk version than the recovery image. To avoid unintended data loss, the user should
+    ///   explicitly initiate any remedial action, such as wiping the device or using a newer image.
+    /// * `ZX_ERR_INTERNAL`: An internal error occured; see fshost logs for more context.
+    ///
+    // TODO(https://fxbug.dev/458436824): We should add a separate error case for separating wrong
+    // on-disk version from genuine corruption.
+    strict GetBlobImageHandle() -> (strict resource union {
+        /// System container is unformatted and should be reprovisioned. This occurs when we do not
+        /// detect the filesystem type as what is expected for this device (e.g. we cannot find the
+        /// superblock), which suggests this device was never formatted.
+        1: unformatted struct {};
+        /// System container is mounted and ready for writing a new system image.
+        2: mounted_system_container resource struct {
+            /// Handle to a file where the new system image should be written to. Callers are
+            /// responsible for ensuring all data written to the file has been flushed to disk
+            /// before `mount_token` is dropped.
+            image_file client_end:<fuchsia.io.File>;
+            /// Token used to maintain exclusive access to the system container. `image_file` is
+            /// only valid as long as this handle is kept alive. Must be dropped to install the new
+            /// blob volume via `fuchsia.fshost/Recovery.InstallBlobImage`.
+            mount_token zx.Handle:EVENTPAIR;
+        };
+    }) error zx.Status;
+
+    /// Installs the blob volume previously written via `GetBlobImageHandle`, replacing the
+    /// existing blob volume in the system container. On failure, the existing blob volume will
+    /// remain intact, and the written image will be deleted to free space. A new blob image can
+    /// then be written and the installation process restarted. If no blob volume has been written,
+    /// this will have no effect. This function will block until the system container is unmounted.
+    strict InstallBlobImage() -> () error zx.Status;
+};
+
+type MountMode = strict enum {
+    MAYBE_CREATE = 1;
+    ALWAYS_CREATE = 2;
+};
+
+/// Provides access to the volume which will be used by Starnix to store its data.
+@discoverable
+closed protocol StarnixVolumeProvider {
+    /// Checks the integrity of the main starnix volume if it exists.
+    ///
+    /// Silently succeeds if the volume is absent, or if fshost is not configured to check
+    /// filesystems (fuchsia.fshost.CheckFilesystems).
+    strict Check(resource struct {
+        crypt client_end:fuchsia.fxfs.Crypt;
+    }) -> () error zx.Status;
+
+    /// Mounts the main starnix volume using `crypt`. `exposed_dir` will be connected to the
+    /// exposed directory of the mounted starnix volume.
+    ///
+    /// If `mode` is `MAYBE_CREATE`, the volume will be created if it does not exist.
+    /// If `mode` is `ALWAYS_CREATE`, the volume will be created, overwriting any existing volume.
+    ///
+    /// Returns the GUID of the mounted volume.
+    strict Mount(resource struct {
+        crypt client_end:fuchsia.fxfs.Crypt;
+        mode MountMode;
+        exposed_dir server_end:fuchsia.io.Directory;
+    }) -> (struct {
+        guid array<uint8, 16>;
+    }) error zx.Status;
+};

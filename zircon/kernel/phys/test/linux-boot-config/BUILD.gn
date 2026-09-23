@@ -1,0 +1,329 @@
+# Copyright 2025 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/python/python_action.gni")
+import("//build/python/python_binary.gni")
+import("//build/zbi/zbi.gni")
+import("//build/zbi/zbi_input.gni")
+import("//zircon/kernel/phys/boot-shim/devicetree.gni")
+import("//zircon/kernel/phys/devicetree_boot_test.gni")
+import("//zircon/kernel/phys/zbi_executable.gni")
+
+# Regfers to `testdata/$boot_config_filenames.txt` such that a test is generated
+# for each entry.
+boot_config_filenames = [
+  "empty",
+  "valid",
+]
+
+# Generates an `initrd` with a `BOOTCONFIG` payload appended. The generated
+# artifact generates the proper trailer. It is OK to attach a BOOTCONFIG payload
+# to an artifact that already contains one. Existing trailer is stripped, new
+# payload is appended and a new trailer is added. Note that padding bytes may be
+# appended to the payload to meet the alignment requirements.
+#
+# This target is compatible with 'assembled_system`'s' `kernel_aib_input`
+# protocol, BUT since the tail contains a special payload it must be treated as
+# a ramdisk, that is, assembly WILL NOT append ZBI items or anything to this
+# artifact.
+#
+# This template will produce two additional subtargets (testonly=true), for the
+# purpose of validation.
+#
+# Subtargets:
+#  * $target_name.cpp: header only `source_set` providing an inline `std::string_view` constant
+#    with the inlined BOOTCONFIG contents.
+#
+#    ```
+#       #include <boot-config-contents.h>
+#       ...
+#          kExpectedBootConfigContents
+#
+#    ```
+#
+# Parameters:
+#
+#   * initrd
+#     - Required: BLOB to which append the BOOTCONFIG payload.
+#     - Type: label
+#
+#   * contents
+#     - Optional: Provides the contents of the BOOTCONFIG payload as a string, as if it was
+#                 just read from a file.
+#     - Type: string
+#
+#   * boot_config
+#     - Optional: path to a file whose contents should become the BOOTCONFIG payload.
+#     - Type: path
+#
+#   * corrupt_checksum
+#     - Optional: when true, the `kExpectedBootConfigContents` will be set to empty and the checksum
+#       in the trailer will be corrupted.
+#     - Type: bool
+#     - Default: false
+#
+#   * corrupt_size
+#     - Optional: when true, the `kExpectedBootConfigContents` will be set to empty and the size
+#       in the trailer will be bigger than the ramdisk.
+#     - Type: bool
+#     - Default: false
+#
+# `contents` OR `boot_config` must be provided, not both or none.
+template("boot_config") {
+  assert(defined(invoker.initrd))
+  assert(defined(invoker.contents) || defined(invoker.boot_config))
+  assert(!(defined(invoker.contents) && defined(invoker.boot_config)))
+
+  labels = {
+    boot_config_gen = "$target_name.gen_boot_config"
+    boot_config_py = target_name
+    boot_config_cpp = "$target_name.cpp"
+    boot_config_cpp_config = "$target_name.cpp-config"
+  }
+
+  files = {
+    if (defined(invoker.contents)) {
+      boot_config = "$target_gen_dir/${labels.boot_config_gen}"
+    } else {
+      boot_config = invoker.boot_config
+    }
+    depfile = "$target_out_dir/$target_name.d"
+    output_initrd = "$target_out_dir/${target_name}.boot_config"
+
+    # Put the header in its own directory to avoid any weird things becoming
+    # visible.
+    output_header_dir = "$target_gen_dir/$target_name.include"
+    output_header = "$output_header_dir/boot-config-contents.h"
+  }
+
+  config(labels.boot_config_cpp_config) {
+    visibility = [ ":${labels.boot_config_cpp}" ]
+    include_dirs = [ files.output_header_dir ]
+  }
+
+  # Library that just exposes a header file containing
+  # `kExpectecBootConfigContents" such that tests can verify that things are
+  # extracted correctly. Can be included through <boot-config-contents.h>
+  source_set(labels.boot_config_cpp) {
+    forward_variables_from(invoker, [ "visibility" ])
+    testonly = true
+    public = [ files.output_header ]
+    public_configs = [ ":${labels.boot_config_cpp_config}" ]
+    deps = [ ":${labels.boot_config_py}" ]
+  }
+
+  # Generate a file with boot-config content OR take the provided file
+  extra_deps = []
+  if (defined(invoker.deps)) {
+    extra_deps = invoker.deps
+  }
+  if (defined(invoker.contents)) {
+    generated_file(boot_config_file) {
+      forward_variables_from(invoker,
+                             [
+                               "contents",
+                               "testonly",
+                             ])
+      visibility = [ ":${labels.boot_config_py}" ]
+      outputs = [ files.boot_config ]
+    }
+    extra_deps += [ ":$boot_config_file" ]
+  }
+
+  python_action(labels.boot_config_py) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    binary_label = "//zircon/kernel/phys/test/linux-boot-config:add_boot_config"
+    depfile = files.depfile
+    sources = [
+      files.boot_config,
+      invoker.initrd,
+    ]
+    outputs = [
+      files.output_initrd,
+      files.output_header,
+    ]
+
+    args = [
+      "--input-initrd",
+      rebase_path(invoker.initrd, root_build_dir),
+      "--boot-config",
+      rebase_path(files.boot_config, root_build_dir),
+      "--output-initrd",
+      rebase_path(files.output_initrd, root_build_dir),
+      "--output-header",
+      rebase_path(files.output_header, root_build_dir),
+      "--depfile",
+      rebase_path(files.depfile, root_build_dir),
+    ]
+
+    if (defined(invoker.corrupt_checksum) && invoker.corrupt_checksum) {
+      args += [ "--corrupt-checksum" ]
+    }
+
+    if (defined(invoker.corrupt_size) && invoker.corrupt_size) {
+      args += [ "--corrupt-size" ]
+    }
+
+    deps = extra_deps
+
+    # This allows `target_name` to be used as a ramdisk in `boot_test.gni`,
+    # by being compatible with assembly.
+    metadata = {
+      kernel_aib_input_barrier = []
+      kernel_aib_input = [
+        {
+          label = get_label_info(":${labels.boot_config_py}",
+                                 "label_with_toolchain")
+          zbi = rebase_path(outputs[0], root_build_dir)
+        },
+      ]
+    }
+  }
+}
+
+python_binary("add_boot_config") {
+  testonly = true
+  visibility = [ ":*" ]
+  main_source = "add_boot_config.py"
+  sources = []
+}
+
+# Generate a base ZBI to be used for the test, with just a commandline.
+zbi_input("cmdline") {
+  type = "cmdline"
+  args = [ "--entry=foo=1234" ]
+}
+
+zbi("ramdisk") {
+  cpu = ""
+  deps = [ ":cmdline" ]
+}
+
+zbi_outputs = get_target_outputs(":ramdisk")
+
+foreach(file, boot_config_filenames) {
+  boot_config("$file.ramdisk") {
+    testonly = true
+    initrd = zbi_outputs[0]
+    boot_config = "testdata/$file.txt"
+    deps = [ ":ramdisk" ]
+  }
+
+  # Generate ZBI for each case, to validate the ZBI payload.
+  zbi_executable("zbi-boot-config-$file-test") {
+    testonly = true
+    sources = [ "zbi-boot-config-test.cc" ]
+    deps = [
+      ":$file.ramdisk.cpp",
+      "..:zbi-test-main",
+      "//sdk/lib/fit",
+    ]
+  }
+
+  zbi("zbi-boot-config-$file-test-zbi") {
+    testonly = true
+    deps = [ ":zbi-boot-config-$file-test($default_toolchain)" ]
+  }
+
+  zbi_test_outputs = []
+  zbi_test_outputs = get_target_outputs(":zbi-boot-config-$file-test-zbi")
+
+  boot_config("$file.ramdisk-zbi") {
+    testonly = true
+    initrd = zbi_test_outputs[0]
+    boot_config = "testdata/$file.txt"
+    deps = [ ":zbi-boot-config-$file-test-zbi" ]
+  }
+}
+
+# Corrupt the size, by making it bigger than the entire ramdisk.
+boot_config("corrupt_size.ramdisk") {
+  testonly = true
+  initrd = zbi_outputs[0]
+  boot_config = "testdata/valid.txt"
+  corrupt_size = true
+  deps = [ ":ramdisk" ]
+}
+
+# Corrupt the checksum, by adding 1 to it.
+boot_config("corrupt_checksum.ramdisk") {
+  testonly = true
+  initrd = zbi_outputs[0]
+  boot_config = "testdata/valid.txt"
+  corrupt_checksum = true
+  deps = [ ":ramdisk" ]
+}
+
+zbi_outputs = []
+
+# This is only provided the matching test executable with the appropriate
+# constants for the cases below (no boot config). The paylaod is generated,
+# and then corrupted.
+zbi_outputs = get_target_outputs(":zbi-boot-config-empty-test-zbi")
+
+boot_config("corrupt_size.ramdisk-zbi") {
+  testonly = true
+  initrd = zbi_outputs[0]
+  boot_config = "testdata/valid.txt"
+  corrupt_size = true
+  deps = [ ":zbi-boot-config-empty-test-zbi" ]
+}
+
+boot_config("corrupt_checksum.ramdisk-zbi") {
+  testonly = true
+  initrd = zbi_outputs[0]
+  boot_config = "testdata/valid.txt"
+  corrupt_checksum = true
+  deps = [ ":zbi-boot-config-empty-test-zbi" ]
+}
+
+# Add the two special cases above.
+boot_config_test_cases = boot_config_filenames + [
+                           "corrupt_size",
+                           "corrupt_checksum",
+                         ]
+tests = []
+if (have_devicetree) {
+  foreach(test_case, boot_config_test_cases) {
+    test_target = "devicetree-linux-boot-config-$test_case-test"
+    devicetree_boot_test(test_target) {
+      ramdisk = ":$test_case.ramdisk"
+      sources = [
+        "boot-config-test.cc",
+        "devicetree-linux-boot-config.cc",
+      ]
+      deps = [
+        ":$test_case.ramdisk.cpp",
+        "//zircon/kernel/phys/boot-shim:devicetree",
+      ]
+    }
+    tests += [ ":$test_target" ]
+
+    boot_test("devicetree-shim-zbi-linux-boot-config-$test_case-test") {
+      environments = [ qemu_env ]
+      if (current_cpu != "riscv64") {
+        environments += [ aemu_env ]
+      }
+      ramdisk = ":$test_case.ramdisk-zbi"
+    }
+    tests += [ ":devicetree-shim-zbi-linux-boot-config-$test_case-test" ]
+  }
+} else {
+  not_needed(boot_config_filenames)
+  not_needed(boot_config_test_cases)
+}
+
+# TODO(https://fxbug.dev/408051286): Additional boot-shims just need to provide the implementation for
+# GetLinuxBootConfig() defined in "linux-boot-config.h"
+
+group("tests") {
+  testonly = true
+  deps = tests
+}

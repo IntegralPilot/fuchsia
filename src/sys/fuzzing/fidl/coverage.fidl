@@ -1,0 +1,122 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.fuzzer;
+
+using zx;
+
+/// Collects VMOs used to share code coverage from instrumented target processes.
+///
+/// The instrumented target processes act as clients to this protocol, which is implemented by
+/// test_manager's fuzz_coverage component. The protocol coordinates feedback collection and other
+/// diagnostics with target processes under test. The connection should be established very early in
+/// a target process's lifecycle, i.e. before `main` begins.
+///
+@discoverable
+closed protocol CoverageDataCollector {
+    /// Registers the instrumented target process.
+    ///
+    /// This method is called once per connection to set up:
+    ///    * The eventpair used to synchronize the start and end of code coverage collection.
+    ///    * The process Handle used to monitor the target process for errors.
+    ///
+    /// This method must be called before the target process can call `AddLlvmModule`.
+    ///
+    /// It returns the currently set options; see `fuchsia.fuzzer.Controller/Configure`.
+    ///
+    /// Certain options determine sanitizer behaviors before `main` is called, and cannot
+    /// subsequently be changed while the target process is running. This is the root cause of the
+    /// constraint in `Controller` against modifying options during "long-running workflows", i.e
+    /// those that spawn target processes.
+    ///
+    /// The channel is closed on FIDL error. Clients should not attempt to reconnect.
+    strict Initialize(resource struct {
+        eventpair zx.Handle:EVENTPAIR;
+        process zx.Handle:PROCESS;
+    }) -> (struct {
+        options Options;
+    });
+
+    /// Adds a VMO with the code coverage of an LLVM module.
+    ///
+    /// The VMO used to share inline 8-bit code-coverage edge counters for a single LLVM module in
+    /// an instrumented target process.
+    ///
+    /// Its ZX_PROP_NAME property must be set, and client and server implementations must agree on
+    /// how to use it to uniquely identify the module. If the same module is added more than once by
+    /// different processes, the module identifiers must match so that the code counters can be
+    /// combined.
+    ///
+    /// Its ZX_PROP_VMO_CONTENT_SIZE property must be set to the actual number of counters present.
+    ///
+    /// It is an error to call this method without first calling |Initialize|.
+    ///
+    /// The channel is closed on FIDL error. Clients should not attempt to reconnect.
+    ///
+    /// See also:
+    ///     https://clang.llvm.org/docs/SanitizerCoverage.html#inline-8bit-counters
+    strict AddInline8bitCounters(resource struct {
+        inline_8bit_counters zx.Handle:VMO;
+    }) -> ();
+};
+
+
+/// Represents an instrumented target process under test.
+///
+/// This struct wraps the eventpair and process provided to `CoverageDataCollector.Initialize` and
+/// associates it with a unique per-`CoverageDataCollector`-client target id.
+type InstrumentedProcess = resource struct {
+    eventpair zx.Handle:EVENTPAIR;
+    process zx.Handle:PROCESS;
+};
+
+/// Represents an instrumented target process or the code coverage it is sharing.
+type CoverageData = resource struct {
+    // Unique per-`CoverageDataCollector`-client target id.
+    target_id uint64;
+
+    data flexible resource union {
+        /// An instrumented target process under test.
+        1: instrumented InstrumentedProcess;
+
+        /// See https://clang.llvm.org/docs/SanitizerCoverage.html#inline-8bit-counters
+        2: inline_8bit_counters zx.Handle:VMO;
+    };
+};
+
+/// Maximum length of a vector of CoverageData structs.
+///
+/// This value matches the maximum number of LLVM modules libFuzzer can track.
+const MAX_COVERAGE_DATA uint64 = 4096;
+
+/// Provides the process Handles and VMOs used to share code coverage to the fuzzing engine.
+///
+/// This protocol is implemented by `test_manager`'s `fuzz_coverage` component. The fuzzing engine
+/// acts as a client, although it does not connect directly. Instead the `fuzz_test_runner` makes
+/// the connection and passes it off to fuzzing engine on process start. It allows the engine to
+/// retrieve the coverage-related Handles published by instrumented target processes.
+///
+/// The channel is closed on FIDL error. Clients should exit and not attempt to reconnect.
+@discoverable
+closed protocol CoverageDataProvider {
+    /// Sets the options to be returned by `fuchsia.fuzzer.CoverageDataCollector/Initialize`.
+    strict SetOptions(struct {
+        options Options;
+    });
+
+    /// Provides coverage data collected from multiple processes.
+    ///
+    /// Returns a vector of `CoverageData` structs containing the information provided by clients of
+    /// `fuchsia.fuzzer.CoverageDataCollector`. This method uses the "hanging get" pattern: The
+    /// initial call will immediately return whatever data is available, up to `MAX_COVERAGE_DATA`.
+    /// If no fuzzed components have been started yet, this be an empty vector. If there are more
+    /// than `MAX_COVERAGE_DATA` elements available, the remainder are retained for subsequent
+    /// calls. If there is no more data available, subsequent calls will block until new coverage
+    /// data is available.
+    ///
+    /// The channel is closed on FIDL error. Clients should exit and not attempt to reconnect.
+    strict WatchCoverageData() -> (resource struct {
+        coverage_data vector<CoverageData>:MAX_COVERAGE_DATA;
+    });
+};

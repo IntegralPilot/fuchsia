@@ -1,0 +1,191 @@
+// Copyright 2017 The Fuchsia Authors
+//
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT
+
+#include <arch/arm64/hypervisor/el2_state.h>
+#include <lib/arch/asm.h>
+#include <arch/defines.h>
+#include <asm.h>
+#include <platform/mexec.h>
+
+/* Arguments Passed via x0 through x8 inclusive */
+bootarg0                .req x25
+bootarg1                .req x26
+bootarg2                .req x27
+boot_el                 .req x28
+
+// This is the address to branch to once the copy is completed.
+new_kernel_entry        .req x24
+
+// This is a null terminated list of memory regions to copy.
+copy_list               .req x23
+
+// This many more entires in the current page to copy before we should
+// interpret the entry as a pointer to the next page in the linked list.
+page_remaining_entries  .req x22
+
+tmp                     .req x9
+
+.section .text
+FUNCTION(mexec_asm)
+// Mask all interrupts before going further. Once we've dsiabled the caches and
+// MMU we don't want to take an unexpected exception because we may no
+// longer have the machinery in place to handle it.
+    msr     daifset, 0xf
+
+// Turn off the caches and MMU
+    mrs     tmp, sctlr_el1      // Read the SCTLR into a temp
+    bic     tmp, tmp, #(1<<12)  // Disable icache
+    bic     tmp, tmp, #(1<<2)   // Disable dcache/ucache
+    bic     tmp, tmp, #(1<<0)   // Disable the MMU
+    msr     sctlr_el1, tmp      // Write the temp back to the control register
+    isb
+
+// Stash the boot arguments to pass to the next kernel since we expect to trash
+// x0 - x5
+    mov     bootarg0, x0
+    mov     bootarg1, x1
+    mov     bootarg2, x2
+
+// Stash the boot el, as we will need it later
+    mov     boot_el,  x3
+
+// This list contains the memmove operations that we need to perform.
+    mov     copy_list, x4
+
+// This is the address of the kernel that we eventueally want to jump to.
+    mov     new_kernel_entry, x5
+
+// If we were originally booted in EL2, transition back into EL2
+    cmp     boot_el, #2
+    b.lt    .Lcopypage  // We booted in EL1, no need to transition
+
+// Transition to EL2. We call the hypervisor, which will branch to the address
+// in x0.
+    adr     x0, 1f
+    hvc     #1
+
+1:
+// We're now running EL2. Just like we did above, mask all interrupts before going further.
+    msr     daifset, 0xf
+
+// Reset SCTLR_EL2 to default state, turning off caches and MMU.
+    movlit  tmp, SCTLR_EL2_RES1
+    msr     sctlr_el2, tmp
+    isb
+
+// Outer loop: Execute all the memmove ops in a given page.
+.Lcopypage:
+    movlit page_remaining_entries, MAX_OPS_PER_PAGE
+
+/* Mempy the new kernel over the old kernel. Keep in mind that since the MMU
+ * is disabled, unaligned accesses are no longer legal. All accesses must be
+ * word aligned.
+ */
+.Lcopy:
+    // Load a copy operation into memory
+    ldr     x0, [copy_list, MEMMOV_OPS_DST_OFFSET]
+    ldr     x1, [copy_list, MEMMOV_OPS_SRC_OFFSET]
+    ldr     x2, [copy_list, MEMMOV_OPS_LEN_OFFSET]
+
+    // Determine if this is the end of the list by checking if all three elems
+    // in the copy list are null.
+    orr     tmp, x0, x1
+    orr     tmp, tmp, x2
+    cbz     tmp, .Lfinish_copy
+
+    // A page may contain up to 169* memmove ops, the 170th op is actually a
+    // pointer to the next page full of memmove ops.
+    cbnz    page_remaining_entries, .Lcontinue_page     // Have we processed 169 entries yet, branch if we haven't.
+    mov     copy_list, x0   // If we've followed all the entries on the current page, follow the next pointer of the linked list.
+    b       .Lcopypage      // And execute the list of copies on the page that we just advanced to.
+.Lcontinue_page:
+
+    // The copy operation is not null, go ahead and memmove
+    bl      memmove_mexec
+
+    // Advance the pointer to the next copy operation.
+    add     copy_list, copy_list, MEMMOV_OPS_STRUCT_LEN
+
+    // Decrement the number of entries remaining in this page, if this reaches 0
+    // we must follow the linked list to the next page.
+    sub     page_remaining_entries, page_remaining_entries, 1
+
+    b       .Lcopy
+
+.Lfinish_copy:
+    // Restore the bootarguments for the next kernel.
+    mov     x0, bootarg0
+    mov     x1, bootarg1
+    mov     x2, bootarg2
+
+    // Get everything out of the pipeline before branching to the new kernel.
+    ic      iallu
+    isb
+
+    // Branch to the next kernel.
+    br      new_kernel_entry
+END_FUNCTION(mexec_asm)
+
+LOCAL_FUNCTION(memmove_mexec)
+        // x6 contains the stride (1 word if we're copying forward
+        // -1 word if we're copying backwards)
+        mov     x6, 1
+
+        // x3 is the start index of the copy, this is the front of the array if
+        // we're copying forward or the back of the array if we're copying
+        // backwards.
+        mov     x3, 0
+
+        // Convert the length of the array from bytes to machine words
+        lsr     x2, x2, 3
+
+        // If the source address and the destination address are the same then
+        // we can return because there's nothing to be done.
+        cmp     x0, x1
+        beq     .done
+
+        // Decide if we need to copy backwards.
+        blt     .no_alias
+        mov     x6, -1          // Set the stride to backwards
+        mov     x3, x2          // Move the copy index to the back of the array
+        sub     x3, x3, 1       // i = (len_wrds - 1); to start at the last word
+
+.no_alias:
+        mov     x4, 0           // Loop iteration index
+.copy_loop:
+        // Copy one word of data
+        // dst[i << 3] = src[i << 3]
+        ldr     tmp, [x1, x3, lsl 3]
+        str     tmp, [x0, x3, lsl 3]
+
+        lsl     x7, x3, 3
+        add     x7, x7, x0
+
+        // Increment the array index by the stride (backwards or forwards).
+        // i += stride
+        add     x3, x3, x6
+
+        // Increment the number of words copied (we use this to decide when to
+        // stop)
+        // words_copied += 1
+        add     x4, x4, 1
+
+        // If we've copied the whole buffer, then finish.
+        // if (words_copied == words_to_copy) break;
+        cmp     x2, x4
+        bne     .copy_loop
+.done:
+        ret
+END_FUNCTION(memmove_mexec)
+
+/* This .ltorg emits any immediate constants here. We need to put this before
+ * the mexec_asm_end symbol because we intend to relocate the assembly contained
+ * within the mexec_asm[_end] block. Any constants needed by this block should
+ * also be relocated so we need to ensure that they occur before mexec_asm_end.
+ */
+.ltorg
+
+DATA(mexec_asm_end)

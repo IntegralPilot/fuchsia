@@ -1,0 +1,314 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/toolchain/rbe.gni")
+import("../libc.gni")
+
+llvm_libc_group("string") {
+  deps = [
+    ":mem",
+    ":str",
+  ]
+
+  # TODO(https://fxbug.dev/42053650): not yet using the llvm-libc versions of these
+  non_test_deps = [
+    "//zircon/third_party/ulib/musl/src/string:strerror_r",
+    "//zircon/third_party/ulib/musl/src/string:strsignal",
+    "//zircon/third_party/ulib/musl/src/string:strverscmp",
+  ]
+
+  # TODO(https://fxbug.dev/42053650): but run their tests in preparation
+  testonly_deps = [ ":strsignalerror" ]
+}
+
+llvm_libc_source_set("mem") {
+  functions = [
+    "memccpy",
+    "memmem",
+    "mempcpy",
+    "memrchr",
+  ]
+
+  deps = [
+    ":memchr",
+    ":memcmp",
+    ":memcpy",
+    ":memset",
+  ]
+}
+
+unsanitized_funcs = [
+  "memcpy",
+  "memmove",
+  "memset",
+]
+
+# The compiler will turn code that looks like it implements these functions
+# into calls to their standard names.  It doesn't recognize that the internal
+# implementation layers are going to be inlined into the public standard C
+# function, so it just produces an infinite recursion (or a call via a PLT
+# entry that hasn't been fixed up yet).  Using `-fno-builtin-FUNCTION` for the
+# particular functions works around this.
+foreach(funcs,
+        [
+          [ "memchr" ],
+          [ "memcmp" ],
+          [
+            "memcpy",
+            "memmove",
+          ],
+          [ "memset" ],
+          [ "strlen" ],
+        ]) {
+  config("no-builtin-${funcs[0]}") {
+    visibility = [ ":*" ]
+
+    cflags = []
+
+    # TODO(https://fxbug.dev/42079782): gcc is not correctly honoring -fno-builtin-memmove,
+    # but -fno-builtin correctly suppresses the call to memmove.
+    if (funcs[0] == "memcpy" && is_gcc) {
+      cflags += [ "-fno-builtin" ]
+    }
+
+    if (is_gcc) {
+      # GCC imputes some attributes to the standard string functions implicitly
+      # and then complains when the declarations don't match.
+      cflags += [ "-Wno-missing-attributes" ]
+    }
+
+    foreach(func, funcs) {
+      cflags += [ "-fno-builtin-$func" ]
+
+      # TODO(https://fxbug.dev/42077425): The .weakref shenanigans in dynlink.c aren't
+      # compatible with full LTO and a memcpy defined in C++. This only affects
+      # riscv64 in practice, since others use assembly definitions regardless.
+      if ((func == "memcpy" || func == "memset") && !is_gcc &&
+          toolchain_environment == "user.basic") {
+        cflags += [
+          "-fno-lto",
+          "-fno-whole-program-vtables",
+        ]
+      }
+    }
+  }
+
+  # These also need to stick to the basic machine ABI so that dynlink.c can
+  # use them early.  This requires hermetic_source_set() to contain any
+  # COMDAT code, so the exported symbols must be named here.
+  # TODO(https://fxbug.dev/501232406): Only unsanitized_funcs probably need
+  # to be special here after the legacy musl code is gone.
+  global_alias_prefixes = []
+  weak_alias_prefixes = []
+  export_alias_prefixes = []
+  global_alias_prefixes = [ "__libc_" ]
+  weak_alias_prefixes = [
+    "__asan_",
+    "__hwasan_",
+  ]
+  if (funcs + unsanitized_funcs - unsanitized_funcs == []) {
+    export_alias_prefixes += [ "__unsanitized_" ]
+  }
+
+  llvm_libc_source_set(funcs[0]) {
+    visibility = [ ":*" ]
+
+    functions = funcs
+
+    # Avoid self-referential libcalls.
+    configs = [ ":no-builtin-${funcs[0]}" ]
+
+    basic_abi = true
+    global_symbols = []
+    foreach(func, funcs) {
+      foreach(prefix,
+              [ "" ] + global_alias_prefixes + weak_alias_prefixes +
+                  export_alias_prefixes) {
+        global_symbols += [ prefix + func ]
+      }
+    }
+
+    # See the generated_file() target below.
+    non_test_deps = [ ":${funcs[0]}.inc" ]
+    non_test_vars = {
+      inputs = [ "$target_gen_dir/${funcs[0]}.inc" ]
+      cflags = [
+        "-include",
+        rebase_path(inputs[0], root_build_dir),
+      ]
+      if (cxx_rbe_enable) {
+        # TODO(https://fxbug.dev/501268588): This is working around an RBE
+        # wrapper bug.  Even though it's in the GN inputs and directly on the
+        # command line, it doesn't notice the -include file as a remote input.
+        cflags +=
+            [ "--remote-inputs=" + rebase_path(inputs[0], root_build_dir) ]
+      }
+    }
+  }
+
+  generated_file("${funcs[0]}.inc") {
+    # The user.basic environment doesn't export the symbols it defines.
+    # When building for export in libc.so, we want these compiled in the
+    # user.basic environment, but we also want to export names for them.
+    #
+    # TODO(https://fxbug.dev/501232406): At the same time, dynlink.c needs to
+    # use hidden symbols to access these so that it won't use PLT entries
+    # before they're ready.
+    #
+    # So compile them with extra macros that make the LLVM_LIBC_FUNCTION macro
+    # inject the extra alias declarations.
+    #
+    # These macros are hairy enough that putting them all into a -D switch via
+    # $defines would be a lot, and a potential quoting nightmare.  Hence
+    # instead an -include switch is passed pointing to this generated file of
+    # `#define` directives.
+
+    outputs = [ "$target_gen_dir/$target_name" ]
+    output_conversion = "list lines"
+
+    contents = [ "// Generated by " +
+                 get_label_info(":$target_name", "label_with_toolchain") +
+                 " -- DO NOT EDIT!" ]
+
+    # $llvm_libc/src/__support/common.h puts LLVM_LIBC_FUNCTION_ATTR_$func
+    # before the actual declarations at the front of the LLVM_LIBC_FUNCTION()
+    # expansion.  But the macro shenanigans for this don't permit using any
+    # commas in the value!
+
+    foreach(func, funcs) {
+      extra_decls = ""
+      foreach(alias,
+              [
+                {
+                  prefixes = global_alias_prefixes
+                  suffix = ""
+                },
+                {
+                  prefixes = weak_alias_prefixes
+                  suffix = " [[gnu::weak]]"
+                },
+                {
+                  prefixes = export_alias_prefixes
+                  suffix = " LLVM_LIBC_FUNCTION_ATTR"
+                },
+              ]) {
+        foreach(prefix, alias.prefixes) {
+          extra_decls +=
+              "extern \"C\" decltype(LIBC_NAMESPACE::$func) " +
+              "$prefix$func [[gnu::alias(\"$func\")]]" + alias.suffix + ";"
+        }
+      }
+
+      contents += [
+        "#define LLVM_LIBC_FUNCTION_ATTR_$func LLVM_LIBC_EMPTY, $extra_decls",
+      ]
+    }
+  }
+}
+
+# These are the functions that are nonproblematic in any context.
+llvm_libc_source_set("minimal-str") {
+  visibility = [
+    ":*",
+    "//src/lib/process_builder:static_pie_test_util",
+  ]
+
+  functions = [
+    "stpcpy",
+    "strchrnul",
+    "strcpy",
+    "strchr",
+    "strspn",
+    "strcat",
+    "strstr",
+    "strsep",
+    "strcspn",
+    "strncat",
+    "strlcat",
+    "strlcpy",
+    "strncmp",
+    "strrchr",
+    "strncpy",
+    "strcmp",
+    "strnlen",
+    "strpbrk",
+    "stpncpy",
+  ]
+
+  deps = [
+    ":mem",
+    ":strlen",
+  ]
+}
+
+llvm_libc_source_set("str") {
+  functions = [
+    "strcasestr",
+    "strcoll",
+    "strxfrm",
+    "strdup",
+    "strndup",
+    "strtok",
+    "strtok_r",
+
+    # TODO(https://fxbug.dev/42053650): the llvm-libc versions of these are problematic
+    #"strerror",
+    #"strerror_r",
+    #"strsignal",
+  ]
+
+  deps = [ ":minimal-str" ]
+}
+
+llvm_libc_source_set("strsignalerror") {
+  visibility = [ ":*" ]
+
+  functions = [
+    "strerror",
+    "strerror_r",
+    "strsignal",
+  ]
+
+  deps = [ ":StringUtil" ]
+}
+
+llvm_libc_source_set("StringUtil") {
+  visibility = [ ":*" ]
+
+  dir = "__support/StringUtil"
+
+  # This doesn't define any functions with tests of their own, but it's still
+  # an llvm_libc_source_set() to get the dual production and testonly targets.
+  # (There will also be an unused empty unittests subtarget.)
+  functions = []
+
+  public = [
+    "error_to_string.h",
+    "signal_to_string.h",
+  ]
+  sources = [
+    "error_to_string.cpp",
+    "message_mapper.h",
+    "signal_to_string.cpp",
+    "tables/linux_extension_errors.h",
+    "tables/linux_extension_signals.h",
+    "tables/linux_platform_errors.h",
+    "tables/linux_platform_signals.h",
+    "tables/minimal_platform_errors.h",
+    "tables/minimal_platform_signals.h",
+    "tables/posix_errors.h",
+    "tables/posix_signals.h",
+    "tables/signal_table.h",
+    "tables/stdc_errors.h",
+    "tables/stdc_signals.h",
+  ]
+}
+
+# This provides an archive library of the universally safe string functions.
+# When built outside the "user.libc" environment, these always define only
+# hidden-visibility symbols and should be safe in any build environment.
+static_library("hermetic") {
+  complete_static_lib = true
+  deps = [ ":minimal-str" ]
+}

@@ -1,0 +1,784 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/dist/generated_resource.gni")
+import("//build/host.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/testing/golden_files.gni")
+import("//build/testing/host_test.gni")
+import("//build/testing/host_test_data.gni")
+
+import("//build/sdk/sdk_atom.gni")
+
+# Private template to generate an SDK Atom for bind_library.
+#
+template("_bind_library_sdk") {
+  library_name = target_name
+  if (defined(invoker.name)) {
+    library_name = invoker.name
+  }
+
+  # Process sources.
+  file_base = "bind/$library_name"
+  all_files = []
+
+  sdk_sources = []
+  sdk_unrebased_sources = []
+  source = invoker.source
+  sdk_unrebased_sources += [ source ]
+  relative_source = rebase_path(source, ".")
+  if (string_replace(relative_source, "..", "bogus") != relative_source) {
+    # If the source file is not within the same directory, just use the file
+    # name.
+    relative_source = get_path_info(source, "file")
+  }
+  destination = "$file_base/$relative_source"
+  sdk_sources += [ destination ]
+  all_files += [
+    {
+      source = source
+      dest = destination
+    },
+  ]
+
+  sdk_deps = []
+  all_deps = []
+  if (defined(invoker.deps)) {
+    all_deps = invoker.deps
+  }
+  foreach(dep, all_deps) {
+    full_label = get_label_info(dep, "label_no_toolchain")
+    sdk_dep = "${full_label}_sdk"
+    sdk_deps += [ sdk_dep ]
+  }
+  _prebuild_info = {
+    file_base = file_base
+  }
+
+  sdk_atom("${target_name}_sdk") {
+    id = "sdk://bind/$library_name"
+    idk_name = library_name
+
+    category = invoker.sdk_category
+    forward_variables_from(invoker, [ "sdk_area" ])
+
+    meta = {
+      source_prebuild_info = _prebuild_info
+      dest = "$file_base/meta.json"
+      type = "bind_library"
+    }
+
+    files = all_files
+
+    deps = sdk_deps
+  }
+}
+
+# Declares a suite of tests for a driver's bind rules.
+#
+# The tests run as host tests by invoking the compiler. To avoid specifying the
+# rules and bind library dependencies twice use the `tests` parameter on the
+# bind_rules template to generate this target with the appropriate parameters.
+#
+# Parameters
+#
+#   rules (required)
+#     [path]: Path to the bind rules source file.
+#
+#   tests (required)
+#     [path]: Path to a test specification. The test specification is a JSON file defining a set
+#     of devices and the expected result of the bind rules when applied to that device. The file
+#     must adhere to the JSON schema defined by //src/devices/bind/debugger/tests_schema.json.
+#
+#   target (optional)
+#     [label]: The test target. Defaults to target_name.
+#
+#   deps (optional)
+#     [list of labels]: List of bind_library targets included by the bind rules.
+#
+#   applicable_licenses, visibility
+#     Forwarded from invoker.
+#
+template("bind_host_test") {
+  assert(defined(invoker.rules), "Need a bind rules source")
+  assert(defined(invoker.tests), "Need a test specification")
+
+  test_target = "_${target_name}_test"
+
+  group(target_name) {
+    testonly = true
+    if (is_host) {
+      deps = [ ":${test_target}" ]
+    }
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+  }
+
+  if (is_host) {
+    response_file_target = "_${target_name}_response_file"
+    response_file = "${target_gen_dir}/${target_name}.rsp"
+    test_data_dir = "${root_out_dir}/test_data/bind-tests/${target_name}"
+    test_data_target = "_${target_name}_test_data"
+
+    generated_file(response_file_target) {
+      visibility = [ ":*" ]
+      testonly = true
+      forward_variables_from(invoker, [ "deps" ])
+      data_keys = [ "test_sources" ]
+      outputs = [ "${response_file}" ]
+    }
+
+    host_test_data(test_data_target) {
+      visibility = [ ":*" ]
+      sources = [
+        "${host_tools_dir}/bindc",
+        invoker.rules,
+        invoker.tests,
+        response_file,
+      ]
+      outputs = [ "${test_data_dir}/{{source_file_part}}" ]
+      deps = [
+        ":${response_file_target}",
+        "//tools/bindc:host($host_toolchain)",
+      ]
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+    }
+
+    host_test(test_target) {
+      visibility = [ ":*" ]
+      if (defined(invoker.target)) {
+        target = invoker.target
+      } else {
+        target = get_label_info(":${target_name}", "label_with_toolchain")
+      }
+      binary_path = "${test_data_dir}/bindc"
+
+      rules_filename = get_path_info(invoker.rules, "file")
+      test_spec_filename = get_path_info(invoker.tests, "file")
+      response_file_filename = get_path_info(response_file, "file")
+      args = [
+        "test",
+        "--lint",
+        rebase_path("${test_data_dir}/${rules_filename}", root_build_dir),
+        "--test-spec",
+        rebase_path("${test_data_dir}/${test_spec_filename}", root_build_dir),
+        "--include-file",
+        rebase_path("${test_data_dir}/${response_file_filename}",
+                    root_build_dir),
+      ]
+      deps = [
+        ":${response_file_target}",
+        ":${test_data_target}",
+        "//tools/bindc:bin($host_toolchain)",
+      ]
+    }
+  } else {
+    not_needed(invoker,
+               [
+                 "applicable_licenses",
+                 "deps",
+                 "tests",
+                 "rules",
+                 "target",
+                 test_target,
+               ])
+  }
+}
+
+# Declares a suite of tests for a driver's bind rules.
+#
+# This template is provided for convenience. It handles redirect bind_host_test
+# to the host toolchain.
+#
+# Parameters
+#
+#   rules (required)
+#     [path]: Path to the bind rules source file.
+#
+#   tests (required)
+#     [path]: Path to a test specification. The test specification is a JSON file defining a set
+#     of devices and the expected result of the bind rules when applied to that device. The file
+#     must adhere to the JSON schema defined by //src/devices/bind/debugger/tests_schema.json.
+#
+#   target (optional)
+#     [label]: The test target. Defaults to target_name.
+#
+#   deps (optional)
+#     [list of labels]: List of bind_library targets included by the bind rules.
+#
+#   applicable_licenses, visibility
+#     Forwarded from invoker.
+#
+template("bind_test") {
+  assert(defined(invoker.rules), "Need a bind rules source")
+  assert(defined(invoker.tests), "Need a test specification")
+  test_target = "${target_name}_test"
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    testonly = true
+
+    # Redirect to the host toolchain.
+    deps = [ ":${test_target}($host_toolchain)" ]
+  }
+
+  bind_host_test(test_target) {
+    if (defined(invoker.target)) {
+      target = invoker.target
+    } else {
+      target = get_label_info(":${test_target}", "label_with_toolchain")
+    }
+    rules = invoker.rules
+    tests = invoker.tests
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "visibility",
+                           ])
+  }
+}
+
+# Call the bindc tool with the correct arguments.
+#
+# This template calls the bindc tool. It can either generate a C header or a
+# bytecode file.
+# For more details refer to //tools/bindc/README.md.
+#
+# Parameters
+#
+#   rules (required)
+#     [path]: Path to the bind rules source file.
+#     Note: This becomes optional when disable_autobind is true. See below.
+#
+#   deps (optional)
+#     [lib of labels]: List of bind_library targets included by the bind rules.
+#
+#   bytecode_output (optional)
+#     [path]: Name of the bytecode file generated by the tool (defaults to target name + ".bindbc")
+#
+#   disable_autobind (optional)
+#     [bool]: Configure the bind compiler to disable autobind, so that the driver must be bound on
+#     a user's request. If this is set to true, then the rules parameter becomes optional and when
+#     it's omitted the driver will bind unconditionally (but must be bound manually.) Defaults to
+#     false.
+#     TODO(https://fxbug.dev/42119701): Eventually this option should be removed when we can define this
+#     configuration in the driver's component manifest.
+#
+#   applicable_licenses, testonly, visibility
+#     Forwarded from invoker.
+#
+template("bindc") {
+  assert(defined(invoker.rules) ||
+             (defined(invoker.disable_autobind) && invoker.disable_autobind),
+         "Need a bind rules source")
+
+  output_file = "$target_name.bindbc"
+  if (defined(invoker.bytecode_output)) {
+    output_file = invoker.bytecode_output
+  }
+
+  response_file_target = "_${target_name}_response_file"
+  response_file = "${target_gen_dir}/${target_name}.rsp"
+
+  generated_file(response_file_target) {
+    visibility = [ ":*" ]
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "testonly",
+                           ])
+    data_keys = [ "sources" ]
+    outputs = [ "${response_file}" ]
+  }
+
+  compiled_action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    tool = "//tools/bindc:bin"
+    tool_output_name = "bindc"
+    mnemonic = "BINDC"
+
+    if (defined(invoker.rules)) {
+      sources = [ invoker.rules ]
+    }
+
+    depfile = "$target_gen_dir/$target_name.d"
+
+    args = [
+      "compile",
+      "--lint",
+      "--output",
+      rebase_path("$target_gen_dir/$output_file", root_build_dir),
+      "--include-file",
+      rebase_path(response_file, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+    if (defined(invoker.disable_autobind) && invoker.disable_autobind) {
+      args += [ "--disable-autobind" ]
+    }
+    if (defined(invoker.rules)) {
+      args += [ rebase_path(invoker.rules, root_build_dir) ]
+    }
+
+    inputs = [ response_file ]
+
+    outputs = [ "$target_gen_dir/$output_file" ]
+
+    deps = [ ":$response_file_target" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    metadata = {
+      # This metadata lets the packaging system know where to put the bytecode
+      # file.
+      distribution_entries = [
+        {
+          source = rebase_path("$target_gen_dir/$output_file", root_build_dir)
+          destination = "meta/bind/$output_file"
+          label = get_label_info(":$target_name", "label_with_toolchain")
+        },
+      ]
+    }
+  }
+}
+
+# Declares a driver's bind rules.
+#
+# Generates both a C header and a bytecode file withe the necessary bind rules.
+# For more details refer to //tools/bindc/README.md.
+#
+# Parameters
+#
+#   rules (optional)
+#     [path]: Path to the bind rules source file.
+#     Note: This becomes optional when disable_autobind is true. See below. Should not be supplied
+#     at the same time as dml_label.
+#
+#   dml_label (optional)
+#     [label]: A dml target that generates a .bind file. If provided, this file
+#     will be used as the bind rules source. Should not be specified at the same time as rules.
+#
+#   deps (optional)
+#     [lib of labels]: List of bind_library targets included by the bind rules.
+#
+#   bind_output (optional)
+#     |string|: Name of the bind binary file
+#     Defaults to target_name + ".bindbc"
+#
+#   tests (optional)
+#     [path]: Path to a test specification. If this parameter is set then the template will
+#     create an additional bind_test target with the name "${target_name}_test". This allows you
+#     to define tests without specifying the bind library dependencies and rules file twice.
+#
+#   disable_autobind (optional)
+#     [bool]: Configure the bind compiler to disable autobind, so that the driver must be bound on
+#     a user's request. If this is set to true, then the rules parameter becomes optional and when
+#     it's omitted the driver will bind unconditionally (but must be bound manually.) Defaults to
+#     false.
+#     TODO(https://fxbug.dev/42119701): Eventually this option should be removed when we can define this
+#     configuration in the driver's component manifest.
+#
+#   applicable_licenses, testonly, visibility
+#     Forwarded from invoker.
+#
+template("driver_bind_rules") {
+  _has_dml_label = defined(invoker.dml_label)
+  _disable_autobind = false
+  if (defined(invoker.disable_autobind)) {
+    _disable_autobind = invoker.disable_autobind
+  }
+
+  _invoker_rules = ""
+  if (defined(invoker.rules)) {
+    _invoker_rules = invoker.rules
+  }
+
+  _invoker_deps = []
+  if (defined(invoker.deps)) {
+    _invoker_deps = invoker.deps
+  }
+
+  if (_has_dml_label) {
+    _dml_outputs = get_target_outputs(invoker.dml_label)
+    _bind_files = filter_include(_dml_outputs, [ "*.bind" ])
+    if (_bind_files == []) {
+      _disable_autobind = true
+    } else {
+      _invoker_rules = _bind_files[0]
+      _invoker_deps += [ invoker.dml_label ]
+    }
+  }
+
+  assert(defined(invoker.rules) || _has_dml_label || _disable_autobind,
+         "Need a bind rules source or dml_label")
+
+  bind_output = "$target_name.bindbc"
+  if (defined(invoker.bind_output)) {
+    bind_output = invoker.bind_output
+  }
+
+  bytecode_file_target = "${target_name}_bytecode"
+  bindc(bytecode_file_target) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "disable_new_bytecode",
+                             "visibility",
+                           ])
+    disable_autobind = _disable_autobind
+    if (_invoker_rules != "") {
+      rules = _invoker_rules
+    }
+    deps = _invoker_deps
+    bytecode_output = bind_output
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+    public_deps = [ ":${bytecode_file_target}" ]
+  }
+
+  if (defined(invoker.tests)) {
+    bind_test("${target_name}_test") {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "tests",
+                             ])
+      if (_invoker_rules != "") {
+        rules = _invoker_rules
+      }
+      deps = _invoker_deps
+    }
+  }
+}
+
+# Generates a target for a bind library's C++ bindings.
+# Only for internal use by bind_library.
+template("_bind_library_cpp") {
+  if (defined(invoker.name)) {
+    library_name = invoker.name
+  } else {
+    library_name = target_name
+  }
+
+  library_name_slashes = string_replace(library_name, ".", "/")
+  cpp_header_file = "${target_gen_dir}/${target_name}/bind_cpp/bind/${library_name_slashes}/cpp/bind.h"
+  cpp_header_file_gen_target = "${target_name}_cpp_header_gen"
+  cpp_header_file_target = "${target_name}_cpp"
+  include_config = "${target_name}_include_config"
+  config(include_config) {
+    include_dirs = [ "${target_gen_dir}/${target_name}/bind_cpp" ]
+  }
+
+  compiled_action(cpp_header_file_gen_target) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    tool = "//tools/bindc:bin"
+    tool_output_name = "bindc"
+
+    sources = [ invoker.source ]
+
+    if (defined(invoker.source_dep)) {
+      deps = [ invoker.source_dep ]
+    }
+
+    args = [
+      "generate-cpp",
+      "--lint",
+      "--output",
+      rebase_path("${cpp_header_file}", root_build_dir),
+      rebase_path("${invoker.source}", root_build_dir),
+    ]
+
+    outputs = [ cpp_header_file ]
+
+    metadata = {
+      generated_sources = rebase_path(outputs, root_build_dir)
+    }
+  }
+
+  if (defined(invoker.cpp_golden_file)) {
+    cpp_header_golden_action = "${target_name}_cpp_golden"
+    golden_files(cpp_header_golden_action) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      comparisons = [
+        {
+          candidate = cpp_header_file
+          golden = invoker.cpp_golden_file
+        },
+      ]
+      public_deps = [ ":${cpp_header_file_gen_target}" ]
+    }
+  }
+
+  source_set(cpp_header_file_target) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    if (defined(invoker.cpp_golden_file)) {
+      deps = [ ":${cpp_header_golden_action}" ]
+    } else {
+      deps = [ ":${cpp_header_file_gen_target}" ]
+    }
+
+    sources = [ cpp_header_file ]
+    public_configs = [ ":${include_config}" ]
+    if (defined(invoker.public_deps)) {
+      public_deps = []
+      foreach(pub_dep, invoker.public_deps) {
+        dep_full_label = get_label_info(pub_dep, "label_no_toolchain")
+        public_deps += [ "${dep_full_label}_cpp" ]
+      }
+    }
+  }
+}
+
+# Generates a target for a bind library's Rust bindings.
+# Only for internal use by bind_library.
+template("_bind_library_rust") {
+  if (defined(invoker.name)) {
+    library_name = invoker.name
+  } else {
+    library_name = target_name
+  }
+
+  library_name_underscore = string_replace(library_name, ".", "_")
+  rust_file =
+      "${target_gen_dir}/${target_name}/rust/${library_name_underscore}_lib.rs"
+  rust_file_gen_target = "${target_name}_rust_file_gen"
+  rust_library_target = "${target_name}_rust"
+  crate_output_directory = "${target_out_dir}/${target_name}"
+
+  compiled_action(rust_file_gen_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    tool = "//tools/bindc:bin"
+    tool_output_name = "bindc"
+
+    sources = [ invoker.source ]
+
+    if (defined(invoker.source_dep)) {
+      deps = [ invoker.source_dep ]
+    }
+
+    args = [
+      "generate-rust",
+      "--lint",
+      "--output",
+      rebase_path("${rust_file}", root_build_dir),
+      rebase_path("${invoker.source}", root_build_dir),
+    ]
+
+    outputs = [ rust_file ]
+
+    metadata = {
+      generated_sources = rebase_path(outputs, root_build_dir)
+    }
+  }
+
+  if (defined(invoker.rust_golden_file)) {
+    rust_file_golden_action = "${target_name}_rust_golden"
+    golden_files(rust_file_golden_action) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      comparisons = [
+        {
+          candidate = rust_file
+          golden = invoker.rust_golden_file
+        },
+      ]
+      public_deps = [ ":${rust_file_gen_target}" ]
+    }
+  }
+
+  rustc_library(rust_library_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    if (defined(invoker.rust_golden_file)) {
+      non_rust_deps = [ ":${rust_file_golden_action}" ]
+    } else {
+      non_rust_deps = [ ":${rust_file_gen_target}" ]
+    }
+
+    edition = "2024"
+    name = "bind_${library_name_underscore}"
+    output_dir = crate_output_directory
+    sources = [ rust_file ]
+    source_root = rust_file
+    configs += [ "//build/config/rust/lints:deny_unused_results" ]
+    if (defined(invoker.public_deps)) {
+      deps = []
+      foreach(pub_dep, invoker.public_deps) {
+        dep_full_label = get_label_info(pub_dep, "label_no_toolchain")
+        deps += [ "${dep_full_label}_rust" ]
+      }
+    }
+  }
+}
+
+# Declares a bind library.
+#
+# Declare a bind library that may be included by other libraries or bind rules.
+# For more details, refer to //tools/bindc/README.md.
+#
+# Parameters
+#
+#   source (required)
+#     [path]: Path to the library source file.
+#
+#   public_deps (optional)
+#     [list of labels]: List of other bind_library targets included by the library.
+#
+#   source_dep (optional)
+#     [label]: The label of a target that generates the source input.
+#
+#   name (optional)
+#     [string] Name of the library. Defaults to the target's name.
+#
+#   cpp_golden_file (optional)
+#     [string] Path to the golden file for the cpp header.
+#
+#   rust_golden_file (optional)
+#     [string] Path to the golden file for the rust file.
+#
+#   sdk_category (optional)
+#     [string] Publication level of the library in SDKs.
+#     See //build/sdk/sdk_atom.gni.
+#
+#   sdk_area (optional)
+#     [string] The API area responsible for maintaining this SDK atom.
+#     See //build/sdk/sdk_atom.gni.
+#
+#   testonly, visibility
+#     Forwarded from invoker.
+#
+template("bind_library") {
+  assert(defined(invoker.source), "Need a source file")
+
+  _bind_library_cpp(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "sdk_category",
+                             "sdk_area",
+                             "rust_golden_file",
+                           ])
+  }
+
+  # Rust tools (eg. rust_rlib) are not defined in the Zircon toolchain.
+  if (zircon_toolchain == false) {
+    _bind_library_rust(target_name) {
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "sdk_category",
+                               "sdk_area",
+                               "cpp_golden_file",
+                             ])
+    }
+  }
+
+  test_data_dir = "${target_out_dir}/${target_name}/test_data/bind-tests/"
+  test_data_target = "${target_name}_test_data"
+
+  copy(test_data_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+    sources = [ invoker.source ]
+    outputs = [ "${test_data_dir}/{{source_file_part}}" ]
+    if (defined(invoker.source_dep)) {
+      deps = [ invoker.source_dep ]
+    }
+  }
+
+  group(target_name) {
+    metadata = {
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+
+      sources = [ rebase_path(invoker.source, root_build_dir) ]
+
+      # Adds metadata for test_spec().
+      test_runtime_deps = get_target_outputs(":${test_data_target}")
+
+      # Adds metadata for bind_test().
+      test_sources = rebase_path(get_target_outputs(":${test_data_target}"),
+                                 root_build_dir)
+    }
+
+    deps = [ ":${test_data_target}" ]
+
+    if (defined(invoker.source_dep)) {
+      deps += [ invoker.source_dep ]
+    }
+
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+  }
+
+  if (defined(invoker.sdk_category)) {
+    _bind_library_sdk("$target_name") {
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "cpp_golden_file",
+                               "rust_golden_file",
+                             ])
+    }
+  }
+}

@@ -1,0 +1,152 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Other
+### Remotely build, fetch and flash a Fuchsia image onto a device, see https://fuchsia.dev/fuchsia-src/development/sdk/ffx/flash-a-device
+
+## usage: fx flash-remote HOST [DIR] [--no-flash] [--no-build]
+##
+## Connect to HOST, run a build using fx from DIR, fetch the artifacts and
+## start the flash.
+##
+##  --no-build                Do not build, just pull artifacts already present
+##  --no-flash                Do not start the fastboot, just pull the artifacts
+##   -s                       Serial of device you wish to flash to (only necessary if multiple
+##                            devices in fastboot mode)
+##  --skip-verify             Skip hardware verification. This is dangerous, please be
+##                            sure the images you are flashing match the device. Only supported
+##                            with ffx
+##  --no-bootloader-reboot    Don't reboot bootloader after flashing firmware or
+##                            recovery fastboot image.
+##
+##  HOST          the hostname to connect to
+##  DIR           defaults to ~/fuchsia, the path to the FUCHSIA_DIR on HOST
+
+set -o errexit
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/fx-remote.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/fx-flash.sh
+fx-config-read
+
+build=true
+flash=true
+host=""
+dir=""
+serial=
+device=$(get-device-name)
+skip_verify=false
+no_bootloader_reboot=false
+while [[ $# -ne 0 ]]; do
+  case "$1" in
+  --help|-h)
+      fx-command-help
+      exit 0
+      ;;
+  --no-build)
+    build=false
+    ;;
+  --no-flash)
+    flash=false
+    ;;
+  -s)
+    shift
+    serial="$1"
+    ;;
+  -device)
+    shift
+    device="$1"
+    ;;
+  --skip-verify)
+    skip_verify=true
+    ;;
+  --no-bootloader-reboot)
+    no_bootloader_reboot=true
+    ;;
+  -*)
+    fx-error "Unknown flag: $1"
+    fx-command-help
+    exit 1
+    ;;
+  *)
+    if [[ -z "${host}" ]]; then
+      host="$1"
+    elif [[ -z "${dir}" ]]; then
+      dir="$1"
+    else
+      fx-error "unexpected argument: '$1'"
+      exit 1
+    fi
+    ;;
+  esac
+  shift
+done
+
+if cached=( $(load_remote_info "$host") ); then
+  host="${cached[0]}"
+  dir="${cached[1]}"
+fi
+
+if [[ -z "${host}" ]]; then
+  fx-error "HOST must be specified"
+  fx-command-help
+  exit 1
+fi
+
+if [[ -z "${dir}" ]]; then
+  if ssh "$host" ls \~/fuchsia/.jiri_root/bin/fx > /dev/null; then
+    dir="~/fuchsia"
+  else
+    fx-error "failed to find ~/fuchsia on $host, please specify DIR"
+    fx-command-help
+    exit 1
+  fi
+fi
+
+save_remote_info "$host" "$dir"
+
+# Fetch remote flashing artifacts
+artifact_dir="${FUCHSIA_DIR}/out/fetched"
+flash_source=$(fetch_remote_flash_source "${host}" "${dir}" "${build}")
+case "${flash_source}" in
+  flash-manifest:*)
+    flash_manifest="${flash_source#flash-manifest:}"
+    product_bundle=""
+    ;;
+  product-bundle:*)
+    flash_manifest=""
+    product_bundle="${flash_source#product-bundle:}"
+    ;;
+  *)
+    fx-error "failed to find a flash manifest or product bundle on $host."
+    exit 1
+esac
+
+fx-info "Fetching artifacts from remote host: ${host}"
+if [[ -n "${flash_manifest}" ]]; then
+  fetch_remote_build_artifacts "${host}" "${dir}" "${artifact_dir}" flash "${build}"
+  fetch_remote_artifacts "${host}" "${dir}" "${artifact_dir}" "${flash_manifest}"
+else
+  # TODO(https://fxbug.dev/42076751): This should be handled better. Right now this is an enumeration of the necessary artifacts for flashing.
+  fetch_remote_artifacts "${host}" "${dir}" "${artifact_dir}" "${product_bundle}/system_a" "${product_bundle}/system_r" "${product_bundle}/partitions" "${product_bundle}/product_bundle.json"
+fi
+
+if "${flash}"; then
+  fx-info "Verifying required host tools..."
+  if is_feature_enabled "legacy_fastboot"; then
+    fetch_or_build_tool ${host} ${dir} "${artifact_dir}" fastboot
+  else
+    fx-info "Fetching or building ffx"
+    fetch_or_build_tool ${host} ${dir} "${artifact_dir}" ffx
+  fi
+  cd "${artifact_dir}"
+  if [[ -n "${flash_manifest}" ]]; then
+    flash_manifest="${artifact_dir}/${flash_manifest}"
+  fi
+  if [[ -n "${product_bundle}" ]]; then
+    product_bundle="${artifact_dir}/${product_bundle}"
+  fi
+  fx-flash "${serial}" "${device}" "${flash_manifest}" "${product_bundle}" "${skip_verify}" "${no_bootloader_reboot}"
+fi

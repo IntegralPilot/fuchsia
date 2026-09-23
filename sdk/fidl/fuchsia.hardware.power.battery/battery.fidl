@@ -1,0 +1,302 @@
+// Copyright 2026 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.power.battery;
+
+using fuchsia.power.system;
+using zx;
+
+/// Errors returned by the battery protocol.
+type Error = flexible enum {
+    /// An unexpected error occurred within the driver.
+    INTERNAL = 1;
+
+    /// The requested operation, field, or mode is not supported by this hardware.
+    NOT_SUPPORTED = 2;
+
+    /// One or more arguments provided to the method were invalid, or a requested value lies
+    /// outside the range the hardware can program.
+    INVALID_ARGS = 3;
+
+    /// Communication with the battery hardware failed (e.g. a bus transfer error).
+    IO = 4;
+
+    /// A `Watch` call is already pending on this connection.
+    ALREADY_WATCHING = 5;
+};
+
+/// Describes the physical charging state of the battery pack.
+type ChargeStatus = flexible enum {
+    /// The battery is neither actively charging nor discharging (net current is near zero) and is
+    /// not yet full (e.g. system is running off an external source with charging suspended/idle,
+    /// thermal throttling, or battery protect mode).
+    NOT_CHARGING = 1;
+
+    /// The battery is actively receiving power from an external source (net current > 0).
+    CHARGING = 2;
+
+    /// The battery is actively supplying power to the system (net current < 0).
+    DISCHARGING = 3;
+
+    /// The battery has reached full charge termination and is no longer charging.
+    FULL = 4;
+};
+
+/// Battery health and safety status, including JEITA temperature regions and fault conditions.
+///
+/// Each value describes whether the pack may be charged and whether it can still supply power to
+/// the system. Unless a value states otherwise, the battery can still supply power.
+type HealthStatus = flexible enum {
+    /// Normal operating temperature and healthy battery condition.
+    /// Both charging and discharging are permitted.
+    GOOD = 1;
+
+    /// Battery temperature is below safe charging threshold (charging prohibited).
+    /// The battery can still supply power, though available capacity and peak current are
+    /// typically reduced.
+    COLD = 2;
+
+    /// Battery temperature is low (charging current or voltage may be restricted).
+    /// The battery can still supply power.
+    COOL = 3;
+
+    /// Battery temperature is elevated (charging current or voltage may be restricted).
+    /// The battery can still supply power.
+    WARM = 4;
+
+    /// Battery temperature exceeded safety threshold (charging prohibited).
+    /// The battery can usually still supply power, but hardware protection may open the discharge
+    /// path if the temperature continues to rise.
+    HOT = 5;
+
+    /// Battery pack voltage is below operating threshold or cell is dead.
+    /// The battery cannot supply usable power to the system.
+    DEAD = 6;
+
+    /// Battery voltage exceeded hardware safety limit (charging prohibited).
+    /// The battery can still supply power; discharging is the expected recovery path.
+    OVER_VOLTAGE = 7;
+
+    /// Unspecified hardware or fuel gauge safety fault.
+    /// Whether the pack may be charged, or can supply power at all, is indeterminate.
+    UNSPECIFIED_FAILURE = 8;
+};
+
+/// Configuration options for battery state watching.
+///
+/// Both fields are optional masks. In both `interest` and `wake_on`, the actual field values within
+/// the `Status` table are ignored; only field presence (set vs. unset) determines the mask.
+///
+/// An absent mask means "use this field's default"; a present but empty mask means "no fields".
+/// The two defaults differ because the safe choice differs: `interest` defaults to everything the
+/// driver supports watching, so a client that never configures anything still makes progress,
+/// while `wake_on` defaults to nothing, since waking the system is a cost a client must opt into.
+type WatchOptions = table {
+    /// Fields the client wants to receive change notifications for.
+    /// Defaults to every field the driver supports watching, as reported by
+    /// `Spec.supported_options`. Pass an explicitly empty table to be notified only for the
+    /// fields named in `wake_on`.
+    1: interest Status;
+
+    /// Fields that should actively wake the system from suspend.
+    /// Any field present in `wake_on` is implicitly included in `interest`.
+    /// Defaults to no fields: changes occurring during suspend are deferred until the next system
+    /// wakeup and do not wake the device.
+    2: wake_on Status;
+};
+
+/// Static hardware characteristics and driver capabilities.
+type Spec = table {
+    /// Optional. Design capacity in microamp-hours.
+    /// Omitted if unsupported by hardware.
+    1: design_capacity_uah uint32;
+
+    /// Optional. Nominal design voltage in microvolts.
+    /// Omitted if unsupported by hardware.
+    2: design_voltage_uv uint32;
+
+    /// Optional. Informational battery chemistry description (e.g. "Li-ion", "LiFePO4", "NiMH").
+    /// Omitted if unknown or unprogrammed in hardware.
+    3: chemistry string:128;
+
+    /// Optional. Informational battery model string or manufacturer part number.
+    /// Omitted if unknown or unprogrammed in hardware.
+    4: model string:128;
+
+    /// Required. The interest and wake options supported by this driver/hardware.
+    ///
+    /// Drivers must populate this table so clients know which fields support active change
+    /// notifications. If omitted by the driver, clients should assume no active interrupt watching
+    /// is supported.
+    ///
+    /// - `supported_options.interest`: Telemetry fields that can actively trigger hanging-get watch
+    ///   notifications on change. Fields omitted are passive measurements that do not generate
+    ///   hardware interrupts; their freshest values are returned during active state changes or via
+    ///   [`Battery.GetStatus`].
+    /// - `supported_options.wake_on`: Telemetry fields capable of actively waking the system from
+    ///   suspend via hardware interrupt lines etc.
+    5: supported_options WatchOptions;
+};
+
+/// Primary telemetry snapshot from the battery fuel gauge.
+///
+/// All fields are optional. Each returned `Status` represents a complete snapshot, not a sparse
+/// delta; fields omitted by the driver indicate that the metric is unsupported by the hardware fuel
+/// gauge or currently unavailable/indeterminate.
+///
+/// NOTE: Some fields (e.g. instantaneous `voltage_uv` and `current_ua`) may be passive measurements
+/// that do not generate hardware interrupts on change. Refer to [`Spec.supported_options`] for the
+/// options that can actively trigger change notifications.
+type Status = table {
+    /// Whether the battery pack is physically present and connected.
+    /// If false, the battery is detached/missing. Omitted if presence is indeterminate.
+    1: present bool;
+
+    /// Present terminal voltage in microvolts.
+    /// Omitted if unsupported by hardware or unavailable.
+    2: voltage_uv uint32;
+
+    /// Present current in microamps: positive (+) for charging, negative (-) for discharging.
+    /// Omitted if unsupported by hardware or unavailable.
+    3: current_ua int32;
+
+    /// State of charge percentage in the range [0.0, 100.0].
+    /// Omitted if indeterminate or unsupported by hardware.
+    4: level_percent float32;
+
+    /// Internal battery temperature in Celsius.
+    /// Omitted if temperature sensing is unsupported or unavailable.
+    5: temp_celsius float32;
+
+    /// High-level charging status.
+    /// Omitted if indeterminate or unsupported by hardware.
+    6: charge_status ChargeStatus;
+
+    /// Estimated remaining usable capacity in microamp-hours.
+    /// Omitted if indeterminate or unsupported by hardware.
+    7: remaining_capacity_uah uint32;
+
+    /// Estimated full charge capacity in microamp-hours, reflecting pack aging.
+    /// Omitted if indeterminate or unsupported by hardware.
+    8: full_charge_capacity_uah uint32;
+
+    /// Health condition or safety trip status.
+    /// Omitted if health diagnostics are unsupported by hardware.
+    9: health HealthStatus;
+
+    /// Total charge-discharge cycle count.
+    /// Omitted if cycle tracking is unsupported by hardware.
+    10: cycle_count uint32;
+
+    /// Estimated duration remaining until fully empty (discharging) or fully charged (charging).
+    /// Omitted if indeterminate, unsupported, or if the battery is idle.
+    11: time_remaining zx.Duration;
+};
+
+/// Diagnostic and telemetry interface for battery hardware.
+///
+/// This is a read-only protocol that supports multiple concurrent clients.
+@discoverable
+open protocol Battery {
+    /// Retrieves the static specification of the battery.
+    ///
+    /// Returns:
+    /// + `spec`: Static hardware characteristics and driver capabilities of the battery.
+    ///
+    /// Errors:
+    /// - `NOT_SUPPORTED`: Hardware does not supply a static specification.
+    /// - `IO`: Communication failure with the fuel gauge hardware (e.g. I2C transfer failure).
+    /// - `INTERNAL`: Internal driver error.
+    flexible GetSpec() -> (struct {
+        spec Spec;
+    }) error Error;
+
+    /// Retrieves an instantaneous snapshot of the battery status.
+    ///
+    /// Returns:
+    /// + `status`: Complete current telemetry snapshot of battery metrics.
+    ///
+    /// Errors:
+    /// - `IO`: Communication failure with the fuel gauge hardware (e.g. I2C transfer failure).
+    /// - `INTERNAL`: Internal driver error.
+    flexible GetStatus() -> (struct {
+        status Status;
+    }) error Error;
+
+    /// Configures the fields of interest and wake triggers for this client connection.
+    ///
+    /// The driver filters the requested masks against hardware capabilities and returns the
+    /// effective configuration in `effective_options`.
+    ///
+    /// - **Partially supported options**: If some requested fields are supported and others are not
+    ///   (e.g., requesting passive fields like `voltage_uv` or `current_ua` that do not support
+    ///   active interrupt notifications), the driver enables the supported fields and returns the
+    ///   active subset in `effective_options`. The call succeeds (`Ok`).
+    /// - **Fully unsupported options**: If non-empty masks were specified but NONE of the requested
+    ///   fields are supported, the driver returns `NOT_SUPPORTED`.
+    ///
+    /// If `ConfigureWatch` is never called, `Watch` defaults to returning on ANY supported field
+    /// change. The driver aggregates constraints across all clients to determine hardware reporting
+    /// rates.
+    ///
+    /// `ConfigureWatch` may be called at any time, including while a `Watch` is pending. The new
+    /// masks take effect immediately and apply to that pending call. Change detection continues to
+    /// compare against the status last delivered on this connection, so a field that changed
+    /// before the reconfiguration can still resolve the pending `Watch`.
+    ///
+    /// Parameters:
+    /// + `options`: Requested watch options. Both `interest` and `wake_on` are optional.
+    ///
+    /// Returns:
+    /// + `effective_options`: The subset of requested options supported and enabled by the driver.
+    ///
+    /// Errors:
+    /// - `NOT_SUPPORTED`: Non-empty options were requested, but none of the requested interest/wake
+    ///   fields are supported by the driver.
+    ///
+    /// On error the connection's configuration is left unchanged; a failed call never partially
+    /// applies.
+    flexible ConfigureWatch(struct {
+        options WatchOptions;
+    }) -> (struct {
+        effective_options WatchOptions;
+    }) error Error;
+
+    /// Change notification for battery state using a hanging-get pattern.
+    ///
+    /// The first call returns the full current hardware state immediately. Subsequent calls block
+    /// until a state change matches the masks in [`ConfigureWatch`]. Each return contains a
+    /// complete telemetry snapshot of all current battery fields, not a sparse delta.
+    ///
+    /// At most one `Watch` call may be outstanding per connection; concurrent calls fail with
+    /// `ALREADY_WATCHING`.
+    ///
+    /// Parameters:
+    /// + `lease`: An optional power lease token used to coordinate handoff between client and
+    ///   server, preventing the system from suspending before critical battery events are handled.
+    ///   If omitted, no lease coordination is performed. If the driver advertises no `wake_on`
+    ///   fields in `Spec.supported_options`, `lease` is ignored and `wake_lease` is always omitted.
+    ///
+    /// Returns:
+    /// + `status`: Complete current telemetry snapshot of the battery.
+    /// + `wake_lease`: An optional lease token provided if the change triggered a `wake_on`
+    ///   condition.
+    ///   Omitted if the change did not trigger a wake condition or if suspend coordination is
+    ///   inactive.
+    ///
+    /// Errors:
+    /// - `ALREADY_WATCHING`: A `Watch` call is already pending on this connection.
+    /// - `IO`: Communication failure with the fuel gauge hardware (e.g. I2C transfer failure).
+    /// - `INTERNAL`: Internal driver error.
+    flexible Watch(resource struct {
+        lease fuchsia.power.system.LeaseToken:optional;
+    }) -> (resource struct {
+        status Status;
+        wake_lease fuchsia.power.system.LeaseToken:optional;
+    }) error Error;
+};
+
+service Service {
+    battery client_end:Battery;
+};

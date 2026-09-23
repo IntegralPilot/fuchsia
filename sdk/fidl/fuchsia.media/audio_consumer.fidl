@@ -1,0 +1,167 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.media;
+
+using zx;
+using fuchsia.media.audio;
+
+/// Interface for creating audio consumers bound to a session.
+@discoverable
+closed protocol SessionAudioConsumerFactory {
+    /// Creates an `AudioConsumer`, which is an interface for playing audio, bound
+    /// to a particular session. `session_id` is the identifier of the media session
+    /// for which audio is to be rendered.
+    // TODO(dalesat): Can't use fuchsia.media.sessions2.SessionId here, because dependencies.
+    strict CreateAudioConsumer(resource struct {
+        session_id uint64;
+        audio_consumer_request server_end:AudioConsumer;
+    });
+};
+
+/// Interface for creating audio consumers for local rendering.
+// TODO(https://fxbug.dev/384934089): deprecate and remove |AudioRenderUsage|
+@discoverable
+@available(deprecated=26, removed=31)
+closed protocol UsageAudioConsumerFactory {
+    strict CreateAudioConsumer(resource struct {
+        usage AudioRenderUsage;
+        audio_consumer_request server_end:AudioConsumer;
+    });
+};
+
+/// Interface for creating audio consumers for local rendering.
+@discoverable
+open protocol Usage2AudioConsumerFactory {
+    /// Creates an `AudioConsumer`, which is an interface for playing audio, given a usage value.
+    /// Audio submitted to such a consumer is always rendered locally.
+    flexible CreateAudioConsumer(resource struct {
+        usage AudioRenderUsage2;
+        audio_consumer_request server_end:AudioConsumer;
+    });
+};
+
+/// Interface for playing and controlling audio.
+closed protocol AudioConsumer {
+    /// Creates a `StreamSink` for the consumer with the indicated properties.
+    ///
+    /// Multiple stream sinks may be acquired using this method, but they are intended to be used
+    /// sequentially rather than concurrently. The first stream sink that's created using this
+    /// method is used as the sole source of packets incoming to the logical consumer until that
+    /// stream sink is closed or the `EndOfStream` method is called on that sink. At that point,
+    /// the second stream sink is used, and so on.
+    ///
+    /// If an unsupported compression type is supplied, the
+    /// `stream_sink_request` request will be closed with an epitaph value of
+    /// `ZX_ERR_INVALID_ARGS`.
+    strict CreateStreamSink(resource struct {
+        buffers vector<zx.Handle:VMO>:16;
+        stream_type AudioStreamType;
+        compression box<Compression>;
+        stream_sink_request server_end:StreamSink;
+    });
+
+    /// Indicates that the last packet prior to the end of the stream has been rendered.
+    strict -> OnEndOfStream();
+
+    /// Starts rendering as indicated by `flags`.
+    ///
+    /// `media_time` indicates the packet timestamp that corresponds to `reference_time`.
+    /// Typically, this is the timestamp of the first packet that will be
+    /// rendered. If packets will be supplied with no timestamps, this value
+    /// should be `NO_TIMESTAMP`.  Passing a `media_time` value of
+    /// `NO_TIMESTAMP` chooses the default media time, established as follows:
+    ///     1. When starting for the first time, the default media time is the
+    ///        timestamp on the first packet sent to the stream sink.
+    ///     2. When resuming after stop, the default media time is the media
+    ///        time at which the stream stopped.
+    ///
+    /// `reference_time` is the monotonic system time at which rendering should
+    /// be started. For supply-driven sources, this must be the time at which
+    /// the first packet was (or will be) sent plus a lead time, which must be
+    /// in the range indicated in the `AudioConsumerStatus`. For demand-driven
+    /// sources, the client must ensure that the lead time requirement is met at
+    /// the start time.  Passing the default value of 0 for `reference_time`
+    /// causes the consumer to choose a start time based on the availability of
+    /// packets, the lead time requirements, and whether `LOW_LATENCY` has been
+    /// specified.
+    ///
+    /// The actual start time will be reflected in the updated status.
+    strict Start(struct {
+        flags AudioConsumerStartFlags;
+        reference_time zx.Time;
+        media_time int64;
+    });
+
+    /// Stops rendering as soon as possible after this method is called. The actual stop time will
+    /// be reflected in the updated status.
+    strict Stop();
+
+    /// Requests to change the playback rate of the renderer. 1.0 means normal
+    /// playback. Negative rates are not supported. The new rate will be
+    /// reflected in the updated status. The default rate of any newly created `StreamSink` is 1.0.
+    strict SetRate(struct {
+        rate float32;
+    });
+
+    /// Binds to this `AudioConsumer` volume control for control and notifications.
+    strict BindVolumeControl(resource struct {
+        volume_control_request server_end:fuchsia.media.audio.VolumeControl;
+    });
+
+    /// Gets the current status of the consumer using the long get pattern. The consumer responds
+    /// to this method when the status changes - initially with respect to the initial status value
+    /// and thereafter with respect to the previously-reported status value.
+    strict WatchStatus() -> (struct {
+        status AudioConsumerStatus;
+    });
+};
+
+/// Flags passed to `AudioConsumer.Start`.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AudioConsumerStartFlags = strict bits {
+    /// Indicates that latency should be kept as low as possible.
+    LOW_LATENCY = 0x01;
+
+    /// Indicates that the timing of packet delivery is determined by an external process rather
+    /// than being demand-based. When this flag is set, the service should expect underflow or
+    /// overflow due to a mismatch between packet arrival rate and presentation rate. When this
+    /// flag is not set, packets arrive on demand.
+    SUPPLY_DRIVEN = 0x02;
+};
+
+/// Represents the status of the consumer. In the initial status, `error` and
+/// `presentation_timeline` are absent. The lead time fields are always present.
+type AudioConsumerStatus = table {
+    /// If present, indicates an error condition currently in effect. Absent if no error.
+    1: error AudioConsumerError;
+
+    /// If present, indicates the current relationship between the presentation timeline
+    /// and local monotonic clock, both in nanosecond units. If not present,
+    /// indicates there is no relationship. Absent initially.
+    ///
+    /// 'Presentation timeline' refers to the `pts` (presentation timestamp) values on the packets.
+    /// This timeline function can be used to determine the local monotonic clock time that a
+    /// packet will be presented based on that packet's `pts` value.
+    2: presentation_timeline TimelineFunction;
+
+    /// Indicates the minimum lead time in nanoseconds supported by this
+    /// `AudioConsumer`.  Or in other words, how small of a gap between the
+    /// `media_time` provided to `AudioConsumer.Start` and the pts on the first
+    /// packet can be. Values outside this range will be clipped.
+    3: min_lead_time uint64;
+
+    /// Indicates the maximum lead time in nanoseconds supported by this
+    /// `AudioConsumer`.  Or in other words, how large of a gap between the
+    /// `media_time` provided to `AudioConsumer.Start` and the pts on the first
+    /// packet can be. Values outside this range will be clipped.
+    4: max_lead_time uint64;
+};
+
+type Void = struct {};
+
+/// Represents a `AudioConsumer` error condition.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AudioConsumerError = strict union {
+    1: place_holder Void;
+};

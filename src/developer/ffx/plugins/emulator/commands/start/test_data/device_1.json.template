@@ -1,0 +1,236 @@
+{{! Copyright 2022 The Fuchsia Authors. All rights reserved. }}
+{{! Use of this source code is governed by a BSD-style license that can be
+    found in the LICENSE file. }}
+{{! This template is processed by Handlebars to render a json file. }}
+{{! Note the use of the nested "eq" helper below: "#if" expects a single
+    parameter which is evaluated for "truthiness". The "eq" helper takes two
+    parameters and compares them against each other using "param1 == param2",
+    returning "true" if they match and nothing otherwise. }}
+{{! Also note the use of the "ua" helper: the device.memory.units variable
+    normally serializes as the full word, e.g. "mebibytes", but the Qemu flag
+    it populates expects a single-character abbreviation, e.g. "M". The "ua"
+    helper calls a rust function to perform that substitution. If the parameter
+    doesn't deserialize to a DataUnits, the helper just returns the usual
+    serialized value of the parameter. }}
+{{! Also note the use of the "di" helper, which invokes a rust function to
+    extract the disk image path from a DiskImage object. }}
+{
+    "args": [
+        "-kernel",
+        "{{guest.kernel_image}}",
+        "-initrd",
+        "{{guest.ramdisk.path}}",
+        "-m",
+        "{{device.memory.quantity}}{{ua device.memory.units}}",
+        "-smp",
+        {{! These should probably be predicated on the host CPU. }}
+            "4,threads=2",
+        {{#if guest.disk_image}}
+            "-drive", "file={{di guest.disk_image}},format=raw,if=none,id=vdisk,cache=unsafe",
+            "-object", "iothread,id=iothread0",
+            "-device", "virtio-blk-pci,drive=vdisk,iothread=iothread0",
+        {{/if}}
+        {{! The QMP is an interface for issuing commands to the emulator. The
+            commands are sent in JSON, as are the results. The syntax for this
+            interface is documented at
+            https://github.com/qemu/qemu/blob/master/qga/qapi-schema.json. }}
+        "-qmp-pretty",
+        "unix:{{runtime.instance_directory}}/qmp,server,nowait",
+        {{#if (eq runtime.console "monitor")}}
+            "-monitor",
+            "stdio",
+        {{else}}
+            "-monitor",
+            "unix:{{runtime.instance_directory}}/monitor,server,nowait",
+        {{/if}}
+        {{#if (eq runtime.console "console")}}
+            "-serial",
+            "mon:stdio",
+        {{else}}
+            "-serial",
+            "unix:{{runtime.instance_directory}}/serial,server,nowait,logfile={{host.log}}.serial",
+        {{/if}}
+        "-machine",
+        {{#if (eq device.cpu.architecture "arm64")}}
+            "virt-9.2",
+            {{#if (eq host.architecture "arm64")}}
+                "-machine", "gic-version=host,highmem-ecam=off",
+            {{else}}
+                "-machine", "virtualization=true,highmem-ecam=off", "-cpu", "max",
+            {{/if}}
+        {{else}} {{! architecture == x64 }}
+            {{#if (eq runtime.engine_type "qemu")}}
+                "q35,smbios-entry-point-type=32",
+            {{else}}
+                "q35",
+            {{/if}}
+            "-device",
+            "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            {{! Override the SeaBIOS serial port to keep it from outputting
+                a terminal reset on start. }}
+            "-fw_cfg",
+            "name=etc/sercon-port,string=0",
+        {{/if}}
+        {{#if (eq host.acceleration "none")}}
+            {{! The QEMU system defaults to TCG for acceleration by default, but when Fuchsia is
+                run with the multi-threaded version it runs into clock-skew issues and crashes.
+                This tag makes it explicit that we always want the single-thread version, even if
+                it may be slower. }}
+            "-accel",
+            "tcg,thread=single",
+            "-cpu",
+            {{#if (eq device.cpu.architecture "arm64")}}
+                "cortex-a53",
+            {{else}}
+                "Haswell,+smap,-check,-fsgsbase",
+            {{/if}}
+        {{else}} {{! acceleration == "hyper" }}
+            {{#if (eq host.os "linux")}}
+                "-enable-kvm",
+                "-cpu",
+                {{#if (eq host.architecture "arm64")}}
+                    "host",
+                {{else}}
+                    "host,migratable=no,+invtsc",
+                {{/if}}
+            {{else}}
+                {{#if (eq host.os "macos")}}
+                    {{#if (eq host.architecture "arm64")}}
+                        "-enable-hvf,highmem=off",
+                    {{else}}
+                        "-enable-hvf",
+                    {{/if}}
+                    "-cpu",
+                    "Haswell",
+                {{/if}}
+            {{/if}}
+        {{/if}}
+        {{#if (eq device.pointing_device "mouse")}}
+            "-device",
+            "virtio-mouse-pci",
+        {{/if}}
+        {{#if (eq device.pointing_device "touch")}}
+            {{#if (eq runtime.engine_type "femu")}}
+              "-device",
+              "virtio_input_multi_touch_pci_1",
+            {{/if}}
+        {{/if}}
+        {{#if (eq device.audio.model "none")}}
+            "-no-audio",
+        {{else}}
+            "-soundhw",
+            "{{device.audio.model}}",
+        {{/if}}
+        {{! Networking goes here }}
+        {{#if (eq host.networking "none")}}
+           "-nic",
+            "none",
+            "-nodefaults",
+        {{else}}
+            {{#if (eq host.networking "tap")}}
+                "-netdev",
+                "type=tap,ifname=qemu,id=net0,script=no,downscript=no",
+                "-device",
+                "virtio-net-pci,vectors=8,netdev=net0,mac={{runtime.mac_address}}",
+            {{else}}
+                {{!-- host.networking must be "user"}}
+                "-netdev",
+                "type=user,id=net0,restrict=off
+                {{~#each host.port_map~}}
+                    ,hostfwd=tcp::{{this.host}}-:{{this.guest}}
+                {{~/each~}}",
+                "-device",
+                "virtio-net-pci,vectors=8,netdev=net0,mac={{runtime.mac_address}}",
+            {{/if}}
+        {{/if}}
+        {{#if runtime.headless}}
+            "-nographic",
+        {{/if}}
+        "-parallel",
+        "none",
+        {{! TODO(https://fxbug.dev/42171410): These last few items were hard-coded into
+            device_launcher, but need to be reevaluated as part of the template
+            here. }}
+        "-vga",
+        "none",
+        "-device",
+        "virtio-keyboard-pci",
+        "-device",
+        "edu"
+    ],
+    "features": [
+        {{! We don't bother checking for "auto" here because the Rust code
+            will resolve "auto" to an actual value before it resolves the
+            template. }}
+        {{#if (eq host.acceleration "hyper")}}
+            {{#if (eq host.os "linux")}}
+                "KVM",
+            {{else}}
+                "HVF",
+            {{/if}}
+        {{/if}}
+        {{#if (eq device.pointing_device "mouse")}}
+            "VirtioMouse",
+        {{/if}}
+        "VirtioInput",
+        "GLDirectMem",
+        "HostComposition",
+        "Vulkan",
+        "RefCountPipe"
+    ],
+    "kernel_args": [
+        {{#if (eq host.acceleration "hyper")}}
+            {{#if (eq host.os "macos")}}
+                "kernel.page-scanner.page-table-eviction-policy=never",
+            {{/if}}
+        {{/if}}
+        {{#if (eq runtime.log_level "verbose")}}
+            "verbose",
+        {{/if}}
+        "kernel.serial=legacy",
+        {{#if (eq runtime.console "console")}}
+            "TERM=xterm-256color",
+        {{else}}
+            "TERM=dumb",
+        {{/if}}
+        "kernel.entropy-mixin=42ac2452e99c1c979ebfca03bce0cbb14126e4021a6199ccfeca217999c0aaa0",
+        "kernel.halt-on-panic=true",
+        "zircon.nodename={{runtime.name}}",
+        "kernel.lockup-detector.critical-section-fatal-threshold-ms=0",
+        "kernel.lockup-detector.critical-section-threshold-ms=5000",
+        "kernel.lockup-detector.heartbeat-age-fatal-threshold-ms=0"
+        {{#each runtime.addl_kernel_args}}
+            ,"{{this}}"
+        {{/each}}
+    ],
+    "options": [
+        "-metrics-collection",
+        {{#if (eq device.cpu.architecture "arm64")}}
+            "-avd-arch", "arm64",
+        {{/if}}
+        {{#unless runtime.hidpi_scaling}}
+            "-no-hidpi-scaling",
+        {{/unless}}
+        "-gpu",
+        "{{host.gpu}}",
+        {{#if runtime.headless}}
+            "-no-window",
+        {{else}}
+            "-window-size",
+            "{{device.screen.width}}x{{device.screen.height}}",
+        {{/if}}
+        {{#if (eq runtime.log_level "verbose")}}
+            "-verbose",
+        {{/if}}
+        {{#if runtime.debugger}}
+            "-wait-for-debugger",
+        {{/if}}
+        "-no-location-ui"
+    ],
+    "envs": {
+        {{#unless runtime.headless}}
+            "DISPLAY": "{{env "DISPLAY"}}",
+        {{/unless}}
+        "QEMU_AUDIO_DRV": "none"
+    }
+}

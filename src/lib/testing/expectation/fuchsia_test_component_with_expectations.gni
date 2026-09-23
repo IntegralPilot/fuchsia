@@ -1,0 +1,203 @@
+# Copyright 2023 The Fuchsia Authors.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//src/lib/testing/expectation/preprocess/preprocess.gni")
+import("//tools/cmc/build/expect_includes.gni")
+
+# Defines a fuchsia_test_component with an expectations file for this test.
+#
+# Parameters
+#  expectations (optional)
+#    Path to a JSON5 test expectations file. See
+#    //src/lib/testing/expectation/example_expectations.json5 for an example of
+#    the format. Either expectations or generated_expectations is required.
+#    Type: path
+#
+#  generated_expectations (optional)
+#    Name of the generated_expectations_file target that generates expectation file. Either
+#    expectations or generated_expectations is required.
+#    Type: target name
+#
+#  manifest (required)
+#    The component manifest.
+#    Type: path
+#
+#  treatment_of_cases_with_error_logs (optional)
+#     Identifies how test cases that are expected to generate error logs should be run. Since most
+#     failed tests fail by panicking on a failed assertion, which generates error logs, this is
+#     useful for segregating expected-to-fail tests from expected-to-pass tests by marking the
+#     former as "expect_failure_with_err_log" and placing them in a separate test package that
+#     allows error logs without failing the whole suite.
+#     Type: string
+#     Options:
+#       - "SKIP_CASES_WITH_ERROR_LOGS" indicates that tests expected to
+#         generate error logs should be skipped.
+#       - "RUN_ONLY_CASES_WITH_ERROR_LOGS" indicates that only those tests
+#         expected to generate error logs should be run.
+#       - By default, all test cases will be run.
+#
+#  All others - same as fuchsia_test_component.
+template("fuchsia_test_component_with_expectations") {
+  assert(defined(invoker.manifest), "Must define path to manifest file.")
+
+  _test_component_name = target_name
+  _skip_err_logs_cases = "SKIP_CASES_WITH_ERROR_LOGS"
+  _run_err_logs_cases = "RUN_ONLY_CASES_WITH_ERROR_LOGS"
+  not_needed([
+               _skip_err_logs_cases,
+               _run_err_logs_cases,
+             ])
+
+  _expectations_target = "${target_name}_preprocessed_expectations"
+  preprocess_expectations(_expectations_target) {
+    testonly = true
+    if (defined(invoker.generated_expectations)) {
+      assert(!defined(invoker.expectations))
+
+      deps = [ invoker.generated_expectations ]
+      expectations =
+          get_label_info(invoker.generated_expectations, "target_gen_dir") +
+          "/" + get_label_info(invoker.generated_expectations, "name") +
+          ".json5"
+    } else {
+      assert(defined(invoker.expectations),
+             "Must define path to expectations file.")
+      expectations = invoker.expectations
+    }
+    if (defined(invoker.treatment_of_cases_with_error_logs)) {
+      assert(
+          invoker.treatment_of_cases_with_error_logs == _skip_err_logs_cases ||
+          invoker.treatment_of_cases_with_error_logs == _run_err_logs_cases)
+      if (invoker.treatment_of_cases_with_error_logs == _skip_err_logs_cases) {
+        cases_to_run = "NoErrLogs"
+      } else {
+        cases_to_run = "WithErrLogs"
+      }
+    }
+    output_path =
+        "data/tests/expectations/${_test_component_name}/expectations.json5"
+  }
+
+  _expectations_offer_cml_shard_target = "${target_name}_offer_cml_shard"
+  _expectations_offer_cml_shard_file =
+      "${target_gen_dir}/${_test_component_name}_expectations_offer.shard.cml"
+  generated_file(_expectations_offer_cml_shard_target) {
+    contents = {
+      offer = [
+        {
+          directory = "pkg"
+          from = "framework"
+          as = "expectations"
+          to = "#expectation-comparer"
+          subdir = "data/tests/expectations/${_test_component_name}"
+        },
+      ]
+    }
+    outputs = [ _expectations_offer_cml_shard_file ]
+    output_conversion = "json"
+  }
+
+  _merged_cml_target = "${target_name}_merged_cml"
+  _merged_cml_file_name = "${_test_component_name}_merged.cml"
+  cmc_merge(_merged_cml_target) {
+    testonly = true
+    deps = [ ":${_expectations_offer_cml_shard_target}" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    sources = [
+      _expectations_offer_cml_shard_file,
+      invoker.manifest,
+    ]
+    output_name = _merged_cml_file_name
+  }
+  _cmc_merge_outputs = get_target_outputs(":${_merged_cml_target}")
+  _merged_cml_file = _cmc_merge_outputs[0]
+
+  # We want to ensure that the manifest of the component built by this
+  # `fuchsia_test_component_with_expectations` invocation includes the
+  # expectation-comparer client shard. In order to validate this at build-time,
+  # we'll wire up a `cmc_check_includes` invocation providing:
+  # (a) The manifest that needs to be checked (this component's manifest)
+  # (b) The shard expected to be included (the expectation client shard)
+
+  # Part (a): the manifest that needs to be checked. `cmc_check_includes`
+  # expects to receive this in the form of a JSON file consisting of an
+  # array with a single element, where that element is the path to the CML file
+  # to check.
+  #
+  # i.e. the JSON file's contents look like:
+  # ```
+  # ["src/foo/bar/meta/test_component.cml"]
+  # ```
+  #
+  # Thus, the following generates a JSON file of that format.
+  _manifest_json_singleton_target = "${target_name}_manifest_json_singleton"
+  generated_file(_manifest_json_singleton_target) {
+    testonly = true
+    outputs = [ "$target_out_dir/$_manifest_json_singleton_target.json" ]
+    output_conversion = "json"
+    contents = [ rebase_path(invoker.manifest, root_build_dir) ]
+
+    visibility = [ ":*" ]
+
+    deps = []
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+  _manifest_json_singleton_target = ":$_manifest_json_singleton_target"
+
+  # Part (b): the shard expected to be included. This is specified to
+  # `cmc_check_includes` by having the `cmc_check_includes` invocation dep on
+  # a target whose metadata specifies the `cmc_expected_includes_cml` like so:
+  _expected_includes_metadata_target = "${target_name}-expected-includes"
+  group(_expected_includes_metadata_target) {
+    metadata = {
+      cmc_expected_includes_cml =
+          [ "//src/lib/testing/expectation/meta/common.shard.cml" ]
+    }
+  }
+  _expected_includes_metadata_target = ":$_expected_includes_metadata_target"
+
+  # Finally, the actual `cmc_check_includes` invocation. Building this target
+  # will fail if `invoker.manifest` does not include the expectation client
+  # shard.
+  _include_check_target = "${target_name}-check-includes"
+  cmc_check_includes(_include_check_target) {
+    testonly = true
+    _json_singleton_outputs =
+        get_target_outputs(_manifest_json_singleton_target)
+    manifest = _json_singleton_outputs[0]
+    deps = [
+      _expected_includes_metadata_target,
+      _manifest_json_singleton_target,
+    ]
+
+    visibility = [ ":*" ]
+  }
+  _include_check_target = ":$_include_check_target"
+
+  fuchsia_test_component(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "deps",
+                             "manifest",
+                           ])
+
+    deps = [
+      ":${_expectations_target}",
+      ":${_merged_cml_target}",
+      "//src/lib/testing/expectation:expectation_comparer",
+      _include_check_target,
+    ]
+    manifest = _merged_cml_file
+
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+}

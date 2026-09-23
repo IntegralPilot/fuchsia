@@ -1,0 +1,126 @@
+#!/bin/bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Toolchain
+### Download the Rust toolchain to the latest green build from toolchain.ci
+
+## usage: fx download-rust-toolchain [x64|arm64]
+##
+## This script downloads the latest green build of the Rust toolchain
+## for the specified architecture (x64 or arm64) and places
+## it in '//local/rust'. It also provides instructions on how to
+## configure your build to use this toolchain.
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh || exit $?
+fx-config-read
+
+function usage {
+  fx-command-help download-rust-toolchain
+  exit 1
+}
+
+if [ -z "$1" ]; then
+  echo "Error: Architecture (x64 or arm64) argument required."
+  usage
+fi
+
+ARCH=$1
+BUILDER=""
+
+if [ "${ARCH}" == "x64" ]; then
+  BUILDER="fuchsia/toolchain.ci/rust-linux-x64"
+elif [ "${ARCH}" == "arm64" ]; then
+  BUILDER="fuchsia/toolchain.ci/rust-linux-arm64"
+else
+  echo "Error: Invalid architecture '${ARCH}'. Must be 'x64' or 'arm64'."
+  usage
+fi
+
+set -e
+
+DOWNLOAD_DIR="$(git rev-parse --show-toplevel)/local/rust"
+
+# Check for jq
+if ! command -v jq &> /dev/null
+then
+    echo "jq could not be found, please install it." >&2
+    exit 1
+fi
+
+BB_TOOL="$(git rev-parse --show-toplevel)/prebuilt/tools/buildbucket/bb"
+
+# Check for bb
+if [ ! -x "${BB_TOOL}" ]; then
+    echo "bb tool not found or not executable at ${BB_TOOL}" >&2
+    exit 1
+fi
+
+# Check if logged in with bb
+if ! "${BB_TOOL}" auth-info >/dev/null 2>&1; then
+    echo "Login required, run \`${BB_TOOL} auth-login\`" >&2
+    exit 1
+fi
+
+# Check for cas
+CAS_TOOL="$(git rev-parse --show-toplevel)/prebuilt/tools/cas/cas"
+if [ ! -x "${CAS_TOOL}" ]; then
+    echo "cas tool not found or not executable at ${CAS_TOOL}" >&2
+    exit 1
+fi
+
+# Check if logged in with cas
+if ! "${CAS_TOOL}" whoami >/dev/null 2>&1; then
+    echo "Login required, run \`${CAS_TOOL} login\`" >&2
+    exit 1
+fi
+
+echo "Fetching latest green build for ${BUILDER}..."
+BUILD_INFO=$("${BB_TOOL}" ls ${BUILDER} -status SUCCESS -n 1 -json)
+
+if [ -z "${BUILD_INFO}" ] || [ "${BUILD_INFO}" == "[]" ]; then
+    echo "Error: No successful builds found for ${BUILDER}." >&2
+    exit 1
+fi
+
+BUILD_ID=$(echo "${BUILD_INFO}" | jq -s -r '.[0].id')
+
+if [ -z "${BUILD_ID}" ] || [ "${BUILD_ID}" == "null" ]; then
+    echo "Could not find latest green build ID." >&2
+    exit 1
+fi
+
+echo "Fetching details for build ${BUILD_ID}..."
+BUILD_DETAILS=$("${BB_TOOL}" get ${BUILD_ID} -json -p)
+
+CAS_DIGEST=$(echo "${BUILD_DETAILS}" | jq -r '.output.properties.isolated')
+
+if [ -z "${CAS_DIGEST}" ] || [ "${CAS_DIGEST}" == "null" ]; then
+    echo "Could not find output.properties.isolated in build details for build ${BUILD_ID}." >&2
+    echo "Build Details: ${BUILD_DETAILS}" >&2 # Debug output
+    exit 1
+fi
+
+echo "Found latest green build ID: ${BUILD_ID}"
+echo "Found CAS digest: ${CAS_DIGEST}"
+
+echo "Cleaning up old artifacts in ${DOWNLOAD_DIR}..."
+rm -rf "${DOWNLOAD_DIR}"
+mkdir -p "${DOWNLOAD_DIR}"
+
+echo "Downloading artifacts to ${DOWNLOAD_DIR}..."
+"${CAS_TOOL}" download -cas-instance projects/chromium-swarm/instances/default_instance -digest "${CAS_DIGEST}" -dir "${DOWNLOAD_DIR}"
+
+echo "Download complete."
+
+echo "To use this toolchain, modify your GN arguments (using fx args) to include:"
+echo "  rustc_prefix = \"//local/rust\""
+echo ""
+echo "And add the following to universe_package_labels:"
+echo '  universe_package_labels = ['
+echo '    "//vendor/google/bundles/kitchen_sink",'
+echo '    "//vendor/google/bundles/buildbot/core",'
+echo '  ]'
+echo ""
+echo "Then run: fx build"

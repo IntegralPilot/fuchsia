@@ -1,0 +1,210 @@
+# Copyright 2019 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/toolchain/ifs_extract.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//build/toolchain/zircon/user_basic_redirect.gni")
+import("//build/zircon/c_utils.gni")
+import("//build/zircon/zircon_cpu.gni")
+
+# A max ELF page size for the vDSO, which is free to be strictly larger than
+# that of the kernel or userspace binaries.
+#
+# TODO(https://crbug.com/gn/455653681): Spell in hex when possible.
+vdso_max_page_size = 4096
+
+config("max-page-size.defines") {
+  visibility = [
+    ":data",
+    "..:vdso",
+  ]
+  defines = [ "VDSO_MAX_PAGE_SIZE=$vdso_max_page_size" ]
+}
+
+# This is how the kernel depends on the built vDSO to embed the image, and
+# userboot depends on it to extract addresses, via the link_output_rspfile()
+# metadata protocol.
+user_basic_redirect("vdso") {
+  select = true
+
+  public_deps = [
+    ":libzircon",
+
+    # This is just an independent testing step that doesn't produce any
+    # output. But making it a dependency here ensures that a kernel can't be
+    # built with a vDSO that doesn't have a verified ABI.
+    ":verify-abi",
+    ":verify-segments",
+  ]
+}
+
+if (toolchain_environment == "user.basic") {
+  # The vDSO is built as a loadable_module() with an explicit -soname switch
+  # rather than as a shared_library() so that it gets independent variant
+  # selection.
+  loadable_module("libzircon") {
+    visibility = [ ":*" ]
+
+    ldflags = [ "-Wl,-soname=libzircon.so" ]
+
+    configs += [ "//build/config/zircon:rodso" ]
+
+    exclude_toolchain_tags = [
+      # The vDSO can use only the basic machine ABI.
+      "needs-compiler-abi",
+
+      # The vDSO cannot have a writable segment.
+      "needs-writable-globals",
+
+      # The vDSO can't usefully wire up a custom runtime.
+      "custom-runtime",
+    ]
+
+    sources = [
+      "syscall-wrappers.cc",
+      "zx_cache_flush.cc",
+      "zx_channel_call.cc",
+      "zx_clock_get_boot.cc",
+      "zx_clock_get_details_mapped.cc",
+      "zx_clock_get_monotonic.cc",
+      "zx_clock_read_mapped.cc",
+      "zx_cprng_draw.cc",
+      "zx_deadline_after.cc",
+      "zx_exception_get_string.cc",
+      "zx_handle_check_valid.cc",
+      "zx_status_get_string.cc",
+      "zx_system_get_dcache_line_size.cc",
+      "zx_system_get_features.cc",
+      "zx_system_get_num_cpus.cc",
+      "zx_system_get_page_size.cc",
+      "zx_system_get_physmem.cc",
+      "zx_system_get_version_string.cc",
+      "zx_thread_start.cc",
+      "zx_ticks_get.cc",
+      "zx_ticks_get_boot.cc",
+      "zx_ticks_per_second.cc",
+    ]
+
+    public_deps = [ "//zircon/vdso:public" ]
+    deps = [
+      ":data",
+      ":syscall-asm",
+      "//sdk/lib/ld:standalone",
+      "//src/zircon/lib/zircon:headers",
+      "//zircon/kernel/lib/arch:headers",
+      "//zircon/kernel/lib/fasttime:headers",
+      "//zircon/kernel/lib/page",
+      "//zircon/kernel/lib/userabi:headers",
+      "//zircon/system/ulib/affine",
+      "//zircon/system/ulib/concurrent:concurrent_vdso",
+      "//zircon/vdso:private",
+    ]
+
+    outputs = [ "$root_out_dir/libzircon.so" ]
+
+    # Instruct the linker to preserve the hidden alternate entry points.
+    # Note, "./" makes GN realize this is a file rather than a -l switch.
+    libs = [ "./alternates.ld" ]
+
+    # Set e_entry so _zx_process_exit is easy to find without reading .dynsym.
+    ldflags += [
+      "-Wl,-e,_zx_process_exit",
+      "-Wl,-z,max-page-size=$vdso_max_page_size",
+    ]
+
+    # This target goes into a kernel package that expects the "vdso" filename,
+    # and never goes into userland Fuchsia packages.
+    metadata = {
+      distribution_entries_barrier = []
+      distribution_entries = [
+        {
+          source = rebase_path(outputs[0], root_build_dir)
+          destination = "vdso"
+          label = get_label_info(":$target_name", "label_with_toolchain")
+        },
+      ]
+    }
+
+    # workaround for b/349448459 to remote-link successfully
+    configs += [ "//build/config/rbe:remote_link_scandeps_workaround" ]
+  }
+
+  source_set("data") {
+    sources = [ "data.S" ]
+    configs += [ ":max-page-size.defines" ]
+    deps = [ "//zircon/kernel/lib/arch:headers" ]
+  }
+
+  source_set("syscall-asm") {
+    visibility = [ ":*" ]
+
+    sources = [
+      "syscalls-$zircon_cpu.S",
+      "zx_futex_wake_handle_close_thread_exit-$zircon_cpu.S",
+      "zx_vmar_unmap_handle_close_thread_exit-$zircon_cpu.S",
+    ]
+    deps = [
+      "//src/zircon/lib/zircon:headers",
+      "//zircon/kernel/lib/arch:headers",
+      "//zircon/kernel/lib/userabi:headers",
+      "//zircon/vdso:private",
+    ]
+  }
+
+  # Make sure the vDSO that goes into the kernel matches the ABI
+  # that userland links against.
+  abi_ifs = "//src/zircon/lib/zircon/zircon.ifs"
+  vdso_ifs = "$target_gen_dir/libzircon.ifs"
+
+  ifs_extract("vdso.ifs") {
+    visibility = [ ":*" ]
+
+    outputs = [ vdso_ifs ]
+    deps = [ ":libzircon" ]
+    args = [ "--strip-ifs-target" ]
+  }
+
+  action("verify-abi") {
+    visibility = [ ":*" ]
+
+    deps = [ ":vdso.ifs" ]
+
+    sources = [
+      abi_ifs,
+      vdso_ifs,
+    ]
+    outputs = [ "$target_out_dir/$target_name.ok" ]
+
+    script = "verify-abi.sh"
+    args = rebase_path(sources + outputs, root_build_dir)
+
+    metadata = {
+      link_output_barrier = []
+    }
+  }
+
+  link_output_rspfile("libzircon.rsp") {
+    visibility = [ ":*" ]
+    outputs = [ "$target_gen_dir/$target_name" ]
+    deps = [ ":libzircon" ]
+  }
+
+  toolchain_utils_action("verify-segments") {
+    visibility = [ ":*" ]
+    script = "//build/toolchain/verify-undefined-symbols.py"
+    utils = [ "llvm-readelf" ]
+    deps = [ ":libzircon.rsp" ]
+    sources = get_target_outputs(deps[0])
+    outputs = [ "$target_out_dir/$target_name.txt" ]
+    depfile = "$target_out_dir/$target_name.d"
+    args = [
+      "--stamp=" + rebase_path(outputs[0], root_build_dir),
+      "--depfile=" + rebase_path(depfile, root_build_dir),
+      "--rspfile=" + rebase_path(sources[0], root_build_dir),
+      "--read-only-segments",
+    ]
+  }
+}

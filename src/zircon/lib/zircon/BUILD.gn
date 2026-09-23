@@ -1,0 +1,87 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/sdk/sdk_noop_atom.gni")
+import("//build/toolchain/ifs_shared_library.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("libzircon.gni")
+
+# LINT.IfChange
+
+# The vDSO ABI is provided at link time by a stub.  The actual runtime image
+# comes from the kernel and is not part of the build or SDK for userland at
+# all.  The kernel's internal build of the vDSO verifies that the ABI matches.
+if (is_fuchsia && toolchain_base_environment != "kernel") {
+  ifs_shared_library("zircon") {
+    abi = "zircon.ifs"
+    public_deps = [ ":headers" ]
+    deps = [ "//zircon/vdso:ifs" ]
+  }
+} else {
+  # References from other environments only get the headers.  This
+  # makes it easy to have "//src/zircon/lib/zircon" deps in common
+  # libraries that need to link against it in userland but that in
+  # other contexts like kernel or userboot are just using the headers.
+  group("zircon") {
+    public_deps = [ ":headers" ]
+  }
+
+  group("zircon.as-needed") {
+    public_deps = [ ":headers" ]
+  }
+}
+
+group("headers") {
+  public_deps = [ ":zircon-headers" ]
+
+  if (is_fuchsia) {
+    public_deps += [ "//zircon/vdso:public" ]
+  }
+  if (!is_fuchsia && !is_kernel) {
+    public_deps += [ "//zircon/system/public" ]
+  }
+}
+
+# These headers can be used in host binaries.
+source_set("zircon-headers") {
+  configs = []
+  public = [
+    "include/zircon/exception.h",
+    "include/zircon/status.h",
+  ]
+  public_configs = [ ":zircon-headers.config" ]
+}
+
+config("zircon-headers.config") {
+  include_dirs = [ "include" ]
+}
+
+# The zircon library is not a real SDK atom since it is provided
+# directly as part of the SDK sysroot.
+sdk_noop_atom("zircon_sdk") {
+  category = "partner"
+}
+
+# When put in the deps graph of a hermetic_source_set() target, this rolls up
+# to its generated_file() target for a response file of extra objcopy switches.
+# Each `zx_*` symbol is renamed to its `_zx_*` counterpart so to avoid exposure
+# to any interposed user definitions replacing the real vDSO entry points in
+# basic ABI code, as the user's definitions won't be compatible with the ABI or
+# any special bootstrapping context that's why hermetic_source_set() was used.
+#
+# Note there is also a `--redefine-syms=<filename>` switch that would allow
+# putting all the `$name=_$name` lines into a generated_file(), instead of
+# generating a giant command line for objcopy.  However, since objcopy doesn't
+# support producing a depfile, GN/Ninja would not correctly track the new input
+# file dependency of the objcopy step to trigger incremental rebuilds.  Since
+# these switches are passed via response file, it's not much different anyway.
+group("hermetic_source_set-underscores-rewrite") {
+  metadata = {
+    hermetic_source_set_objcopy_flags = []
+    foreach(name, libzircon_public_linkage_names) {
+      hermetic_source_set_objcopy_flags += [ "--redefine-sym=$name=_$name" ]
+    }
+  }
+}
+# LINT.ThenChange(BUILD.bazel)

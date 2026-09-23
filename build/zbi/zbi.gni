@@ -1,0 +1,199 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/zircon/tools.gni")
+import("zbi_input.gni")
+
+# Assembles a Zircon Boot Image file from various inputs.
+#
+# Parameters
+#
+# This template has two outputs: the first is the ZBI in question, whose path
+# is a function of the `output_dir`, `output_name`, and `output_extension`
+# parameters in the usual way, and the second is a JSON representation of its
+# contents whose path is formed by adding a further ".json" to the ZBI's path.
+#
+#   cpu
+#     Optional: A CPU name ("arm64" or "x64") or "".  If not "", ensure that
+#     the ZBI is bootable on this CPU, failing if not.  If "", then no such
+#     check is performed so this can be used to generate a partial ZBI
+#     which can be converted to a full bootable ZBI by a later action.
+#     Type: string
+#     Default: current_cpu
+#
+#   compress
+#     Optional: Whether to compress the BOOTFS and other `ZBI_TYPE_STORAGE`
+#     items in the output.  See the `--compressed` switch in `zbi --help`.
+#     If this is a string rather than a bool, it's the argument for the
+#     `--compressed` switch to `zbi`.  A value of `true` is replaced with
+#     "zstd".
+#     Type: bool or string
+#     Default: true
+#
+#   output_dir
+#     Optional: Directory where the output file is written.
+#     Type: dir
+#     Default: target_out_dir
+#
+#   output_extension
+#     Optional: Extension added to $output_name.
+#     Type: string
+#     Default: "zbi"
+#
+#   output_name
+#     Optional: Name of the output file.
+#     Type: string
+#     Default: target_name
+#
+#   deps, data_deps, testonly, assert_no_deps, metadata, visibility
+#     See `gn help`.
+template("zbi") {
+  main_target = target_name
+  input_target = "${target_name}_input"
+  rsp_target = "${target_name}_rsp"
+
+  rsp_file = "$target_gen_dir/$target_name.zbi.rsp"
+
+  zbi_input(input_target) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "testonly",
+                           ])
+  }
+
+  # Collect metadata corresponding to additional command-line arguments
+  # passed to the `zbi` host tool, describing inputs to be assembled into
+  # the final ZBI image. The schema for the metadata is:
+  #
+  #   zbi_input_args: a list of strings, each one corresponding to a
+  #     command-line argument.
+  #
+  #   zbi_input_barrier: usual GN metadata collection walk key, used to
+  #     restrict collection to specific target dependencies when needed.
+  #
+  generated_file(rsp_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    deps = [ ":$input_target" ]
+    data_keys = [ "zbi_input_args" ]
+    walk_keys = [ "zbi_input_barrier" ]
+    output_conversion = "list lines"
+    outputs = [ rsp_file ]
+  }
+
+  _output_name = target_name
+  if (defined(invoker.output_name)) {
+    _output_name = invoker.output_name
+  }
+  if (defined(invoker.output_extension)) {
+    if (invoker.output_extension != "") {
+      _output_name += ".${invoker.output_extension}"
+    }
+  } else {
+    _output_name += ".zbi"
+  }
+  if (defined(invoker.output_dir)) {
+    output_file = "${invoker.output_dir}/${_output_name}"
+  } else {
+    output_file = "$target_out_dir/${_output_name}"
+  }
+  json_output_file = "$output_file.json"
+
+  action(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "compress",
+                             "data_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    script = "//build/zbi/run_zbi.py"
+
+    deps = [
+      ":$rsp_target",
+      zbi_tool_target,
+    ]
+
+    inputs = [
+      rsp_file,
+      zbi_tool_path,
+    ]
+    outputs = [
+      output_file,
+      json_output_file,
+    ]
+    depfile = "$output_file.d"
+
+    args = [
+      "--zbi",
+      rebase_path(zbi_tool_path, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+      "--rspfile",
+      rebase_path(rsp_file, root_build_dir),
+
+      # The remaining arguments are passed to the zbi tool along with the
+      # contents of the response file.
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+
+      "--json-output",
+      rebase_path(outputs[1], root_build_dir),
+    ]
+
+    # Require a bootable ZBI for the specified $cpu (or $current_cpu).
+    # A value of "" means it need not be a bootable ZBI.
+    if (defined(invoker.cpu)) {
+      cpu = invoker.cpu
+    } else {
+      cpu = current_cpu
+    }
+    if (cpu != "") {
+      args += [ "--bootable=$cpu" ]
+    }
+
+    # This comes last to affect the output despite any earlier
+    # "-c" or "-u" from metadata.zbi_input_args meant to affect
+    # a particular input (e.g. for "--type=ramdisk").
+    if (!defined(compress) || compress == true) {
+      compress = "zstd"
+    }
+    if (compress == false) {
+      args += [ "--uncompressed" ]
+    } else {
+      args += [ "--compressed=$compress" ]
+    }
+
+    metadata = {
+      # Provide metadata for possible inclusion as an input ZBI for a
+      # `kernel_aib`. Assembly will pick the top level metadata entry from a
+      # `zbi` target by using the `kernel_aib_input_barrier`.
+      kernel_aib_input_barrier = []
+      kernel_aib_input = [
+        {
+          label = get_label_info(":$main_target", "label_with_toolchain")
+          zbi = rebase_path(output_file, root_build_dir)
+        },
+      ]
+
+      # Provide metadata so that a zbi() target can also act as if it were a
+      # zbi_input() with type == "zbi" and $sources of this target's $outputs.
+      # Thus a zbi() target can be a dependency of another zbi() target to
+      # combine them without requiring an intervening zbi_input() target.
+      zbi_input_barrier = []
+      zbi_input_args = []
+
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+
+      zbi_input_args += [
+        "--type=container",
+        rebase_path(output_file, root_build_dir),
+      ]
+    }
+  }
+}

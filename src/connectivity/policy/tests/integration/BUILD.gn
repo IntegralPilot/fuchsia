@@ -1,0 +1,204 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import(
+    "//src/lib/testing/expectation/fuchsia_test_component_with_expectations.gni")
+import(
+    "//src/lib/testing/expectation/fuchsia_test_with_expectations_package.gni")
+import("//src/lib/testing/sharding/fuchsia_sharded_test_package.gni")
+
+tests = [ "reachability" ]
+
+tests_with_err_logs = [
+  {
+    label = "management"
+    long = true
+  },
+]
+
+foreach(test, tests) {
+  name = "policy-${test}-integration-test"
+  fuchsia_test_component_with_expectations(name) {
+    expectations = "expects/${name}.json5"
+    manifest = "meta/${name}.cml"
+    deps = [ test ]
+  }
+}
+
+package_deps_for_tests = [
+  # netemul-sandbox is used to create hermetic test realms.
+  "//src/connectivity/network/testing/netemul/service:netemul-sandbox",
+
+  # netstack3 is under test.
+  "//src/connectivity/network/netstack3:component-debug",
+  "//src/connectivity/network/netstack3:component-for-tests",
+
+  # reachability monitor is under test.
+  "//src/connectivity/policy/reachability:component_with_fake_time",
+
+  # stash_secure is used by dhcpd and netstack.
+  "//src/sys/stash:stash_secure_v2",
+
+  # DHCPv4 Server is used to test DHCP address acquisition.
+  "//src/connectivity/network/dhcpv4/server:component",
+
+  # DHCP(v4) client is under test.
+  "//src/connectivity/network/dhcpv4/client/bindings:component",
+
+  # DHCPv6 client is under test.
+  "//src/connectivity/network/dhcpv6/client:component",
+
+  # dns_resolver integration with netstack is tested.
+  "//src/connectivity/network/dns:component_with_fake_time",
+
+  # the DNS resolver under test uses the fake clock.
+  "//src/lib/fake-clock/svc",
+
+  # netcfg integration with netstack is tested.
+  ":netcfg-netemul-configs",
+  "//src/connectivity/policy/netcfg:component-advanced",
+  "//src/connectivity/policy/netcfg:component-basic",
+  "//src/connectivity/policy/netcfg/integration/fake-netcfg:component",
+
+  # netcfg integration with socket-proxy is tested.
+  "//src/connectivity/policy/socket-proxy:component",
+
+  # fake socket proxy for netcfg testing.
+  "//src/connectivity/policy/socket-proxy/integration/fake-socket-proxy:svc",
+]
+
+# RISC-V on Fuchsia does not support Golang.
+if (target_cpu != "riscv64") {
+  package_deps_for_tests += [
+    "//src/connectivity/network/netstack:component",
+    "//src/connectivity/network/netstack:component-debug",
+    "//src/connectivity/network/netstack:component-with-fast-udp-debug",
+  ]
+}
+
+fuchsia_test_package("policy-integration-tests") {
+  test_components = []
+  foreach(test, tests) {
+    test_components += [ ":policy-${test}-integration-test" ]
+  }
+
+  deps = package_deps_for_tests +
+         [ "//src/lib/testing/expectation:expectation_comparer" ]
+}
+
+err_log_package_deps = []
+foreach(test, tests_with_err_logs) {
+  _long = false
+  if (defined(test.long)) {
+    _long = test.long
+  }
+  _name = "policy-${test.label}-integration-test"
+  _no_err_logs_name = "${_name}-no-err-logs"
+  _with_err_logs_name = "${_name}-with-err-logs"
+
+  if (_long) {
+    _component_attributes = {
+    }
+    _component_attributes = {
+      manifest = "meta/${_name}.cml"
+      deps = [ test.label ]
+      expectations = "expects/${_name}.json5"
+      num_shards = 10
+
+      # Matches the first `::`-delimited section of the test case name,
+      # or the whole name if there are no `::` delimiters.
+      shard_part_regex = "([^::]+)(?:::.*)?"
+    }
+
+    fuchsia_sharded_test_package(_no_err_logs_name) {
+      test_components = [
+        {
+          forward_variables_from(_component_attributes, "*")
+          name = _no_err_logs_name
+          treatment_of_cases_with_error_logs = "SKIP_CASES_WITH_ERROR_LOGS"
+        },
+      ]
+      deps = package_deps_for_tests +
+             [ "//src/lib/testing/expectation:expectation_comparer" ]
+    }
+    fuchsia_sharded_test_package(_with_err_logs_name) {
+      test_components = [
+        {
+          forward_variables_from(_component_attributes, "*")
+          name = _with_err_logs_name
+          treatment_of_cases_with_error_logs = "RUN_ONLY_CASES_WITH_ERROR_LOGS"
+        },
+      ]
+      deps = package_deps_for_tests +
+             [ "//src/lib/testing/expectation:expectation_comparer" ]
+      test_specs = {
+        log_settings = {
+          max_severity = "ERROR"
+        }
+      }
+    }
+  } else {
+    _component_label = "${_name}"
+    fuchsia_test_component(_component_label) {
+      component_name = _name
+      manifest = "meta/${_name}.cml"
+      deps = [ test.label ]
+    }
+
+    fuchsia_test_with_expectations_package(_no_err_logs_name) {
+      test_components = [ ":${_component_label}" ]
+      expectations = "expects/${_name}.json5"
+      treatment_of_cases_with_error_logs = "SKIP_CASES_WITH_ERROR_LOGS"
+      deps = package_deps_for_tests +
+             [ "//src/lib/testing/expectation:expectation_comparer" ]
+    }
+    fuchsia_test_with_expectations_package(_with_err_logs_name) {
+      test_components = [ ":${_component_label}" ]
+      expectations = "expects/${_name}.json5"
+      treatment_of_cases_with_error_logs = "RUN_ONLY_CASES_WITH_ERROR_LOGS"
+      deps = package_deps_for_tests +
+             [ "//src/lib/testing/expectation:expectation_comparer" ]
+      test_specs = {
+        log_settings = {
+          max_severity = "ERROR"
+        }
+      }
+    }
+  }
+
+  err_log_package_deps += [
+    ":${_no_err_logs_name}",
+    ":${_with_err_logs_name}",
+  ]
+}
+
+# Note: using configs in tests requires for this path to be added to
+# network/tests/integration/common/src/realms.rs with an enum type.
+resource("netcfg-netemul-configs") {
+  testonly = true
+
+  sources = [
+    "management/config/all_delegated.json",
+    "management/config/all_interface_local_delegated.json",
+    "management/config/dhcpv6.json",
+    "management/config/duplicate_names.json",
+    "management/config/empty.json",
+    "management/config/enable_socket_proxy.json",
+    "management/config/enable_socket_proxy_all_delegated.json",
+    "management/config/forwarding.json",
+    "management/config/iface_prefix.json",
+    "management/config/packet_filter_ethernet.json",
+    "management/config/packet_filter_wlan.json",
+    "management/config/with_blackhole.json",
+  ]
+
+  outputs = [ "netcfg/{{source_file_part}}" ]
+}
+
+group("tests") {
+  testonly = true
+
+  deps = [ ":policy-integration-tests" ] + err_log_package_deps
+}

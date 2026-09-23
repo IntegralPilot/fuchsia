@@ -1,0 +1,60 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+use crate::reverser::ReverserServerFactory;
+use anyhow::{Context, Error};
+use fidl_fuchsia_examples_inspect::FizzBuzzMarker;
+use fuchsia_component::client;
+use fuchsia_component::server::ServiceFs;
+use fuchsia_inspect::component;
+use fuchsia_inspect::health::Reporter;
+use futures::{FutureExt, StreamExt};
+use log::info;
+
+mod reverser;
+
+#[fuchsia::main(logging_tags = ["inspect_rust_codelab", "part3"])]
+async fn main() -> Result<(), Error> {
+    let mut fs = ServiceFs::new();
+
+    info!("starting up...");
+
+    let _inspect_server_task = inspect_runtime::publish(
+        component::inspector(),
+        inspect_runtime::PublishOptions::default(),
+    );
+
+    // ComponentInspector has built-in health checking. Set it to "starting up" so snapshots show
+    // we may still be initializing.
+    component::health().set_starting_up();
+
+    // Create a version string. We use record_ rather than create_ to tie the lifecyle of the
+    // inspector root with the string property.
+    // It is an error to not retain the created property.
+    component::inspector().root().record_string("version", "part3");
+
+    // Create a new Reverser Server factory. The factory holds global stats for the reverser
+    // server.
+    let reverser_factory =
+        ReverserServerFactory::new(component::inspector().root().create_child("reverser_service"));
+
+    // Serve the reverser service
+    fs.dir("svc").add_fidl_service(move |stream| reverser_factory.spawn_new(stream));
+    fs.take_and_serve_directory_handle()?;
+
+    // Send a request to the FizzBuzz service and print the response when it arrives.
+    let fizzbuzz =
+        client::connect_to_protocol::<FizzBuzzMarker>().context("failed to connect to fizzbuzz")?;
+    match fizzbuzz.execute(30u32).await {
+        Ok(result) => {
+            component::health().set_ok();
+            info!(result:%; "Got FizzBuzz");
+        }
+        Err(_) => {
+            component::health().set_unhealthy("FizzBuzz connection closed");
+        }
+    };
+
+    fs.collect::<()>().map(Ok).await
+}

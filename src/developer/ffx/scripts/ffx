@@ -1,0 +1,100 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# LINT.IfChange
+function find_tree_root {
+  local parent="$1"
+  if [[ ! -d "$parent" ]]; then
+    return 1
+  fi
+  while [[ ! -f "${parent}/.fx-root" ]]; do
+    if [[ "$parent" == "/" ]]; then
+      return 1
+    fi
+    parent="$(dirname "${parent}")"
+  done
+  echo "$parent"
+}
+
+# We walk the parent directories looking for //.fx-root rather than using
+# BASH_SOURCE so that we find the fuchsia_dir enclosing the current working
+# directory instead of the one containing this file in case the user has
+# multiple source trees and is picking up this file from another one.
+#
+# NOTE: The FUCHSIA_DIR environment variable is ignored here because it
+# could point to a different Fuchsia checkout in some developer setups.
+if ! fuchsia_dir="$(find_tree_root "$(pwd)")"; then
+  echo >&2 "ERROR: Cannot find the Platform Source Tree in a parent of the current directory: $(pwd)"
+  exit 1
+fi
+
+script_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
+# NOTE: This check MUST be executed immediately after `fuchsia_dir` is set.
+# Do NOT add any metric gathering or other setup before this block, as this
+# `ffx` instance may be run in a foreign fuchsia checkout.
+if [[ "${script_dir}/" != "${fuchsia_dir}/"* && "${script_dir}/" != "$(realpath "${fuchsia_dir}")/"* ]]; then
+  # When running `ffx` from `$PATH` within a foreign fuchsia checkout
+  # that is owned by the current user, run the version of `ffx` from
+  # the foreign checkout instead.
+  if [[ "$0" == *"/.jiri_root/bin/"* ]] && \
+     [[ -O "${fuchsia_dir}" ]] && \
+     [[ -x "${fuchsia_dir}/src/developer/ffx/scripts/ffx" ]]; then
+    exec "${fuchsia_dir}/src/developer/ffx/scripts/ffx" "$@"
+  fi
+
+  echo >&2 "ERROR: You are executing ffx from outside of the current source tree"
+  echo >&2 "ERROR: This is not supported as fx does not have a stable internal API"
+  echo >&2
+  echo >&2 "    'ffx' was executed from: ${BASH_SOURCE[0]}"
+  echo >&2 "    'fuchsia directory' resolved to: ${fuchsia_dir}"
+  echo >&2 "    'script_dir' resolved to: ${script_dir}"
+  echo >&2
+  echo >&2 "To run a command in the current Fuchsia directory, run fx from:"
+  echo >&2 "  ${fuchsia_dir}/scripts/fx ffx"
+  exit 1
+fi
+# LINT.ThenChange(
+#   //scripts/fx,
+#   //scripts/hermetic-env,
+#   //scripts/zsh-completion/_fx,
+# )
+
+# If --strict is present, locate and run the compiled ffx binary directly
+for arg in "$@"; do
+  if [[ "${arg}" == "--strict" ]]; then
+    if [[ -f "${fuchsia_dir}/.fx-build-dir" ]]; then
+      build_dir="$(<"${fuchsia_dir}/.fx-build-dir")"
+      if [[ "${build_dir}" != /* ]]; then
+        build_dir="${fuchsia_dir}/${build_dir}"
+      fi
+      if [[ -x "${build_dir}/host-tools/ffx" ]]; then
+        exec "${build_dir}/host-tools/ffx" "$@"
+      else
+        echo "Error: --strict requested, but ffx binary not found or not executable at: ${build_dir}/host-tools/ffx" >&2
+        echo "Please run 'fx build' first." >&2
+        exit 1
+      fi
+    else
+      echo "Error: --strict requested, but .fx-build-dir is missing." >&2
+      echo "Please run 'fx set' and 'fx build' first." >&2
+      exit 1
+    fi
+    break
+  fi
+done
+
+# This script is usually used to invoke `ffx` directly while in-tree without
+# explicitly wrapping it in `fx` (ie. `fx ffx --help`). If we don't set a
+# wrapper here, the `fx`'s ffx subscript will override it and produce confusing
+# help output.
+# So be explicit, and unless something else overrode this when invoking *this*
+# script, force our 'name' to just be `ffx`.
+FFX_WRAPPER_INVOKE=${FFX_WRAPPER_INVOKE:-ffx}
+export FFX_WRAPPER_INVOKE
+
+export FUCHSIA_METRICS_CALL_STACK="${FUCHSIA_METRICS_CALL_STACK:+${FUCHSIA_METRICS_CALL_STACK} }ffx_script"
+
+exec "${fuchsia_dir}"/scripts/fx ffx --config fuchsia.analytics.ffx_invoker=fx "$@"

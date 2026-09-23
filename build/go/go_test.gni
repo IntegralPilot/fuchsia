@@ -1,0 +1,148 @@
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# A template for an action that creates a Fuchsia Go test binary.
+
+import("//build/go/go_build.gni")
+import("//build/go/go_library.gni")
+import("//build/testing/host_test.gni")
+
+# Parameters: same as go_build, along with
+#
+#   embed (optional)
+#     The go_library this test target is for. Should contain exactly one element.
+#     Type: list of labels
+#
+#   use_prebuilt_go (optional)
+#     If true, use a prebuilt go toolchain, rather than building the toolchain.
+#     If not set, defaults to false when targeting Fuchsia and true otherwise.
+#
+#   output_name (optional)
+#     The name of the binary that that will be generated.
+#     It defaults to the target name.
+#
+#   args
+#     Optional: additional arguments needed when invoking the test.
+#     Only applies to host tests.
+#     Type: list of strings.
+#
+#   environments
+#     Optional: what environments this test should target. Only applies to host
+#     host tests. See //build/testing/test_spec.gni for more details.
+#     Type: list of scopes.
+#
+#   package_deps
+#     Optional: the `fuchsia_package` dependencies needed by this test at runtime.
+#     See //build/testing/test_spec.gni for more details.
+#     Type: list of labels.
+#
+#   timeout:
+#     Optional: override default timeout. Only applies to host tests.
+#     Values must be valid Go durations such as "300ms", "1.5h" or "2h45m".
+#     See https://golang.org/cmd/go/#hdr-Testing_flags for details on timeout.
+#     See https://golang.org/pkg/time/#ParseDuration for duration format.
+#     Type: string.
+#
+#   embedsrcs (optional)
+#     For sources used by go:embed.
+#
+#   sources: Usual GN meaning.
+#
+template("go_test") {
+  _output_name = target_name
+  if (defined(invoker.output_name)) {
+    _output_name = invoker.output_name
+  }
+
+  assert(is_host || (!defined(invoker.args) && !defined(invoker.environments) &&
+                         !defined(invoker.timeout)),
+         "args, environments, and timeout are only supported for host tests")
+
+  _go_build_target_name = target_name
+
+  if (is_host) {
+    _go_build_target_name = "${target_name}_go_build"
+    _test_data_target = "${target_name}_go_test_data"
+    host_test_data(_test_data_target) {
+      sources = [ "$root_out_dir/$_output_name" ]
+      deps = [ ":${_go_build_target_name}" ]
+    }
+    host_test(target_name) {
+      # LINT.IfChange(go_test_wrapper)
+      binary_path = get_label_info("//tools/go_test_parser", "root_out_dir") +
+                    "/go_test_parser"
+
+      timeout = "5m"
+      if (defined(invoker.timeout)) {
+        timeout = invoker.timeout
+      }
+      args = [
+        rebase_path("$root_out_dir/$_output_name", root_build_dir),
+        "-test.timeout",
+        timeout,
+        "-test.v",  # Emit detailed test case information.
+      ]
+
+      # LINT.ThenChange(//build/bazel/rules/host_tests/host_go_test.bzl:go_test_wrapper)
+      if (defined(invoker.args)) {
+        args += invoker.args
+      }
+
+      deps = [
+        ":${_go_build_target_name}",
+        ":${_test_data_target}",
+        "//tools/go_test_parser",
+      ]
+
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+      if (defined(invoker.non_go_deps)) {
+        deps += invoker.non_go_deps
+      }
+      forward_variables_from(invoker,
+                             [
+                               "data_deps",
+                               "environments",
+                               "package_deps",
+                               "public_deps",
+                               "visibility",
+                             ])
+    }
+  }
+
+  go_sources = []
+  if (!defined(invoker.embed) && !defined(invoker.gopackages)) {
+    lib_target = "_${target_name}_go_lib"
+    go_library(lib_target) {
+      testonly = true
+      forward_variables_from(invoker,
+                             [
+                               "deps",
+                               "embedsrcs",
+                               "source_dir",
+                               "sources",
+                             ])
+    }
+    embed = [ ":${lib_target}" ]
+  } else {
+    if (defined(invoker.sources)) {
+      go_sources = invoker.sources
+    }
+  }
+
+  go_build(_go_build_target_name) {
+    test = true
+    output_name = _output_name
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "args",
+                             "environments",
+                             "package_deps",
+                             "sources",
+                             "timeout",
+                           ])
+  }
+}

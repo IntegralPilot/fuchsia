@@ -1,0 +1,124 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/cpp/sdk_source_set.gni")
+import("//build/zircon/zx_library.gni")
+
+trace_engine_headers = [
+  # keep-sorted: begin
+  "lib/trace-engine/context.h",
+  "lib/trace-engine/fields.h",
+  "lib/trace-engine/handler.h",
+  "lib/trace-engine/instrumentation.h",
+  "lib/trace-engine/types.h",
+
+  # keep-sorted: end
+]
+
+trace_engine_header_deps = [
+  # <trace-engine/handler.h> has #include <lib/async/dispatcher.h>.
+  "//sdk/lib/async",
+]
+
+template("trace_engine_library") {
+  zx_library(target_name) {
+    forward_variables_from(invoker, "*")
+
+    sdk_headers = trace_engine_headers
+
+    public_deps = [ ":trace-engine-headersonly" ]
+    public_deps += trace_engine_header_deps
+
+    sources = [
+      "buffer.cc",
+      "buffer.h",
+      "context.cc",
+      "context_api.cc",
+      "context_impl.h",
+      "engine.cc",
+      "hash_table.h",
+      "include/lib/trace-engine/buffer_internal.h",
+      "nonce.cc",
+      "rolling_buffer.cc",
+      "rolling_buffer.h",
+    ]
+    deps = [
+      "//sdk/lib/async:async-cpp",
+      "//zircon/system/ulib/zx",
+    ]
+  }
+}
+
+config("trace_engine_include") {
+  include_dirs = [ "include" ]
+}
+
+# Header-only source package for use by trace-provider:handler,
+# which is engine-agnostic.
+sdk_source_set("trace-engine-headersonly") {
+  sdk_name = "trace-engine-headersonly"
+  category = "partner"
+  stable = true
+
+  sources = [ "include/lib/trace-engine/buffer_internal.h" ]
+
+  public = []
+  foreach(header, trace_engine_headers) {
+    public += [ "include/" + header ]
+  }
+
+  public_deps = trace_engine_header_deps
+  public_configs = [ ":trace_engine_include" ]
+}
+
+# We build trace-engine in two different ways:
+#
+# 1) Shared library
+#      Most users should use this version. The trace-engine library keeps a fair amount of state:
+#    buffer management, the current state of the trace, several caches etc. If we distribute tracing
+#    only as a static library, each shared library that includes tracing will get its own copy of
+#    the tracing state. When we start a trace, only the trace-engine linked directly into the main
+#    executable would start.
+#
+#      Distributing a shared library ensures that the dynamic linker will load the library once, and
+#    each library that uses tracing will point to the same trace-engine state.
+#
+#      While most in tree components don't extensively use shared libraries that include tracing, the
+#    main exception is drivers. The driver host is capable of tracing, and multiple drivers, which
+#    are also capable of tracing, can be dynamically loaded into a single driver host. When a driver
+#    host starts tracing, we need to ensure the included drivers also start tracing.
+trace_engine_library("trace-engine") {
+  sdk = "shared"
+  sdk_publishable = "partner"
+}
+
+# 2) Static library
+#       We produce a static library version of trace-engine for (currently) one special case: magma.
+#     Unlike components which get packaged and run with the shared libraries they were built with,
+#     the vulkan icds get loaded at runtime into an application with mostly-arbitrary library
+#     versions. Since there's no guarantee of the trace-engine abi in this environment, magma
+#     instead statically links against the trace-engine libraries so that it can safely trace with a
+#     known implementation of trace-engine.
+trace_engine_library("trace-engine-static") {
+  sdk = "static"
+  defines = [ "STATIC_LIBRARY" ]
+}
+
+# Header-only source package for use by exported trace-reader package.
+# This code also runs on the host.
+zx_library("trace-engine-headers-for-reader") {
+  sdk = "source"
+  sdk_headers = [
+    "lib/trace-engine/fields.h",
+    "lib/trace-engine/types.h",
+    "lib/trace-engine/buffer_internal.h",
+    "lib/trace-engine/context.h",
+  ]
+  sources = []
+}
+
+group("tests") {
+  testonly = true
+  deps = [ "test:tests" ]
+}

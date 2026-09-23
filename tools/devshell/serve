@@ -1,0 +1,216 @@
+#!/bin/bash
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Software delivery
+### start the update server and attach to a running fuchsia device
+## usage: fx serve [-v] [-l host[:port]] [-c version] [--no-device] [--name NAME]
+##
+##   -l port            port that "fx serve" will listen on
+##   --address          address that "fx serve will listen on"
+##   --no-device        Do not register the repository with a specific device.
+##   --name NAME        Name the generated update source config NAME.
+##   --[no-]persist     enable or disable persistence of repository metadata. Disabled
+##                      by default.
+##   -v                 verbose mode, shows info and debug messages from "ffx repository serve"
+##   -C|--clean         clean the package repository first. This flag is only
+##                      valid if the incremental package publishing is enabled.
+##   --foreground       run the repository server in the foreground (the default).
+##   --background       run the repository server in the background.
+##
+## This command supports:
+##  - incremental package publishing. If enabled, it will auto-publish packages as they
+##    are created or modified.
+##
+## To enable incremental package serving, run "fx --enable=incremental serve ..."
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/updates.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/fx-optional-features.sh || exit $?
+fx-config-read
+
+function usage {
+  fx-command-help serve
+}
+
+fx-standard-switches "$@"
+set -- "${FX_ARGV[@]}"
+
+port=""
+address="[::]"
+verbose=false
+clean_first=false
+source_name=""
+storage_type="ephemeral"
+no_device=""
+server_mode="--foreground"
+while (($#)); do
+  case "$1" in
+    -l)
+      port="${2##*:}"
+      shift
+      ;;
+    --address)
+      address="$2"
+      shift
+      ;;
+    --name)
+      source_name="$2"
+      shift
+      ;;
+    --no-persist)
+      storage_type="ephemeral"
+      ;;
+    --persist)
+      storage_type="persistent"
+      ;;
+    --no-device)
+      no_device="--no-device"
+      ;;
+    --background)
+      server_mode="--background"
+      ;;
+    --foreground)
+      server_mode="--foreground"
+      ;;
+    -v|--verbose)
+      verbose=true
+      ;;
+    -C|--clean)
+      clean_first=true
+      ;;
+    *)
+      echo "Unrecognized option: $1"
+      usage
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+# Check if running in a non-interactive environment (no TTY attached to stdin/stdout)
+if [[ ! -t 0 || ! -t 1 ]] && [[ "${server_mode}" == "--foreground" ]]; then
+  fx-info "Running fx serve in foreground mode. Use 'fx serve --background' for non-blocking execution."
+fi
+
+if fx-is-bringup; then
+  fx-error "$0 is not supported in the bringup build configuration, as there are no package features in bringup."
+  exit 1
+fi
+
+if [[ -z "${source_name}" ]]; then
+  source_name="$(ffx-default-repository-name)"
+fi
+
+log() {
+  # This format matches bootserver so that `fx serve` ui is easier to read.
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [serve] $@"
+}
+
+# TODO(b/360930691): Set the default repo_dir in the configuration.
+repo_dir="${FUCHSIA_BUILD_DIR}/amber-files"
+
+if is_feature_enabled "incremental" || is_feature_enabled "incremental_new"; then
+  # macOS in particular has a low default for number of open file descriptors
+  # per process, which is prohibitive for higher job counts. Here we raise
+  # the number of allowed file descriptors per process if it appears to be
+  # low in order to avoid failures due to the limit. See `getrlimit(2)` for
+  # more information.
+  if [[ $(ulimit -n) -lt 1000 ]]; then
+    ulimit -n 32768
+  fi
+
+  if $clean_first; then
+    $verbose && echo -n >&2 "Cleaning the package repository..."
+    if [[ -d "${repo_dir}" ]]; then
+      rm -Rf "${repo_dir}"
+    fi
+    $verbose && echo >&2 "done"
+  fi
+
+  if [[
+      ! -e "${repo_dir}/keys/snapshot.json" ||
+      ! -e "${repo_dir}/keys/targets.json" ||
+      ! -e "${repo_dir}/keys/timestamp.json" ||
+      ! -e "${repo_dir}/repository/1.root.json" ||
+      ! -e "${repo_dir}/repository/root.json"
+  ]]; then
+    echo >&2 "Preparing the package repository..."
+
+    # TODO(b/361326913: Would `ffx repository create` work here?
+    if ! fx-command-run build build/images/updates:prepare_publish
+    then
+      exit $?
+    fi
+
+    echo >&2 "done"
+  fi
+else
+  if $clean_first; then
+    fx-error "Flag '-C' or '--clean' can only be used if the incremental feature is enabled"
+    exit 1
+  fi
+fi
+
+# TODO(b/360931702): Allow setting the port independent of the IP address.
+# Default the port to 0 (ephemeral) if it is unset.
+if [[ -z "${port}" ]]; then
+  port="$(fx-command-run ffx config get repository.server.default_port 2>/dev/null | tr -d '"')"
+fi
+# If it is still not set, just use 0 to allocate a free port dynamically
+if [[ -z "${port}" ]]; then
+  port="0"
+fi
+
+# Error out if we can't start a package server.
+check-if-we-can-start-package-server  "" "${port}"
+err=$?
+if [[ "${err}" -ne 0 ]]; then
+  exit 1
+fi
+
+if [[ "${no_device}" == "--no-device" ]]; then
+  fx-info "Please note that '--no-device' disables automatic device configuration."
+  if [[ "${port}" == "0" ]]; then
+    fx-info "Use 'ffx repository server list' to discover the dynamically allocated port,"
+    fx-info "then run 'fx -t DEVICE add-update-source --port PORT' to reconfigure devices"
+  else
+    fx-info "Use 'fx -t DEVICE add-update-source --port ${port}' to reconfigure devices"
+  fi
+  fx-info "as needed, since it is not persisted across flashes."
+else
+  # Make sure the ssh config is present and has the expected private key
+  check-ssh-config
+fi
+
+log "Starting repository server"
+
+if [[ "${verbose}" == true ]]; then
+  ffx_flags+=( --verbose )
+fi
+
+if [[ -n "${FUCHSIA_NODENAME}" && -z "${no_device}" ]]; then
+  ffx_flags+=( --target "${FUCHSIA_NODENAME}" )
+fi
+
+# Start repository server in foreground, wait until it
+# voluntarily exits
+# TODO(b/360931702): Allow listening IP address to be set.
+# LINT.IfChange
+server_flags=( repository server start "${server_mode}"  --address "${address}:${port}" )
+server_flags+=( --repository "${source_name}" --repo-path "${repo_dir}" )
+server_flags+=( --trusted-root "${repo_dir}/repository/9.root.json" )
+server_flags+=( --alias "fuchsia.com" --alias "chromium.org" )
+server_flags+=( --storage-type "${storage_type}" )
+if [[ -n "$no_device" ]]; then
+  server_flags+=( --no-device )
+fi
+
+if is_feature_enabled "incremental" || is_feature_enabled "incremental_new"; then
+  server_flags+=(  --auto-publish "${FUCHSIA_BUILD_DIR}/all_package_manifests.list" )
+fi
+# LINT.ThenChange(//scripts/lib/package_server/lib.py:get_command)
+fx-command-run ffx "${ffx_flags[@]}" "${server_flags[@]}"
+
+exit 0

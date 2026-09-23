@@ -1,0 +1,155 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang.gni")
+import("//build/config/compiler.gni")
+import("//build/config/sysroot.gni")
+import("//build/fidl/toolchain.gni")
+import("//build/rust/rust_auxiliary_args.gni")
+
+default_rustc_prefix = "//prebuilt/third_party/rust/${host_platform}"
+
+_version_file_dir =
+    get_label_info("//build/rust:rust_toolchain_version", "target_out_dir")
+rustc_version_file = "$_version_file_dir/rustc_version_file"
+
+declare_args() {
+  # Sets a custom base directory for `rustc` and `cargo`.
+  # This can be used to test custom Rust toolchains.
+  # LINT.IfChange
+  rustc_prefix = default_rustc_prefix
+
+  # LINT.ThenChange(//build/bazel/BUILD.gn)
+
+  # Enable debug assertions, e.g. for overflow checking.
+  rust_debug_assertions = !is_release
+}
+
+if (rustc_prefix == default_rustc_prefix) {
+  _rustc_version = read_file(
+          "//prebuilt/third_party/rust/${host_platform}/.versions/rust.cipd_version",
+          "json")
+  default_rustc_version_string = _rustc_version.instance_id
+} else {
+  default_rustc_version_string = ""
+}
+
+# The default value used for `rust_cap_lints`, this variable is used to detect
+# when it's been changed from the default and to use the correct logic with RBE
+# to ensure cache hits when using a different value with local execution.
+rust_cap_lints_default = "deny"
+
+declare_args() {
+  # This is a string identifying the particular toolchain version in use.  Its
+  # only purpose is to be unique enough that it changes when switching to a new
+  # toolchain, so that recompilations with the new compiler can be triggered.
+  #
+  # When using the prebuilt, this is ignored and the CIPD instance ID of the
+  # prebuilt is used.
+  rustc_version_string = default_rustc_version_string
+
+  # Human-readable identifier for the toolchain version.
+  #
+  # TODO(tmandry): Make this the same repo/revision info from `rustc --version`.
+  # e.g., clang_version_description = read_file("$_rustc_lib_dir/VERSION")
+  rustc_version_description = ""
+
+  # Sets the default LTO type for rustc builds.
+  rust_lto = ""
+
+  # Sets the maximum lint level. "deny" will make all warnings into errors,
+  # "warn" preserves them as warnings, and "allow" will ignore warnings.
+  # LINT.IfChange
+  rust_cap_lints = rust_cap_lints_default
+
+  # LINT.ThenChange(//build/bazel/BUILD.gn)
+
+  # Set the lint level for all clippy lints to "warn".
+  # Note: setting lint levels in source takes precedence over this.
+  clippy_warn_all = false
+
+  # Force the lint level for all clippy lints to "warn".
+  # Note: this overrides both source attributes and our default lint levels, and
+  # should only be used to collect stats about clippy lints in our source tree.
+  clippy_force_warn_all = false
+
+  # Makes clippy targets fail to build when any "deny" lints are found
+  clippy_cause_failure = true
+
+  # See args in //build/rust/rust_auxiliary_args.gni for `include_clippy` and
+  # `include_rustdoc`
+
+  # Final destination of docs generated with `fx rustdoc-link`, as a URL. May
+  # use the file:/// scheme for local testing. Rustdoc will generate some links
+  # based on this path, appending "/host" for host toolchains.
+  rustdoc_extern_html_root_url_base =
+      "https://fuchsia-docs.firebaseapp.com/rust"
+
+  # By default building clippy targets prints lints as well as any rustc
+  # diagnostics that were emitted by check-building the crate. This flag makes
+  # the output in the build only contain lints to avoid duplicating the
+  # diagnostics from rustc (which will be emitted when the actual target is
+  # built). Note that `fx clippy` will still emit rustc diagnostics alongside
+  # clippy lints, they just wont show up in ninja's stderr
+  clippy_ignore_rustc = false
+}
+
+if (rustc_prefix == default_rustc_prefix &&
+    rustc_version_string != default_rustc_version_string) {
+  # You almost never want to set this when using a prebuilt, it could result in
+  # failing to rebuild when the prebuilt updates.
+  print(
+      "WARNING: Using prebuilt toolchain, but rustc_version_string is set! Toolchain updates won't be detected.")
+}
+
+# rustc_prefix rebased to root_build_dir, useful in string expansions that go
+# into command arguments.
+rebased_rustc_prefix = rebase_path(rustc_prefix, root_build_dir)
+
+# Similar to above, but the toolchain is one copied to the output directory for
+# host tests. Test targets that use this sysroot must depend on
+# //build/rust:prebuilt_toolchain_host_test_data
+out_rustc_prefix = rebase_path("$root_out_dir/rust-sysroot/bin", root_build_dir)
+
+if (is_fuchsia) {
+  rust_panic = "abort"
+} else {
+  # Always use panic=unwind on host, or proc macros won't work.
+  rust_panic = "unwind"
+}
+
+write_file(rustc_version_file, rustc_version_string)
+
+assert(current_os == "linux" || current_os == "fuchsia" ||
+           (current_os == "unknown" && current_cpu == "wasm32") ||
+           current_os == "win" || current_os == "uefi",
+       "current_os was neither linux, win, uefi, wasm32, unknown, nor fuchsia")
+assert(
+    current_cpu == "x64" || current_cpu == "arm64" || current_cpu == "wasm32" ||
+    current_cpu == "riscv64" || current_cpu == "arm")
+if (current_os == "linux") {
+  _suffix = "unknown-linux-gnu"
+} else if (current_os == "win") {
+  _suffix = "windows-msvc"
+} else if (current_os == "uefi") {
+  # TODO(https://fxbug.dev/460196031): Remove this assert when aarch64-uefi triple is supported.
+  assert(current_cpu == "x64")
+  _suffix = "unknown-uefi"
+} else if (current_os == "fuchsia") {
+  _suffix = "unknown-fuchsia"
+}
+if (current_cpu == "x64") {
+  rust_target = "x86_64-${_suffix}"
+} else if (current_cpu == "arm64") {
+  rust_target = "aarch64-${_suffix}"
+} else if (current_cpu == "arm") {
+  rust_target = "arm-${_suffix}"
+} else if (current_cpu == "riscv64") {
+  rust_target = "riscv64gc-${_suffix}"
+} else if (current_cpu == "wasm32" && current_os == "unknown") {
+  rust_target = "wasm32-unknown-unknown"
+}
+
+rustc_lib_dir = "$rustc_prefix/lib"
+rustc_runtime = read_file("${rustc_lib_dir}/runtime.json", "json")

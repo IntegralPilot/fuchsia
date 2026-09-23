@@ -1,0 +1,91 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_CONNECTIVITY_NETWORK_TESTING_NETEMUL_NETWORK_CONTEXT_LIB_NETWORK_H_
+#define SRC_CONNECTIVITY_NETWORK_TESTING_NETEMUL_NETWORK_CONTEXT_LIB_NETWORK_H_
+
+#include <fuchsia/net/virtualization/cpp/fidl.h>
+#include <fuchsia/netemul/network/cpp/fidl.h>
+#include <lib/fidl/cpp/binding_set.h>
+#include <zircon/types.h>
+
+#include <fstream>
+#include <memory>
+
+#include "src/connectivity/network/testing/netemul/network-context/lib/netdump.h"
+#include "src/lib/fxl/memory/weak_ptr.h"
+
+namespace netemul {
+namespace impl {
+class NetworkBus;
+}
+class NetworkContext;
+class NetworkManager;
+class PacketCapture;
+class Network : public fuchsia::netemul::network::Network {
+ public:
+  using FNetwork = fuchsia::netemul::network::Network;
+  using Config = fuchsia::netemul::network::NetworkConfig;
+  using Ptr = std::unique_ptr<Network>;
+  using ClosedCallback = fit::function<void(const Network&)>;
+
+  Network(NetworkContext* context, std::string name, Config config);
+  ~Network() override;
+
+  const std::string& name() const { return name_; }
+
+  // Attaches named endpoint to network
+  zx_status_t AttachEndpoint(std::string name);
+
+  // fidl interface implementations:
+  void AddPort(fidl::InterfaceHandle<::fuchsia::hardware::network::Port> port,
+               fidl::InterfaceRequest<fuchsia::net::virtualization::Interface> interface) override;
+  void GetConfig(GetConfigCallback callback) override;
+  void GetName(GetNameCallback callback) override;
+  void SetConfig(fuchsia::netemul::network::NetworkConfig config,
+                 SetConfigCallback callback) override;
+  void AttachEndpoint(::std::string name, AttachEndpointCallback callback) override;
+  void RemoveEndpoint(::std::string name, RemoveEndpointCallback callback) override;
+  void CreateFakeEndpoint(
+      fidl::InterfaceRequest<fuchsia::netemul::network::FakeEndpoint> ep) override;
+  void StartCapture(::std::string name, StartCaptureCallback callback) override;
+  void StopCapture(StopCaptureCallback callback) override;
+
+  // ClosedCallback is called when all bindings to the service are gone
+  void SetClosedCallback(ClosedCallback cb);
+
+  // returns true if network config is valid.
+  static bool CheckConfig(const Config& config);
+
+ protected:
+  friend NetworkManager;
+
+  void Bind(fidl::InterfaceRequest<FNetwork> req);
+
+ private:
+  ClosedCallback closed_callback_;
+  std::unique_ptr<impl::NetworkBus> bus_;
+  // Pointer to parent context. Not owned.
+  NetworkContext* parent_;
+  std::string name_;
+  Config config_;
+  fidl::BindingSet<FNetwork> bindings_;
+  std::unique_ptr<PacketCapture> packet_capture_;
+};
+
+class PacketCapture {
+ public:
+  explicit PacketCapture(fxl::WeakPtr<impl::NetworkBus> bus, const std::string& pcap_name);
+  NetworkDump& Dump();
+  void Stop();
+
+ private:
+  std::ofstream pcap_file_;
+  NetworkDump dump_;
+  fxl::WeakPtr<impl::NetworkBus> bus_;
+};
+
+}  // namespace netemul
+
+#endif  // SRC_CONNECTIVITY_NETWORK_TESTING_NETEMUL_NETWORK_CONTEXT_LIB_NETWORK_H_

@@ -1,0 +1,147 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.camera2;
+
+using fuchsia.sysmem;
+using fuchsia.sysmem2;
+using zx;
+
+/// Maximum number of image formats per stream.
+const MAX_IMAGE_FORMATS uint64 = 256;
+
+/// Status to be set when a frame is signalled available.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type FrameStatus = strict enum {
+    OK = 0;
+    /// An error occurred during the production of a frame.
+    /// No data will be available in the data buffer corresponding to this
+    /// notification.
+    ERROR_FRAME = 1;
+
+    /// No space was available in the data buffer, resulting in a dropped frame.
+    ERROR_BUFFER_FULL = 2;
+};
+
+type FrameMetadata = table {
+    1: timestamp int64;
+    /// |image_format_index| references the index into the vector of available
+    /// formats supported by the stream.
+    2: image_format_index uint32;
+    /// The value of the system monotonic clock at the moment the buffer used to construct this
+    /// frame was received from the ISP.
+    3: capture_timestamp int64;
+};
+
+/// Sent by the driver to the client when a frame is available for processing,
+/// or an error occurred.
+type FrameAvailableInfo = struct {
+    /// Non zero if an error occurred.
+    frame_status FrameStatus;
+
+    /// The index of the buffer in the buffer collection.
+    buffer_id uint32;
+
+    metadata FrameMetadata;
+};
+
+type FrameRate = struct {
+    /// The frame rate is frames_per_sec_numerator / frames_per_sec_denominator.
+    frames_per_sec_numerator uint32;
+    frames_per_sec_denominator uint32;
+};
+
+/// Different Stream types provided by the camera stack.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type CameraStreamType = strict bits : uint32 {
+    /// ML request FR(Full Resolution) stream as well as
+    /// a DS(Down Scaled Resolution) stream for Security Use Case
+    /// which are of fixed resolutions
+    MACHINE_LEARNING = 0x01;
+    /// This is Security Video Stream which could support multiple
+    /// resolutions at runtime.
+    MONITORING = 0x02;
+    FULL_RESOLUTION = 0x04;
+    /// ML request a DS stream for Video Conferencing which is fixed resolution
+    DOWNSCALED_RESOLUTION = 0x08;
+    /// This is Video Conferencing Stream which could support
+    /// multiple resolutions at runtime.
+    VIDEO_CONFERENCE = 0x10;
+    /// Stream with extended field of view.
+    EXTENDED_FOV = 0x20;
+};
+
+type StreamProperties = table {
+    /// These could be one or more of the above mentioned Stream Types
+    1: stream_type CameraStreamType;
+};
+
+closed protocol Stream {
+    /// Control Operations
+    /// Starts the streaming of frames.
+    strict Start();
+
+    /// Stops the streaming of frames.
+    strict Stop();
+
+    /// Unlocks the specified frame, allowing the driver to reuse the memory.
+    strict ReleaseFrame(struct {
+        buffer_id uint32;
+    });
+
+    /// Sent by the driver to the client when a frame is available for processing,
+    /// or an error occurred.  The frame is considered read-locked by the client
+    /// after this message.  The client must call ReleaseFrame to release the
+    /// read-lock for a non-error frame, or the consumer will eventually run out of buffers.
+    /// If a frame has an error, the client must call AcknowledgeFrameError before
+    /// another OnFrameAvailable will be called with an error frame.
+    strict -> OnFrameAvailable(struct {
+        frame FrameAvailableInfo;
+    });
+
+    /// Provides flow control for receiving frame errors. See OnFrameAvailable comment.
+    strict AcknowledgeFrameError();
+
+    /// Data operations
+    /// This is used by clients to provide inputs for region of interest
+    /// selection.
+    /// Inputs are the x & y coordinates for the new bounding box.
+    /// For streams which do not support smart framing, this would
+    /// return an error.
+    strict SetRegionOfInterest(struct {
+        x_min float32;
+        y_min float32;
+        x_max float32;
+        y_max float32;
+    }) -> (struct {
+        s zx.Status;
+    });
+
+    /// Change the image format of the stream. This is called when clients want
+    /// to dynamically change the resolution of the stream while the streaming is
+    /// is going on.
+    strict SetImageFormat(struct {
+        image_format_index uint32;
+    }) -> (struct {
+        s zx.Status;
+    });
+
+    /// Get the image formats that this stream supports.
+    strict GetImageFormats() -> (struct {
+        image_formats vector<fuchsia.sysmem.ImageFormat_2>:MAX_IMAGE_FORMATS;
+    });
+
+    /// Returns a token to the buffers that are being used to output frames on the stream. The
+    /// token is `dispensable` which means it doesn't have to be turned in to sysmem for allocation
+    /// to complete. This also means that any SetConstraints call on the returned token can't
+    /// conflict with the constraints in the `StreamConfig`, otherwise attempts to wait for buffers
+    /// on the token will fail.
+    @available(added=25)
+    strict GetBuffers2() -> (resource struct {
+        token client_end:fuchsia.sysmem2.BufferCollectionToken;
+    });
+    @available(deprecated=25, note="use GetBuffers2 or preferably fuchsia.camera3")
+    strict GetBuffers() -> (resource struct {
+        token client_end:fuchsia.sysmem.BufferCollectionToken;
+    });
+};

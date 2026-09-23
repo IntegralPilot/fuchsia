@@ -1,0 +1,1640 @@
+# Copyright 2016 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/call_graph_section.gni")
+import("//build/config/clang/clang.gni")
+import("//build/config/clang/crash_diagnostics.gni")
+import("//build/config/clang/stack_clash_protection.gni")
+import("//build/config/clang/time_trace.gni")
+import("//build/config/compiler.gni")
+import("//build/config/compiler_config.gni")
+import("//build/config/enable_frame_pointers.gni")
+import("//build/config/fuchsia_cxx_version.gni")
+import("//build/config/linker.gni")
+import("//build/config/lto/config.gni")
+import("//build/rust/config.gni")
+import("//build/toolchain/ccache.gni")
+import("//build/toolchain/concurrent_jobs.gni")
+import("//build/toolchain/ifs_shared_library.gni")
+import("//build/toolchain/rbe.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//build/toolchain/variant.gni")
+
+declare_args() {
+  # Controls whether to promote warnings to errors.
+  deny_warnings = true
+}
+
+# No frame pointers for host compiles.
+if (current_toolchain == host_toolchain) {
+  enable_frame_pointers = false
+}
+
+if (zircon_toolchain != false) {
+  import("//build/config/zircon/levels.gni")
+  enable_frame_pointers = zx_assert_level > 0
+}
+
+config("language") {
+  cflags_c = [ "-std=c11" ]
+  cflags_cc = [ "-std=c++$fuchsia_cxx_version" ]
+  defines = []
+
+  # Pass the same C/C++ flags to the Objective-C/C++ compiler.
+  cflags_objc = cflags_c
+  cflags_objcc = cflags_cc
+}
+
+# These configs can be used to override the C++ version for a particular
+# target.  This is used primarily for tests to specifically validate building
+# under supported modes other than $fuchsia_cxx_version.
+foreach(cxx_version, fuchsia_sdk_cxx_supported_versions) {
+  config("c++$cxx_version") {
+    cflags_cc = [ "-std=c++$cxx_version" ]
+
+    if (cxx_version < 20) {
+      # TODO(https://fxbug.dev/42064981): libc++ now marks the C++20
+      # synchronization primitives as deprecated in older C++ standards which
+      # affects Fuchsia since we use these primitives across the codebase. We
+      # temporarily suppress these warnings until C++20 becomes the default.
+      if (!defined(defines)) {
+        defines = []
+      }
+      defines += [ "_LIBCPP_DISABLE_DEPRECATION_WARNINGS" ]
+    }
+  }
+}
+
+compiler_config("color_diagnostics") {
+  # GCC correctly defaults this from the terminal, so leave it alone.
+  if (!is_gcc) {
+    c_family_flags = [ "-fcolor-diagnostics" ]
+    linker_flags = [ "--color-diagnostics" ]
+  }
+}
+
+compiler_config("crash_diagnostics") {
+  if (!is_gcc) {
+    c_family_flags = [
+      "-fcrash-diagnostics-dir=" +
+          rebase_path(crash_diagnostics_dir, root_build_dir),
+      "-fcrash-diagnostics=all",
+    ]
+    if (clang_enable_error_reproducers) {
+      c_family_flags += [ "-gen-reproducer=error" ]
+    }
+  }
+}
+
+compiler_config("call-graph-section") {
+  if (call_graph_section && !is_gcc && is_elf) {
+    c_family_flags = [ "-fexperimental-call-graph-section" ]
+  }
+}
+
+compiler_config("stack-size-section") {
+  if (!is_gcc) {
+    c_family_flags = [ "-fstack-size-section" ]
+  }
+
+  rustflags = [ "-Zemit-stack-sizes" ]
+
+  # TODO(https://fxbug.dev/434231527): Remove the --stack-size-section
+  # workaround once rustc does this.
+  rust_linker_llvm_flags = [ "--stack-size-section" ]
+}
+
+config("stack-clash-protection") {
+  # see https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html#index-fstack-clash-protection
+  #
+  # NOTE: PAGE_SIZE used in probing is a compile-time constant, controlled by
+  # -mstack-probe-size, and defaults to 4096. Advanced probing can be
+  # controlled with a function attribute, "probe-stack" to use a function to do
+  # the probing. Otherwise, the compiler will emit the probing instructions
+  # directly in the prologue. Rust code always emits these checks via
+  # __rust_probestack in all functions that require probing.
+  #
+  # stack-clash-protection is only enabled for Fuchsia and Linux targets on
+  # x64, arm64, and riscv64 architectures.
+  if (stack_clash_protection && (is_linux || is_fuchsia) &&
+      (current_cpu == "arm64" || current_cpu == "riscv64" ||
+       current_cpu == "x64")) {
+    cflags = [ "-fstack-clash-protection" ]
+  }
+}
+
+config("time-trace") {
+  if (!is_gcc && time_trace) {
+    cflags = [ "-ftime-trace" ]
+    asmflags = cflags
+    ldflags = cflags
+  }
+}
+
+config("rust-depinfo") {
+  # rustc depfiles should identify all the .rlib / .rmeta / etc. input files,
+  # not just the .rs source files.
+  rustflags = [ "-Zbinary-dep-depinfo" ]
+}
+
+config("compiler") {
+  cflags = []
+  cflags_cc = [ "-fvisibility-inlines-hidden" ]
+  cflags_objcc = [ "-fvisibility-inlines-hidden" ]
+  configs = [
+    ":color_diagnostics",
+    ":crash_diagnostics",
+    ":time-trace",
+    ":toolchain_version_stamp",
+    ":call-graph-section",
+    ":stack-size-section",
+    ":stack-clash-protection",
+    ":rust-depinfo",
+  ]
+
+  if (is_gcc) {
+    configs += [ ":default-tls-dialect" ]
+
+    # Accept / as division rather than comment.  This is GCC's default for
+    # *-linux targets, but not for *-elf targets; Clang always does it.
+    cflags += [ "-Wa,--divide" ]
+  } else {
+    configs += [
+      ":clang_defaults",
+      ":embed_bitcode",
+      ":gnuc_version",
+      ":ffp_contract",
+    ]
+  }
+
+  if (current_os == "fuchsia") {
+    configs += [ "//build/config/fuchsia:compiler" ]
+  } else {
+    if (current_os == "linux") {
+      configs += [ "//build/config/linux:compiler" ]
+    } else if (current_cpu == "wasm32" && current_os == "unknown") {
+      configs += [ "//build/config/wasm:compiler" ]
+    }
+  }
+
+  asmflags = cflags
+}
+
+# This is separate from :compiler so it can be removed from configs when also
+# adding :no-libc++-include.
+config("libc++-include") {
+  if (zircon_toolchain != false) {
+    cflags_cc = []
+
+    # The toolchain-supplied headers come after include_dirs from targets and
+    # configs but before libc.
+    foreach(dir, zircon_toolchain.include_dirs_cc) {
+      cflags_cc += [
+        "-isystem",
+        rebase_path(dir, root_build_dir),
+      ]
+    }
+  }
+}
+
+# Adding this must always be paired with removing :no-libc++-include.
+config("no-libc++-include") {
+  if (!is_gcc) {
+    cflags_cc = [ "-nostdinc++" ]
+  }
+}
+
+compiler_config("cpu_baseline") {
+  if (current_cpu != "wasm32") {
+    compiler_configs = [ "//build/config/$current_cpu" ]
+  }
+}
+
+# These flags are enabled by default in Fuchsia's Clang toolchain, but we set
+# them explicitly to support other Clang toolchains and Clang-based tools.
+config("clang_defaults") {
+  # Set relax relocations flag only for x64 ELF targets.
+  if (current_cpu == "x64" && is_elf) {
+    asmflags = [ "-Wa,--mrelax-relocations=yes" ]
+  }
+  if (current_os == "linux") {
+    cflags_cc = [ "-stdlib=libc++" ]
+    ldflags = [
+      "-stdlib=libc++",
+      "--start-no-unused-arguments",
+      "-unwindlib=libunwind",
+      "-rtlib=compiler-rt",
+      "--end-no-unused-arguments",
+    ]
+  }
+}
+
+config("embed_bitcode") {
+  if (clang_embed_bitcode) {
+    cflags = [
+      "-Xclang",
+      "-fembed-bitcode=all",
+    ]
+  }
+}
+
+# -ffast-math enables 4 sets of optimizations:
+#     no-math-errno, no-rounding-math, unsafe-math-optimizations, finite-math-only
+# This config sets the first 3. Use one of the subsequent configs to disable/enable the last one.
+config("fast-math-baseline") {
+  cflags = [
+    "-fno-math-errno",
+    "-fno-rounding-math",
+
+    # Enables six targeted optimizations: approx-func, associative-math,
+    # reciprocal-math, no-signed-zeros, no-trapping-math and fp-contract=fast
+    "-funsafe-math-optimizations",
+
+    # -ffinite-math-only is set (or cleared) elsewhere.
+  ]
+}
+
+# Disables finite-math-only, but sets all other fast-math optimizations. Allow
+# inf/nan to be used (while avoiding UB), with the other float-based
+# optimizations.
+config("fast-math") {
+  configs = [ ":fast-math-baseline" ]
+  cflags = [
+    "-fno-finite-math-only",  # Implies honor-infinities and honor-nans.
+  ]
+}
+
+# Enables finite-math-only, along with all other fast-math optimizations.
+# To be used when inf/nan are guaranteed to NOT be encountered.
+config("fast-math-no-inf-nan") {
+  configs = [ ":fast-math-baseline" ]
+  cflags = [
+    "-ffinite-math-only",  # Implies no-honor-infinities and no-honor-nans.
+  ]
+}
+
+config("ffp_contract") {
+  # TODO(https://fxbug.dev/42169939): This was the default for -ffp-model=precise until
+  # LLVM revision f04e387055e495e3e14570087d68e93593cf2918 when Clang switched
+  # to -ffp-contract=on.
+  cflags = [ "-ffp-contract=off" ]
+  asmflags = cflags
+}
+
+# We want to force a recompile and relink of the world whenever our toolchain
+# changes since artifacts from an older version of the toolchain may or may not
+# be compatible with newer ones.
+#
+# To achieve this, we insert an unused flag in the compile line.
+config("toolchain_version_stamp") {
+  if (clang_prefix == default_clang_prefix) {
+    clang_version = read_file(
+            "//prebuilt/third_party/clang/${host_platform}/.versions/clang.cipd_version",
+            "json")
+    defines = [ "TOOLCHAIN_VERSION=\"${clang_version.instance_id}\"" ]
+  }
+  rustflags = [ "--cfg=__rust_toolchain=\"${rustc_version_string}\"" ]
+}
+
+compiler_config("relative_paths") {
+  if (is_gcc) {
+    # Relativize paths without leaking the build output directory in debug info.
+    # Note: with multiple prefix map options, the mappings are checked in
+    # reverse-order, and *stops* after the first match is applied.
+    # Thus, longest prefix matches should be near the tail of this list.
+    c_family_flags = [
+      # Map "/some/dir/fuchsia" to "../..".
+      "-ffile-prefix-map=" + rebase_path("//") + "=" +
+          rebase_path("//", root_build_dir),
+
+      # Map "/some/dir/fuchsia/out" to "..".
+      "-ffile-prefix-map=" + rebase_path("$root_build_dir/..") + "=..",
+
+      # Map "/some/dir/fuchsia/out/my-build.my-arch" to ".".
+      "-ffile-prefix-map=" + rebase_path(root_build_dir) + "=.",
+    ]
+  } else {
+    # Make builds independent of the absolute file path. -ffile-prefix-map= can
+    # be used to the same effect, but it requires putting the absolute path to
+    # the build directory in the compile command, thus making it dependent on
+    # the absolute path of build directory. -ffile-compilation-dir is designed
+    # to address this issue, making both debug info and coverage mapping
+    # independent of the absolute path of the build directory.
+    c_family_flags = [ "-ffile-compilation-dir=." ]
+  }
+
+  # This makes sure that include directories in the toolchain are represented
+  # as relative to the build directory (because that's how we invoke the
+  # compiler), rather than absolute.  This can affect __FILE__ expansions
+  # (e.g. assertions in system headers).  We normally run a compiler that's
+  # someplace within the source tree, so its absolute installation path will
+  # have a prefix matching `absolute_path` and hence be mapped to
+  # `relative_path` in the debugging information, so this should actually be
+  # superfluous for purposes of the debugging information.
+  c_family_flags += [ "-no-canonical-prefixes" ]
+
+  if (is_pecoff) {
+    linker_flags = [
+      # This embeds just "name.pdb" in the binary instead of the absolute
+      # path to the PDB file.
+      "/pdbaltpath:%_PDB%",
+
+      # This embeds a fake Windows-style absolute path rather than the real
+      # build-time absolute path in the PDB file.  Windows apparently
+      # requires an absolute path here, so we use an arbitrary fake one for
+      # reproducibility.
+      "/pdbsourcepath:c:\\src",
+    ]
+  }
+
+  # `-Zremap-cwd-prefix` ensures that absolute paths do not leak into
+  # outputs for universal reproducibility while keeping the command line
+  # free of absolute paths for remote caching benefit.
+  # Available since: https://github.com/rust-lang/rust/pull/87320
+  rustflags = [ "-Zremap-cwd-prefix=." ]
+}
+
+config("debug") {
+}
+
+config("release") {
+  defines = [ "NDEBUG=1" ]
+}
+
+config("exceptions") {
+  cflags_cc = [ "-fexceptions" ]
+  cflags_objcc = cflags_cc
+  ldflags = cflags_cc
+}
+
+config("no_exceptions") {
+  cflags_cc = [ "-fno-exceptions" ]
+  cflags_objcc = cflags_cc
+  ldflags = cflags_cc
+}
+
+config("rtti") {
+  cflags_cc = [ "-frtti" ]
+  cflags_objcc = cflags_cc
+  ldflags = cflags_cc
+}
+
+config("no_rtti") {
+  cflags_cc = [ "-fno-rtti" ]
+
+  if (is_kernel && is_fuchsia && !is_gcc) {
+    cflags_cc += [
+      # Remove the unused rtti component from vtables.
+      "-Xclang",
+      "-fexperimental-omit-vtable-rtti",
+    ]
+  }
+
+  cflags_objcc = cflags_cc
+  ldflags = cflags_cc
+}
+
+config("default_include_dirs") {
+  include_dirs = [
+    "//",
+    root_gen_dir,
+  ]
+}
+
+variant("linker_gc") {
+  configs = [
+    ":linker_gc.compiler",
+    ":linker_gc.linker",
+  ]
+}
+
+compiler_config("linker_gc.linker") {
+  visibility = [ ":*" ]
+
+  # These are the link-time flags to take advantage of the code generation
+  # flags in config("linker_gc.compiler").
+  if (is_pecoff) {
+    linker_flags = [ "/opt:ref" ]
+  } else {
+    linker_flags = [ "--gc-sections" ]
+  }
+}
+
+# These are the code-generation flags.
+config("linker_gc.compiler") {
+  visibility = [ ":*" ]
+
+  cflags = [
+    "-fdata-sections",
+    "-ffunction-sections",
+  ]
+
+  # Just to be safe, pass them to the linker too.
+  ldflags = cflags
+
+  # `-Zfunction-sections` flag controls both text and data sections.
+  rustflags = [ "-Zfunction-sections" ]
+}
+
+config("default_linker_gc") {
+  configs = [ ":linker_gc" ]
+}
+
+compiler_config("linker_string_merging") {
+  if (is_pecoff) {
+    linker_flags = [ "/opt:lldtailmerge" ]
+  } else {
+    linker_flags = [ "-O2" ]
+  }
+}
+
+# Temporary placeholder to allow for a soft-transition.
+config("no_remote_link") {
+  configs = [ "//build/config/rbe:no_remote_link" ]
+}
+
+# Each 'optimize_$optimize' config below corresponds to a single setting that's
+# controlled by a 'foo_optimize' argument. The 'default_optimize' level is set
+# to an 'optimize_$optimize' for convenience, but individual targets can
+# override their optimization level by removing default_optimize and manually
+# applying one of
+# the configs below.
+
+config("default_optimize") {
+  configs = [ ":optimize_${optimize}" ]
+}
+
+config("optimize_none") {
+  cflags = [ "-O0" ]
+  ldflags = cflags
+  rustflags = [ "-Copt-level=0" ]
+}
+
+config("optimize_debug") {
+  cflags = [ "-Og" ]
+  ldflags = cflags
+
+  # Rust doesn't recognize opt level "g", the closest is "1".
+  # See: https://doc.rust-lang.org/rustc/codegen-options/index.html#opt-level
+  rustflags = [ "-Copt-level=1" ]
+}
+
+config("optimize_minimal") {
+  cflags = [ "-O1" ]
+  ldflags = cflags
+  rustflags = [ "-Copt-level=1" ]
+}
+
+config("optimize_moderate") {
+  cflags = [ "-O2" ]
+  ldflags = cflags
+  rustflags = [ "-Copt-level=2" ]
+}
+
+config("optimize_size") {
+  cflags = [ "-Os" ]
+  ldflags = cflags
+
+  if (clang_ml_inliner) {
+    cflags += [
+      # `release` uses AOT model embedded inside the compiler.
+      "-mllvm",
+      "-enable-ml-inliner=release",
+    ]
+  }
+
+  rustflags = [ "-Copt-level=s" ]
+
+  configs = [ ":linker_string_merging" ]
+
+  # Enable LLD's Balanced Partitioning (BP) to reorder functions for better
+  # binary compression. This optimization is specific to the ELF linker (ld.lld)
+  # and is not supported by the Windows/COFF linker (lld-link) used for EFI.
+  if (is_elf) {
+    configs += [ ":bp-compression-sort" ]
+  }
+}
+
+config("optimize_speed") {
+  cflags = [ "-O3" ]
+  ldflags = cflags
+  rustflags = [ "-Copt-level=3" ]
+  configs = [ ":linker_string_merging" ]
+}
+
+# Each of those "well-optimized" primary optimization modes gets corresponding
+# _lto and _thinlto modes.
+foreach(primary,
+        [
+          "moderate",
+          "size",
+          "speed",
+        ]) {
+  foreach(lto,
+          [
+            "lto",
+            "thinlto",
+          ]) {
+    config("optimize_${primary}_${lto}") {
+      configs = [
+        ":optimize_${primary}",
+        "//build/config/lto:${lto}-if-compatible",
+      ]
+    }
+  }
+}
+
+# TODO(https://fxbug.dev/517626589): Remove this and just use
+# optimize_size_thinlto when compiler issues are resolved.
+config("optimize_size_thinlto_clang") {
+  # Primarily optimize for size.
+  configs = [ ":optimize_size" ]
+
+  _is_not_instrumented = toolchain_variant.tags + [ "instrumented" ] -
+                         [ "instrumented" ] == toolchain_variant.tags
+
+  # Do not enable LTO for the instrumented variants.
+  # Do not enable LTO (here) for the lto or thinlto variants.
+  if (_is_not_instrumented && !is_lto_variant) {
+    # Enable ThinLTO for the binaries that are generated by Clang.
+    configs += [ "//build/config/lto:thinlto-clang" ]
+  }
+}
+
+config("optimize_sanitizer") {
+  # Instrumentation adds overhead that is greatly improved by optimization.
+  # -O1 is well-tested with the instrumentation modes and does not degrade the
+  # comprehensibility of backtraces produced by sanitizer failures.
+  cflags = [ "-O1" ]
+  ldflags = cflags
+  rustflags = [ "-Copt-level=1" ]
+}
+
+config("optimize_profile") {
+  cflags = [ "-O1" ]
+  ldflags = cflags
+  rustflags = [ "-Copt-level=1" ]
+}
+
+config("optimize_coverage") {
+  cflags = [ "-O1" ]
+  ldflags = cflags
+  rustflags = [ "-Copt-level=1" ]
+}
+
+# Each of the debuginfo_$debuginfo configs below corresponds to a single setting
+# that controls the amount of debugging information used and is controlled by
+# the debuginfo argument. The default_debuginfo level is set to
+# debuginfo_$debuginfo for convenience, but individual targets can override
+# their debuginfo level by manually applying one of the configs below.
+
+config("debuginfo_none") {
+  cflags = [ "-g0" ]
+  if (is_dwarf) {
+    asmflags = cflags
+  }
+  ldflags = cflags
+  rustflags = [ "-Cdebuginfo=0" ]
+}
+
+config("debuginfo_backtrace") {
+  cflags = [ "-g1" ]
+  if (is_dwarf) {
+    asmflags = cflags
+  }
+  ldflags = cflags
+  rustflags = [ "-Cdebuginfo=1" ]
+}
+
+config("debuginfo_debug") {
+  cflags = [
+    "-g3",
+
+    # Add command-line details to each TU's DW_AT_producer to aid build
+    # diagnosis working backwards from debug files.  Clang aliases this switch
+    # to -grecord-command-line, but both compilers accept this spelling for it.
+    "-grecord-gcc-switches",
+  ]
+  if (is_dwarf) {
+    asmflags = cflags
+  }
+  ldflags = cflags
+  rustflags = [ "-Cdebuginfo=2" ]
+}
+
+config("dwarf_version") {
+  cflags = [ "-gdwarf-${dwarf_version}" ]
+  asmflags = cflags
+  ldflags = cflags
+}
+
+config("compress_debuginfo") {
+  if (compress_debuginfo != "none") {
+    gz_flag = "-gz=${compress_debuginfo}"
+    cflags = [ gz_flag ]
+    asmflags = cflags
+    ldflags = cflags
+
+    # rustc driver invokes LLD directly when targeting Fuchsia, so we need to
+    # use the linker spelling of this flag, whereas on other targets rustc
+    # invokes Clang so we use the same spelling as for C/C++.
+    if (is_fuchsia) {
+      rustflags =
+          [ "-Clink-arg=--compress-debug-sections=${compress_debuginfo}" ]
+    } else {
+      rustflags = [ "-Clink-arg=${gz_flag}" ]
+    }
+  }
+}
+
+compiler_config("default_debuginfo") {
+  cflags = []
+  linker_flags = []
+  configs = [ ":debuginfo_${debuginfo}" ]
+  if (is_dwarf) {
+    configs += [
+      ":dwarf_version",
+      ":compress_debuginfo",
+    ]
+    if (!is_gcc) {
+      # This option forces Clang to only emit class type information when
+      # constructors are emitted which can significantly reduce debug info
+      # size. Eventually, this option will enabled by default in Clang when
+      # -fno-standalone-debug is used.
+      cflags += [
+        "-Xclang",
+        "-debug-info-kind=constructor",
+      ]
+    }
+  } else if (debuginfo != "none" && is_pecoff) {
+    # TODO(https://fxbug.dev/42132853): This produces the .pdb file, but it doesn't seem
+    # to get the DWARF data out of the main output file.
+    linker_flags += [ "/debug:full" ]
+  }
+}
+
+config("default_frame_pointers") {
+  if (enable_frame_pointers) {
+    configs = [ ":frame_pointers" ]
+  } else {
+    configs = [ ":no_frame_pointers" ]
+  }
+}
+
+variant("frame_pointers") {
+  cflags = [
+    "-fno-omit-frame-pointer",
+    "-momit-leaf-frame-pointer",
+  ]
+  ldflags = cflags
+  rustflags = [ "-Cforce-frame-pointers" ]
+  if (zircon_toolchain != false) {
+    defines = [ "WITH_FRAME_POINTERS=1" ]
+  }
+}
+
+variant("no_frame_pointers") {
+  cflags = [ "-fomit-frame-pointer" ]
+  ldflags = cflags
+
+  # rustc automatically does this for release builds, and there's no way to
+  # force it for non-release.
+  if (zircon_toolchain != false) {
+    defines = [ "WITH_FRAME_POINTERS=0" ]
+  }
+}
+
+config("suppress_iterator_warnings") {
+  defines = [ "_LIBCPP_DISABLE_DEPRECATION_WARNINGS" ]
+  visibility = [ "//third_party/grpc/*" ]
+}
+
+# LINT.IfChange(default_warnings)
+config("default_warnings") {
+  # TODO(https://fxbug.dev/542707525): Suppress unused variable warnings in libc++ containers.
+  defines = [ "_LIBCPP_DISABLE_UNUSED_STRUCT_WARNINGS" ]
+
+  cflags = [
+    "-Wall",
+    "-Wextra",
+    "-Wconversion",
+    "-Wextra-semi",
+    "-Wimplicit-fallthrough",
+    "-Wnewline-eof",
+    "-Wstrict-prototypes",
+    "-Wwrite-strings",
+    "-Wno-sign-conversion",
+    "-Wno-unused-parameter",
+    "-Wnonportable-system-include-path",
+  ]
+  cflags_c = []
+  cflags_cc = []
+
+  # TODO(https://fxbug.dev/42142861): Disable "-Wmissing-field-initializers"
+  # which warns when designated initializers are used on some (but not all)
+  # fields in C++, but not C.
+  #
+  # There is ongoing discussion about whether it should apply to C++ or not.
+  # See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=96868 for details.
+  cflags += [ "-Wno-missing-field-initializers" ]
+
+  # These -W... switches only exist in Clang, so are disabled only there.
+  if (!is_gcc) {
+    cflags += [
+      # This is still needed for -Wmaybe-uninitialized which is added as a
+      # pragma in source code. Clang hasn't implemented this yet.
+      "-Wno-unknown-warning-option",
+    ]
+  }
+
+  if (is_gcc) {
+    # Just elide any [[clang::...]] attributes when compiling with GCC, so they
+    # don't have to be guarded with `#ifdef __clang__`.  Cases where the GCC
+    # version should do something other will still need an `#ifdef` but that
+    # won't be necessarily flagged by seeing compilation errors under GCC.
+    cflags_cc += [ "-Wno-attributes=clang::" ]
+
+    # GCC is pedantic about which flags apply to which language.
+    cflags -= [
+      "-Wstrict-prototypes",
+      "-Wextra-semi",
+    ]
+    cflags_c += [ "-Wstrict-prototypes" ]
+    cflags_cc += [ "-Wextra-semi" ]
+
+    # GCC doesn't support these flags
+    cflags -= [
+      "-Wnewline-eof",
+      "-Wnonportable-system-include-path",
+    ]
+
+    cflags += [
+      # This warns about compatibility with ancient binaries, not relevant.
+      "-Wno-psabi",
+
+      # TODO(https://fxbug.dev/42052174): -Warray-bounds has false positives in GCC 12.
+      # When https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105762 is fixed,
+      # remove this.
+      "-Wno-array-bounds",
+
+      # gcc will never catch anything that clang will not with this warning.
+      # Moreover, most folks don't build with gcc. We just disable this
+      # warning on gcc to make it easier to see actual errors.
+      "-Wno-deprecated-declarations",
+
+      # TODO(https://fxbug.dev/351904809): -Wstringop-overread has false
+      # positives in GCC 13, and -Wstringop-overflow does in GCC 14.
+      # Needs to be pursued upstream.
+      "-Wno-stringop-overread",
+      "-Wno-stringop-overflow",
+
+      # TODO(https://fxbug.dev/351904809): -Wmaybe-uninitialized has at least
+      # one false positive in GCC 14 that was not obvious how to work around
+      # locally.  Needs to be pursued upstream.
+      "-Wno-maybe-uninitialized",
+
+      # TODO(https://fxbug.dev/362618077): Spuriously fires.
+      "-Wno-alloc-size-larger-than",
+
+      #TODO(https://fxbug.dev/42077425): libcxx namespace macros can sometimes
+      # include #pragma clang ... directives.
+      "-Wno-unknown-pragmas",
+    ]
+  }
+
+  configs = [
+    # TODO(https://fxbug.dev/42073532): //third_party/spirv* need this but they
+    # need it added to BUILD.gn files not in fuchsia.git
+    ":Wno-deprecated-this-capture",
+
+    # TODO(https://fxbug.dev/495789303): Disable "-Wunused-but-set-variable" until
+    # all instances are fixed.
+    ":Wno-unused-but-set-variable",
+
+    # TODO(https://fxbug.dev/500111548): Disable "-Wunused-but-set-global" until
+    # all instances are fixed.
+    ":Wno-unused-but-set-global",
+
+    # TODO(https://fxbug.dev/534361287): Clean up unused templates in first-party code.
+    # This is currently applied globally to unblock the toolchain update.
+    # Eventually, this should be removed from default_warnings and only applied
+    # to third_party targets.
+    ":Wno-unused-template",
+  ]
+}
+
+# LINT.ThenChange(//build/bazel_sdk/bazel_rules_fuchsia/common/toolchains/clang/cc_features.bzl:default_warnings)
+
+# Code that goes into the SDK or otherwise contributes to the SDK surface area
+# in source form will be compiled in many different environments. As such, we
+# should compile it with stricter warnings in fuchsia.git.
+config("sdk_extra_warnings") {
+  cflags_cc = [
+    "-Wnon-virtual-dtor",
+    "-Wshadow",
+    "-Wctad-maybe-unsupported",
+  ]
+}
+
+# Same as `sdk_extra_warnings`, but intended to be added to the configuration of
+# test targets that exercise SDK headers, to verify that the public headers of
+# SDK libraries build under a stricter set of warnings.
+config("test_exercising_sdk_headers") {
+  configs = [ ":sdk_extra_warnings" ]
+}
+
+config("Wmissing-declarations") {
+  if (is_gcc) {
+    cflags = [ "-Wmissing-declarations" ]
+    cflags_c = [
+      "-Wmissing-prototypes",
+      "-Wmissing-variable-declarations",
+    ]
+  } else {
+    cflags = [
+      "-Wmissing-prototypes",
+      "-Wmissing-variable-declarations",
+    ]
+  }
+}
+
+config("Wno-missing-declarations") {
+  visibility = [
+    "//sdk/lib/c/*",
+    "//third_party/*",
+  ]
+
+  if (is_gcc) {
+    cflags = [ "-Wno-missing-declarations" ]
+    cflags_c = [
+      "-Wno-missing-prototypes",
+      "-Wno-missing-variable-declarations",
+    ]
+  } else {
+    cflags = [
+      "-Wno-missing-prototypes",
+      "-Wno-missing-variable-declarations",
+    ]
+  }
+}
+
+config("Wno-unused-function") {
+  cflags = [ "-Wno-unused-function" ]
+  visibility = [
+    "//zircon/third_party/ulib/musl/ldso",
+    "//zircon/third_party/ulib/musl/src/network",
+    "//zircon/third_party/ulib/musl/src/time",
+  ]
+}
+
+# TODO(https://fxbug.dev/534361287): Clean up unused templates in first-party code.
+# This config will stay permanently for third_party.
+config("Wno-unused-template") {
+  cflags = [ "-Wno-unused-template" ]
+}
+
+config("Wno-deprecated-declarations") {
+  visibility = [ "//third_party/*" ]
+  cflags = [ "-Wno-deprecated-declarations" ]
+}
+
+config("Wno-strict-prototypes") {
+  cflags = [ "-Wno-strict-prototypes" ]
+}
+
+config("Wno-undef") {
+  cflags = [ "-Wno-undef" ]
+  visibility = [ "//third_party/googletest:*" ]
+}
+
+config("Wno-character-conversion") {
+  cflags = [ "-Wno-character-conversion" ]
+  visibility = [
+    "//src/lib/android/aidl:*",
+    "//third_party/googletest:*",
+  ]
+}
+
+config("Wno-bitfield-conversion") {
+  cflags = [ "-Wno-bitfield-conversion" ]
+  visibility = [ "//src/lib/vulkan:*" ]
+}
+
+# TODO(https://fxbug.dev/42085293): Remove the use of variable length arrays.
+#
+# NOTE: Do not add this to public_configs under any circumstances. Public
+# configs are viral and will infect unsuspecting targets.
+
+config("Wno-vla-cxx-extension") {
+  if (!is_gcc) {
+    cflags_cc = [ "-Wno-vla-cxx-extension" ]
+  }
+  visibility = [
+    "//sdk/lib/c/startup:*",
+    "//sdk/lib/fdio:*",
+    "//sdk/lib/fdio/tests:*",
+    "//sdk/lib/zxio:*",
+    "//src/bringup/bin/console:*",
+    "//src/bringup/bin/console-launcher:*",
+    "//src/bringup/bin/dlog:*",
+    "//src/camera/bin/camera-gym/controller_parser:*",
+    "//src/camera/bin/factory_cli:*",
+    "//src/camera/drivers/hw_accel/task:*",
+    "//src/camera/lib/raw_formats:*",
+    "//src/connectivity/bluetooth/core/bt-host/fidl:*",
+    "//src/connectivity/bluetooth/core/bt-host/socket:*",
+    "//src/connectivity/bluetooth/hci/transport/usb:*",
+    "//src/connectivity/ethernet/drivers/ethernet/netdevice-migration:*",
+    "//src/connectivity/ethernet/drivers/gvnic:*",
+    "//src/connectivity/network/netstack/udp_serde:*",
+    "//src/connectivity/network/tests/benchmarks/udp-serde:*",
+    "//src/connectivity/network/tests/external_network:*",
+    "//src/connectivity/network/tests/socket:*",
+    "//src/connectivity/telephony/drivers/qmi-usb-transport:*",
+    "//src/connectivity/wlan/drivers/lib/log/cpp/test:*",
+    "//src/connectivity/wlan/drivers/third_party/broadcom/brcmfmac:*",
+    "//src/developer/adb/bin/adb-file-sync:*",
+    "//src/developer/debug/debug_agent/test_data:*",
+    "//src/developer/memory/metrics/tests:*",
+    "//src/devices/block/bin/gpt:*",
+    "//src/devices/block/bin/iochk:*",
+    "//src/devices/spi/bin/spiutil:*",
+    "//src/graphics/display/drivers/amlogic-display:*",
+    "//src/graphics/display/drivers/intel-i915:*",
+    "//src/graphics/lib/compute/spinel/platforms/vk/tests/spinel_vk_tests:*",
+    "//src/graphics/lib/magma/src/libmagma_virt:*",
+    "//src/media/audio/examples/effects:*",
+    "//src/media/drivers/amlogic_decoder:*",
+    "//src/performance/cpu_profiler:*",
+    "//src/performance/lib/gperftools:*",
+    "//src/performance/lib/trace_converters:*",
+    "//src/starnix/tests/syscalls/cpp:*",
+    "//src/storage/blobfs/test:*",
+    "//src/storage/fs_test:*",
+    "//src/storage/fxfs:*",
+    "//src/storage/gpt:*",
+    "//src/storage/lib/block_client/cpp:*",
+    "//src/storage/lib/fs_management/cpp:*",
+    "//src/storage/lib/vfs/cpp:*",
+    "//src/storage/lib/vfs/cpp/journal:*",
+    "//src/storage/minfs:*",
+    "//src/storage/minfs/test:*",
+    "//src/sys/bin/psutils:*",
+    "//src/ui/input/drivers/hid:*",
+    "//src/ui/input/drivers/hid-input-report:*",
+    "//src/ui/scenic/lib/flatland/renderer/tests:*",
+    "//third_party/openweave-core/src/lib/profiles:*",
+    "//tools/fidl/fidlc:*",
+    "//vendor/arm/camera/driver/fuchsia/wrappers:*",
+    "//vendor/google/starnix/android:*",
+    "//vendor/google/starnix/tests/*",
+    "//zircon/system/ulib/runtests-utils:*",
+    "//zircon/system/ulib/test-utils:*",
+    "//zircon/system/ulib/zxtest:*",
+  ]
+}
+
+config("Wno-nullability-completeness") {
+  cflags = [ "-Wno-nullability-completeness" ]
+}
+
+# TODO(https://fxbug.dev/42136089): clean up instances of this outside of third party code.
+#
+# NOTE: Do not add this to public_configs under any circumstances. Public
+# configs are viral and will infect unsuspecting targets.
+config("Wno-conversion") {
+  cflags = [ "-Wno-conversion" ]
+
+  # Don't enable extra ubsan checks that will cite issues for the same code
+  # that -Wconversion would complain about.  If the code's not warning-clean,
+  # then it's not likely to avoid implicit truncation behavior at runtime.
+  # (The casts that would prevent the warnings also prevent these checks
+  # firing, since an explicit cast counts as an explicit intended truncation.)
+  configs = [ "//src/lib/ubsan-custom:allow-implicit-integer-truncation" ]
+
+  # To trim this list:
+  # $ scripts/gn/trim_visibility.py --target="//build/config:Wno-conversion"
+  visibility = [
+    "//src/connectivity/bluetooth/hci/transport/uart/cpp:*",
+    "//src/connectivity/bluetooth/hci/vendor/broadcom:*",
+    "//src/connectivity/bluetooth/hci/vendor/intel:*",
+    "//src/connectivity/network/tools/nc/third_party/openbsd-netcat:*",
+    "//src/connectivity/openthread/drivers/ot-radio:*",
+    "//src/connectivity/openthread/tests/fake-drivers/fake-ot-radio:*",
+    "//src/connectivity/telephony/drivers/qmi-fake-transport:*",
+    "//src/connectivity/telephony/drivers/qmi-usb-transport:*",
+    "//src/connectivity/wlan/drivers/testing/lib/sim-env:*",
+    "//src/connectivity/wlan/drivers/testing/lib/sim-env/test:*",
+    "//src/connectivity/wlan/drivers/testing/lib/sim-fake-ap:*",
+    "//src/connectivity/wlan/drivers/testing/lib/sim-fake-ap/test:*",
+    "//src/connectivity/wlan/drivers/third_party/broadcom/brcmfmac:*",
+    "//src/connectivity/wlan/drivers/third_party/broadcom/brcmfmac/chipset:*",
+    "//src/connectivity/wlan/drivers/third_party/broadcom/brcmfmac/sdio:*",
+    "//src/connectivity/wlan/drivers/third_party/broadcom/brcmfmac/sdio/test:*",
+    "//src/connectivity/wlan/drivers/third_party/broadcom/brcmfmac/sim:*",
+    "//src/connectivity/wlan/drivers/third_party/broadcom/brcmfmac/sim/test:*",
+    "//src/connectivity/wlan/drivers/third_party/broadcom/brcmfmac/test:*",
+    "//src/connectivity/wlan/drivers/wlanif:*",
+    "//src/connectivity/wlan/drivers/wlansoftmac:*",
+    "//src/connectivity/wlan/lib/common/cpp:*",
+    "//src/connectivity/wlan/testing/wlantap-driver:*",
+    "//src/developer/debug/debug_agent:*",
+    "//src/developer/debug/debug_agent/integration_tests:*",
+    "//src/developer/debug/zxdb/client:*",
+    "//src/developer/debug/zxdb/console:*",
+    "//src/developer/debug/zxdb/debug_adapter:*",
+    "//src/developer/debug/zxdb/expr:*",
+    "//src/developer/debug/zxdb/symbols:*",
+    "//src/developer/ffx/lib/buildid/cpp:*",
+    "//src/developer/forensics/exceptions/tests:*",
+    "//src/developer/forensics/feedback_data/tests:*",
+    "//src/devices/block/drivers/ftl:*",
+    "//src/devices/block/drivers/ftl/tests:*",
+    "//src/devices/board/drivers/x86:*",
+    "//src/devices/cpu/drivers/aml-cpu-legacy:*",
+    "//src/devices/i2c/drivers/intel-i2c:*",
+    "//src/devices/lib/amlogic:*",
+    "//src/devices/lib/fidl-metadata/test:*",
+    "//src/devices/lib/goldfish/pipe_io:*",
+    "//src/devices/nand/drivers/intel-spi-flash:*",
+    "//src/devices/nand/drivers/ram-nand:*",
+    "//src/devices/pci/drivers/pci:*",
+    "//src/devices/pci/drivers/pci/test:*",
+    "//src/devices/pci/testing:*",
+    "//src/devices/power/drivers/fusb302:*",
+    "//src/devices/power/drivers/ti-ina231:*",
+    "//src/devices/pwm/drivers/aml-pwm:*",
+    "//src/devices/rtc/drivers/intel-rtc:*",
+    "//src/devices/spi/drivers/aml-spi:*",
+    "//src/devices/tee/drivers/optee:*",
+    "//src/devices/temperature/drivers/shtv3:*",
+    "//src/devices/testing/fake-msi:*",
+    "//src/devices/testing/goldfish/fake_pipe:*",
+    "//src/devices/tpm/drivers/cr50-spi:*",
+    "//src/devices/tpm/drivers/tpm:*",
+    "//src/diagnostics/validator/inspect/lib/cpp:*",
+    "//src/graphics/display/drivers/goldfish-display:*",
+    "//src/graphics/drivers/misc/goldfish:*",
+    "//src/graphics/drivers/misc/goldfish_address_space:*",
+    "//src/graphics/drivers/misc/goldfish_sync:*",
+    "//src/graphics/lib/compute/svg:*",
+    "//src/lib/backoff:*",
+    "//src/lib/chunked-compression:*",
+    "//src/lib/cobalt/cpp:*",
+    "//src/lib/containers/cpp:*",
+    "//src/lib/ddk:*",
+    "//src/lib/elflib:*",
+    "//src/lib/fidl/llcpp/tests:*",
+    "//src/lib/fidl/llcpp/tests/conformance:*",
+    "//src/lib/fidl/llcpp/tests/integration:*",
+    "//src/lib/fidl/llcpp/tests/wire_types:*",
+    "//src/lib/fsl/socket:*",
+    "//src/lib/fsl/vmo:*",
+    "//src/lib/icu/tools/extractor:*",
+    "//src/lib/json_parser:*",
+    "//src/lib/line_input:*",
+    "//src/lib/listnode:*",
+    "//src/lib/ui/scenic/cpp:*",
+    "//src/lib/vmo_store:*",
+    "//src/media/audio/drivers/aml-g12-tdm/test:*",
+    "//src/media/audio/drivers/codecs/tas27xx:*",
+    "//src/media/audio/drivers/codecs/tas5720:*",
+    "//src/media/audio/drivers/intel-hda/controller:*",
+    "//src/media/audio/drivers/lib/audio-utils:*",
+    "//src/media/audio/drivers/lib/intel-hda:*",
+    "//src/media/drivers/amlogic_decoder/third_party/libvpx:*",
+    "//src/media/drivers/amlogic_decoder/third_party/vp9_adapt_probs:*",
+    "//src/media/lib/codec_impl/unit_tests:*",
+    "//src/media/lib/extend_bits/unit_tests:*",
+    "//src/media/sounds/soundplayer:*",
+    "//src/performance/lib/gperftools:*",
+    "//src/performance/lib/gperftools/tests:*",
+    "//src/security/bin/tee_manager:*",
+    "//src/sys/pkg/lib/far/cpp:*",
+    "//src/ui/a11y/bin/a11y_manager/tests:*",
+    "//src/ui/a11y/lib/annotation:*",
+    "//src/ui/a11y/lib/configuration:*",
+    "//src/ui/a11y/lib/configuration/tests:*",
+    "//src/ui/a11y/lib/gesture_manager/recognizers/tests:*",
+    "//src/ui/a11y/lib/magnifier/tests:*",
+    "//src/ui/a11y/lib/screen_reader/focus/tests/mocks:*",
+    "//src/ui/a11y/lib/screen_reader/i18n/tests:*",
+    "//src/ui/a11y/lib/screen_reader/tests:*",
+    "//src/ui/a11y/lib/semantics:*",
+    "//src/ui/a11y/lib/semantics/tests:*",
+    "//src/ui/a11y/lib/semantics/tests/mocks:*",
+    "//src/ui/a11y/lib/semantics/util/tests:*",
+    "//src/ui/a11y/lib/util:*",
+    "//src/ui/backlight/drivers/ti-lp8556:*",
+    "//src/ui/examples/escher/common:*",
+    "//src/ui/input/drivers/goodix-gt92xx:*",
+    "//src/ui/input/drivers/pc-ps2:*",
+    "//src/ui/input/lib/hid:*",
+    "//src/ui/input/lib/hid-input-report:*",
+    "//src/ui/lib/escher/test:*",
+    "//src/ui/lib/escher/test/common:*",
+    "//src/ui/lib/yuv:*",
+    "//src/ui/scenic/bin:*",
+    "//src/virtualization/third_party/fdt:*",
+    "//third_party/crashpad/src/*",
+    "//third_party/glfw/*",
+    "//third_party/iperf/*",
+    "//third_party/libc-tests/*",
+    "//third_party/mesa-migrating/*",
+    "//third_party/micro-ecc/*",
+    "//third_party/ogg/*",
+    "//third_party/opus/*",
+    "//third_party/rust_crates/compat/brotli:*",
+    "//third_party/tpm2-tss/*",
+    "//third_party/zstd:*",
+    "//vendor/*",
+    "//zircon/system/ulib/image-format:*",
+    "//zircon/system/ulib/tftp:*",
+    "//zircon/third_party/dev/ethernet/e1000:*",
+    "//zircon/third_party/lib/jitterentropy",
+    "//zircon/third_party/uapp/fsck-msdosfs:*",
+    "//zircon/third_party/uapp/mkfs-msdosfs:*",
+    "//zircon/third_party/ulib/cksum:*",
+    "//zircon/third_party/ulib/musl/*",
+    "//zircon/tools/lz4:*",
+  ]
+}
+
+config("Wno-extra-semi") {
+  cflags = [ "-Wno-extra-semi" ]
+}
+
+config("Wno-implicit-fallthrough") {
+  cflags = [ "-Wno-implicit-fallthrough" ]
+  visibility = [
+    "//src/lib/fxl:third_party",
+    "//third_party/lz4",
+    "//third_party/rust_crates/compat/brotli",
+    "//zircon/third_party/dev/ethernet/e1000:e1000_third_party",
+    "//zircon/third_party/ulib/boringssl",
+    "//zircon/tools/lz4",
+  ]
+}
+
+# Config to suppress Wno-unused-but-set-parameter warning in the third party
+# code that doesn't comply with.
+config("Wno-unused-but-set-parameter") {
+  cflags = [ "-Wno-unused-but-set-parameter" ]
+  visibility = [
+    "//third_party/*",
+    "//vendor/*",
+  ]
+}
+
+# Config to suppress Wunused-but-set-variable warning in the third party code
+# that doesn't comply with.
+config("Wno-unused-but-set-variable") {
+  cflags = [ "-Wno-unused-but-set-variable" ]
+  visibility = [
+    "//src/connectivity/network/tools/nc/third_party/openbsd-netcat/*",
+    "//src/connectivity/wlan/drivers/third_party/*",
+    "//src/devices/power/drivers/fusb302/*",
+    "//src/devices/usb/drivers/xhci/*",
+    "//src/media/audio/drivers/usb-audio/*",
+    "//third_party/*",
+    "//vendor/*",
+  ]
+}
+
+# Config to suppress Wunused-but-set-global warning in the third party code
+# that doesn't comply with.
+config("Wno-unused-but-set-global") {
+  cflags = [ "-Wno-unused-but-set-global" ]
+  visibility = [ "//vendor/*" ]
+}
+
+# Config to suppress Wbitwise-instead-of-logical warning in the third party code
+# that doesn't comply with.
+config("Wno-bitwise-instead-of-logical") {
+  cflags = [ "-Wno-bitwise-instead-of-logical" ]
+  visibility = [ "//third_party/zstd:*" ]
+}
+
+config("Wno-defaulted-function-deleted") {
+  cflags = [ "-Wno-defaulted-function-deleted" ]
+  visibility = [ "//src/lib/vulkan/*" ]
+}
+
+config("Wno-missing-prototypes") {
+  visibility = [
+    "//third_party/lz4",
+    "//third_party/tpm2-tss:tss2-mu",
+  ]
+
+  cflags_c = [ "-Wno-missing-prototypes" ]
+}
+
+config("Wno-deprecated-anon-enum-enum-conversion") {
+  cflags = [ "-Wno-deprecated-anon-enum-enum-conversion" ]
+  visibility = [
+    "//src/android/api/*",  # Used in code generated by the aidl compiler.
+    "//src/microfuchsia/tee/*",  # Used in code generated by the aidl compiler.
+    "//vendor/*",
+  ]
+}
+
+config("Wno-newline-eof") {
+  cflags = [ "-Wno-newline-eof" ]
+  visibility = [ "//third_party/github.com/google/cppdap/*" ]
+}
+
+config("symbol_visibility_hidden") {
+  # Disable libc++ visibility annotations to make sure that the compiler option
+  # has effect on symbols defined in libc++ headers. Note that we don't want to
+  # disable these annotations altogether to ensure that our toolchain is usable
+  # outside of our build since not every user uses hidden visibility by default.
+  defines = [ "_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS" ]
+  cflags = [ "-fvisibility=hidden" ]
+  asmflags = cflags
+  if (zircon_toolchain != false) {
+    cflags_cc = [ "-fvisibility-inlines-hidden" ]
+  }
+}
+
+compiler_config("symbol_no_undefined") {
+  linker_flags = [ "--no-undefined" ]
+}
+
+config("shared_library_config") {
+  if (current_os == "fuchsia") {
+    configs = [ "//build/config/fuchsia:shared_library_config" ]
+  } else if (current_os == "linux") {
+    cflags = [ "-fPIC" ]
+  }
+}
+
+config("executable_config") {
+  configs = []
+
+  if (current_os == "fuchsia") {
+    configs += [ "//build/config/fuchsia:executable_config" ]
+  }
+}
+
+config("default_libs") {
+  configs = []
+}
+
+compiler_config("werror") {
+  if (!use_ccache) {
+    cflags = [
+      "-Werror",
+      # Do not add -Wno-error= options to this config.
+    ]
+
+    asmflags = [ "-Wa,--fatal-warnings" ]
+    cflags += asmflags
+
+    if (is_pecoff) {
+      linker_flags = [ "/WX" ]
+    }
+
+    # New versions of C++ often include new deprecations, so treat them as
+    # warnings by default.
+    if (experimental_cxx_version != false) {
+      cflags += [ "-Wno-error=deprecated-declarations" ]
+    }
+  }
+
+  if (deny_warnings) {
+    rustflags = [ "-Dwarnings" ]
+  } else if (rust_rbe_exec_strategy == "local") {
+    # The local exec strategy tries to see if there's an RBE cache hit before
+    # running the command locally. The RBE cache is often populated by infra
+    # builders which never have this flag, so we want to include it *only* when
+    # checking for a cache hit. This flag doesn't affect the output of the
+    # artifact, so it's safe to reuse it.
+    rustflags = [ "--remote-only=-Dwarnings" ]
+  }
+}
+
+config("no-template-backtrace-limit") {
+  cflags_cc = [ "-ftemplate-backtrace-limit=0" ]
+}
+
+config("no-stack-protector") {
+  cflags = [ "-fno-stack-protector" ]
+}
+
+variant("no-safe-stack") {
+  if (!is_gcc) {
+    cflags = [ "-fno-sanitize=safe-stack" ]
+  }
+}
+
+config("no-shadow-call-stack") {
+  if ((current_cpu == "arm64" || current_cpu == "riscv64") && !is_gcc) {
+    cflags = [ "-fno-sanitize=shadow-call-stack" ]
+  }
+}
+
+variant("no-compiler-abi") {
+  configs = [
+    ":no-safe-stack",
+    ":no-shadow-call-stack",
+    ":no-stack-protector",
+  ]
+
+  if (!is_gcc) {
+    ldflags = [
+      # Make sure libc++ is not linked in.  Header-only use is OK.
+      "-nostdlib++",
+    ]
+  }
+}
+
+config("no_profile") {
+  # The difference between this config and removing //build/config/profile is
+  # the dynamic linker setting which is necessary for it to use at runtime with
+  # the libraries it was linked against.
+  cflags = [
+    "-fno-profile-instr-generate",
+    "-fno-coverage-mapping",
+  ]
+}
+
+compiler_config("icf") {
+  # This changes C/C++ semantics and might be incompatible with third-party
+  # code that relies on function pointers comparison.
+  if (is_pecoff) {
+    linker_flags = [ "/opt:icf=all" ]
+  } else if (linker == "gold" || linker == "lld") {
+    linker_flags = [ "--icf=all" ]
+  }
+}
+
+# "_ALL_SOURCE" is used by some system headers to expose more features (say in
+# fcntl.h) beyond those strictly defined in standard.
+config("all_source") {
+  defines = [ "_ALL_SOURCE" ]
+}
+
+config("auto_var_init") {
+  if (!is_gcc) {
+    # Automatically initialize variables with a pattern.
+    cflags = [ "-ftrivial-auto-var-init=pattern" ]
+  }
+}
+
+config("thread_safety_annotations") {
+  if (!is_gcc) {
+    cflags = [
+      "-Wthread-safety",
+
+      # TODO(https://fxbug.dev/42085252): Clang is catching instances of these in the kernel and drivers.
+      # Temporarily disable them for now to facilitate the roll then come back
+      # and fix them.
+      "-Wno-unknown-warning-option",
+      "-Wno-thread-safety-reference-return",
+    ]
+    defines = [ "_LIBCPP_ENABLE_THREAD_SAFETY_ANNOTATIONS=1" ]
+  }
+}
+
+# Generally, we don't want to opt out of thread safety annotations, but
+# occasionally, we get false positives, and need to work around them when
+# updating the toolchain.
+config("Wno-thread-safety-analysis") {
+  visibility = [ "//src/connectivity/wlan/drivers/lib/timer:*" ]
+  if (!is_gcc) {
+    cflags = [ "-Wno-thread-safety-analysis" ]
+  }
+}
+
+config("zero-call-used-regs") {
+  # TODO(fxrev.dev/710262): Enable on arm64 when there's performance data.
+  if (current_cpu == "x64") {
+    cflags = [ "-fzero-call-used-regs=used-gpr" ]
+    defines = [ "ZERO_CALL_USED_REGS" ]
+  }
+}
+
+# libc++ removed a number of transitive includes between version 14 and 15
+# but those were later re-added and conditionally gated on a new define in
+# https://reviews.llvm.org/D128661. In Fuchsia, we have already done the
+# cleanup so we can remove these transitive includes unconditionally to
+# avoid regressions.
+#
+# Note: This is going to become the default in future libc++ versions.
+config("libcpp_remove_transitive_includes") {
+  defines = [ "_LIBCPP_REMOVE_TRANSITIVE_INCLUDES" ]
+}
+
+# Infinite loops are undefined behavior in C++ and thus can be optimized away
+# by the compiler. This config inhibits that optimization.
+config("no-finite-loops") {
+  cflags = [ "-fno-finite-loops" ]
+}
+
+if (current_toolchain == default_toolchain) {
+  import("//build/toolchain/default_concurrent_jobs.gni")
+
+  # Tools that must be executed locally.
+  pool("local") {
+    depth = default_concurrent_jobs.local
+  }
+
+  # For actions that consume exceptionally large amounts of memory.
+  # The largest LTO link actions may fall into this category.
+  # See https://fxbug.dev/42062387 for context.
+  pool("highmem") {
+    depth = default_concurrent_jobs.highmem
+  }
+}
+
+tlsdesc = {
+  if (current_cpu == "arm64") {
+    enable_dialect = "desc"
+    disable_dialect = "trad"
+    have_tlsdesc = 1
+
+    # On arm64 TLSDESC is opt-in or opt-out via -mtls-dialect=... under GCC, but
+    # is always enabled for Clang.
+    can_enable = is_gcc
+    can_disable = is_gcc
+    compiler_default = !is_gcc
+  } else if (current_cpu == "riscv64") {
+    enable_dialect = "desc"
+    disable_dialect = "trad"
+    have_tlsdesc = 1
+
+    can_enable = true
+    can_disable = true
+    compiler_default = true
+  } else if (current_cpu == "x64") {
+    enable_dialect = "gnu2"
+    disable_dialect = "gnu"
+    have_tlsdesc = 1
+
+    can_enable = true
+    can_disable = true
+    compiler_default = !is_gcc
+  } else if (current_cpu == "arm") {
+    enable_dialect = "gnu2"
+    disable_dialect = "gnu"
+    have_tlsdesc = 1
+
+    # On arm64 TLSDESC is opt-in or opt-out via -mtls-dialect=... under GCC, but
+    # is always enabled for Clang.
+    can_enable = is_gcc
+    can_disable = is_gcc
+    compiler_default = true
+  }
+}
+
+config("default-tls-dialect") {
+  if (is_fuchsia && !tlsdesc.compiler_default) {
+    assert(tlsdesc.can_enable)
+    cflags = [ "-mtls-dialect=${tlsdesc.enable_dialect}" ]
+    ldflags = cflags
+  }
+}
+
+config("tlsdesc") {
+  have_tlsdesc = tlsdesc.have_tlsdesc
+  if (tlsdesc.can_enable) {
+    cflags = [ "-mtls-dialect=${tlsdesc.enable_dialect}" ]
+    ldflags = cflags
+    have_tlsdesc = 1
+  }
+  defines = [
+    "WANT_TLSDESC=1",
+    "HAVE_TLSDESC=$have_tlsdesc",
+  ]
+}
+
+config("no-tlsdesc") {
+  have_tlsdesc = tlsdesc.have_tlsdesc
+  if (tlsdesc.can_disable) {
+    cflags = [ "-mtls-dialect=${tlsdesc.disable_dialect}" ]
+    ldflags = cflags
+    have_tlsdesc = 0
+  }
+  defines = [
+    "WANT_TLSDESC=0",
+    "HAVE_TLSDESC=$have_tlsdesc",
+  ]
+}
+
+# TODO(https://fxbug.dev/376323001): Disable "-Wnontrivial-memaccess" until
+# all instances are fixed.
+config("Wno-nontrivial-memaccess") {
+  visibility = [
+    "//src/lib/android:*",
+    "//third_party/openweave-core/src/include:*",
+  ]
+  if (!is_gcc) {
+    cflags = [ "-Wno-nontrivial-memaccess" ]
+  }
+}
+
+# TODO(https://fxbug.dev/415133536): Disable "-Wunterminated-string-initialization"
+# until all instances are fixed.
+config("Wno-unterminated-string-initialization") {
+  visibility = [
+    "//third_party/acpica-migrating/*",
+    "//third_party/acpica/*",
+    "//third_party/mesa-migrating/*",
+    "//third_party/openssh-portable/*",
+    "//tools/vboot_reference/*",
+    "//vendor/third_party/oemcrypto/*",
+  ]
+  cflags_c = [ "-Wno-unterminated-string-initialization" ]
+}
+
+config("Wno-deprecated-this-capture") {
+  visibility = [
+    ":*",
+    "//third_party/*",
+  ]
+  cflags_cc = [ "-Wno-deprecated-this-capture" ]
+}
+
+config("Wno-unused-result") {
+  visibility = [ "//third_party/*" ]
+  cflags = [ "-Wno-unused-result" ]
+}
+
+config("Wsystem-headers") {
+  cflags = [ "-Wsystem-headers" ]
+}
+
+# Adding this config directly to a linking target ensures that any deps on
+# ifs_shared_library() `.as-needed` targets don't bring link stubs into the
+# link.  This should be used for a relocatable link, along with a metadata
+# collection across ifs_shared_library_ldscript as an input linker script.
+config("ifs-as-needed") {
+  lib_dirs = [ ifs_shared_library_as_needed_dir ]
+}
+
+group("test_executable_deps") {
+  deps = []
+
+  # Symbolizer markup is currently only supported on Linux hosts.
+  #
+  # TODO(https://fxbug.dev/319148300): Determine if we can make this just
+  # `is_linux`. The other uses we have for non-host Linux toolchains are
+  # probably places where markup makes sense, but that can be for later
+  # consideration.
+  if (is_host && is_linux) {
+    deps += [ "//build/config/sanitizers:sanitizers_use_symbolizer_markup" ]
+  }
+}
+
+config("crel") {
+  # TODO(drewry) arm doesn't like this so far.
+  if (is_elf && !is_gcc && current_cpu != "arm") {
+    cflags = [ "-Wa,--crel,--allow-experimental-crel" ]
+    asmflags = cflags
+  }
+}
+
+# This should be used by executables that avoid the normal libc dependencies.
+# These must also omit toolchain-provided instrumentation runtimes that will
+# themselves depend on libc.
+config("standalone") {
+  configs = [ "//build/config/zircon:nolibc" ]
+
+  ldflags = []
+  if (is_gcc) {
+    ldflags += [ "-nostdlib" ]
+  } else {
+    # The sanitizer runtimes need libc ABIs that aren't provided here.
+    ldflags += [ "-fno-sanitize-link-runtime" ]
+
+    # The standard profiling runtime can't be used in standalone contexts.  The
+    # instrumentation works fine to collect data, and //src/lib/llvm-profdata
+    # can be used to wire up a custom runtime if possible in context.
+    ldflags += [ "-noprofilelib" ]
+
+    # Make sure the unwinder isn't implicitly brought in for any reason.
+    ldflags += [ "-unwindlib=none" ]
+  }
+}
+
+# Enable LLD's balanced partitioning for ordering function sections.
+compiler_config("bp-compression-sort") {
+  linker_flags = [ "--bp-compression-sort=function" ]
+}
+
+# Set __GNUC__ and related predefines as GCC does.  This doesn't control what
+# features Clang actually supports, just the predefines.  Clang doesn't support
+# quite all the same features and so its default value is quite low (4.2.1).
+# But it does support many, many features of newer GCC versions.  Also, Clang
+# does not set the predefine at all under -fms-compatibility (UEFI).
+config("gnuc_version") {
+  if (!is_gcc) {
+    gnuc_version = "16.1"
+    if (is_linux) {
+      # glibc headers expect GCC >= 7 means _Float32 et al are available.
+      gnuc_version = "6"
+    }
+    cflags = [ "-fgnuc-version=$gnuc_version" ]
+  }
+}

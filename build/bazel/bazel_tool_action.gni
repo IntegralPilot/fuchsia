@@ -1,0 +1,164 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_root_targets_list.gni")
+import("//build/config/clang/clang_prefix.gni")
+import("//build/host.gni")
+
+# This file introduces two related templates that act like action and
+# action_foreach but instead of running a script, it will build a Bazel host
+# tool binary, and run that (either once or over the list of inputs,
+# depending on the variant).
+#
+# Parameters
+#
+# * tool_label
+#   - Required: Bazel label of the tool to run. This must correspond to
+#     one of the entries defined in bazel_default_root_targets or
+#     bazel_root_targets.
+#   - Type: label
+#
+# * outputs
+#   - Required:  Like the outputs of action() (if using compiled_action(),
+#     this would be just the list of outputs), or action_foreach() (if using
+#     compiled_action_foreach(), this would contain source expansions mapping
+#     input to output files).
+#   - Type: list(path)
+#
+# * args, inputs sources, depfile, deps, public_deps, testonly, visibility
+#   - See action() / action_foreach().
+#
+# Example usage:
+#
+#   bazel_tool_action("run_my_tool") {
+#     tool = "//tools/something:mytool"
+#     outputs = [
+#       "$target_gen_dir/mysource.cc",
+#       "$target_gen_dir/mysource.h",
+#     ]
+#
+#     # The tool takes this input.
+#     sources = [ "my_input_file.idl" ]
+#
+#     # In this case, the tool takes as arguments the input file and the output
+#     # build dir (both relative to the "cd" that the script will be run in)
+#     # and will produce the output files listed above.
+#     args = [
+#       rebase_path("my_input_file.idl", root_build_dir),
+#       "--output-dir", rebase_path(target_gen_dir, root_build_dir),
+#     ]
+#   }
+#
+# You must declare your tool as a root host bazel target.
+# See //build/bazel/bazel_root_targets_list.gni for full details.
+#
+template("_bazel_tool_action_target") {
+  assert(defined(invoker.outputs), "outputs must be defined for $target_name")
+  assert(defined(invoker.args), "args must be defined for $target_name")
+
+  # Verify the tool_label value by finding the corresponding entry
+  # in bazel_root_host_targets.
+  _tool_root_target = {
+  }
+  _found = false
+  foreach(_root_target, resolved_bazel_root_targets) {
+    if (invoker.tool_label == _root_target.bazel_label) {
+      _tool_root_target = _root_target
+      _found = true
+    }
+  }
+  assert(
+      _found,
+      "The Bazel label ${invoker.tool_label} does not name one of the root Bazel host targets. See //build/bazel/bazel_root_targets.gni")
+
+  _tool_deps = [ _tool_root_target.host_bin_label ]
+  _tool_executable = "${host_out_dir}/${_tool_root_target.ninja_name}"
+
+  if (host_tools_base_path_override != "") {
+    # Use a prebuilt version of the host tool. Assume the tool is already
+    # built so do not add any dependency to the target.
+    _tool_subdir = rebase_path(host_out_dir, root_build_dir)
+    _tool_executable_rebased =
+        "${host_tools_base_path_override}/${_tool_subdir}/" +
+        get_path_info(_tool_executable, "file")
+    _tool_executable =
+        "//" + rebase_path(_tool_executable_rebased, "//", root_build_dir)
+    _tool_deps = []
+  } else {
+    _tool_executable_rebased = rebase_path(_tool_executable, root_build_dir)
+  }
+
+  # Locate the host tool.
+
+  target(invoker._target_type, target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "assert_no_deps",
+                             "data_deps",
+                             "depfile",
+                             "deps",
+                             "hermetic_action_ignored_prefixes",
+                             "hermetic_deps",
+                             "hermetic_inputs_file",
+                             "hermetic_inputs_target",
+                             "inputs",
+                             "metadata",
+                             "mnemonic",
+                             "check_for_output_dir_leaks",
+                             "outputs",
+                             "public_deps",
+                             "repeatable",
+                             "sources",
+                             "testonly",
+                             "visibility",
+                           ])
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += _tool_deps
+
+    if (!defined(inputs)) {
+      inputs = []
+    }
+
+    script = "//build/gn_run_binary.sh"
+
+    inputs += [ _tool_executable ]
+
+    # The script takes as arguments Clang bin directory (for passing
+    # llvm-symbolizer to runtimes), the binary to run, and then the
+    # arguments to pass it.
+    args = [
+             rebased_clang_prefix,
+             _tool_executable_rebased,
+           ] + invoker.args
+  }
+}
+
+# See _bazel_tool_action_target().
+template("bazel_tool_action") {
+  _bazel_tool_action_target(target_name) {
+    _target_type = "action"
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    forward_variables_from(invoker, "*", [ "visibility" ])
+  }
+}
+
+# See _bazel_tool_action_target().
+template("bazel_tool_action_foreach") {
+  _bazel_tool_action_target(target_name) {
+    _target_type = "action_foreach"
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    forward_variables_from(invoker, "*", [ "visibility" ])
+  }
+}

@@ -1,0 +1,368 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "src/graphics/drivers/misc/goldfish/pipe_connection.h"
+
+#include <fidl/fuchsia.hardware.goldfish/cpp/wire.h>
+#include <lib/driver/logging/cpp/logger.h>
+#include <lib/fzl/owned-vmo-mapper.h>
+#include <lib/trace/event.h>
+#include <lib/zx/bti.h>
+#include <zircon/status.h>
+
+#include <fbl/auto_lock.h>
+
+#include "src/devices/lib/goldfish/pipe_headers/include/base.h"
+#include "src/graphics/drivers/misc/goldfish/pipe_device.h"
+
+namespace goldfish {
+namespace {
+
+static const char* kTag = "GoldfishPipe";
+
+constexpr size_t DEFAULT_BUFFER_SIZE = 8192;
+
+constexpr zx_signals_t SIGNALS = fuchsia_hardware_goldfish::wire::kSignalReadable |
+                                 fuchsia_hardware_goldfish::wire::kSignalWritable;
+
+}  // namespace
+
+PipeConnection::PipeConnection(PipeDevice* pipe, async_dispatcher_t* dispatcher, OnBindFn on_bind,
+                               OnCloseFn on_close)
+    : on_bind_(std::move(on_bind)),
+      on_close_(std::move(on_close)),
+      dispatcher_(dispatcher),
+      pipe_(pipe) {}
+
+PipeConnection::~PipeConnection() {
+  fbl::AutoLock lock(&lock_);
+  if (id_) {
+    if (cmd_buffer_.vmo().is_valid()) {
+      auto buffer = static_cast<PipeCmdBuffer*>(cmd_buffer_.start());
+      buffer->id = id_;
+      buffer->cmd = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kClose);
+      buffer->status = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kInval);
+
+      pipe_->Exec(id_);
+      ZX_DEBUG_ASSERT(!buffer->status);
+    }
+    pipe_->Destroy(id_);
+  }
+
+  if (binding_ref_) {
+    binding_ref_->Unbind();
+  }
+}
+
+void PipeConnection::Init() {
+  fbl::AutoLock lock(&lock_);
+
+  zx_status_t status = pipe_->GetBti(&bti_);
+  if (status != ZX_OK) {
+    FailAsync(status);
+    fdf::error("[{}] Pipe::Pipe() GetBti failed: {}", kTag, zx_status_get_string(status));
+    return;
+  }
+
+  status = SetBufferSizeLocked(DEFAULT_BUFFER_SIZE);
+  if (status != ZX_OK) {
+    FailAsync(status);
+    fdf::error("[{}] Pipe::Pipe() failed to set initial buffer size: {}", kTag,
+               zx_status_get_string(status));
+    return;
+  }
+
+  zx::event event;
+  status = zx::event::create(0, &event);
+  if (status != ZX_OK) {
+    FailAsync(status);
+    fdf::error("[{}] Pipe::Pipe() failed to create event: {}", kTag, zx_status_get_string(status));
+    return;
+  }
+  status = event.signal(0, SIGNALS);
+  ZX_ASSERT(status == ZX_OK);
+
+  zx::vmo vmo;
+  status = pipe_->Create(&id_, &vmo);
+  if (status != ZX_OK) {
+    FailAsync(status);
+    fdf::error("[{}] Pipe::Pipe() failed to create pipe: {}", kTag, zx_status_get_string(status));
+    return;
+  }
+
+  status = pipe_->SetEvent(id_, std::move(event));
+  if (status != ZX_OK) {
+    fdf::error("[{}] Pipe::Pipe() failed to set event: {}", kTag, zx_status_get_string(status));
+    return;
+  }
+
+  status =
+      cmd_buffer_.Map(std::move(vmo), /*offset=*/0, /*size=*/0, ZX_VM_PERM_READ | ZX_VM_PERM_WRITE);
+  if (status != ZX_OK) {
+    FailAsync(status);
+    fdf::error("Failed to map the command buffer VMO: {}", zx_status_get_string(status));
+    return;
+  }
+
+  auto buffer = static_cast<PipeCmdBuffer*>(cmd_buffer_.start());
+  buffer->id = id_;
+  buffer->cmd = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kOpen);
+  buffer->status = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kInval);
+
+  pipe_->Open(id_);
+  if (buffer->status) {
+    FailAsync(ZX_ERR_INTERNAL);
+    fdf::error("[{}] Pipe::Pipe() failed to open pipe", kTag);
+    return;
+  }
+}
+
+void PipeConnection::Bind(fidl::ServerEnd<fuchsia_hardware_goldfish::Pipe> server_request) {
+  using PipeProtocol = fuchsia_hardware_goldfish::Pipe;
+  using PipeServer = fidl::WireServer<PipeProtocol>;
+  auto on_unbound = [this](PipeServer*, fidl::UnbindInfo info, fidl::ServerEnd<PipeProtocol>) {
+    if (info.is_peer_closed() || info.is_user_initiated()) {
+      fdf::debug("Pipe closed: {}", info.FormatDescription());
+    } else {
+      fdf::error("Pipe error: {}", info.FormatDescription());
+    }
+    if (on_close_) {
+      on_close_(this);
+    }
+  };
+
+  auto binding =
+      fidl::BindServer(dispatcher_, std::move(server_request), this, std::move(on_unbound));
+  binding_ref_ =
+      std::make_unique<fidl::ServerBindingRef<fuchsia_hardware_goldfish::Pipe>>(std::move(binding));
+}
+
+void PipeConnection::SetBufferSize(SetBufferSizeRequestView request,
+                                   SetBufferSizeCompleter::Sync& completer) {
+  TRACE_DURATION("gfx", "Pipe::SetBufferSize", "size", request->size);
+
+  fbl::AutoLock lock(&lock_);
+
+  zx_status_t status = SetBufferSizeLocked(request->size);
+  if (status != ZX_OK) {
+    fdf::error("[{}] Pipe::SetBufferSize() failed to create buffer: {}", kTag, request->size);
+  }
+
+  if (status != ZX_OK && status != ZX_ERR_NO_MEMORY) {
+    completer.Close(status);
+  } else {
+    completer.Reply(status);
+  }
+}
+
+void PipeConnection::SetEvent(SetEventRequestView request, SetEventCompleter::Sync& completer) {
+  TRACE_DURATION("gfx", "Pipe::SetEvent");
+
+  if (!request->event.is_valid()) {
+    fdf::error("[{}] Pipe::SetEvent() invalid event", kTag);
+    completer.Close(ZX_ERR_INVALID_ARGS);
+    return;
+  }
+
+  fbl::AutoLock lock(&lock_);
+
+  zx_status_t status = pipe_->SetEvent(id_, std::move(request->event));
+  if (status != ZX_OK) {
+    fdf::error("[{}] SetEvent failed: {}", kTag, zx_status_get_string(status));
+    completer.Close(ZX_ERR_INTERNAL);
+    return;
+  }
+}
+
+void PipeConnection::GetBuffer(GetBufferCompleter::Sync& completer) {
+  TRACE_DURATION("gfx", "Pipe::GetBuffer");
+
+  fbl::AutoLock lock(&lock_);
+
+  zx::vmo vmo;
+  zx_status_t status = buffer_.vmo.duplicate(ZX_RIGHT_SAME_RIGHTS, &vmo);
+  if (status != ZX_OK) {
+    fdf::error("[{}] Pipe::GetBuffer() zx_vmo_duplicate failed: {}", kTag,
+               zx_status_get_string(status));
+    completer.Close(status);
+  } else {
+    completer.Reply(ZX_OK, std::move(vmo));
+  }
+}
+
+void PipeConnection::Read(ReadRequestView request, ReadCompleter::Sync& completer) {
+  TRACE_DURATION("gfx", "Pipe::Read", "count", request->count);
+
+  fbl::AutoLock lock(&lock_);
+
+  if ((request->offset + request->count) > buffer_.size ||
+      (request->offset + request->count) < request->offset) {
+    completer.Close(ZX_ERR_INVALID_ARGS);
+    return;
+  }
+
+  size_t actual;
+  zx_status_t status =
+      TransferLocked(static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kRead),
+                     static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWakeOnRead),
+                     fuchsia_hardware_goldfish::wire::kSignalReadable,
+                     buffer_.phys + request->offset, request->count, 0, 0, &actual);
+  completer.Reply(status, actual);
+}
+
+void PipeConnection::Write(WriteRequestView request, WriteCompleter::Sync& completer) {
+  TRACE_DURATION("gfx", "Pipe::Write", "count", request->count);
+
+  fbl::AutoLock lock(&lock_);
+
+  if ((request->offset + request->count) > buffer_.size ||
+      (request->offset + request->count) < request->offset) {
+    completer.Close(ZX_ERR_INVALID_ARGS);
+    return;
+  }
+
+  size_t actual;
+  zx_status_t status = TransferLocked(
+      static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWrite),
+      static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWakeOnWrite),
+      fuchsia_hardware_goldfish::wire::kSignalWritable, buffer_.phys + request->offset,
+      request->count, 0, 0, &actual);
+  completer.Reply(status, actual);
+}
+
+void PipeConnection::DoCall(DoCallRequestView request, DoCallCompleter::Sync& completer) {
+  TRACE_DURATION("gfx", "Pipe::DoCall", "count", request->count, "read_count", request->read_count);
+
+  fbl::AutoLock lock(&lock_);
+
+  if ((request->offset + request->count) > buffer_.size ||
+      (request->offset + request->count) < request->offset) {
+    completer.Close(ZX_ERR_INVALID_ARGS);
+    return;
+  }
+  if ((request->read_offset + request->read_count) > buffer_.size ||
+      (request->read_offset + request->read_count) < request->read_offset) {
+    completer.Close(ZX_ERR_INVALID_ARGS);
+    return;
+  }
+
+  int32_t cmd = 0, wake_cmd = 0;
+  uint32_t wake_signal = 0u;
+  zx_paddr_t read_paddr = 0u, write_paddr = 0u;
+  // Set write command, signal and offset.
+  if (request->count) {
+    cmd = request->read_count
+              ? static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kCall)
+              : static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWrite);
+    wake_cmd = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWakeOnWrite);
+    wake_signal = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWakeOnWrite);
+    write_paddr = buffer_.phys + request->offset;
+  }
+  // Set read command, signal and offset.
+  if (request->read_count) {
+    cmd = request->count ? static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kCall)
+                         : static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kRead);
+    wake_cmd = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWakeOnRead);
+    wake_signal = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeCmdCode::kWakeOnRead);
+    read_paddr = buffer_.phys + request->read_offset;
+  }
+
+  size_t actual = 0u;
+  zx_status_t status = TransferLocked(cmd, wake_cmd, wake_signal, write_paddr, request->count,
+                                      read_paddr, request->read_count, &actual);
+
+  completer.Reply(status, actual);
+}
+
+// This function can be trusted to complete fairly quickly. It will cause a
+// VM exit but that should never block for a significant amount of time.
+zx_status_t PipeConnection::TransferLocked(int32_t cmd, int32_t wake_cmd, zx_signals_t state_clr,
+                                           zx_paddr_t paddr, size_t count, zx_paddr_t read_paddr,
+                                           size_t read_count, size_t* actual) {
+  TRACE_DURATION("gfx", "Pipe::Transfer", "count", count, "read_count", read_count);
+
+  auto buffer = static_cast<PipeCmdBuffer*>(cmd_buffer_.start());
+  buffer->id = id_;
+  buffer->cmd = cmd;
+  buffer->status = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kInval);
+  buffer->rw_params.ptrs[0] = paddr;
+  buffer->rw_params.sizes[0] = static_cast<uint32_t>(count);
+  buffer->rw_params.ptrs[1] = read_paddr;
+  buffer->rw_params.sizes[1] = static_cast<uint32_t>(read_count);
+  buffer->rw_params.buffers_count = read_paddr ? 2 : 1;
+  buffer->rw_params.consumed_size = 0;
+  buffer->rw_params.read_index = 1;  // Read buffer is always second.
+  pipe_->Exec(id_);
+
+  // Positive consumed size always indicate a successful transfer.
+  if (buffer->rw_params.consumed_size) {
+    *actual = buffer->rw_params.consumed_size;
+    return ZX_OK;
+  }
+
+  *actual = 0;
+  // Early out if error is not because of back-pressure.
+  if (buffer->status != static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kAgain)) {
+    fdf::error("[{}] Pipe::Transfer() transfer failed: {}", kTag, buffer->status);
+    return ZX_ERR_INTERNAL;
+  }
+
+  buffer->id = id_;
+  buffer->cmd = wake_cmd;
+  buffer->status = static_cast<int32_t>(fuchsia_hardware_goldfish_pipe::PipeError::kInval);
+  pipe_->Exec(id_);
+  if (buffer->status) {
+    fdf::error("[{}] Pipe::Transfer() failed to request interrupt: {}", kTag, buffer->status);
+    return ZX_ERR_INTERNAL;
+  }
+
+  return ZX_ERR_SHOULD_WAIT;
+}
+
+zx_status_t PipeConnection::SetBufferSizeLocked(size_t size) {
+  zx::vmo vmo;
+  zx_status_t status = zx::vmo::create_contiguous(bti_, size, 0, &vmo);
+  if (status != ZX_OK) {
+    fdf::error("[{}] Pipe::CreateBuffer() zx_vmo_create_contiguous failed {} size: {}", kTag,
+               status, size);
+    return status;
+  }
+
+  zx_paddr_t phys;
+  zx::pmt pmt;
+  // We leave pinned continuously, since buffer is expected to be used frequently.
+  status = bti_.pin(ZX_BTI_PERM_READ | ZX_BTI_CONTIGUOUS, vmo, 0, size, &phys, 1, &pmt);
+  if (status != ZX_OK) {
+    fdf::error("[{}] Pipe::CreateBuffer() zx_bti_pin failed {} size: {}", kTag, status, size);
+    return status;
+  }
+
+  buffer_ = Buffer{.vmo = std::move(vmo), .pmt = std::move(pmt), .size = size, .phys = phys};
+  return ZX_OK;
+}
+
+void PipeConnection::FailAsync(zx_status_t epitaph) {
+  if (binding_ref_) {
+    binding_ref_->Close(epitaph);
+  }
+}
+
+PipeConnection::Buffer& PipeConnection::Buffer::operator=(PipeConnection::Buffer&& other) noexcept {
+  if (pmt.is_valid()) {
+    pmt.unpin();
+  }
+  vmo = std::move(other.vmo);
+  pmt = std::move(other.pmt);
+  phys = other.phys;
+  size = other.size;
+  return *this;
+}
+
+PipeConnection::Buffer::~Buffer() {
+  if (pmt.is_valid()) {
+    pmt.unpin();
+  }
+}
+
+}  // namespace goldfish

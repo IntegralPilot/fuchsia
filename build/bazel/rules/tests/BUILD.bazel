@@ -1,0 +1,219 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+"""Tests of platform Bazel rules, macros, and (temporarily) migrated targets.
+
+This file will always contain tests for rules and macros.
+
+During the migration, it also contains migrated targets that are not yet
+otherwise part of the build.
+
+There are three top-level targets:
+* "host_tests": A `test_suite()` that includes all Bazel tests within the
+  `rules/` directory to be run in the host configuration. Run with `bazel test`
+  using the host configuration.
+* "quick_tests": A build-only target that provides significant coverage of the
+  rules and macros defined within the `rules/` directory while completing
+  reasonably quickly. Run with `bazel build` using the `fuchsia_platform`
+  configuration.
+* "tests": A build-only target that includes "quick_tests", additional
+  build-only tests of the rules and macros that take longer to run, and specific
+  production targets relevant to the rules and macros (or, during the migration,
+  that are not yet otherwise part of the build). Run with `bazel build` using
+  the `fuchsia_platform` configuration.
+
+Add a new target by adding it as a dependency to the appropriate target(s) as follows:
+* A Bazel test to be run in the host configuration: Add to "host_tests".
+* A direct build-only test of a rule or macro defined in `rules/` that
+  builds reasonably quickly:
+    - If it supports Fuchsia, add it to "quick_build_only_tests".
+    - If it supports the host platform, add it to "quick_targets_to_build_in_host_configuration".
+* Otherwise, especially if it is a build-only target that is not yet otherwise
+  part of the build and/or takes a long time to build:
+    - If it supports Fuchsia, add it to "long_build_only_tests".
+    - If it supports the host platform, add it to "long_targets_to_build_in_host_configuration".
+"""
+
+load("@platforms//host:constraints.bzl", "HOST_CONSTRAINTS")
+load("//build/bazel/platforms:constraints.bzl", "HOST_OS_CONSTRAINTS")
+load("//build/bazel/rules:stamp_group.bzl", "stamp_group")
+load(":rules.bzl", "build_for_host")
+
+package(default_applicable_licenses = ["//:license"])
+
+# Runs all tests and writes a stamp file.
+stamp_group(
+    name = "tests",
+    testonly = True,
+    stamp = "tests.bazel_stamp",
+    # This target is only intended to be built in Fuchsia configurations.
+    # Individual test groups can use a transition to build targets in host
+    # configurations if needed.
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [
+        # Include all the quick tests.
+        ":quick_tests",
+
+        # Additional long tests.
+        ":long_build_only_tests",
+    ],
+)
+
+# Runs all tests that can be run fairly quickly and writes a stamp file.
+# It covers the rules and macros but not most of the targets that use them.
+# Specifically, it does not build all FIDL atoms or the full IDKs.
+stamp_group(
+    name = "quick_tests",
+    testonly = True,
+    stamp = "quick_tests.bazel_stamp",
+    # This target is only intended to be built in Fuchsia configurations.
+    # Individual test groups can use a transition to build targets in host
+    # configurations if needed.
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [
+        ":quick_build_only_tests",
+    ],
+)
+
+# Builds targets for which building successfully is the test.
+filegroup(
+    name = "quick_build_only_tests",
+    testonly = True,
+    srcs = [
+        ":quick_build_only_tests_in_host_configuration",
+        "//build/bazel/bazel_idk/tests:analysis_tests",
+        "//build/bazel/bazel_idk/tests:api_level_and_cpu_combinations_build_only_tests",
+        "//build/bazel/bazel_idk/tests:build_only_tests",
+        # Not yet built elsewhere.
+        "//sdk/lib/zxio",
+        # Tests `fx_cc_library_headers()`.
+        "//zircon/system/ulib/zircon-internal",
+        # Tests `fx_package()`.
+        "//src/security/bin/root_ssl_certificates",
+        # Tests `fx_component()`.
+        "//src/developer/build_info:build-info-component",
+        # Tests `fx_package()` with a C++ binary.
+        "//src/developer/build_info:build-info-service",
+        # Build libraries that support next-generation FIDL bindings for Rust.
+        # TODO(https://fxbug.dev/454452299): Replace these build-only tests with:
+        # * A `test_suite()` containing all the test targets in the package once the tests build.
+        # * A "..._rust_next" bindings target or (better) an executable that
+        #   uses the bindings once they are implemented.
+        "//src/lib/fidl/rust_next:build_only_tests",
+    ],
+    # This target is only intended to be built in Fuchsia configurations.
+    # Individual test groups can use a transition to build targets in host
+    # configurations if needed.
+    target_compatible_with = ["@platforms//os:fuchsia"],
+)
+
+filegroup(
+    name = "quick_targets_to_build_in_host_configuration",
+    testonly = True,
+    srcs = [
+        "//build/bazel/bazel_idk/tests:targets_to_build_in_host_configurations",
+        "//build/bazel/toolchains/tests:build",
+
+        # Aspect tests
+        "//build/bazel/aspects/tests",
+    ],
+    target_compatible_with = HOST_OS_CONSTRAINTS,
+)
+
+# Builds targets for which building successfully is the test using the host configuration.
+build_for_host(
+    name = "quick_build_only_tests_in_host_configuration",
+    testonly = True,
+    stamp = "quick_build_only_tests_in_host_configuration.stamp",
+    # This target transitions to the host config ("exec") to build the test targets.
+    # To build the targets directly for the host platform, build the dependency
+    # directly.
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [":quick_targets_to_build_in_host_configuration"],
+)
+
+filegroup(
+    name = "long_targets_to_build_in_host_configuration",
+    testonly = True,
+    srcs = [
+        # Host tools not in the IDK
+        "//tools/cargo-gnaw:cargo-gnaw-bin",
+        "//tools/fidl/fidlgen_rust",
+
+        # Miscellaneous libraries.
+        "//sdk/lib/stdcompat",
+        "//sdk/lib/utf-utils",
+        "//src/zircon/lib/zircon",
+        "//zircon/system/ulib/zx",
+
+        # To guard against build regression before ffx main binary target is fully migrated.
+        "//src/developer/ffx/frontends/ffx",
+
+        # Build libraries that support next-generation FIDL bindings for Rust.
+        # TODO(https://fxbug.dev/454452299): Replace these build-only tests with:
+        # * A `test_suite()` containing all the test targets in the package once the tests build.
+        # * A "..._rust_next" bindings target or (better) an executable that
+        #   uses the bindings once they are implemented.
+        "//src/lib/fidl/rust_next:build_only_tests",
+    ],
+    target_compatible_with = HOST_OS_CONSTRAINTS,
+)
+
+# Builds targets for which building successfully is the test using the host configuration.
+build_for_host(
+    name = "long_build_only_tests_in_host_configuration",
+    testonly = True,
+    stamp = "long_build_only_tests_in_host_configuration.stamp",
+    # This target transitions to the host config ("exec") to build the test targets.
+    # To build the targets directly for the host platform, build the dependency
+    # directly.
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [":long_targets_to_build_in_host_configuration"],
+)
+
+# Builds targets for which building successfully is the test.
+filegroup(
+    name = "long_build_only_tests",
+    testonly = True,
+    srcs = [
+        ":long_build_only_tests_in_host_configuration",
+        # Build the IDKs to exercise all the atoms migrated so far.
+        "//sdk:fuchsia_idk_molecule_idk",
+        "//sdk:in_tree_idk_molecule_idk",
+
+        # Some libraries represented by atoms are not built with the IDK atom
+        # targets, so build them here for each combination of API level and CPU
+        # architecture.
+        # Note: The GN build does not explicitly build these targets like this.
+        # Note: Header-only libraries are not compiled.
+        "//sdk:all_underlying_libraries_not_built_with_atoms_in_all_api_level_and_cpu_combinations",
+
+        # Compile, generate the atom, and run compatibility tests for all FIDL
+        # libraries in all categories.
+        "//sdk/fidl:compatibility_tests",
+    ],
+    # This target is only intended to be built in Fuchsia configurations.
+    # Individual test groups can use a transition to build targets in host
+    # configurations if needed.
+    target_compatible_with = ["@platforms//os:fuchsia"],
+)
+
+# A `test_suite()` containing all Bazel tests for rules and macros to be run in
+# the host configuration only.
+#
+# Unlike the other targets in this file, this `test_suite()` and the Bazel tests
+# it includes must be run with `bazel test` rather than `bazel build`, which is
+# currently used by GN to build the other targets. The tests are currently
+# included in the GN tree, via `//build/tools:host_tests`.
+# TODO(https://fxbug.dev/500485175): Enable building and running all rules tests
+# with one command, and remove the deps from `//build/tools:host_tests`.
+test_suite(
+    name = "host_tests",
+    target_compatible_with = HOST_CONSTRAINTS,
+    tests = [
+        "//build/bazel/rules/build_flags/tests:host_tests",
+        "//build/bazel/rules/host_tests/tests:host_tests",
+    ],
+    visibility = ["//build/tools:__pkg__"],
+)

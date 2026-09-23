@@ -1,0 +1,191 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/fidl/fidl.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/testing/perf/test.gni")
+import("//src/starnix/kernel/starnix.gni")
+
+rustc_library("framework") {
+  testonly = true
+  edition = "2024"
+  name = "storage_verity_benchmarks_lib"
+  sources = [ "src/lib.rs" ]
+  deps = [
+    "//src/performance/lib/fuchsiaperf",
+    "//src/starnix/lib/linux_uapi",
+    "//third_party/rust_crates:libc",
+    "//third_party/rust_crates:serde_json",
+  ]
+}
+
+rustc_binary("verity-storage-benchmarks") {
+  edition = "2024"
+  testonly = true
+  name = "storage_verity_benchmarks"
+  sources = [ "src/main.rs" ]
+  deps = [
+    ":framework",
+    ":fuchsia.fxfs.test_rust",
+    "//sdk/fidl/fuchsia.component:fuchsia.component_rust",
+    "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+    "//sdk/lib/device-watcher/rust",
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-component",
+    "//src/lib/fuchsia-fs",
+    "//src/performance/lib/fuchsiaperf",
+    "//third_party/rust_crates:serde_json",
+  ]
+}
+
+fidl("fuchsia.fxfs.test") {
+  testonly = true
+  public_deps = [
+    "//sdk/fidl/fuchsia.io",
+    "//zircon/vdso/zx",
+  ]
+  sources = [ "src/test.fxfs.test.fidl" ]
+}
+
+rustc_binary("test_fxfs_bin") {
+  testonly = true
+  edition = "2024"
+  source_root = "src/test_fxfs.rs"
+  sources = [ source_root ]
+  deps = [
+    ":fuchsia.fxfs.test_rust",
+    ":verity-benchmarks-test-fxfs-config",
+    "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-component",
+    "//src/lib/fuchsia-fs",
+    "//src/storage/benchmarks:framework",
+    "//src/storage/benchmarks/fuchsia:framework",
+    "//src/storage/lib/vfs/rust:vfs",
+    "//third_party/rust_crates:futures",
+  ]
+}
+
+fuchsia_component_manifest("verity-benchmarks-test-fxfs-component-manifest") {
+  component_name = "test_fxfs"
+  manifest = "meta/test_fxfs.cml"
+}
+
+fuchsia_structured_config_rust_lib("verity-benchmarks-test-fxfs-config") {
+  name = "verity_benchmarks_test_fxfs_config"
+  cm_label = ":verity-benchmarks-test-fxfs-component-manifest"
+}
+
+fuchsia_component("test_fxfs") {
+  testonly = true
+  cm_label = ":verity-benchmarks-test-fxfs-component-manifest"
+  deps = [ ":test_fxfs_bin" ]
+}
+
+fuchsia_test_component("fuchsia-verity-benchmarks-component") {
+  component_name = "storage-verity-benchmarks"
+  manifest = "meta/verity-benchmarks.cml"
+  deps = [ ":verity-storage-benchmarks" ]
+  test_type = "storage"
+}
+
+fuchsia_test_package("verity-benchmarks") {
+  test_components = [ ":fuchsia-verity-benchmarks-component" ]
+  deps = [
+    ":read_verified_file",
+    ":setup_verity",
+    ":test_fxfs",
+    "//src/starnix/containers/debian:container_resources",
+    "//src/storage/crypt/fxfs",
+    "//src/storage/fvm:fvm-component",
+    "//src/storage/fxfs:fxfs_component",
+  ]
+  subpackages = [
+    "//src/starnix/kernel:starnix_kernel_package",
+    "//src/starnix/containers/debian:debian_package",
+  ]
+
+  # Prevent this test from being run as a target-side test, because it
+  # is run by a host-side wrapper.
+  test_specs = {
+    build_only = true
+
+    package_resolution_timeout_secs = 660
+  }
+}
+
+if (is_linux) {
+  rustc_binary("setup_verity_bin") {
+    testonly = true
+    edition = "2024"
+    source_root = "src/setup_verity.rs"
+    sources = [ source_root ]
+    deps = [ ":framework" ]
+    exclude_toolchain_tags = [ "instrumented" ]
+  }
+
+  rustc_binary("read_verified_file_bin") {
+    testonly = true
+    edition = "2024"
+    source_root = "src/read_verified_file.rs"
+    sources = [ source_root ]
+    deps = [ ":framework" ]
+    exclude_toolchain_tags = [ "instrumented" ]
+  }
+}
+
+_setup_verity_label = ":setup_verity_bin($target_linux_toolchain)"
+_verity_outdir = get_label_info(_setup_verity_label, "root_out_dir")
+resource("setup_verity_resource") {
+  testonly = true
+  sources = [ "${_verity_outdir}/setup_verity_bin" ]
+  deps = [ _setup_verity_label ]
+  outputs = [ "data/tests/{{source_file_part}}" ]
+}
+
+fuchsia_component("setup_verity") {
+  testonly = true
+  manifest = "meta/setup_verity.cml"
+  deps = [ ":setup_verity_resource" ]
+}
+
+_read_verified_file_label = ":read_verified_file_bin($target_linux_toolchain)"
+_read_verity_outdir = get_label_info(_read_verified_file_label, "root_out_dir")
+resource("read_verified_file_resource") {
+  testonly = true
+  sources = [ "${_read_verity_outdir}/read_verified_file_bin" ]
+  deps = [ _read_verified_file_label ]
+  outputs = [ "data/tests/{{source_file_part}}" ]
+}
+
+fuchsia_component("read_verified_file") {
+  testonly = true
+  manifest = "meta/read_verified_file.cml"
+  deps = [ ":read_verified_file_resource" ]
+}
+
+fuchsia_component_perf_test("verity-benchmarks-perf") {
+  package = ":verity-benchmarks"
+  component_name = "storage-verity-benchmarks"
+  test_type = "storage"
+  expected_metric_names_filepath =
+      "//src/tests/end_to_end/perf/expected_metric_names/fuchsia.verity.txt"
+
+  # We don't enable this test on Astro because of the potential for it to cause
+  # extra flash wear on that device type.
+  environments = performance_testing_environments - [ astro_env ]
+}
+
+group("benchmarks") {
+  testonly = true
+  deps = [ ":verity-benchmarks-perf" ]
+}
+
+group("benchmark-packages") {
+  testonly = true
+  deps = [ ":verity-benchmarks" ]
+}

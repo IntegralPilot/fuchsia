@@ -1,0 +1,357 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.bluetooth.bredr;
+
+using fuchsia.bluetooth;
+using fuchsia.media;
+using zx;
+
+alias ChannelMode = fuchsia.bluetooth.ChannelMode;
+alias ChannelParameters = fuchsia.bluetooth.ChannelParameters;
+
+/// The RFCOMM channel ID used when requesting to open a channel.
+/// This is known as a ServerChannel in RFCOMM. It must be within the
+/// range [1,30] (inclusive). See RFCOMM 5.4.
+alias RfcommChannel = uint8;
+
+/// The parameters associated with a connection over the RFCOMM protocol.
+type RfcommParameters = table {
+    /// Required. RFCOMM channel for the connection.
+    1: channel RfcommChannel;
+};
+
+/// The parameters associated with a connection over the L2CAP protocol.
+type L2capParameters = table {
+    /// Required. L2CAP PSM for the connection. See the defined PSMs in `service.fidl`.
+    1: psm uint16;
+
+    /// Optional. L2CAP channel parameters.
+    2: parameters ChannelParameters;
+};
+
+/// The channel and relevant parameters for a connection.
+@strict_audit(bug="https://fxbug.dev/467127725", state="PENDING_REVIEW")
+type ConnectParameters = strict union {
+    /// An L2CAP connection.
+    1: l2cap L2capParameters;
+
+    /// An RFCOMM connection.
+    2: rfcomm RfcommParameters;
+};
+
+/// A channel opened to a peer.
+type Channel = resource table {
+    /// Deprecated.
+    /// Socket interface for sending/receiving SDUs on the channel.
+    /// The channel will be closed if both this socket and the Connection are closed.
+    /// Always present.
+    1: socket zx.Handle:SOCKET;
+    /// Channel mode accepted by the peer.
+    /// Always present.
+    2: channel_mode ChannelMode;
+    /// Maximum SDU size the peer is capable of accepting.
+    /// Always present.
+    3: max_tx_sdu_size uint16;
+    /// Audio Direction priority extension. See `AudioDirectionExt`.
+    /// Present only if supported.
+    4: ext_direction client_end:AudioDirectionExt;
+    // Duration after which packets are dropped from the controller.
+    // Present only if a flush timeout was successfully configured.
+    5: flush_timeout zx.Duration;
+    /// L2CAP parameter extension. See `L2capParametersExt`.
+    /// Always present for L2CAP Channels, never present for other Channels.
+    6: ext_l2cap client_end:L2capParametersExt;
+    /// Audio offload extension. See `AudioOffloadExt`.
+    /// Present only if supported.
+    7: ext_audio_offload client_end:AudioOffloadExt;
+    /// Protocol for sending/receiving SDUs on the channel.
+    /// If present, closing this and `socket` will close the channel.
+    8: connection client_end:fuchsia.bluetooth.Channel;
+};
+
+/// A2DP packet priority used in `AudioDirectionExt`. `NORMAL` should be used whenever audio is not
+/// streaming, and `SOURCE`/`SINK` should match the direction audio is being streamed.
+@strict_audit(bug="https://fxbug.dev/467127725", state="PENDING_REVIEW")
+type A2dpDirectionPriority = strict enum {
+    NORMAL = 1;
+    SOURCE = 2;
+    SINK = 3;
+};
+
+/// Audio Priority Direction extension. Used to put the channel in a mode where A2DP packets are
+/// prioritized over other packets in the source or sink direction.
+open protocol AudioDirectionExt {
+    flexible SetPriority(struct {
+        priority A2dpDirectionPriority;
+    }) -> () error fuchsia.bluetooth.ErrorCode;
+};
+
+/// L2CAP Parameters Extension. Used to configure L2CAP channel parameters on an open channel.
+open protocol L2capParametersExt {
+    /// Request a L2CAP channel parameter update. `request` indicates the
+    /// desired parameters, and `new` indicates the new parameters
+    /// (which may differ from the requested parameters if they are
+    /// rejected/modified).
+    /// Currently only the following parameters can be changed:
+    /// - flush_timeout
+    flexible RequestParameters(struct {
+        request ChannelParameters;
+    }) -> (struct {
+        new ChannelParameters;
+    });
+};
+
+type AudioSbcSupport = table {};
+type AudioAacSupport = table {};
+
+/// Audio offload features used in `AudioOffloadExt`.
+type AudioOffloadFeatures = flexible union {
+    1: sbc AudioSbcSupport;
+    2: aac AudioAacSupport;
+};
+
+type AudioSamplingFrequency = flexible enum : uint8 {
+    HZ_44100 = 1;
+    HZ_48000 = 2;
+    HZ_88200 = 3;
+    HZ_96000 = 4;
+};
+
+type AudioBitsPerSample = flexible enum : uint8 {
+    BPS_16 = 1;
+    BPS_24 = 2;
+    BPS_32 = 3;
+};
+
+type AudioChannelMode = flexible enum : uint8 {
+    MONO = 0;
+    STEREO = 1;
+};
+
+type AudioEncoderSettings = flexible union {
+    1: sbc fuchsia.media.SbcEncoderSettings;
+    2: aac fuchsia.media.AacEncoderSettings;
+};
+
+type AudioOffloadConfiguration = table {
+    1: codec AudioOffloadFeatures;
+    2: max_latency uint16;
+    3: scms_t_enable bool;
+    4: sampling_frequency AudioSamplingFrequency;
+    5: bits_per_sample AudioBitsPerSample;
+    6: channel_mode AudioChannelMode;
+    7: encoded_bit_rate uint32;
+    8: encoder_settings AudioEncoderSettings;
+};
+
+/// Protocol representing the controller actively encoding offloaded audio to or from this channel.
+/// Closing the protocol will stop the encoding, which can also be done using the Stop() if
+/// synchronization is required. If the controller fails to start audio offloading, an epitaph will
+/// be sent when this is closed.
+///
+/// This channel will be closed with a `ZX_ERR_NOT_SUPPORTED` epitaph if the audio offload
+/// configuration for the controller is not supported.
+///
+/// This channel will be closed with a `ZX_ERR_UNAVAILABLE` epitaph if the controller sends an
+/// error.
+///
+/// This channel will be closed with a `ZX_ERR_ALREADY_BOUND` epitaph if audio offloading starting
+/// or stopping is already in progress/complete on another channel.
+///
+/// This channel will be closed with a `ZX_ERR_INTERNAL` epitaph if commands are issued when audio
+/// offloading is not started.
+open protocol AudioOffloadController {
+    /// Sent from the server when the audio offloading is started successfully.
+    /// Only sent once per protocol.
+    flexible -> OnStarted();
+
+    /// Request the audio offloading be stopped.
+    /// This call will be responded to before the protocol is closed on the server side.
+    flexible Stop() -> ();
+};
+
+/// Audio Offload Extension. Used to retrieve offloading capability and supported features.
+open protocol AudioOffloadExt {
+    /// Returns the vendor features supported on this chipset
+    flexible GetSupportedFeatures() -> (table {
+        1: audio_offload_features vector<AudioOffloadFeatures>:MAX;
+    });
+
+    /// Begin the audio encoding hardware offloading process
+    flexible StartAudioOffload(resource struct {
+        configuration AudioOffloadConfiguration;
+        controller server_end:AudioOffloadController;
+    });
+};
+
+/// Represents a service which is registered by this profile. Closing this protocol will remove the
+/// service registration.
+@available(deprecated=27)
+open protocol ConnectionReceiver {
+    /// Called when a peer connects to this service.  The channel connected is delivered
+    /// with parameters in `channel`.
+    /// `protocol` will contain a protocol list up to the point connected (for example, if
+    /// L2CAP is connected, it will contain the L2CAP protocol and specify the PSM connected)
+    flexible Connected(resource struct {
+        peer_id fuchsia.bluetooth.PeerId;
+        channel Channel;
+        protocol ProtocolDescriptorList;
+    });
+
+    /// An event produced by a FIDL server to signal that the registered service should be revoked
+    /// and removed from the Service Discovery Protocol database.
+    /// It is expected that this protocol will be subsequently closed after issuing this event.
+    flexible -> OnRevoke();
+};
+
+/// Represents a service which is registered by this profile. Closing this protocol will remove the
+/// service registration.
+@available(added=27)
+open protocol ConnectionReceiver2 {
+    /// Called when a peer connects to this service.  The channel connected is delivered
+    /// with parameters in `channel`.
+    /// `protocol` will contain a protocol list up to the point connected (for example, if
+    /// L2CAP is connected, it will contain the L2CAP protocol and specify the PSM connected)
+    flexible Connected(resource table {
+        1: peer_id fuchsia.bluetooth.PeerId;
+        2: channel Channel;
+        3: protocol ProtocolDescriptorList;
+    }) -> ();
+
+    /// Signals that the registered service should be revoked and removed from
+    /// the Service Discovery Protocol database. When the protocol is closed, the service
+    /// has been removed.
+    flexible -> OnRevoke();
+};
+
+/// Maximum number of attributes returned or allowed in a search request.
+const MAX_ATTRIBUTES uint16 = 512;
+
+/// Represents an active search which can produce results when peers are connected.  Closing this
+/// protocol will result in the associated search not being performed on new connected peers.
+open protocol SearchResults {
+    /// Called when a search this client added finds a matching service on a peer.
+    /// `peer_id` is the peer the service was found on.
+    /// `protocol` includes the ProtocolDescriptorList in the service record if it exists
+    /// (it is also included in `attributes`.)
+    /// `attributes` contains all attributes requested from the search that are present on the
+    /// peer record.  It may also include additional attributes.
+    /// Each ServiceFound call should be acknowledged by replying.
+    /// A limited amount of unacknowledged results will be sent on the channel. Results may be
+    /// dropped if results are received while too many results are unacknowledged.
+    flexible ServiceFound(struct {
+        peer_id fuchsia.bluetooth.PeerId;
+        protocol ProtocolDescriptorList:optional;
+        attributes vector<Attribute>:MAX_ATTRIBUTES;
+    }) -> ();
+};
+
+/// Maximum service records that can be advertised at once.
+const MAX_SERVICES_PER_ADVERTISEMENT uint8 = 32;
+
+/// Service provides Bluetooth BR/EDR profiles a way to register a service definition, making a
+/// profile discoverable by peers. Registered services can receive L2CAP connections made to the
+/// advertised records, and can open new connections on peers.
+@discoverable
+open protocol Profile {
+    /// Register a set of services.
+    ///
+    /// These services will be discoverable via Service Discovery Protocol server.
+    /// All services advertising the same channel must be added at once - if services are already
+    /// registered on any channel advertised, registration will fail, the receiver will be closed
+    /// with ZX_ERR_ALREADY_BOUND and an error will be returned.
+    /// The ConnectionReceiver will get calls for connections to the channels included in the
+    /// `protocol_descriptor` or `alternative_protocol_descriptors` in the services advertised.
+    /// The receiver will be closed if there are any errors advertising.
+    ///
+    /// The `ConnectionReceiver::OnRevoke` event can be used to synchronize revoking the
+    /// advertisement, if necessary. Closing the `ConnectionReceiver` protocol will also stop
+    /// advertising these services.
+    ///
+    /// If the advertisement cannot be made for any reason, an error of `INVALID_ARGUMENTS`
+    /// will be returned and the receiver will be closed with a suitable epitaph.
+    /// Returns the set of services that are registered via the Service Discovery Protocol
+    /// server. The returned services may differ from the input `services` if any L2CAP protocol
+    /// descriptors request `PSM_DYNAMIC`. In this case, the `Profile` server shall assign a valid
+    /// PSM and include this value in the returned services.
+    flexible Advertise(resource table {
+        /// The set of definitions describing the services that will be registered.
+        /// Required.
+        1: services vector<ServiceDefinition>:MAX_SERVICES_PER_ADVERTISEMENT;
+        /// Receives connections made to the advertised services.
+        /// Either `receiver` or `connection_receiver` is required.
+        @available(deprecated=27)
+        2: receiver client_end:ConnectionReceiver;
+        /// The default parameters used to configure L2CAP connections on the `receiver`.
+        /// Optional. See `ChannelParameters` for defaults.
+        3: parameters ChannelParameters;
+        /// Receives connections made to the advertised services.
+        /// Either `receiver` or `connection_receiver` is required.
+        @available(added=27)
+        4: connection_receiver client_end:ConnectionReceiver2;
+    }) -> (table {
+        /// Set of service definitions as registered by the SDP server, updated with definitions
+        /// for requested dyanmic PSM & RFCOMM assignments.
+        1: services vector<ServiceDefinition>:MAX_SERVICES_PER_ADVERTISEMENT;
+    }) error fuchsia.bluetooth.ErrorCode;
+
+    /// Register a search for services on newly connected peers. The SearchResults protocol will be
+    /// used to report results for this search.
+    /// Only one of `service_uuid` or `full_uuid` must be present. Any service result with a service
+    /// matching the specified UUID will be returned with the additional attributes in `attr_ids`.
+    /// If both `service_uuid` and `full_uuid` are present, then `ZX_ERR_INVALID_ARGS` will be
+    /// returned.
+    /// If `attr_ids` is empty or omitted, all attributes will be requested. The additional
+    /// attribute BLUETOOTH_PROTOCOL_DESCRIPTOR_LIST is always requested. See the Bluetooth
+    /// Spec v5.2, Vol 3, Part B, Section 5) and relevant profile specification documents.
+    flexible Search(resource table {
+        /// Required - only one of `service_uuid` or `full_uuid` should be present.
+        1: service_uuid ServiceClassProfileIdentifier;
+        /// Optional.
+        2: attr_ids vector<uint16>:MAX_ATTRIBUTES;
+        /// Required.
+        3: results client_end:SearchResults;
+        /// Required - only one of `full_uuid` or `service_uuid` should be present.
+        @available(added=24)
+        4: full_uuid fuchsia.bluetooth.Uuid;
+    });
+
+    /// Connect an L2CAP or RFCOMM channel to the connected peer identified by `peer_id` using the
+    /// desired `connection` parameters listed. Dynamic PSMs can be specified in `connection`.
+    ///
+    /// Returns the channel connected once established, or an error code if the channel could not
+    /// be connected.
+    flexible Connect(struct {
+        peer_id fuchsia.bluetooth.PeerId;
+        connection ConnectParameters;
+    }) -> (resource struct {
+        channel Channel;
+    }) error fuchsia.bluetooth.ErrorCode;
+
+    /// Attempt to establish a synchronous connection to `peer_id` configured
+    /// using `params`.
+    ///
+    /// If `initiator` is true, a connection request will be sent. Only 1
+    /// parameter may be specified.
+    ///
+    /// If `initiator` is false, the host will attempt to accept the next
+    /// connection request using the parameters given in order. The parameters
+    /// will be tried in order until either a connection is successful, all
+    /// parameters have been rejected (`ScoErrorCode.PARAMETERS_REJECTED`), or
+    /// the procedure is canceled.
+    ///
+    /// The result of the connection attempt and the parameters used for the
+    /// connection will be returned with `connection`.  Dropping `connection` will
+    /// cancel the request.
+    flexible ConnectSco(resource table {
+        /// Required.
+        1: peer_id fuchsia.bluetooth.PeerId;
+        /// Required.
+        2: initiator bool;
+        /// Required.
+        3: params vector<ScoConnectionParameters>:MAX;
+        /// Required.
+        4: connection server_end:ScoConnection;
+    });
+};

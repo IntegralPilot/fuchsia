@@ -1,0 +1,123 @@
+# Stack Size Estimator Documentation
+
+## Overview
+
+The `stack_estimator.py` tool estimates the maximum stack usage of a program by analyzing its call graph and the stack frame size of individual functions.
+
+## Usage
+
+The script accepts two positional arguments: the path to the configuration JSON, and the path to the call graph JSON.
+
+```bash
+python3 scripts/stack_size_estimator/stack_estimator.py config.json callgraph.json
+```
+
+## Configuration
+
+The `stack_estimator.py` expects a configuration JSON file. The schema of `config.json` is as follows:
+
+```json
+{
+  "entry_functions": ["main", "task_entry"],
+  "llvm_symbolizer_path": "/path/to/llvm-symbolizer",
+  "elf_file": "/path/to/binary.elf"
+}
+```
+
+*   `entry_functions`: (Optional) A list of entry point function names to analyze. Defaults to `["main"]` if not specified.
+*   `llvm_symbolizer_path`: (Optional) Path to the `llvm-symbolizer` binary.
+*   `elf_file`: (Optional) Path to the corresponding ELF binary. Required alongside `llvm_symbolizer_path` to resolve source locations.
+
+## Output
+
+The standard output will be a JSON object containing the global graph nodes, detected recursive cycles, and a summary for each defined entry function:
+
+```json
+{
+  // entry_functions is the main output of the analysis which provides the stack usage
+  // data for each entry point provided by the config.json entry_functions list.
+  "entry_functions": [
+    {
+      "entry_function": "main",
+      "scc_id": 0,
+      "max_stack_usage": 1024,
+      "has_cycles": false
+    }
+  ],
+  "nodes": {
+    "12345": {
+      "name": "main",
+      "stack": 64,
+      "max_cumulative_stack": 1024,
+      "sccId": 0,
+      "direct": [12350, 12400],
+      "indirect": [],
+      "source": "main.c:10"
+    }
+  },
+  "cycles": [
+    {
+      "id": 1,
+      "max_stack": 128,
+      "nodes": [12350, 12360]
+    }
+  ]
+}
+```
+
+## Architecture & Core Concepts
+
+*   **Call Graph (CG)**: A directed graph where nodes represent functions and edges represent function calls (direct or indirect).
+*   **Stack Usage**: The amount of stack memory (in bytes) reserved by a function's stack frame.
+*   **Strongly Connected Component (SCC)**: A subgraph where every vertex is reachable from every other vertex. In a call graph, SCCs represent recursive cycles.
+*   **Condensation Graph**: A Directed Acyclic Graph (DAG) derived by contracting each SCC into a single node.
+
+The tool operates in three main phases:
+
+1.  **Input Parsing & Graph Construction**: Reads JSON input containing call graph info and stack sizes to build an in-memory graph.
+2.  **Analysis**: Calculates the maximum cumulative stack usage starting from configured entry points.
+3.  **Reporting**: Outputs the results as a structured JSON object to stdout.
+
+### 1. Input Parsing
+*   **Input Format**: Expects a configuration JSON and a call graph JSON output from `llvm-readelf --call-graph-info --stack-sizes --elf-output-style=JSON`.
+*   **Graph Construction**:
+    *   Nodes are created for each function address.
+    *   Edges are added for direct calls and resolved indirect calls (using type ID mappings).
+    *   Stack sizes are associated with each node from the `llvm-readelf` data.
+
+### 2. Analysis
+
+The estimator calculates stack usage by handling recursion conservatively via Strongly Connected Components.
+
+1.  **SCC Identification**: Uses Tarjan's algorithm to identify all Strongly Connected Components (SCCs) in the call graph.
+2.  **Condensation Graph**: Builds a DAG where each node is an SCC.
+3.  **Local Max**: For each SCC, calculates the sum of stack usages of all functions within it (conservative maximum, except if SCC has cycles i.e. recurses, then the worst-case usage can't be bounded).
+4.  **Path Calculation**: Performs a bottom-up traversal (reverse topological sort) of the Condensation DAG.
+    *   `MaxStack(SCC) = LocalStack(SCC) + Max(MaxStack(SuccessorSCCs))`
+5.  **Result**: The path logic dictates the max stack usage reachable from the entry point's SCC.
+
+### 3. Reporting
+
+*   **JSON Output**: Generates a structured JSON object containing a consolidated map of all analyzed nodes, a list of identified cycles, and summarized stack metrics for each configured entry function. This output is printed to `stdout`.
+
+## Data Structures
+
+### Internal Graph
+The `Graph` class (in `graph.py`) uses an adjacency list representation:
+```python
+class Graph:
+    vertices: Set[Address]
+    graph: Dict[Address, List[Address]]
+```
+
+### Output Structure
+The JSON output contains the following three main sections that provide the results of the analysis:
+
+1.  **`entry_functions`**: An array containing max stack usage metrics and cycle detection flags for each entry point defined in `config.json`. This is the primary result of the tool to consult for a program's overall stack usage.
+2.  **`cycles`**: An array of objects detailing any detected strongly connected components (recursive cycles) reachable in the parsed call graph.
+3.  **`nodes`**: A dictionary containing structural call graph info directly (direct and indirect calls) along with the calculated max cumulative stack metric per function in the graph. It also includes the original file and line number sources when the `llvm-symbolizer` is used.
+
+## Key Algorithms
+
+*   **Tarjan's Algorithm**: For finding SCCs in $O(V+E)$.
+*   **Topological Sort**: For processing the Condensation DAG in dependency order.

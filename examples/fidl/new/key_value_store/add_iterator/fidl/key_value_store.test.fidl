@@ -1,0 +1,85 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library examples.keyvaluestore.additerator;
+
+/// An item in the store. The key must match the regex `^[A-z][A-z0-9_\.\/]{2,62}[A-z0-9]$`. That
+/// is, it must start with a letter, end with a letter or number, contain only letters, numbers,
+/// periods, and slashes, and be between 4 and 64 characters long.
+type Item = struct {
+    key string:128;
+    value vector<byte>:64000;
+};
+
+/// An enumeration of things that may go wrong when trying to write a value to our store.
+type WriteError = flexible enum {
+    UNKNOWN = 0;
+    INVALID_KEY = 1;
+    INVALID_VALUE = 2;
+    ALREADY_EXISTS = 3;
+};
+
+// [START diff_1]
+/// An enumeration of things that may go wrong when trying to create an iterator.
+type IterateConnectionError = flexible enum {
+    /// The starting key was not found.
+    UNKNOWN_START_AT = 1;
+};
+// [END diff_1]
+
+/// A key-value store which supports insertion and iteration.
+@discoverable
+open protocol Store {
+    /// Writes an item to the store.
+    flexible WriteItem(struct {
+        attempt Item;
+    }) -> () error WriteError;
+
+    // [START diff_2]
+    /// Iterates over the items in the store, using lexicographic ordering over the keys.
+    ///
+    /// The [`iterator`] is [pipelined][pipelining] to the server, such that the client can
+    /// immediately send requests over the new connection.
+    ///
+    /// [pipelining]: https://fuchsia.dev/fuchsia-src/development/api/fidl?hl=en#request-pipelining
+    flexible Iterate(resource struct {
+        /// If present, requests to start the iteration at this item.
+        starting_at string:<128, optional>;
+
+        /// The [`Iterator`] server endpoint. The client creates both ends of the channel and
+        /// retains the `client_end` locally to use for pulling iteration pages, while sending the
+        /// `server_end` off to be fulfilled by the server.
+        iterator server_end:Iterator;
+    }) -> () error IterateConnectionError;
+    // [END diff_2]
+};
+
+// [START diff_3]
+/// An iterator for the key-value store. Note that this protocol makes no guarantee of atomicity -
+/// the values may change between pulls from the iterator. Unlike the `Store` protocol above, this
+/// protocol is not `@discoverable`: it is not independently published by the component that
+/// implements it, but rather must have one of its two protocol ends transmitted over an existing
+/// FIDL connection.
+///
+/// As is often the case with iterators, the client indicates that they are done with an instance of
+/// the iterator by simply closing their end of the connection.
+///
+/// Since the iterator is associated only with the Iterate method, it is declared as closed rather
+/// than open. This is because changes to how iteration works are more likely to require replacing
+/// the Iterate method completely (which is fine because that method is flexible) rather than
+/// evolving the Iterator protocol.
+closed protocol Iterator {
+    /// Gets the next batch of keys.
+    ///
+    /// The client pulls keys rather than having the server proactively push them, to implement
+    /// [flow control][flow-control] over the messages.
+    ///
+    /// [flow-control]:
+    ///     https://fuchsia.dev/fuchsia-src/development/api/fidl?hl=en#prefer_pull_to_push
+    strict Get() -> (struct {
+        /// A list of keys. If the iterator has reached the end of iteration, the list will be
+        /// empty. The client is expected to then close the connection.
+        entries vector<string:128>:10;
+    });
+};
+// [END diff_3]

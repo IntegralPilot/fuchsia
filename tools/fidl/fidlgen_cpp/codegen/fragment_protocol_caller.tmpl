@@ -1,0 +1,179 @@
+{{/*
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "Protocol:Caller:WireMessagingHeader" }}
+{{- EnsureNamespace "" }}
+
+// Methods to make a sync FIDL call directly on an unowned handle or a
+// const reference to a |{{ .ClientEnd }}|,
+// avoiding setting up a client.
+template<>
+class {{ .WireSyncClientImpl }} final :
+    public ::fidl::internal::SyncEndpointManagedVeneer<{{ .WireSyncClientImpl }}> {
+ public:
+  {{ range .ClientMethods }}
+    {{- .Docs }}
+    {{- if .DocComments }}
+    //
+    {{- end }}
+    // {{- template "Method:ClientAllocationComment:Helper" . }}
+    {{- if ExperimentEnabled "api_coverage" }}
+    {{ .ApiCoverageMethodAnnotation }}
+    {{ end }}
+    {{ if .HasResponse }}{{ .WireResult }}{{ else }}::fidl::OneWayStatus{{ end }}
+    {{ .Name }}({{- RenderParams .RequestArgs }});
+    {{- if ExperimentEnabled "api_coverage" }}
+    {{ .ApiCoverageMethodAnnotation }}:end
+    {{ end }}
+{{ "" }}
+  {{- end }}
+};
+
+template <>
+class {{ .WireSyncBufferClientImpl }} final :
+    public ::fidl::internal::SyncEndpointBufferVeneer<{{ .WireSyncBufferClientImpl }}> {
+ public:
+  {{ range .ClientMethods }}
+    {{- .Docs }}
+    // Caller provides the backing storage for FIDL message via an argument to `.buffer()`.
+    {{- if ExperimentEnabled "api_coverage" }}
+    {{ .ApiCoverageMethodAnnotation }}
+    {{ end }}
+    {{ if .HasResponse }}{{ .WireUnownedResult }}{{ else }}::fidl::OneWayStatus{{ end }}
+    {{ .Name }}({{ RenderParams .RequestArgs }});
+    {{- if ExperimentEnabled "api_coverage" }}
+    {{ .ApiCoverageMethodAnnotation }}:end
+    {{ end }}
+{{ "" }}
+  {{- end }}
+};
+{{- end }}
+
+{{- define "Protocol:Caller:WireMessagingSource" }}
+  {{- if eq .Transport.Name "Channel" }}
+    {{- $protocol := . }}
+    {{- range .ClientMethods }}
+{{ if ExperimentEnabled "api_coverage" }}
+      {{ .ApiCoverageMethodAnnotation }}
+{{ end }}
+      {{ if .HasResponse }}{{ .WireResult }}{{ else }}::fidl::OneWayStatus{{ end }}
+      {{ $protocol.WireSyncClientImpl.NoLeading }}::{{ .Name }}({{- RenderParams .RequestArgs }}) {
+        {{ .WireTransactionalRequest }} _request{ {{ RenderForwardParams .RequestArgs }} };
+        return {{ .WireResult }}(
+          {{ $protocol.UnownedClientEnd }}(_transport().get<{{ $protocol.Transport.Type }}>()), &_request);
+      }
+{{ if ExperimentEnabled "api_coverage" }}
+      {{ .ApiCoverageMethodAnnotation }}:end
+{{ end }}
+
+{{ if ExperimentEnabled "api_coverage" }}
+      {{ .ApiCoverageMethodAnnotation }}
+{{ end }}
+      {{ if .HasResponse }}{{ .WireUnownedResult }}{{ else }}::fidl::OneWayStatus{{ end }}
+      {{ $protocol.WireSyncBufferClientImpl.NoLeading }}::{{ .Name }}({{ RenderParams .RequestArgs }}) {
+        {{ .WireTransactionalRequest }} _request{ {{ RenderForwardParams .RequestArgs }} };
+        return {{ .WireUnownedResult }}(
+          {{ $protocol.UnownedClientEnd }}(_transport().get<{{ $protocol.Transport.Type }}>()), _allocator(), &_request);
+      }
+{{ if ExperimentEnabled "api_coverage" }}
+      {{ .ApiCoverageMethodAnnotation }}:end
+{{ end }}
+
+    {{- end }}
+  {{ end }}
+{{- end }}
+
+{{- define "Protocol:Caller:NaturalMessagingHeader" }}
+{{- EnsureNamespace "" }}
+
+template <>
+class {{ .NaturalSyncClientImpl }} final
+    : public ::fidl::internal::SyncEndpointManagedVeneer<{{ .NaturalSyncClientImpl }}> {
+ public:
+  {{ range .TwoWayMethods }}
+    {{ .Docs }}
+    {{- if ExperimentEnabled "api_coverage" }}
+    {{ .ApiCoverageMethodAnnotation }}
+    {{ end }}
+    {{ .NaturalResult }} {{ .Name }}({{ .NaturalRequestArg "request" }});
+    {{- if ExperimentEnabled "api_coverage" }}
+    {{ .ApiCoverageMethodAnnotation }}:end
+    {{ end }}
+
+  {{ end }}
+
+  {{ range .OneWayMethods }}
+    {{ .Docs }}
+    {{- if ExperimentEnabled "api_coverage" }}
+    {{ .ApiCoverageMethodAnnotation }}
+    {{ end }}
+    ::fit::result<::fidl::OneWayError> {{ .Name }}({{ .NaturalRequestArg "request" }});
+    {{- if ExperimentEnabled "api_coverage" }}
+    {{ .ApiCoverageMethodAnnotation }}:end
+    {{ end }}
+
+  {{ end }}
+
+ private:
+  {{ .UnownedClientEnd }} _client_end() const;
+};
+
+{{- end }}
+
+
+
+{{- define "Protocol:Caller:NaturalMessagingSource" }}
+{{- EnsureNamespace "" }}
+
+{{ range .TwoWayMethods }}
+  {{- if ExperimentEnabled "api_coverage" }}
+  {{ .ApiCoverageMethodAnnotation }}
+  {{ end }}
+  {{ .NaturalResult }}
+  {{ $.NaturalSyncClientImpl.NoLeading }}::{{ .Name }}({{ .NaturalRequestArg "request" }}) {
+    ::fidl::internal::NaturalMessageEncoder encoder{
+        &::fidl::internal::ChannelTransport::VTable, {{ .OrdinalName }}, {{ .DynamicFlagsName }} };
+    {{- if .HasRequestPayload }}
+    encoder.EncodeBody({{ .Request.Forward "request" }});
+    {{- end }}
+    ::fidl::OutgoingMessage msg = encoder.GetMessage();
+    {{ .IncomingMessageStorageForResponse }} response_storage;
+    return ::fidl::internal::DecodeResponseAndFoldError<{{ .Marker }}>(
+        msg.Call(_client_end().handle(), response_storage.view()), nullptr);
+  }
+  {{- if ExperimentEnabled "api_coverage" }}
+  {{ .ApiCoverageMethodAnnotation }}:end
+  {{ end }}
+
+{{ end }}
+
+{{ range .OneWayMethods }}
+  {{- if ExperimentEnabled "api_coverage" }}
+  {{ .ApiCoverageMethodAnnotation }}
+  {{ end }}
+  ::fit::result<::fidl::OneWayError>
+  {{ $.NaturalSyncClientImpl.NoLeading }}::{{ .Name }}({{ .NaturalRequestArg "request" }}) {
+    ::fidl::internal::NaturalMessageEncoder encoder{
+        &::fidl::internal::ChannelTransport::VTable, {{ .OrdinalName }}, {{ .DynamicFlagsName }} };
+    {{- if .HasRequestPayload }}
+    encoder.EncodeBody({{ .Request.Forward "request" }});
+    {{- end }}
+    ::fidl::OutgoingMessage msg = encoder.GetMessage();
+    msg.Write(_client_end().handle());
+    return ::fidl::internal::ToFitxResult(::fidl::OneWayStatus{msg});
+  }
+  {{- if ExperimentEnabled "api_coverage" }}
+  {{ .ApiCoverageMethodAnnotation }}:end
+  {{ end }}
+
+{{ end }}
+
+{{ .UnownedClientEnd }} {{ .NaturalSyncClientImpl.NoLeading }}::_client_end() const {
+  return {{ .UnownedClientEnd }}(
+    _transport().get<{{ .Transport.Type }}>());
+}
+
+{{- end }}

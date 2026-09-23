@@ -1,0 +1,58 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+use super::util::*;
+use crate::{FONTS_ALIASED_CM, FONTS_SMALL_CM};
+use futures::future::join_all;
+use itertools::Itertools;
+
+// Add new tests here so we don't overload component manager with requests (58150)
+#[fuchsia::test]
+async fn test_get_font_family_info() {
+    let factory = ProviderFactory::new();
+    test_get_font_family_info_basic(&factory).await.unwrap();
+    test_get_font_family_info_aliases(&factory).await.unwrap();
+}
+
+async fn test_get_font_family_info_basic(factory: &ProviderFactory) -> Result<(), Error> {
+    let font_provider = factory.get_provider(FONTS_SMALL_CM).await?;
+
+    let font_family_info = font_provider
+        .get_font_family_info(&fonts::FamilyName { name: "materialicons".to_string() })
+        .await?;
+
+    assert!(font_family_info != fonts::FontFamilyInfo::default());
+
+    assert_eq!(font_family_info.name.unwrap().name, "Material Design Icons");
+    assert!(font_family_info.styles.unwrap().len() > 0);
+
+    Ok(())
+}
+
+async fn test_get_font_family_info_aliases(factory: &ProviderFactory) -> Result<(), Error> {
+    let font_provider = factory.get_provider(FONTS_ALIASED_CM).await?;
+
+    let known_aliases =
+        vec!["AlphaSans", "alpha sans", "Alpha Sans Condensed", "Alpha Sans Hebrew"];
+
+    let font_family_infos: Result<Vec<_>, _> = join_all(
+        known_aliases
+            .into_iter()
+            .map(|alias| {
+                font_provider.get_font_family_info(&fonts::FamilyName { name: alias.to_string() })
+            })
+            .collect_vec(),
+    )
+    .await
+    .into_iter()
+    .collect();
+
+    for font_family_info in font_family_infos? {
+        assert!(font_family_info != fonts::FontFamilyInfo::default());
+        assert_eq!(font_family_info.name.unwrap().name, "Alpha Sans");
+        assert!(font_family_info.styles.unwrap().len() > 0);
+    }
+
+    Ok(())
+}

@@ -1,0 +1,222 @@
+#!/bin/bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../../lib/platform.sh || exit $?
+
+BT_FILE_DEPS=(
+    # "prebuilt/third_party/jq/${HOST_PLATFORM}/bin/jq"
+    "scripts/fx"
+    # "scripts/fuchsia-vendored-python"
+    # "scripts/fuchsia-vendored-python3.11"
+    "build/bazel/wrapper.bazel.sh"
+    "scripts/hermetic-env"
+    "tools/devshell/bazel"
+    "tools/devshell/lib/bazel_utils.sh"
+    "tools/devshell/lib/platform.sh"
+    "tools/devshell/lib/vars.sh"
+    "tools/devshell/lib/is_invoked_by_agent.sh"
+    "tools/devshell/lib/agents.txt"
+    #"tools/devshell/jq.fx"
+    # "tools/devshell/lib/build_api_client.sh"
+    "tools/devshell/lib/fx-cmd-locator.sh"
+    "tools/devshell/lib/fx-optional-features.sh"
+    "tools/devshell/lib/platform.sh"
+    "tools/devshell/lib/generate-ssh-config.sh"
+)
+
+declare fx
+
+BT_MKDIR_DEPS=(
+    "out/default"
+)
+
+BT_MOCKED_TOOLS=(
+  "build/api/client"
+  "build/regenerator"
+  "scripts/fuchsia-vendored-python"
+  "tools/devshell/rbe"
+  "tools/devshell/lib/platform.sh"
+  "tools/devshell/contrib/lib/count-ninja-actions.py"
+  "tools/integration/bootstrap.sh"
+)
+
+BT_SET_UP() {
+    source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+    fx="$(btf::setup_fx)"
+    TEST_BUILD_DIR="${BT_TEMP_DIR}/out/default"
+
+    bazel_bin="$(btf::make_mock_binary bin/bazel)"
+    ninja_bin="$(btf::make_mock_binary bin/ninja)"
+    python3_bin="$(btf::make_mock_binary bin/python3)"
+    echo 0 > "${python3_bin}.mock_status"
+    python3_dir="$(dirname "${python3_bin}")"
+
+    bazel_workspace_dir="${TEST_BUILD_DIR}/bazel_workspace"
+    mkdir -p "${bazel_workspace_dir}"
+
+    bazel_output_base="${TEST_BUILD_DIR}/bazel_output_base"
+    bazel_output_user_root="${TEST_BUILD_DIR}/bazel_output_user_root"
+
+    bazel="${TEST_BUILD_DIR}/bazel"
+    ln -sf "${BT_TEMP_DIR}/build/bazel/wrapper.bazel.sh" "${bazel}"
+
+    bazel_log_dir="${TEST_BUILD_DIR}/bazel_logs"
+
+    bazel_sh_config="${TEST_BUILD_DIR}/bazel.sh.config"
+    cat > "${bazel_sh_config}" <<EOF
+_BAZEL_BIN="${bazel_bin}"
+_BAZEL_LOG_DIR="${bazel_log_dir}"
+_BAZEL_WORKSPACE="${bazel_workspace_dir}"
+_BAZEL_OUTPUT_BASE="${bazel_output_base}"
+_BAZEL_OUTPUT_USER_ROOT="${bazel_output_user_root}"
+_NINJA_BUILD_DIR="${TEST_BUILD_DIR}"
+_PREBUILT_NINJA="${ninja_bin}"
+_PREBUILT_PYTHON_DIR="${python3_dir}"
+EOF
+
+    mkdir -p "${python3_dir}"
+}
+
+TEST_bazel-wrapper-no-config-file() {
+    rm -f "${bazel_sh_config}"
+    "${bazel}" 2> stderr.txt || true
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: Missing Bazel script config file: ${bazel_sh_config}"
+}
+
+TEST_bazel-wrapper-config-with-missing-variables() {
+    config_variables=($(sed 's|=.*$||g' "${bazel_sh_config}"))
+    cp "${bazel_sh_config}" "${bazel_sh_config}.origin"
+    for var in "${config_variables[@]}"; do
+      cp -f "${bazel_sh_config}.origin" "${bazel_sh_config}"
+      sed -i -e "/^${var}=/d" "${bazel_sh_config}"
+      "${bazel}" 2> stderr.txt || true
+      BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: Missing ${var} config variable"
+    done
+}
+
+TEST_parse-bazel-command-default() {
+    source "${bazel}"
+
+    parse_bazel_command
+    BT_EXPECT_EQ "${_BAZEL_COMMAND}" ""
+    BT_EXPECT_EQ "${_BAZEL_PRE_COMMAND_ARGS[*]}" ""
+    BT_EXPECT_EQ "${_BAZEL_POST_COMMAND_ARGS[*]}" ""
+    BT_EXPECT_EQ "${_BAZEL_REST_ARGS[*]}" ""
+
+    parse_bazel_command build //foo
+    BT_EXPECT_EQ "${_BAZEL_COMMAND}" "build"
+    BT_EXPECT_EQ "${_BAZEL_PRE_COMMAND_ARGS[*]}" ""
+    BT_EXPECT_EQ "${_BAZEL_POST_COMMAND_ARGS[*]}" "//foo"
+    BT_EXPECT_EQ "${_BAZEL_REST_ARGS[*]}" ""
+
+    parse_bazel_command --pre-option command arg --post-option
+    BT_EXPECT_EQ "${_BAZEL_COMMAND}" "command"
+    BT_EXPECT_EQ "${_BAZEL_PRE_COMMAND_ARGS[*]}" "--pre-option"
+    BT_EXPECT_EQ "${_BAZEL_POST_COMMAND_ARGS[*]}" "arg --post-option"
+    BT_EXPECT_EQ "${_BAZEL_REST_ARGS[*]}" ""
+
+    parse_bazel_command run --config-opt -- //target:label --command-opt command-arg
+    BT_EXPECT_EQ "${_BAZEL_COMMAND}" "run"
+    BT_EXPECT_EQ "${_BAZEL_PRE_COMMAND_ARGS[*]}" ""
+    BT_EXPECT_EQ "${_BAZEL_POST_COMMAND_ARGS[*]}" "--config-opt"
+    BT_EXPECT_EQ "${_BAZEL_REST_ARGS[*]}" "-- //target:label --command-opt command-arg"
+}
+
+TEST_bazel_wrapper_no_command() {
+    "${bazel}"
+    expected_invocation=(
+      env USER=$USER
+      "${bazel_bin}"
+      --nohome_rc
+      --output_base="${bazel_output_base}"
+      --output_user_root="${bazel_output_user_root}"
+      --bazelrc="${TEST_BUILD_DIR}/regenerator_outputs/remote_services.bazelrc"
+    )
+    BT_EXPECT_FILE_CONTAINS "${bazel_log_dir}/bazel_invocation" "${expected_invocation[*]}"
+
+    source "${bazel_bin}.mock_state"
+    BT_EXPECT_EQ "${#BT_MOCK_ARGS[@]}" 5
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[0]}" "${bazel_bin}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[1]}" --nohome_rc
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[2]}" --output_base="${bazel_output_base}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[3]}" --output_user_root="${bazel_output_user_root}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[4]}" --bazelrc="${TEST_BUILD_DIR}"/regenerator_outputs/remote_services.bazelrc
+}
+
+TEST_bazel_wrapper_no_user_defined() {
+    USER= "${bazel}"
+    expected_invocation=(
+      env USER=unused-bazel-build-user
+      "${bazel_bin}"
+      --nohome_rc
+      --output_base=${bazel_output_base}
+      --output_user_root=${bazel_output_user_root}
+      --bazelrc="${TEST_BUILD_DIR}/regenerator_outputs/remote_services.bazelrc"
+    )
+    BT_EXPECT_FILE_CONTAINS "${bazel_log_dir}/bazel_invocation" "${expected_invocation[*]}"
+
+    source "${bazel_bin}.mock_state"
+    BT_EXPECT_EQ "${#BT_MOCK_ARGS[@]}" 5
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[0]}" "${bazel_bin}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[1]}" --nohome_rc
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[2]}" --output_base="${bazel_output_base}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[3]}" --output_user_root="${bazel_output_user_root}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[4]}" --bazelrc="${TEST_BUILD_DIR}"/regenerator_outputs/remote_services.bazelrc
+}
+
+TEST_bazel_wrapper_build_command() {
+    "${bazel}" build --config=some_config //some:target
+    source "${bazel_bin}.mock_state"
+    BT_EXPECT_EQ "${#BT_MOCK_ARGS[@]}" 8
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[0]}" "${bazel_bin}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[1]}" --nohome_rc
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[2]}" --output_base="${bazel_output_base}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[3]}" --output_user_root="${bazel_output_user_root}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[4]}" --bazelrc="${TEST_BUILD_DIR}"/regenerator_outputs/remote_services.bazelrc
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[5]}" build
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[6]}" --config=some_config
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[7]}" //some:target
+}
+
+TEST_bazel_wrapper_build_command_with_disk_cache() {
+    FUCHSIA_BAZEL_DISK_CACHE="${BT_TEMP_DIR}/disk-cache" \
+    "${bazel}" build --config=some_config //some:target
+    source "${bazel_bin}.mock_state"
+    BT_EXPECT_EQ "${#BT_MOCK_ARGS[@]}" 9
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[0]}" "${bazel_bin}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[1]}" --nohome_rc
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[2]}" --output_base="${bazel_output_base}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[3]}" --output_user_root="${bazel_output_user_root}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[4]}" --bazelrc="${TEST_BUILD_DIR}"/regenerator_outputs/remote_services.bazelrc
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[5]}" build
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[6]}" --disk_cache="${BT_TEMP_DIR}"/disk-cache
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[7]}" --config=some_config
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[8]}" //some:target
+}
+
+TEST_bazel_wrapper_build_command_with_disk_cache_with_max_size() {
+    FUCHSIA_BAZEL_DISK_CACHE="${BT_TEMP_DIR}/disk-cache" \
+    FUCHSIA_BAZEL_DISK_CACHE_SIZE="40G" \
+    "${bazel}" build --config=some_config //some:target
+    source "${bazel_bin}.mock_state"
+    BT_EXPECT_EQ "${#BT_MOCK_ARGS[@]}" 10
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[0]}" "${bazel_bin}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[1]}" --nohome_rc
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[2]}" --output_base="${bazel_output_base}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[3]}" --output_user_root="${bazel_output_user_root}"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[4]}" --bazelrc="${TEST_BUILD_DIR}"/regenerator_outputs/remote_services.bazelrc
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[5]}" build
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[6]}" --disk_cache="${BT_TEMP_DIR}"/disk-cache
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[7]}" --experimental_disk_cache_gc_max_size=40G
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[8]}" --config=some_config
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[9]}" //some:target
+}
+
+TEST_bazel_wrapper_print_commands() {
+    FUCHSIA_BAZEL_PRINT_COMMANDS=1 "${bazel}" build --config=some_config //some:target 2> stderr.txt
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING stderr.txt "[bazel-command]"
+    BT_EXPECT_FILE_CONTAINS_SUBSTRING stderr.txt "//some:target"
+}
+
+BT_RUN_TESTS "$@"

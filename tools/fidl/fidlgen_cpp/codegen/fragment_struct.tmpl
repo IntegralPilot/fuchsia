@@ -1,0 +1,141 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "Struct:ForwardDeclaration:WireTypesHeader" }}
+{{ EnsureNamespace . }}
+struct {{ .Name }};
+{{- end }}
+
+{{- define "Struct:WireTypesHeader" }}
+{{ EnsureNamespace . }}
+{{- IfdefFuchsiaIf .IsResourceType -}}
+{{ .Docs }}
+struct {{ .Name }} {
+{{- range .AnonymousChildren }}
+  using {{ .ScopedName }} = {{ .FlattenedName }};
+{{- end }}
+  {{- if .Serializable.IsSerializable }}
+  static constexpr char kSerializableName[] = "{{ .Serializable.Name }}";
+  {{- end }}
+
+  {{- range .Members }}
+{{ "" }}
+    {{- .Docs }}
+    {{ .Type }} {{ .Name }} = {};
+  {{- end }}
+
+  {{- if .IsResourceType }}
+
+  void _CloseHandles();
+  {{- end }}
+};
+
+{{- EndifFuchsiaIf .IsResourceType -}}
+{{- end }}
+
+{{- define "Struct:WireTypesSource" }}
+{{ EnsureNamespace "" }}
+{{- IfdefFuchsiaIf .IsResourceType -}}
+{{ if .IsResourceType }}
+    void {{ . }}::_CloseHandles() {
+      {{- range .Members }}
+        {{ CloseHandles . false }}
+      {{- end }}
+    }
+{{- end }}
+
+template <bool IsRecursive>
+void fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, IsRecursive>::Encode(
+    ::fidl::internal::WireEncoder* encoder, {{ . }}* value, ::fidl::internal::WirePosition position, ::fidl::internal::RecursionDepth<IsRecursive> recursion_depth) {
+  if constexpr (kIsMemcpyCompatible) {
+    memcpy(position.As<void>(), value, sizeof({{ . }}));
+  } else {
+    {{- range .PaddingV2 }}
+    internal::WireZeroPadding<uint{{ .MaskBitWidth }}_t>(encoder, position + {{ .Offset }});
+    {{- end }}
+    {{- range .Members }}
+    internal::WireCodingTraits<{{ .Type }}, {{ .WireConstraint }}, IsRecursive>::Encode(encoder, &value->{{ . }}, position + {{ .OffsetV2 }}, recursion_depth);
+    {{- end }}
+  }
+}
+
+template <bool IsRecursive>
+void fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, IsRecursive>::Decode(
+    ::fidl::internal::WireDecoder* decoder, ::fidl::internal::WirePosition position, ::fidl::internal::RecursionDepth<IsRecursive> recursion_depth) {
+  if constexpr (!Base::are_members_memcpy_compatible) {
+    {{- range .Members }}
+    internal::WireCodingTraits<{{ .Type }}, {{ .WireConstraint }}, IsRecursive>::Decode(
+      decoder, position + {{ .OffsetV2 }}, recursion_depth);
+    {{- end }}
+  }
+  {{- range .PaddingV2 }}
+  internal::WireCheckPadding<uint{{ .MaskBitWidth }}_t>(decoder, position + {{ .Offset }}, {{ .Mask | printf "%#x" }});
+  {{- end }}
+  {{- if .IsEmpty }}
+  if (*position.As<uint8_t>() != 0) {
+    decoder->SetError(kCodingErrorInvalidPaddingBytes);
+  }
+  {{- end }}
+}
+
+template struct ::fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, true>;
+template struct ::fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, false>;
+
+static_assert(std::is_standard_layout_v<{{ . }}>);
+{{- $struct := . }}
+{{- range .Members }}
+static_assert(offsetof({{ $struct }}, {{ .Name }}) == {{ .OffsetV2 }});
+{{- end }}
+static_assert(sizeof({{ . }}) == ::fidl::TypeTraits<{{ . }}>::kPrimarySize);
+
+  {{- EndifFuchsiaIf .IsResourceType -}}
+
+{{- end }}
+
+{{- define "Struct:Traits:WireTypesHeader" }}
+{{- IfdefFuchsiaIf .IsResourceType -}}
+{{ if .IsResourceType }}
+template <>
+struct IsResource<{{ . }}> : public std::true_type {};
+{{- end }}
+
+template<>
+struct TypeTraits<{{ . }}> {
+  static constexpr uint32_t kMaxNumHandles = {{ .TypeShapeV2.MaxHandles }};
+  static constexpr uint32_t kMaxDepth = {{ .TypeShapeV2.Depth }};
+  static constexpr uint32_t kPrimarySize = {{ .TypeShapeV2.InlineSize }};
+  [[maybe_unused]]
+  static constexpr uint32_t kMaxOutOfLine = {{ .TypeShapeV2.MaxOutOfLine }};
+  static constexpr bool kHasFlexibleEnvelope = {{ .TypeShapeV2.HasFlexibleEnvelope }};
+  static constexpr bool kHasPointer = {{ .TypeShapeV2.HasPointer }};
+};
+
+template <>
+struct IsFidlType<{{ . }}> : public std::true_type {};
+template <>
+struct IsWire<{{ . }}> : public std::true_type {};
+template <>
+struct IsStruct<{{ . }}> : public std::true_type {};
+
+template <bool IsRecursive>
+struct ::fidl::internal::WireCodingTraits<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, IsRecursive> {
+  static constexpr size_t kInlineSize = {{ .TypeShapeV2.InlineSize }};
+  static constexpr auto kMembers = std::make_tuple(
+    {{- range $i, $m := .Members }}
+      {{- if $i }}, {{ end -}}
+    ::fidl::internal::WireStructMemberCodingInfo<{{ $m.Type }}, {{ $m.WireConstraint }}, IsRecursive>()
+    {{- end }});
+  static constexpr bool kHasPadding = {{ gt (len .PaddingV2) 0 }};
+  using Base = WireStructCodingTraitsBase<{{ . }}, ::fidl::internal::WireCodingConstraintEmpty, IsRecursive>;
+  static constexpr bool kIsMemcpyCompatible = Base::kIsMemcpyCompatible;
+
+  static void Encode(
+    internal::WireEncoder* encoder, {{ . }}* value, ::fidl::internal::WirePosition position, RecursionDepth<IsRecursive> recursion_depth);
+  static void Decode(
+    internal::WireDecoder* decoder, ::fidl::internal::WirePosition position, RecursionDepth<IsRecursive> recursion_depth);
+};
+{{- EndifFuchsiaIf .IsResourceType -}}
+{{- end }}

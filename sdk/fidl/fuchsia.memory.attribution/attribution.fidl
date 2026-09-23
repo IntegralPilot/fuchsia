@@ -1,0 +1,184 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.memory.attribution;
+
+using zx;
+
+/// Provides memory attribution information under this principal.
+///
+/// The typical expected usage of this protocol is:
+///  - Component Runners implement this protocol and declare it in their
+///    manifest.
+///  - A Component that wants to provide extra internal information may also
+///    declare and implement this protocol;
+///  - Clients connect to a `Provider`, and use the `Get` methods to
+///    recursively explore the Principal hierarchy.
+///
+/// Clients will typically maintain the connection and start a hanging get to
+/// retrieve attribution information. Runners need to inspect the manifest of
+/// their runnees to determine if they serve this protocol, and proactively
+/// create the connection. They can also proxy this protocol in case their
+/// runnee provides attribution information in an unsuitable format.
+// TODO(https://fxbug.dev/307580082): This protocol is under construction.
+@discoverable
+open protocol Provider {
+    /// Returns the attribution information known to the provider.
+    ///
+    /// The first call returns immediately with the current information.
+    /// Subsequent calls will be held if no additional information is
+    /// available, and return only when there are changes to the attribution
+    /// information to be reported.
+    ///
+    /// Runners will typically report the kernel resources (e.g. job, process,
+    /// etc) associated with each component that they are responsible for
+    /// running.
+    ///
+    /// Components may optionally report resource usage by different categories
+    /// within their implementation.
+    Get() -> (resource table {
+        1: attributions vector<AttributionUpdate>:MAX;
+    }) error Error;
+};
+
+type Error = flexible enum : uint32 {
+    /// Internal error within the principal.
+    INTERNAL = 1;
+};
+
+/// Describes a change affecting attribution of resources to a single principal.
+type AttributionUpdate = flexible resource union {
+    /// Reports a new principal managed by the reporter.
+    ///
+    /// Declaring a Principal means that the declarer/reporter is providing the
+    /// resources for the Principal to run. Typically, Component Framework
+    /// Runners will declare the components they run as Principals.
+    1: add NewPrincipal;
+
+    /// Replaces the attribution information for a Principal.
+    ///
+    /// When this is received, the client is should discard any attribution
+    /// information received by this channel for the Principal, and replace it
+    /// with this information.
+    2: update UpdatedPrincipal;
+
+    /// Removes a Principal.
+    ///
+    /// Declares that a Principal is no longer active on the system. All
+    /// attribution information for this Principal can be removed after this
+    /// message. Any remaining resources will still be attributed according to
+    /// the default attribution rules.
+    3: remove Identifier;
+};
+
+/// Represents a newly added principal.
+type NewPrincipal = resource table {
+    /// The identifier of this principal.
+    1: identifier Identifier;
+
+    /// Description of the identity of the principal.
+    ///
+    /// Description holds a human-friendly (or a reference to a human-friendly)
+    /// identity descriptor of the principal. This will be used by clients to
+    /// identify this principal to users at display time.
+    2: description flexible resource union {
+        /// Token identifying the component instance run by this principal.
+        ///
+        /// This is the token defined in the component_instance field of
+        /// fuchsia.component.runner.ComponentStartInfo.
+        1: component zx.Handle:EVENT;
+
+        /// A subpart of a component, which isn't a fully-blown Component within
+        /// Component Framework but still represents a coherent unit of
+        /// computation. This can be, for instance, a Linux process under Starnix.
+        ///
+        /// This name needs to be unique within the component this principal is
+        /// part of.
+        2: part string:MAX;
+    };
+
+    /// The type of the principal.
+    // TODO(b/347257225): `type` is not compatible with measure_tape.
+    3: principal_type flexible enum : uint32 {
+        /// An independent unit of computation that can be described as
+        /// running, such as a component or an application.
+        ///
+        /// Runnable principals will be shown in the default memory view.
+        RUNNABLE = 1;
+
+        /// A part of another principal that isn't independent, such as a
+        /// cache.
+        ///
+        /// Part principals will be shown in the detailed memory view of the
+        /// principal they are a part of.
+        PART = 2;
+    };
+
+    /// If this principal provides attribution information, a channel to its
+    /// provider.
+    4: detailed_attribution client_end:<Provider>;
+};
+
+/// The complete set of Resources used by a Principal.
+///
+/// Upon receiving this message, the previous set of Resources attributed to the identified
+/// Principal by this connection should be replaced. If, on another connection, another
+/// Provider attributed resources to this principal, these attributions should be kept.
+type UpdatedPrincipal = resource table {
+    /// The identifier of this principal.
+    1: identifier Identifier;
+
+    /// The resources owned by this principal.
+    ///
+    /// If the size of the Resource vector is too big to fit in a FIDL message, `buffer` should
+    /// contain a serialized vector of Resources.
+    2: resources flexible resource union {
+        1: data struct {
+            resources vector<Resource>:MAX;
+        };
+
+        /// buffer is read-only.
+        2: buffer zx.Handle:VMO;
+    };
+};
+
+type Resource = flexible union {
+    /// Identifies a kernel object whose memory is being attributed.
+    ///
+    /// Refers to all memory held by VMOs reachable from the object
+    /// (currently a Job, Process or VMO).
+    1: kernel_object zx.Koid;
+
+    /// The entire memory of any VMO will be attributed if its mapping within the
+    /// specified process overlaps with the defined virtual address range.
+    2: process_mapped struct {
+        /// Selects the root VMAR of the specified process.
+        process zx.Koid;
+
+        /// Lower bound of the address range.
+        base uint64;
+
+        /// Length of the address range.
+        len uint64;
+
+        /// True if memory held via the handle-table may be ignored for this process.
+        ///
+        /// This should only be set if all memory accessible via the handle-table is
+        /// already attributed via some other reference (e.g. a memory-mapping or another
+        /// process' handle table).
+        ///
+        /// Clients may use the hint to skip querying the handle table, since all memory
+        /// it refers to is otherwise accounted for.
+        hint_skip_handle_table bool;
+    };
+};
+
+/// Unique identifier within the scope of an attribution provider, used to
+/// identify a specific principal (Component, part of a Component, etc.)
+/// in attribution updates.
+/// The `0` identifier should be used to point to the source principal itself.
+alias Identifier = uint64;
+
+/// Identifier that refers to the principal that emits the attribution.
+const SELF Identifier = 0;

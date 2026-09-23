@@ -1,0 +1,212 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/dist/distribution_manifest_generated_file.gni")
+
+# Generates a manifest containing the list of distributable objects in the given
+# dependency tree.
+#
+# Distributable objects are binaries and data files eligible for inclusion in a
+# build product destined to be used at runtime. Objects within the dependency
+# tree defined by the `deps` and `data_deps` parameters of dependents end up
+# included in the resulting manifest file.
+#
+# This template produces a file using the JSON format listing all distributable
+# objects, with entries that look like:
+# ```
+# [
+#   {
+#     "destination": "bin/foobar",
+#     "source": "obj/path/to/foobar"
+#     "label": "//path/to/foobar"
+#   }
+# ]
+# ```
+#
+# See //docs/development/build/gn_concepts/internals/manifest_formats.md for
+# more details.
+#
+# Parameters
+#
+#   deps (optional)
+#     [list of labels] The targets to generate a manifest for.
+#     See `gn help` for more details.
+#
+#   data_deps, testonly, visibility, metadata (optional)
+#     See `gn help`.
+#
+#   outputs (optional)
+#     Singleton list containing the path to the manifest file.
+#     Defaults to `[ "$target_gen_dir/$target_name.dist" ]`.
+template("distribution_manifest") {
+  main_target = target_name
+  generate_target = "${target_name}_generate"
+
+  # Build the name of the output file.
+  if (defined(invoker.outputs)) {
+    _outputs = invoker.outputs
+    assert(_outputs != [] && _outputs == [ _outputs[0] ],
+           "Outputs list must have exactly one element.")
+    manifest_file = _outputs[0]
+  } else {
+    manifest_file = "$target_gen_dir/$target_name.dist"
+  }
+  intermediate_file = "$manifest_file.partial"
+
+  distribution_manifest_generated_file(generate_target) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "testonly",
+                           ])
+
+    visibility = [
+      ":$main_target",
+      ":${main_target}__hermetic_inputs",
+    ]
+    outputs = [ intermediate_file ]
+  }
+
+  # Detect collisions in metadata entries.
+  action(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "data_deps",
+                             "deps",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    script = "//build/python/modules/distribution_manifest/expand_and_find_conflicting_dist_entries.py"
+    check_for_output_dir_leaks = false
+
+    sources = [ intermediate_file ]
+    outputs = [ manifest_file ]
+    inputs = [
+      "//build/python/modules/distribution_manifest/distribution_manifest.py",
+    ]
+
+    args = [
+      "--input",
+      rebase_path(intermediate_file, root_build_dir),
+      "--output",
+      rebase_path(manifest_file, root_build_dir),
+    ]
+
+    if (defined(invoker.prefix) && invoker.prefix != "") {
+      args += [ "--prefix=${invoker.prefix}/" ]
+    }
+
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [ ":$generate_target" ]
+
+    # This flag will make the build system call script with
+    # an extra --hermetic-inputs-file=PATH argument to generate
+    # a depfile, which is needed for list input files referenced
+    # by distribution_entries_files metadata values.
+    hermetic_inputs_file = "$target_gen_dir/${main_target}.hermetic_inputs"
+
+    metadata = {
+      # Add a barrier here to avoid double of inclusion of elements listed in
+      # the generated manifest.
+      distribution_entries_barrier = []
+
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+    }
+  }
+}
+
+# Adds distribution entries from a given distribution manifest file.
+#
+# Use this template to ensure that all entries from a given input
+# distribution manifest file are collected through distribution_manifest() or
+# fini_manifest() when this target is part of their dependency tree.
+#
+# See documentation for distribution_manifest() for the file format.
+#
+# Parameters
+#
+#   file (required)
+#     Path to a distribution manifest file.
+#
+#   deps
+#   testonly
+#   visibility
+template("distribution_entries_file") {
+  assert(defined(invoker.file), "Must specify file")
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    metadata = {
+      distribution_entries_files = [
+        {
+          file = rebase_path(invoker.file, root_build_dir)
+          label = get_label_info(":$target_name", "label_with_toolchain")
+        },
+      ]
+    }
+  }
+}
+
+# Creates distribution entries from a given FINI manifest file.
+#
+# Parameters
+#
+#   file (required)
+#     Path to a FINI file.
+#
+#   deps
+#   testonly
+#   visibility
+template("distribution_entries_from_fini") {
+  assert(defined(invoker.file), "Must specify file")
+  _output = "$target_out_dir/${target_name}_distribution_manifest"
+  _label = get_label_info(":$target_name", "label_with_toolchain")
+
+  action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "data_deps",
+                             "deps",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    script = "//build/dist/convert_fini_to_manifest.py"
+    inputs = [
+      "//build/python/modules/distribution_manifest/distribution_manifest.py",
+    ]
+
+    sources = [ invoker.file ]
+    outputs = [ _output ]
+
+    args = [
+      "--input",
+      rebase_path(invoker.file, root_build_dir),
+      "--output",
+      rebase_path(_output, root_build_dir),
+      "--label",
+      rebase_path(_label, root_build_dir),
+    ]
+
+    metadata = {
+      distribution_entries_files = [
+        {
+          file = rebase_path(_output, root_build_dir)
+          label = _label
+        },
+      ]
+    }
+  }
+}

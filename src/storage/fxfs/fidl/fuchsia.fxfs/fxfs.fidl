@@ -1,0 +1,376 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.fxfs;
+
+using fuchsia.io;
+using fuchsia.storage.block;
+using zx;
+
+type EmptyStruct = struct {};
+
+/// Designates the purpose of a key.
+type KeyPurpose = flexible enum {
+    /// The key will be used to encrypt metadata.
+    METADATA = 1;
+    /// The key will be used to encrypt data.
+    DATA = 2;
+};
+
+/// Designates the type of object that is interacting with the Crypt protocol.
+type ObjectType = flexible enum {
+    FILE = 1;
+    DIRECTORY = 2;
+    SYMLINK = 3;
+};
+
+type FxfsKey = struct {
+    wrapping_key_id array<uint8, 16>;
+    wrapped_key array<uint8, 48>;
+};
+
+type FscryptKeyIdentifierAndNonce = struct {
+    key_identifier array<uint8, 16>;
+    nonce array<uint8, 16>;
+};
+type FscryptKeyIdentifier = struct {
+    key_identifier array<uint8, 16>;
+};
+
+type WrappedKey = flexible union {
+    /// Fxfs's default crypto (AES256GCM-SIV wrapped key using AES256XTS encryption)
+    ///   In: 16-byte wrapping_key_id + 48-byte wrapped key.
+    ///   Out: 32-byte unwrapped key.
+    1: fxfs FxfsKey;
+
+    /// Zxcrypt (For use with FVM/Minfs only)
+    ///   In: 132-byte request blob.
+    ///   Out: 80-byte unwrapped key blob.
+    2: zxcrypt vector<uint8>:132;
+
+    /// Fscrypt INO_LBLK32 directory (For use with starnix only)
+    ///   In: 16-byte key_identifier + 16-byte UUID + 16-byte nonce.
+    ///   Out: 32-byte xts_key1, 32-byte xts_key2, 16-byte ino_hash, 16-byte dirhash.
+    3: fscrypt_ino_lblk32_dir FscryptKeyIdentifierAndNonce;
+
+    /// Fscrypt INO_LBLK32 file (For use with starnix only)
+    ///   In: 16-byte key_identifier + 16-byte UUID.
+    ///   Out: 32-byte xts_key1, 32-byte xts_key2, 16-byte ino_hash.
+    4: fscrypt_ino_lblk32_file FscryptKeyIdentifier;
+};
+
+@discoverable
+closed protocol Crypt {
+    /// Creates a new key wrapped with the key identified by `wrapping_key_id`.  `owner` identifies
+    /// the owner of the key and must be supplied to `UnwrapKey`.  The crypt service chooses a
+    /// `wrapping_key_id` which must be supplied to UnwrapKey.  The `wrapping_key_id` has no
+    /// meaning to Fxfs.
+    /// TODO(https://fxbug.dev/445189846): Add an `object_type` field to support inline encryption.
+    strict CreateKey(struct {
+        owner uint64;
+        purpose KeyPurpose;
+    }) -> (struct {
+        wrapping_key_id array<uint8, 16>;
+        wrapped_key vector<uint8>:132;
+        unwrapped_key vector<uint8>:80;
+    }) error zx.Status;
+
+    /// Creates a new key wrapped with the key identified by `wrapping_key_id`.  `owner` identifies
+    /// the owner of the key and must be supplied to `UnwrapKey` along with  `wrapping_key_id`.
+    /// The `wrapping_key_id` has no meaning to Fxfs.
+    strict CreateKeyWithId(struct {
+        owner uint64;
+        wrapping_key_id array<uint8, 16>;
+        object_type ObjectType;
+    }) -> (struct {
+        wrapped_key WrappedKey;
+        unwrapped_key vector<uint8>:80;
+    }) error zx.Status;
+
+    /// Unwraps a key.  `owner` must be the same as that passed to `CreateKey`.
+    /// This can fail due to permission reasons, but an incorrect key or owner will not fail;
+    /// it will just return an unwrapped key that won't actually decrpyt the data.
+    /// ZX_ERR_UNAVAILABLE is returned if the key is known but cannot be unwrapped (e.g. it is
+    /// locked).
+    /// ZX_ERR_NOT_FOUND is returned if the key is not known. In some cases, implementations are
+    /// unable to tell the difference between the two, in which case, ZX_ERR_UNAVAILABLE is
+    /// returned.
+    strict UnwrapKey(struct {
+        owner uint64;
+        wrapped_key WrappedKey;
+    }) -> (struct {
+        unwrapped_key vector<uint8>:128;
+    }) error zx.Status;
+};
+
+type CryptSettings = table {
+    1: active_data_wrapping_key_id array<uint8, 16>;
+    2: active_metadata_wrapping_key_id array<uint8, 16>;
+};
+
+@discoverable
+closed protocol CryptManagement {
+    /// Adds a new wrapping key to the Crypt service.  The new key will immediately be available
+    /// for unwrapping keys (Crypt::UnwrapKeys) but won't be used for wrapping keys until
+    /// CryptManagement::SetActiveKeys is called.
+    strict AddWrappingKey(struct {
+        wrapping_key_id array<uint8, 16>;
+        key vector<uint8>:32;
+    }) -> () error zx.Status;
+
+    /// Updates the key which will be used for wrapping keys (Crypt::CreateKey).  `purpose`
+    /// describes which active key to modify.
+    strict SetActiveKey(struct {
+        purpose KeyPurpose;
+        wrapping_key_id array<uint8, 16>;
+    }) -> () error zx.Status;
+
+    /// Forgets a wrapping key, preventing its use for future key-unwrapping.  All future calls to
+    /// Crypt::UnwrapKeys with that wrapping key ID will fail.
+    /// If either the data or metadata part of the key is active, an error is returned.
+    strict ForgetWrappingKey(struct {
+        wrapping_key_id array<uint8, 16>;
+    }) -> () error zx.Status;
+};
+
+/// A token used for paging through tracked projects. One may be returned by the `ProjectId.List`
+/// call so it can be passed into the succeeding call to continue the listing from where it left
+/// off.
+type ProjectIterToken = struct {
+    value uint64;
+};
+
+/// Storage for a pair of related byte and node values.
+type BytesAndNodes = struct {
+    bytes uint64;
+    nodes uint64;
+};
+
+@discoverable
+closed protocol ProjectId {
+    /// Set the limit in bytes and node count for an XFS project id. Setting limits lower than
+    /// current usage is accepted but may in the future prevent further increases. Returns
+    ///  ZX_ERR_OUT_OF_RANGE if `project_id` is set to zero.
+    strict SetLimit(struct {
+        project_id uint64;
+        bytes uint64;
+        nodes uint64;
+    }) -> () error zx.Status;
+
+    /// Stop tracking a project id. This will return  ZX_ERR_NOT_FOUND if the project isn't
+    /// currently tracked. It will succeed even if the project is still in use more by one or more
+    /// nodes.
+    strict Clear(struct {
+        project_id uint64;
+    }) -> () error zx.Status;
+
+    /// Apply project id to a node_id from a GetAttrs call. This will return ZX_ERR_NOT_FOUND if
+    /// node doesn't exist, and ZX_ERR_OUT_OF_RANGE if `project_id` is set to zero.
+    strict SetForNode(struct {
+        node_id uint64;
+        project_id uint64;
+    }) -> () error zx.Status;
+
+    /// Get the project id based on a given node_id from a GetAttrs call.This will return
+    /// ZX_ERR_NOT_FOUND if the node doesn't exist, and a `project_id` of zero if one is not
+    /// currently applied.
+    strict GetForNode(struct {
+        node_id uint64;
+    }) -> (struct {
+        project_id uint64;
+    }) error zx.Status;
+
+    /// Remove any project id marker for a given node_id from a GetAttrs call. This will return
+    /// ZX_ERR_NOT_FOUND if the node doesn't exist, or success if the node is found to currently
+    /// have no project id applied to it.
+    strict ClearForNode(struct {
+        node_id uint64;
+    }) -> () error zx.Status;
+
+    /// Fetches project id numbers currently tracked with a limit or with non-zero usage from lowest
+    /// to highest. If `token` is null, start at the beginning, if `token` is populated with a
+    /// previously provided `next_token` the iteration continues where it left off. If there are
+    /// more projects to be listed then `next_token` will be populated, otherwise it will be null.
+    strict List(struct {
+        token box<ProjectIterToken>;
+    }) -> (struct {
+        entries vector<uint64>:MAX;
+        next_token box<ProjectIterToken>;
+    }) error zx.Status;
+
+    /// Looks up the limit and usage for a tracked `project_id`. If the `project_id` does not have
+    /// a limit set, or non-zero usage it will return ZX_ERR_NOT_FOUND.
+    strict Info(struct {
+        project_id uint64;
+    }) -> (struct {
+        limit BytesAndNodes;
+        usage BytesAndNodes;
+    }) error zx.Status;
+};
+
+/// Error type for [`BlobCreator.Create`].
+type CreateBlobError = strict enum {
+    /// This blob is currently readable in fxblob.
+    ALREADY_EXISTS = 1;
+
+    /// An unspecified error occurred while creating the blob.
+    INTERNAL = 2;
+};
+
+@discoverable
+closed protocol BlobCreator {
+    /// Creates a blob with the merkle root `hash`. If `allow_existing` is true, the server will
+    /// overwrite the existing blob if there is one. The server may fail this request with
+    /// `[CreateBlobError.ALREADY_EXISTS]` if there is already an inflight `BlobWriter` for the same
+    /// hash which has not been closed or completed. The client will truncate the blob with
+    /// [BlobWriter.GetVmo] and get a handle to a vmo in return. The client will then write blob
+    /// contents into the vmo and call [BlobWriter.BytesReady] on the 'writer` to signal to the
+    /// server that some number of bytes has been written to the vmo.
+    strict Create(struct {
+        hash array<uint8, 32>;
+        allow_existing bool;
+    }) -> (resource struct {
+        writer client_end:BlobWriter;
+    }) error CreateBlobError;
+
+    /// Given the hash of a blob, returns true if it should be overwritten using Create with
+    /// `allow_existing` set to true. Must respond the same as `BlobReader.GetVmo` in terms of
+    /// existence checks, responding ZX_ERR_NOT_FOUND under the same conditions.
+    strict NeedsOverwrite(struct {
+        blob_hash array<uint8, 32>;
+    }) -> (struct {
+        needs_overwrite bool;
+    }) error zx.Status;
+};
+
+closed protocol BlobWriter {
+    /// Truncates the blob associated with this BlobWriter proxy to length `size`. Returns a handle
+    /// to a `vmo` shared between the server and the client, which is implemented as a ring buffer.
+    /// As the client writes blob contents into the `vmo`, it will call BytesReady to signal to the
+    /// server that some number of bytes have been written.
+    ///
+    /// Ring Buffer Semantics
+    /// The server sets the size of the vmo passed back to the client. The chunks that the client
+    /// writes are arbitrarily sized and do not have any alignment guarantees. Any particular write
+    /// can wrap around the ring buffer. The client can have several outstanding BytesReady
+    /// requests but the client is responsible for not overwriting a given range in the ring buffer
+    /// until the BytesReady request corresponding to that range has completed.
+    strict GetVmo(struct {
+        size uint64;
+    }) -> (resource struct {
+        vmo zx.Handle:VMO;
+    }) error zx.Status;
+
+    /// Indicates to the server that an additional `bytes_written` number of bytes have been
+    /// written to the shared vmo and are ready to be read off the vmo and written to disk. The
+    /// blob will be readable when the final BytesReady response is received by the client.
+    strict BytesReady(struct {
+        bytes_written uint64;
+    }) -> () error zx.Status;
+};
+
+@discoverable
+closed protocol BlobReader {
+    /// Given the hash of a blob, returns a VMO with its contents.
+    strict GetVmo(struct {
+        blob_hash array<uint8, 32>;
+    }) -> (resource struct {
+        vmo zx.Handle:VMO;
+    }) error zx.Status;
+};
+
+/// This is an internal protocol for on-device debugging and testing only.
+/// See `ffx fxfs help` for more details.
+@discoverable
+closed protocol Debug {
+    /// Forces a compaction.
+    strict Compact() -> () error zx.Status;
+
+    /// Deletes a recorded profile from a volume. Fails if the volume isn't mounted or there is
+    /// active profile recording or replay.
+    strict DeleteProfile(struct {
+        volume fuchsia.io.Name;
+        profile fuchsia.io.Name;
+    }) -> () error zx.Status;
+
+    /// Begins recording a profile for a named volume for up to the given duration in seconds. If a
+    /// profile already exists under the given name then it will begin replaying it as well. Fails
+    /// if the volume isn't mounted or there is active profile recording or replay on the volume.
+    /// Page faults for objects that do not get opened by a caller during the recording period will
+    /// will be filtered out of the profile.
+    ///
+    /// This "record-while-replaying" strategy is meant to support boot-profiling in an environment
+    /// where we don't explicitly know when the system has updated. By recording during replay and
+    /// filtering objects without open events, Fxfs drops dead/replaced objects to refresh the
+    /// profile.
+    strict RecordAndReplayProfile(struct {
+        volume fuchsia.io.Name:optional;
+        profile fuchsia.io.Name;
+        duration_secs uint32;
+    }) -> () error zx.Status;
+
+    /// Replays a profile if one exists, and only records if one does not exist. Fails if the volume
+    /// isn't mounted or there is active profile recording or replay on the volume.
+    ///
+    /// This profile method is meant to support app launch profiling. These profiles do not filter
+    /// entries based on Open events since outside of the boot process objects may already be opened
+    /// or cached in overlays like Starnix.
+    strict ReplayXorRecordProfile(struct {
+        volume fuchsia.io.Name;
+        profile fuchsia.io.Name;
+        duration_secs uint32;
+    }) -> () error zx.Status;
+
+    /// Stops all profile recording and replay activity. Ongoing recordings are completed and
+    /// persisted.
+    strict StopProfileTasks() -> () error zx.Status;
+
+    /// Clears the directory entry cache (dirent cache) and internal object store caches (including
+    /// LSM tree object caches, layer file chunk caches, and non-permanent unwrapped keys). This
+    /// drops strong references held by the cache to filesystem nodes (files and directories). If
+    /// these nodes are not currently open elsewhere, they will be dropped, freeing their associated
+    /// resources (including VMOs). Subsequent access to these paths will force Fxfs to recreate
+    /// the nodes and reload metadata from disk.
+    strict ClearCaches() -> () error zx.Status;
+};
+
+/// A protocol to serve the Volume protocol on a file-backed device.
+@discoverable
+closed protocol FileBackedVolumeProvider {
+    /// Opens a file as a block device and starts serving block requests.
+    ///
+    /// `name` must refer to an existing file in the directory represented by
+    /// `parent_directory_token`.
+    ///
+    /// The block size of the device will match the underlying filesystem's block size.  If the
+    /// file's size is not a multiple of the block size, the apparent size of the device will be
+    /// rounded down.
+    ///
+    /// `parent_directory_token` is a token obtained via `fuchsia.io.Directory/GetToken`.  The
+    /// directory connection must have the `MODIFY_DIRECTORY` right.
+    ///
+    /// Errors will be sent as an epitaph on `server_end`.
+    strict Open(resource struct {
+        parent_directory_token zx.Handle;
+        name fuchsia.io.Name;
+        server_end server_end:fuchsia.storage.block.Block;
+    });
+};
+
+
+/// Allows installing a volume from an fxfs partition image.
+@discoverable
+closed protocol VolumeInstaller {
+    /// Using the partition image in `image_file` contained in the volume `src`, overwrites the
+    /// volume `dst` with a volume of the same name from the image. On success, `src` will no longer
+    /// exist. There must be no objects in `src` other than the image that contain extents.
+    /// Neither `src` nor `dst` can be mounted or otherwise in-use.
+    ///
+    /// *WARNING*: This will delete the existing contents of `dst`.
+    strict Install(struct {
+        src fuchsia.io.Name;
+        image_file fuchsia.io.Name;
+        dst fuchsia.io.Name;
+    }) -> () error zx.Status;
+};

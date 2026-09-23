@@ -1,0 +1,312 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/compilation_modes.gni")
+import("//build/config/zircon/standard.gni")
+import("//build/rust/config.gni")
+import("//build/toolchain/zircon/zircon_toolchain_suite.gni")
+import("//build/zircon/zircon_cpu.gni")
+import("params.gni")
+
+assert(
+    current_toolchain == default_toolchain,
+    "A switchset should only be defined in the default toolchain (and not $current_toolchain)")
+
+# A kernel "switchset" is a suite of kernel-specific GN toolchains parameterized
+# by target architecture. A switchset represents a set of kernel-defining
+# compiler and linker flags.
+#
+# kernel_switchset(name) must be instantiated in
+# //zircon/kernel/switch/set/$name/BUILD.gn. The associated cpu-specific
+# toolchain is then defined as
+# //zircon/kernel/switch/set/$name:kernel_$cpu.$name.
+#
+# # Parameters
+#
+#   * lk_debug_level
+#     - Required: A general knob parameterizing the `LK_DEBUGLEVEL` macro, which
+#       itself parameterizes a host of "debug" features in the kernel:
+#         * the print levels enabled for dprintf() (see <kernel/debug.h>);
+#         * whether ZX_DEBUG_ASSERT() is enabled;
+#         * whether the kernel serial console is enabled;
+#
+#       More specifically, we have the features by level as follows:
+#
+#       +-------------------+------------------+-----------+-----------+
+#       | Feature \ Level   | 0                | 1         | 2         |
+#       +-------------------+------------------+-----------+-----------+
+#       | Print levels      | CRITICAL, ALWAYS | ..., INFO | ..., SPEW |
+#       | Debug asserts     | N                | N         | Y         |
+#       | Console           | N                | Y         | Y         |
+#       +-------------------+------------------+-----------+-----------+
+#
+#       # TODO(https://fxbug.dev/42117912): Break this up into individual knobs.
+#     - Type: int
+#
+#   * unit_tests_enabled
+#     - Required: Whether unit tests are compiled into the kernel or not. Note
+#       that tests are only runnable if the console is enabled (via `k ut`).
+#     - Type: bool
+#
+#   * optimization_mode
+#     - Optional: Optimization mode; see $optimize GN build argument.
+#     - Type: string
+#     - Default: compilation_settings.kernel_optimize or optimize build arg.
+#
+#   * exclude_variant_tags
+#     - Optional: As for zircon_toolchain_suite().
+#     - Type: list(string)
+#
+#   * toolchain_args
+#     - Optional: As for zircon_toolchain_suite().
+#     - Type: scope
+#
+template("kernel_switchset") {
+  _dir = get_label_info(":$target_name", "dir")
+  _expected_dir = "//zircon/kernel/switch/set/${target_name}"
+  assert(_dir == _expected_dir,
+         "This switchset must be instantiated in ${_expected_dir}/BUILD.gn")
+
+  assert(defined(invoker.lk_debug_level),
+         "kernel_switchset($target_name) must define lk_debug_level")
+
+  _lk_debug_level = invoker.lk_debug_level
+  _allowed_levels = [
+    0,
+    1,
+    2,
+  ]
+  assert(_allowed_levels + [ _lk_debug_level ] - [ _lk_debug_level ] !=
+             _allowed_levels,
+         "lk_debug_level must be <= 2")
+
+  assert(defined(invoker.unit_tests_enabled),
+         "kernel_switchset($target_name) must define unit_tests_enabled")
+  assert(!invoker.unit_tests_enabled || _lk_debug_level > 0,
+         "unit_tests_enabled cannot be true when lk_debug_level is 0")
+
+  if (defined(invoker.optimization_mode)) {
+    switchset_optimize = invoker.optimization_mode
+  } else if (optimize_build_argument != false) {
+    switchset_optimize = optimize_build_argument
+  } else {
+    switchset_optimize = compilation_settings.kernel_optimize
+  }
+
+  foreach(cpu, standard_fuchsia_cpus) {
+    tc_name = "kernel_${cpu}.${target_name}"
+    zircon_toolchain_suite(tc_name) {
+      cpu = cpu
+      os = "fuchsia"
+      environment = "kernel"
+
+      if (cpu == "x64") {
+        kernel_cpu = "x86"
+      } else {
+        kernel_cpu = cpu
+      }
+
+      toolchain_tags = [
+        "kernel",
+        "custom-abi",
+        "no-floating-point",
+        "standalone",
+      ]
+
+      if (invoker.unit_tests_enabled) {
+        toolchain_tags += [ "kernel-with-tests" ]
+      }
+
+      prefix_configs = [
+        "//zircon/kernel/switch:headers",
+
+        # TODO(https://fxbug.dev/42121444): Many include/ headers use <ktl/*.h> headers.
+        "//zircon/kernel/lib/ktl:headers.config",
+        "//sdk/lib/fit:headers.config",
+
+        # <arch/aspace.h> has #include <lib/mmu_rcu/simple_generational_rcu.h>.
+        "//zircon/kernel/lib/mmu_rcu:headers.config",
+
+        # <stdlib.h> has #include <lib/heap.h>.
+        "//zircon/kernel/lib/heap:headers.config",
+
+        # <lib/lockup_detector.h> is included by some "low-level" headers.
+        "//zircon/kernel/lib/lockup_detector:headers.config",
+
+        # <kernel/percpu.h> has #include <lib/lazy_init/lazy_init.h>.
+        "//src/lib/lazy_init:headers.config",
+
+        # <kernel/spinlock.h> has #include <lockdep/lock_policy.h>.
+        "//src/lib/lockdep:headers.config",
+
+        # <kernel/{scheduler.h,scheduler_state.h> has #include <ffl/fixed.h>.
+        "//zircon/system/ulib/ffl:headers.config",
+
+        # <kernel/thread.h> has #include <lib/kconcurrent/*.h>.
+        "//zircon/kernel/lib/kconcurrent:headers.config",
+        "//zircon/system/ulib/concurrent:headers.config",
+
+        # <kernel/thread.h> has #include <vm/kstack.h>.
+        "//zircon/kernel/vm:headers.config",
+
+        # <vm/page.h> has #include <vm/phys/arena.h>
+        "//zircon/kernel/vm/phys:headers.config",
+
+        # <vm/vm_object.h> has #include <lib/user_copy/user_ptr.h>.
+        "//zircon/kernel/lib/user_copy:headers.config",
+
+        # <vm/pmm_checker.h> has #include <lib/boot-options/boot-options.h>.
+        "//zircon/kernel/lib/acpi_lite:headers.config",
+        "//zircon/kernel/lib/boot-options:headers.config",
+        "//zircon/kernel/lib/devicetree:headers.config",
+        "//zircon/system/ulib/uart:headers.config",
+        "//zircon/system/ulib/hwreg:headers.config",
+
+        # <vm/phys/arena.h> has #include <lib/memalloc/range.h>
+        "//zircon/kernel/phys/lib/memalloc:range.headers.config",
+
+        # <lib/ktrace.h> has #include <lib/zircon-internal/ktrace.h>.
+        "//zircon/system/ulib/zircon-internal:headers.config",
+
+        # <lib/ktrace.h> has #include <lib/spsc_buffer/spsc_buffer.h>.
+        "//zircon/kernel/lib/spsc_buffer:headers.config",
+
+        # <lib/ktrace.h> has #include <lib/fxt/*.h>.
+        "//src/performance/lib/fxt:headers.config",
+
+        # <lib/ktrace.h> has #include <lib/percpu_writer/percpu_buffer.h>.
+        "//zircon/kernel/lib/percpu_writer:headers.config",
+
+        # <lib/fxt/section_symbols.h> has #include
+        # <lib/special-sections/special-sections.h>.
+        "//zircon/kernel/lib/special-sections:headers.config",
+
+        # <kernel/thread.h> has #include <fbl/macros.h>
+        "//zircon/system/ulib/fbl:headers.config",
+
+        # <dev/iommu.h> has #include <fbl/name.h>
+        "//zircon/kernel/lib/fbl:headers.config",
+
+        # <reg.h> has #include <lib/mmio-ptr/mmio-ptr.h>.
+        "//zircon/system/ulib/mmio-ptr:headers.config",
+
+        # <arch/*/hypervisor.h> has #include <lib/id_allocator.h>.
+        "//zircon/kernel/lib/id_allocator:headers.config",
+
+        # <platform/efi.h> as #include <lib/instrumentation/asan.h>
+        "//zircon/kernel/lib/instrumentation:headers.config",
+
+        # Everywhere has #include <lib/fit/result.h>
+        # Everywhere has #include <lib/zx/result.h>
+        "//zircon/system/ulib/zx:headers.config",
+
+        # Those (and others, like fbl) lead to stdcompat.
+        "//sdk/lib/stdcompat:headers.config",
+
+        "//zircon/kernel/lib/backtrace:headers.config",
+
+        "//zircon/kernel/lib/wake-vector:headers.config",
+
+        "//zircon/kernel/lib/sched:headers.config",
+
+        # <platform.h> has #include <lib/arch/ticks.h>.
+        "//zircon/kernel/lib/arch/$kernel_cpu:headers.config",
+        "//zircon/kernel/lib/arch:common-headers.config",
+
+        # Many headers have #include <lib/zbi-format/zbi.h>.
+        "//sdk/lib/zbi-format:include",
+
+        # <kernel/scheduler.h> depends on <lib/power-management/power-state.h>
+        "//zircon/kernel/lib/power-management:headers.config",
+
+        # <kernel/scheduler.h> depends on <lib/stall.h>
+        "//zircon/kernel/lib/stall:headers.config",
+
+        # <kernel/thread.h> depends on <lib/page-map/accessor.h>
+        "//zircon/kernel/lib/page-map:headers.config",
+      ]
+
+      # The kernel_config includes the use of the custom target.
+      # The default config for --target=$rust_target would conflict.
+      remove_common_configs = [ "//build/config/rust:target" ]
+      configs = [
+        "//zircon/kernel/switch:abi",
+
+        # The :abi configs tree doesn't do all the work for Rust.  Instead,
+        # they contribute to the rules for creating the custom target JSON.
+        "//zircon/kernel/lib/rust:target",
+
+        # This rolls up configs that don't need to be separately removable.
+        "//zircon/kernel/switch:kernel_config",
+      ]
+
+      # NOTE: kernel artifacts currently do not build under fuzzer
+      # variants. This was also true with the Zircon build, but
+      # the Fuchsia build never invoked it with corresponding
+      # variant selectors. Using an exclude_variant_tag is
+      # enough to fix the issue.
+      # No GCC toolchain variant for the core kernel.
+      exclude_variant_tags = [
+        "fuzzer",
+        "gcc",
+      ]
+      if (cpu == "riscv64") {
+        # TODO(https://fxbug.dev/42076027): no asan for riscv64 yet
+        exclude_variant_tags += [ "asan" ]
+      } else if (cpu == "arm64") {
+        # TODO(https://fxbug.dev/379891035): arm64 KASan support was
+        # temporarily removed and is to be reimplemeted.
+        exclude_variant_tags += [ "asan" ]
+      }
+      if (defined(invoker.exclude_variant_tags)) {
+        # GN list subtraction in variant_toolchain_suite() fails if exclude_tags
+        # contains duplicate items. Use the `+= -= +=` idiom to insert tags as a
+        # set without introducing duplicates.
+        foreach(tag, invoker.exclude_variant_tags) {
+          exclude_variant_tags += [ tag ]
+          exclude_variant_tags -= [ tag ]
+          exclude_variant_tags += [ tag ]
+        }
+      }
+
+      # Always enable frame pointers in the kernel so there are panic
+      # backtraces and such.
+      # TODO(mcgrathr): Consider either removing this so there's a
+      # no-frame-pointers option, or removing the kernel's support for
+      # !WITH_FRAME_POINTERS if it will never be used.
+      remove_common_configs += [ "//build/config:default_frame_pointers" ]
+      configs += [ "//build/config:frame_pointers" ]
+
+      if (cpu == "x64") {
+        # TODO(https://fxbug.dev/42101838): x86 kernel can't be built without --gc-sections
+        # because of crufty acpica code, and some compiler instrumentation
+        # is broken wrt --gc-sections semantics.
+        # Ensure that linker GC is enabled.
+        configs += [ "//build/config:linker_gc" ]
+      }
+
+      configs += [ "//zircon/kernel/switch:lk_debug_level_${_lk_debug_level}" ]
+
+      if (invoker.unit_tests_enabled) {
+        configs += [ "//zircon/kernel/switch:unit-tests-enabled" ]
+      }
+
+      # TODO(https://fxbug.dev/42117912): Map debug level to assert level for
+      # now.
+      remove_common_configs += [ "//build/config/zircon:default_assert_level" ]
+      configs += [ "//build/config/zircon:assert_level_${_lk_debug_level}" ]
+
+      toolchain_args = {
+        if (defined(invoker.toolchain_args)) {
+          forward_variables_from(invoker.toolchain_args, "*", [ "optimize" ])
+        }
+        optimize = switchset_optimize
+      }
+
+      remove_common_configs += [ "//build/config/rust:no_features" ]
+    }
+  }
+}

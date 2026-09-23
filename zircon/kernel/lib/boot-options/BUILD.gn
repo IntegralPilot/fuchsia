@@ -1,0 +1,207 @@
+# Copyright 2020 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/compiled_action.gni")
+import("//build/cpp/library_headers.gni")
+import("//build/testing/golden_files.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//zircon/kernel/kernel_bindgen_crate.gni")
+
+if (current_toolchain == default_toolchain) {
+  compiled_action("json") {
+    outputs = [ "$root_build_dir/boot-options.json" ]
+    tool = ":boot-options-tool"
+    args = [ "--json" ] + rebase_path(outputs, root_build_dir)
+  }
+
+  action("markdown") {
+    script = "markdown.py"
+    outputs = [ "$root_build_dir/boot-options.md" ]
+    deps = [ ":json" ]
+    sources = get_target_outputs(":json") + [
+                "preamble.md",
+
+                # This comment is here to ensure 'preamble.md' appears
+                # before postamble.md in this list, even after GN reformatting.
+                "postamble.md",
+              ]
+    args = rebase_path(outputs + sources, root_build_dir)
+    validations = [ ":check-markdown" ]
+  }
+
+  golden_files("check-markdown") {
+    deps = [ ":markdown" ]
+
+    sources = get_target_outputs(":markdown")
+    comparisons = [
+      {
+        candidate = sources[0]
+        golden = "//docs/gen/boot-options.md"
+      },
+    ]
+  }
+}
+
+static_library("boot-options") {
+  public_deps = [ ":headers" ]
+
+  complete_static_lib = true
+
+  sources = [
+    "boot-options.cc",
+    "word-view.cc",
+  ]
+  deps = [ "//zircon/system/ulib/uart" ]
+
+  if (is_kernel) {
+    deps += [
+      "//src/lib/lazy_init",
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+    ]
+  }
+}
+
+library_headers("headers") {
+  headers = []
+  public_deps = [
+    "//src/lib/stdbind:headers",
+    "//zircon/system/ulib/uart:headers",
+  ]
+  if (is_kernel) {
+    public_deps += [ "//zircon/kernel/lib/ktl:headers" ]
+  }
+}
+
+kernel_bindgen_crate("boot-options-rs") {
+  crate_name = "boot-options"
+
+  notice_year = "2026"
+
+  cpp = true
+  headers = [ "include/lib/boot-options/boot-options.h" ]
+  non_rust_deps = [ ":boot-options" ]
+  deps = [ "//src/lib/stdbind:stdbind-rs" ]
+
+  # The layout of BootOptions is compilation-dependent and very load-bearing,
+  # so these tests represent an important regression stop against drift.
+  layout_tests = true
+
+  # It's a big struct and so explicit padding can make it difficult to inspect.
+  explicit_padding = false
+
+  # No functions needed at this time.
+  function_blocklist = [ ".*" ]
+
+  type_allowlist = [ "BootOptions" ]
+  type_blocklist = [
+    "BootOptions_WordResult",  # Not needed.
+    "stdbind::optional",  # Ready-made bindings swapped in instead
+    "AutoOr",  # Aliased in raw_lines.
+  ]
+
+  opaque_types = [
+    "std::.*",
+    "uart::.*",
+  ]
+
+  # Always better.
+  rustified_enum = [ ".*" ]
+
+  expect_lints = [
+    "non_camel_case_types",
+    "non_upper_case_globals",
+  ]
+
+  raw_lines = [
+    "#![no_std]",
+    "use stdbind::Optional as stdbind_optional;",
+    "",
+    "pub type AutoOr<T> = stdbind::Optional<T>;",
+  ]
+
+  if (is_kernel) {
+    raw_lines += [
+      "",
+      "unsafe extern \"C\" { fn cpp_boot_options_get() -> *const BootOptions; }",
+      "",
+      "impl BootOptions {",
+      "    pub fn get() -> &'static Self { ",
+      "        // Safety: This pointer is set before the kernel proper boots.",
+      "        unsafe { cpp_boot_options_get().as_ref_unchecked() } ",
+      "    }",
+      "}",
+    ]
+  }
+
+  replacements = [
+    # A more convenient representation of SmallString.
+    [
+      "pub type SmallString = __BindgenOpaqueArray<\\[u8; ([0-9]+)usize\\]>",
+      "pub type SmallString = [u8; \\1]",
+    ],
+
+    # Drop "k" prefixes since that's a C++-ism that doesn't help with
+    # readability on the Rust side.
+    [
+      "\bk([A-Z0-9])",
+      "\\1",
+    ],
+  ]
+}
+
+if (toolchain_environment == "kernel") {
+  source_set("boot-options-cli") {
+    sources = [ "console.cc" ]
+    deps = [
+      ":boot-options",
+      "//zircon/kernel/lib/console",
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/vm:headers",
+    ]
+  }
+}
+
+if (is_host) {
+  executable("boot-options-tool") {
+    # This recompiles the library's source file rather than using the library
+    # directly because the #if logic includes details for all machines when
+    # building for the generator tool but not in the library.
+    defines = [
+      "BOOT_OPTIONS_GENERATOR=1",
+      "UART_ALL_DRIVERS=1",
+    ]
+    sources = [
+      "boot-options.cc",
+      "tool.cc",
+      "word-view.cc",
+    ]
+    deps = [
+      ":headers",
+      "//third_party/rapidjson",
+      "//zircon/system/ulib/uart",
+    ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [ "tests" ]
+}
+
+group("kernel-tests") {
+  testonly = true
+  deps = [ "tests:kernel-tests" ]
+}
+
+group("phys-tests") {
+  testonly = true
+  deps = [ "tests:phys-tests" ]
+}
+
+group("boot_tests") {
+  testonly = true
+}

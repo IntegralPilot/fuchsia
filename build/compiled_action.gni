@@ -1,0 +1,193 @@
+# Copyright 2016 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang.gni")
+import("//build/host.gni")
+
+# This file introduces two related templates that act like action and
+# action_foreach but instead of running a script, it will compile a given tool
+# in the host toolchain and run that (either once or over the list of inputs,
+# depending on the variant).
+#
+# As a special case, when the `host_tools_base_path_override` build
+# argument is not empty, the host tool binary is taken directly, as a prebuilt
+# from the build directory pointed to by the variable. This happens when
+# launching IDK sub-builds to generate binaries for different target CPU
+# architectures and API levels. Use `can_use_previously_built_tool = false` to
+# disable it.
+#
+# Parameters
+#
+#  * tool
+#    - Required: Label of the tool to run. This should be an executable, and
+#    this label should not include a toolchain (anything in parens). The
+#    host compile of this tool will be used.
+#    - Type: label
+#
+#   * tool_output_dir
+#     - Optional: The $output_dir in the executable() for $tool.
+#     - Type: path
+#
+#   * tool_output_name
+#     - Required: The $output_name in the executable() for $tool.
+#     - Type: string
+#     - Default: get_label_info(tool, "name")
+#
+#   * outputs
+#     - Required:  Like the outputs of action() (if using compiled_action(),
+#       this would be just the list of outputs), or action_foreach() (if using
+#       compiled_action_foreach(), this would contain source expansions mapping
+#       input to output files).
+#     - Type: list(path)
+#
+#   * can_use_previously_built_tool
+#     - Optional: set to false to avoid using a host tool coming from previous
+#       builds (e.g. when `host_tools_base_path_override` is set). In practice,
+#       this should only be disabled when the host binary itself or its
+#       location depends on the current CPU architecture and/or Fuchsia API
+#       level.
+#     - Type: boolean
+#     - Default: true
+#
+#   * args, inputs sources, depfile, deps, public_deps, testonly, visibility
+#     - See action() / action_foreach().
+#
+# Example of usage:
+#
+#   compiled_action("run_my_tool") {
+#     tool = "//tools/something:mytool"
+#     outputs = [
+#       "$target_gen_dir/mysource.cc",
+#       "$target_gen_dir/mysource.h",
+#     ]
+#
+#     # The tool takes this input.
+#     sources = [ "my_input_file.idl" ]
+#
+#     # In this case, the tool takes as arguments the input file and the output
+#     # build dir (both relative to the "cd" that the script will be run in)
+#     # and will produce the output files listed above.
+#     args = [
+#       rebase_path("my_input_file.idl", root_build_dir),
+#       "--output-dir", rebase_path(target_gen_dir, root_build_dir),
+#     ]
+#   }
+#
+# You would typically declare your tool like this:
+#   if (host_toolchain == current_toolchain) {
+#     executable("mytool") {
+#       ...
+#     }
+#   }
+#
+# The if statement around the executable is optional. That says "I only care
+# about this target in the host toolchain". Usually this is what you want, and
+# saves unnecessarily compiling your tool for the target platform. But if you
+# need a target build of your tool as well, just leave off the if statement.
+template("_compiled_action_target") {
+  assert(defined(invoker.tool), "tool must be defined for $target_name")
+  assert(defined(invoker.outputs), "outputs must be defined for $target_name")
+  assert(defined(invoker.args), "args must be defined for $target_name")
+
+  target(invoker._target_type, target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "assert_no_deps",
+                             "data_deps",
+                             "depfile",
+                             "deps",
+                             "hermetic_action_ignored_prefixes",
+                             "hermetic_deps",
+                             "hermetic_inputs_file",
+                             "hermetic_inputs_target",
+                             "inputs",
+                             "metadata",
+                             "mnemonic",
+                             "check_for_output_dir_leaks",
+                             "outputs",
+                             "public_deps",
+                             "repeatable",
+                             "sources",
+                             "testonly",
+                             "tool_output_dir",
+                             "tool_output_name",
+                             "disable_rustdoc",
+                             "visibility",
+                             "validations",
+                           ])
+    if (!defined(deps)) {
+      deps = []
+    }
+    if (!defined(inputs)) {
+      inputs = []
+    }
+
+    script = "//build/gn_run_binary.sh"
+
+    # Construct the host toolchain version of the tool.
+    host_tool = "${invoker.tool}($host_toolchain)"
+
+    # Get the path to the executable.
+    if (!defined(tool_output_name)) {
+      tool_output_name = get_label_info(host_tool, "name")
+    }
+    if (!defined(tool_output_dir)) {
+      tool_output_dir = get_label_info(host_tool, "root_out_dir")
+    }
+    host_executable = "$tool_output_dir/$tool_output_name"
+
+    _allow_host_tools_override = true
+    if (defined(invoker.can_use_previously_built_tool)) {
+      _allow_host_tools_override = invoker.can_use_previously_built_tool
+    }
+    if (_allow_host_tools_override && host_tools_base_path_override != "") {
+      # Use a prebuilt version of the host tool. Assume the tool is already
+      # built so do not add any dependency to the target.
+      host_executable_rebased = host_tools_base_path_override + "/" +
+                                rebase_path(host_executable, root_build_dir)
+      host_executable =
+          "//" + rebase_path(host_executable_rebased, "//", root_build_dir)
+    } else {
+      deps += [ host_tool ]
+      host_executable_rebased = rebase_path(host_executable, root_build_dir)
+    }
+
+    inputs += [ host_executable ]
+
+    # The script takes as arguments Clang bin directory (for passing
+    # llvm-symbolizer to runtimes), the binary to run, and then the
+    # arguments to pass it.
+    args = [
+             rebased_clang_prefix,
+             host_executable_rebased,
+           ] + invoker.args
+  }
+}
+
+# See _compiled_action_target().
+template("compiled_action") {
+  _compiled_action_target(target_name) {
+    _target_type = "action"
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    forward_variables_from(invoker, "*", [ "visibility" ])
+  }
+}
+
+# See _compiled_action_target().
+template("compiled_action_foreach") {
+  _compiled_action_target(target_name) {
+    _target_type = "action_foreach"
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    forward_variables_from(invoker, "*", [ "visibility" ])
+  }
+}

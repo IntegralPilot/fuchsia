@@ -1,0 +1,65 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang_cpu.gni")
+
+source_set("ldso") {
+  deps = [
+    ":dlstart",
+    "//sdk/lib/c/startup/musl-processargs",
+    "//sdk/lib/ld:tlsdesc",
+    "//zircon/system/ulib/ldmsg",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+  sources = [
+    "//zircon/third_party/ulib/musl/arch/${clang_cpu}/debug_break.S",
+    "//zircon/third_party/ulib/musl/arch/${clang_cpu}/dl-entry.S",
+    "dynlink-hwasan.S",
+    "dynlink-sancov.S",
+    "dynlink.c",
+  ]
+
+  # This is needed by dynlink-sancov.S and dynlink.c for "sancov-stubs.h".
+  include_dirs = [ "//sdk/lib/c/sanitizers" ]
+
+  if (toolchain_variant.libprefix != "") {
+    # The libprefix always ends with a / but that's not part of the
+    # "config" string in the loader-service protocol.
+    ldsvc_config =
+        get_path_info("${toolchain_variant.libprefix}libfoo.so", "dir")
+    assert(ldsvc_config != "" && ldsvc_config != ".")
+    defines = [ "DYNLINK_LDSVC_CONFIG=\"$ldsvc_config\"" ]
+  }
+
+  configs -= [ "//build/config:symbol_visibility_hidden" ]
+
+  # TODO(https://fxbug.dev/42136088): delete the below and fix compiler warnings
+  configs += [ "//build/config:Wno-unused-function" ]
+
+  # TODO(https://fxbug.dev/42136089): delete the below and fix compiler warnings
+  configs += [ "//build/config:Wno-conversion" ]
+
+  # TODO(https://fxbug.dev/327630180): Temporarily disable vector extension for
+  # riscv on dynlink.c. Under asan-ubsan instrumentation, the dynamic loader
+  # already uses a lot of stack and we're somewhat close to the limit. Using
+  # vector instructions decrements the stack a bit more and pushes us below the
+  # limit leading to stack overflows. In the long run, the new dynamic linker
+  # may alleviate some of this and we can re-enable it then. It's probably
+  # better to keep sanitizer instrumentation here over vector instructions.
+  if (current_cpu == "riscv64" &&
+      toolchain_variant.tags + [ "instrumented" ] - [ "instrumented" ] !=
+      toolchain_variant.tags) {
+    configs += [ "//build/config/riscv64:no-vector" ]
+
+    # The stack-malloc code generation winds up using _more_ stack itself too.
+    configs += [ "//build/config/sanitizers:asan-use-after-return-never" ]
+  }
+}
+
+source_set("dlstart") {
+  visibility = [ ":*" ]
+  sources = [ "dlstart.c" ]
+  configs += [ "//build/config/sanitizers:no_sanitizers" ]
+  deps = [ "//zircon/third_party/ulib/musl:musl_internal" ]
+}

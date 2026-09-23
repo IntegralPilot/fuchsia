@@ -1,0 +1,168 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.kms;
+
+using fuchsia.mem as mem;
+
+const MAX_KEY_NAME_SIZE uint8 = 32;
+const MAX_DATA_SIZE uint32 = 65536;
+
+type Error = strict enum {
+    /// Internal unexpected error.
+    INTERNAL_ERROR = 1;
+    /// When trying to create/import a new key but a key with the same name already exists.
+    KEY_ALREADY_EXISTS = 2;
+    /// When the key you are trying to use is not found.
+    KEY_NOT_FOUND = 3;
+    /// When the key material could not be parsed.
+    PARSE_KEY_ERROR = 4;
+    /// When the size for input data is larger than `MAX_DATA_SIZE`.
+    INPUT_TOO_LARGE = 5;
+};
+
+type AsymmetricKeyAlgorithm = strict enum {
+    RSA_SSA_PSS_SHA256_2048 = 1;
+    RSA_SSA_PSS_SHA256_3072 = 2;
+    RSA_SSA_PSS_SHA512_4096 = 3;
+    RSA_SSA_PKCS1_SHA256_2048 = 4;
+    RSA_SSA_PKCS1_SHA256_3072 = 5;
+    RSA_SSA_PKCS1_SHA512_4096 = 6;
+    ECDSA_SHA256_P256 = 7;
+    ECDSA_SHA512_P384 = 8;
+    ECDSA_SHA512_P521 = 9;
+};
+
+type KeyOrigin = strict enum {
+    /// The key was generated in this KMS instance.
+    GENERATED = 1;
+    /// The key was imported.
+    IMPORTED = 2;
+};
+
+type KeyProvider = strict enum {
+    /// A mock provider only used for unit testing.
+    MOCK_PROVIDER = 1;
+    /// A software provider that uses rust AesGcm trait for symmetric key operation and mundane for
+    /// asymmetric key operation.
+    SOFTWARE_PROVIDER = 2;
+    /// A software provider that only supports mundane-based asymmetric key operation.
+    SOFTWARE_ASYMMETRIC_ONLY_PROVIDER = 3;
+    /// A crypto provider based on Keysafe Trusted App in OPTEE.
+    OPTEE_PROVIDER = 4;
+};
+
+type Signature = struct {
+    bytes vector<uint8>:512;
+};
+
+type PublicKey = struct {
+    bytes vector<uint8>:256;
+};
+
+@discoverable
+closed protocol KeyManager {
+    /// Seal data to an encrypted form.
+    ///
+    /// Seal data to an encrypted form. The sealed data can only be unsealed by the same KMS instance
+    /// by using UnsealData. `plain_text` needs to be less than `MAX_DATA_SIZE` bytes.
+    strict SealData(resource struct {
+        plain_text mem.Buffer;
+    }) -> (resource struct {
+        cipher_text mem.Buffer;
+    }) error Error;
+
+    /// Unseal sealed data.
+    ///
+    /// Unseal data previously sealed by this KMS instance.
+    strict UnsealData(resource struct {
+        cipher_text mem.Buffer;
+    }) -> (resource struct {
+        plain_text mem.Buffer;
+    }) error Error;
+
+    /// Generate an asymmetric key.
+    ///
+    /// Generate an asymmetric key using `key_name` as the unique name. `key` is the generated
+    /// asymmetric key interface request. If the `key_name` is not unique, you would get
+    /// `KEY_ALREADY_EXISTS`. The generated key can be used to sign data. The algorithm used for
+    /// generating asymmetric key is `ECDSA_SHA512_P521`.
+    strict GenerateAsymmetricKey(resource struct {
+        key_name string:MAX_KEY_NAME_SIZE;
+        key server_end:AsymmetricPrivateKey;
+    }) -> () error Error;
+
+    /// Generate an asymmetric key with a specific algorithm.
+    ///
+    /// Generate an asymmetric key using `key_name` as the unique name and `key_algorithm` as
+    /// algorithm. `key` is the generated asymmetric key interface request. If the `key_name` is not
+    /// unique, you would get `KEY_ALREADY_EXISTS`.
+    strict GenerateAsymmetricKeyWithAlgorithm(resource struct {
+        key_name string:MAX_KEY_NAME_SIZE;
+        key_algorithm AsymmetricKeyAlgorithm;
+        key server_end:AsymmetricPrivateKey;
+    }) -> () error Error;
+
+    /// Import an asymmetric private key with a specific algorithm.
+    ///
+    /// Import an asymmetric private key using `key_name` as the unique name, `key_algorithm` as
+    /// algorithm and `data` as key data. `key` is imported asymmetric key interface request. Key
+    /// data should be in asn.1 encoded DER format. If the `key_name` is not unique, you would get
+    /// `KEY_ALREADY_EXISTS`.
+    strict ImportAsymmetricPrivateKey(resource struct {
+        data vector<uint8>:MAX;
+        key_name string:MAX_KEY_NAME_SIZE;
+        key_algorithm AsymmetricKeyAlgorithm;
+        key server_end:AsymmetricPrivateKey;
+    }) -> () error Error;
+
+    /// Get an asymmetric private key handle.
+    ///
+    /// Get an asymmetric private key handle using the `key_name`. If such key is not found, would
+    /// return `KEY_NOT_FOUND`.
+    strict GetAsymmetricPrivateKey(resource struct {
+        key_name string:MAX_KEY_NAME_SIZE;
+        key server_end:AsymmetricPrivateKey;
+    }) -> () error Error;
+
+    /// Delete a key.
+    ///
+    /// Delete a key for `key_name`.  For all the current handle to the deleted key, they would
+    /// become invalid and all following requests on those handles would return `KEY_NOT_FOUND`, user
+    /// should close the invalid handles once get `KEY_NOT_FOUND` error.
+    strict DeleteKey(struct {
+        key_name string:MAX_KEY_NAME_SIZE;
+    }) -> () error Error;
+};
+
+closed protocol Key {
+    /// Get the key origin (generated/imported).
+    strict GetKeyOrigin() -> (struct {
+        key_origin KeyOrigin;
+    }) error Error;
+
+    /// Get the name for the crypto provider backing up the key.
+    strict GetKeyProvider() -> (struct {
+        key_provider KeyProvider;
+    }) error Error;
+};
+
+closed protocol AsymmetricPrivateKey {
+    compose Key;
+
+    /// Sign `data` using the current key. `data` needs to be less than `MAX_DATA_SIZE` bytes.
+    strict Sign(resource struct {
+        data mem.Buffer;
+    }) -> (struct {
+        signature Signature;
+    }) error Error;
+    /// Get the DER format public key for the current private key.
+    strict GetPublicKey() -> (struct {
+        public_key PublicKey;
+    }) error Error;
+    /// Get the key algorithm.
+    strict GetKeyAlgorithm() -> (struct {
+        key_algorithm AsymmetricKeyAlgorithm;
+    }) error Error;
+};

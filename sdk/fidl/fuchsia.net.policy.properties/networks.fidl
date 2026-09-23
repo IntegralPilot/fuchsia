@@ -1,0 +1,137 @@
+// Copyright 2025 The Fuchsia Authors.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.net.policy.properties;
+
+using fuchsia.net;
+using fuchsia.net.name;
+using zx;
+
+/// The NetworkToken is an opaque token minted by this service that represents a
+/// logical network for the purpose of accessing network properties.
+type NetworkToken = resource struct {
+    value zx.Handle:EVENTPAIR;
+};
+
+/// A set of properties that a client may be interested in.
+type PropertyInterest = flexible bits {
+    SOCKET_MARKS = 0b1;
+    DNS_CONFIGURATION = 0b10;
+};
+
+/// An update from [`Networks.WatchProperties`]. Only the fields specified in
+/// [`PropertyInterest`] may be set.
+type PropertyUpdate = table {
+    /// The socket marks associated with this network.
+    1: socket_marks fuchsia.net.Marks;
+    /// The DNS Configuration associated with this network.
+    2: dns_configuration @generated_name("DnsConfiguration") table {
+        /// A preference ordered list of [`fuchsia.net.name.DnsServer`]s.
+        /// NOTE: Required, this field must always be set.
+        1: servers vector<fuchsia.net.name.DnsServer>:MAX;
+    };
+};
+
+// TODO(https://fxbug.dev/42159332): Use built-in empty struct when available.
+type Empty = struct {};
+
+/// Protocol to allow operations on `NetworkToken` objects, including resolving
+/// `NetworkToken` to its canonical form.
+@discoverable
+open protocol NetworkTokenResolver {
+    /// Resolves a network token to a canonical form.
+    ///
+    /// Since a "default network" network token is a distinct token from the
+    /// non-default network variant, there needs to be a way to disambiguate
+    /// the pair.
+    ///
+    /// Since a "default network" token (i.e. a token obtained from
+    /// [`Networks.WatchDefault`]) is a distinct token from the non-default
+    /// network variant, there needs to be a way to disambiguate the pair. If a
+    /// non-default network token is passed, the same token is returned.
+    strict ResolveToken(resource struct {
+        token NetworkToken;
+    }) -> (resource struct {
+        /// The resolved token, it represents a specific logical network,
+        /// regardless of if that network happens to be the current default
+        /// network.
+        resolved_token NetworkToken;
+    }) error flexible enum : uint32 {
+        /// The provided `NetworkToken` is invalid or out-of-date.
+        INVALID_NETWORK_TOKEN = 1;
+    };
+};
+
+/// Protocol for acquiring [`NetworkToken`]s, and querying properties of that
+/// network.
+@discoverable
+open protocol Networks {
+    /// Watches for changes in the default network.
+    ///
+    /// The first call always returns a [`NetworkToken`] representing the
+    /// current default network, or if one is not present, blocks until a
+    /// default network is set. Subsequent calls block until the default
+    /// network has changed, or has been lost, returning a new [`NetworkToken`]
+    /// for the updated default network, or [`no_default_network`] if the
+    /// network is lost.
+    ///
+    /// Only one call to this method may be pending per connection.
+    flexible WatchDefault() -> (flexible resource union {
+        1: network NetworkToken;
+        2: no_default_network Empty;
+    });
+
+    /// Registers a [`PropertyWatcher`] to watch for changes in requested
+    /// properties for the given [`NetworkToken`].
+    ///
+    /// The watcher receives updates for the requested properties on the
+    /// network represented by `network`.
+    flexible WatchProperties(resource table {
+        /// A network token acquired from [`WatchDefault`].
+        /// NOTE: REQUIRED
+        1: network NetworkToken;
+
+        /// The set of properties for which changes should be reported.
+        /// NOTE: REQUIRED
+        2: properties PropertyInterest;
+
+        /// The server end of the `PropertyWatcher`.
+        /// NOTE: REQUIRED
+        3: watcher server_end:PropertyWatcher;
+    }) -> () error @generated_name("WatchError") flexible enum : uint32 {
+        /// The provided `properties` had no bits set.
+        NO_PROPERTIES = 1;
+        /// The provided NetworkToken was either not acquired from
+        /// [`WatchDefault`] or is no longer valid.
+        INVALID_NETWORK_TOKEN = 2;
+
+        /// An argument marked above as REQUIRED was not provided.
+        MISSING_REQUIRED_ARGUMENT = 99;
+    };
+};
+
+/// A watcher for network property changes.
+closed protocol PropertyWatcher {
+    /// A hanging-get method that returns updates to the properties requested
+    /// when the watcher was created via [`Networks.WatchProperties`].
+    ///
+    /// The first call returns a snapshot of all requested properties
+    /// for the watched network. Subsequent calls block until a property
+    /// has changed since the last call to `Watch` returned.
+    ///
+    /// Only one call to this method may be pending at a time. Concurrent calls
+    /// on the same `PropertyWatcher` immediately closes the connection with
+    /// an `zx.Status.ALREADY_EXISTS` epitaph.
+    strict Watch() -> (struct {
+        /// A table of updates that have occurred since the last update was
+        /// reported via this watcher. If a property changes multiple times
+        /// between updates, only the most recent version is reported.
+        updates PropertyUpdate;
+    }) error @generated_name("PropertyWatcherError") flexible enum : uint32 {
+        /// When the network watched by this watcher no longer exists, a new
+        /// [`NetworkToken`] must be acquired. After delivering this error, the
+        /// server immediately closes the `PropertyWatcher` connection.
+        NETWORK_GONE = 1;
+    };
+};

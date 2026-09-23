@@ -1,0 +1,2207 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.media;
+
+using fuchsia.math;
+using fuchsia.images2;
+using fuchsia.sysmem;
+using fuchsia.sysmem2;
+using zx;
+
+/// This enum indicates the StreamProcessor input or output. This is used in
+/// messages which can apply to either input or output. For example, the
+/// `StreamProcessor.ParticipateInBufferAllocation` message includes a `port`
+/// field.
+@available(added=32)
+type Port = flexible enum : uint32 {
+    INVALID = 0;
+    INPUT = 1;
+    OUTPUT = 2;
+};
+
+/// This struct conveys the buffer_constraints_version_ordinal.
+///
+/// Historically this table conveyed more fields than it currently does, but
+/// those fields are all deprecated in favor of using sysmem instead.
+///
+/// There are separate instances of this struct for stream input and stream
+/// output.
+///
+/// Notes about fields:
+///
+/// For uncompressed video, separate and complete frames in their
+/// separate buffers (buffer-per-packet mode) are always a requirement.
+type StreamBufferConstraints = table {
+    /// This is a version number the server sets on the constraints to allow the
+    /// server to determine when the client has caught up with the latest
+    /// constraints sent by the server.  The server won't emit output data until
+    /// the client has configured output settings and buffers with a
+    /// buffer_constraints_version_ordinal >= the latest
+    /// buffer_constraints_version_ordinal that had
+    /// buffer_constraints_action_required true.  See
+    /// buffer_constraints_action_required comments for more.
+    ///
+    /// A buffer_constraints_version_ordinal of 0 is not permitted, to simplify
+    /// initial state handling. Other than 0, both odd and even version ordinals
+    /// are allowed (in contrast to the stream_lifetime_ordinal, neither the
+    /// client nor server ever has a reason to consider the latest version to be
+    /// stale, so there would be no benefit to disallowing even values).
+    1: buffer_constraints_version_ordinal uint64;
+
+    /// If a codec has
+    /// `[fuchsia.mediacodec/DetailedCodecDescription.supports_dynamic_buffers]`
+    /// set to true, this field must be set by the server and will be the
+    /// minimum number of input or output buffers that the server needs to be
+    /// able to concurrently use (or continue using) to guarantee forward
+    /// progress. For video decoders, this number assumes a
+    /// bitstream-standard-compliant stream. Any time the server doesn't have
+    /// this many buffers available for the server's concurrent use (DPB size +
+    /// 1), processing may pause, but will not fail - in this case the client
+    /// can add more buffers with AddBuffers to get the processing to start
+    /// again. When the DPB needs to reference more images, recycling an output
+    /// buffer won't necessarily cause processing to start again, as the image
+    /// may still be in the DPB, so the buffer can't be re-used yet despite
+    /// being recycled by the client.
+    ///
+    /// For input, the codec may require this many buffers before the codec will
+    /// process any input. Currently, for input, this value is static per
+    /// StreamProcessor instance. The client is allowed to send QueueInput...()
+    /// messages before this many input buffers have been added, but should not
+    /// expect any output to necessarily be emitted until at least this many
+    /// input buffers have been added. This also applies for
+    /// QueueInputFormatDetails and QueueInputEndOfStream before any
+    /// QueueInputPacket, for a newly starting stream, so the first two can be
+    /// sent while there are still zero added input buffers so far. Codecs that
+    /// only need one input buffer to make forward progress (non-continuous
+    /// non-smooth forward progress still counts) should set this to one. Most
+    /// clients will want to add a low number of additional buffers to keep the
+    /// pipeline running smoothly, to avoid stalling processing while an
+    /// OnFreeInputPacket is on its way from the codec to the client. Decoders
+    /// that copy input data into a separate stream buffer (sometimes treated as
+    /// circular) typically will only need one input buffer for forward progress
+    /// to be possible, but most clients will still want to add a low number of
+    /// additional input buffers for smoother thread scheduling, even if such a
+    /// decoder core might be able to run at 100% utilization with a single
+    /// input buffer.
+    ///
+    /// For video decoder output, if a client were to only `AddBuffers` this
+    /// many buffers overall, every time `OnOutputPacket` happened, the decoder
+    /// would be potentially stalled until `RecycleOutputPacket` is received at
+    /// the server. For this reason, most clients will prefer to allocate a few
+    /// more buffers, accounting for other parts of the pipeline (locally in the
+    /// client or not) that may also need to "camp" on buffers for reasons
+    /// unrelated to video decode, and possibly also a low number of additional
+    /// buffers to keep the pipeline running smoothly, to avoid stalling decode
+    /// while a free buffer on its way to being recycled or similar.
+    ///
+    /// For video decoder output, when set, this value will always be less than
+    /// or equal to
+    /// `[fuchsia.mediacodec/DetailedCodecDescription.dynamic_buffers_video_decoder_output_safe]`.
+    ///
+    /// This value can be updated by a new OnOutputConstraints from the server
+    /// with action_required false. However, despite "action_required" being
+    /// false, the client must still ensure that the number of buffers currently
+    /// available for concurrent use by the codec is at least this many.
+    ///
+    /// If a client using dynamic buffers with a video decoder doesn't want to
+    /// pay attention to this field, the client should still pay attention to
+    /// `[fuchsia.mediacodec/DetailedCodecDescription.dynamic_buffers_video_decoder_output_safe]`.
+    /// Or the client can instead use
+    /// SetInputBufferPartialSettings/SetOutputBufferPartialSettings which has
+    /// approximately the same (potentially adverse) effect in terms of overall
+    /// buffer count (assuming a correctly operating pipeline). While these less
+    /// complicated client implementation options might initially seem like
+    /// they're wasting some memory, paying attention to
+    /// buffer_count_for_server_current (in contrast to only
+    /// dynamic_buffers_video_decoder_output_safe) only saves memory if the
+    /// stream has the needed optional fields with values less than the max DPB
+    /// size, which is unfortunately not guaranteed. In particular, h.264
+    /// streams without max_num_reorder_frames or max_dec_frame_buffering set in
+    /// vui_parameters (or anywhere else) seem more common than not (to this
+    /// author, among streams looked at so far), though this could depend
+    /// strongly on which particular set of streams a client wants to decode.
+    /// Client implementers may want to check some of the relevant streams for
+    /// relevant bitstream header fields before caring about this field and the
+    /// dynamic changes to the value conveyed by this field, for video decoders.
+    /// Also, client implementers are free to use other strategies to save
+    /// memory, such as being stingy with buffer counts but adding buffers
+    /// dynamically and quickly if it seems like the codec might be starving for
+    /// buffers (such as if downstream queued output buffers start to run low).
+    /// This sort of strategy is up to the client, and it's on the client to get
+    /// the timing right if it goes with that sort of strategy (not super easy
+    /// to get perfectly correct / tuned). The platform makes no specific
+    /// guarantee re. how quickly an additional buffer can be allocated, so a
+    /// client attempting to run with fewer than
+    /// dynamic_buffers_video_decoder_output_safe may encounter stream rendering
+    /// jank or similar, including mid-stream. The platform makes no promises
+    /// regarding the ability to avoid jank in this situation, such as if
+    /// there's a mid-stream header that increases this value for output (not
+    /// common).
+    ///
+    /// Layers above are encouraged to permit storing smaller images in larger
+    /// buffers, so that mid-stream dimensions changes don't each need to
+    /// re-allocate buffers. Instead, it's almost always better to just keep
+    /// using existing larger buffers in this case, to avoid possibility of
+    /// rendering jank due to allocating buffers not always being as fast as
+    /// desired combined with output buffer count not necessarily having
+    /// sufficient extra buffers to absorb the buffer reallocation in a timing
+    /// sense. However, if a layer above really must re-allocate buffers when
+    /// the image size changes and the needed buffer size to hold the images
+    /// goes down, such a client must set force_new_buffers_for_new_dimensions
+    /// passed to CreateDecoder. Otherwise a video decoder is permitted to start
+    /// putting smaller images in the existing larger buffers, with
+    /// OnOutputFormat message(s) indicating this.
+    @available(added=32)
+    14: buffer_count_for_server_current uint32;
+
+    /// Clients are free to ignore this field.
+    ///
+    /// This field is set iff
+    /// `[fuchsia.mediacodec/DetailedCodecDescription.supports_dynamic_buffers]`
+    /// is true and the indicating port is outputting uncompressed video.
+    ///
+    /// This field is provided for informational purposes, for clients that may
+    /// want to know this information. However, the StreamProcessor and sysmem
+    /// protocols work fine without the client ever reading this field.
+    ///
+    /// This is the required coded size, without any cropping down to display
+    /// size.
+    ///
+    /// If the client gets directly involved as a sysmem participant, the client
+    /// should not set constraints which are incompatible with this size, or
+    /// allocation will fail. This field should not be taken to imply that a
+    /// given buffer only has a single allowed image size. That is incorrect in
+    /// general. Rather, this field indicates a size which will be covered by
+    /// the required_min_size and required_max_size set by the StreamProcessor
+    /// sysmem participant using token passed into
+    /// SetInputBufferPartialSettings, SetOutputBufferPartialSettings, or
+    /// ParticipateInBufferAllocation.
+    ///
+    /// Despite this size indicating a specific width and height, the allocated
+    /// buffers may permit a range of image sizes (for video decoder output or
+    /// video encoder input).
+    @available(added=32)
+    15: size fuchsia.math.SizeU;
+
+    /// Clients are free to ignore this field.
+    ///
+    /// This field is set iff
+    /// `[fuchsia.mediacodec/DetailedCodecDescription.supports_dynamic_buffers]`
+    /// is true and the indicating port is conveying uncompressed video.
+    ///
+    /// This field is provided for informational purposes, for clients that may
+    /// want to know this information. However, the StreamProcessor and sysmem
+    /// protocols work fine without the client ever reading this field.
+    ///
+    /// Among the pixel formats supported by the StreamProcessor server which
+    /// can carry the full bit depth of the images, and which are broadly
+    /// supported for carrying images of the needed bit depth, and assuming
+    /// linear pixel_format_modifier, this is the pixel format that is most
+    /// performant for the StreamProcessor considered in isolation. If multiple
+    /// qualified formats are essentially the same performance, this should be
+    /// the most common format (or chosen arbitrarily among roughly
+    /// equally-common formats). Most StreamProcessor servers will hard code a
+    /// particular format to put in this field for each supported bit depth.
+    ///
+    /// Currently, there is no anticipated need for a list here, but please
+    /// don't hesitate to reach out if a non-test scenario is encountered which
+    /// can only be addressed by having a list here (or by attempting several
+    /// test allocations via ParticipateInBufferAllocation, or by adding a
+    /// sysmem feature).
+    ///
+    /// In general, sysmem is not guaranteed to select this pixel format, since
+    /// that depends on the full set of pixel formats supported by the
+    /// StreamProcessor instance and other sysmem participants. If only the
+    /// client and StreamProcessor are sysmem participants (such as in some
+    /// tests), if the client requires this pixel format, buffer allocation can
+    /// still succeed. Typical non-test clients will not need or want to
+    /// constrain the sysmem allocation to only allow this pixel format, as that
+    /// would be more likely to fail allocation in comparison to letting sysmem
+    /// pick a format mutually supported by all participants.
+    @available(added=32)
+    16: pixel_format fuchsia.images2.PixelFormat;
+
+    @deprecated("Ignore. Obsolete.")
+    12: single_buffer_mode_allowed bool;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    2: default_settings StreamBufferSettings;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    3: per_packet_buffer_bytes_min uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    4: per_packet_buffer_bytes_recommended uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    5: per_packet_buffer_bytes_max uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    6: packet_count_for_server_min uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    7: packet_count_for_server_recommended uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    8: packet_count_for_server_recommended_max uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    9: packet_count_for_server_max uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    10: packet_count_for_client_min uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    11: packet_count_for_client_max uint32;
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    13: is_physically_contiguous_required bool;
+};
+
+/// The stream-processor-controlled output configuration, including both
+/// StreamBufferConstraints for the output and FormatDetails for the output.
+//
+// TODO(dustingreen): Need a better name for this struct, but still short
+// hopefully.  It's stuff the stream processor gets to control, not the client.
+// It's different than output buffer settings, which the client does get to
+// control to some extent.  It's different than any configurable output
+// settings the client might specify for output of an encoder.
+type StreamOutputConstraints = table {
+    /// A client which always immediately re-configures output buffers on
+    /// receipt of OnOutputConstraints() with buffer_constraints_action_required
+    /// true can safely ignore this field.
+    ///
+    /// A client is permitted to ignore an OnOutputConstraints() message even with
+    /// buffer_constraints_action_required true if the client knows the server
+    /// has already been told to discard the remainder of the stream with the
+    /// same stream_lifetime_ordinal or if this stream_lifetime_ordinal field is
+    /// set to 0.  The server is required to re-send needed output config via
+    /// OnOutputConstraints() with new stream_lifetime_ordinal and
+    /// buffer_constraints_action_required true, if the most recent completed
+    /// server-side output config isn't what the server wants/needs yet for the
+    /// new stream.
+    1: stream_lifetime_ordinal uint64;
+
+    /// When the buffer constraints are delivered, they indicate whether action
+    /// is required. A false value here permits delivery of constraints which
+    /// are fresher without forcing a buffer reconfiguration. If this is false,
+    /// a client cannot assume that it's safe to immediately re-configure output
+    /// buffers. If this is true, the client can assume it's safe to immediately
+    /// configure output buffers once.
+    ///
+    /// When not using dynamic buffers, a false value is deprecated and not sent
+    /// by any known servers.
+    ///
+    /// When using dynamic buffers, a false value can be sent by the server to
+    /// update buffer_count_for_server_current, but that value will always be
+    /// less than or equal to dynamic_buffers_video_decoder_output_safe. A
+    /// client that prefers to just use
+    /// dynamic_buffers_video_decoder_output_safe can ignore new
+    /// StreamOutputConstraints if buffer_constraints_action_required false
+    /// (assuming the client has no other reason to pay attention to the
+    /// message). If a client is using buffer_count_for_server_current to
+    /// potentially save a few buffers for streams that explicitly allow for
+    /// that (unfortunately streams which specify a lower required DPB size are
+    /// fairly rare AFAICT), the client must pay attention to new values of
+    /// buffer_count_for_server_current even when
+    /// buffer_constraints_action_required false, and ensure that the codec will
+    /// have a buffer count available for the codec's use that's consistent with
+    /// the new value. The codec will not set true or false depending on how
+    /// many buffers the codec currently has available / free / seemingly for
+    /// the codec's use, because there's no way for the codec to reliably detect
+    /// that, as buffers can be opportunistically handed to the codec, yet
+    /// actually reserved for potential use (and potential "camping") by the
+    /// downstream pipeline (or similar).
+    ///
+    /// A client is permitted to ignore buffer constraint versions which have
+    /// buffer_constraints_action_required false.  The server is not permitted
+    /// to change buffer_constraints_action_required from false to true for the
+    /// same buffer_constraints_version_ordinal.
+    ///
+    /// For each configuration, a client must use new buffers, never buffers
+    /// that were previously used for anything else, and never buffers
+    /// previously used for any other StreamProcessor purposes.  This rule
+    /// exists for multiple good reasons, relevant to both mid-stream changes,
+    /// and changes on stream boundaries. A client should just use new buffers
+    /// each time.
+    ///
+    /// When this is true, the server has already de-refed as many low-level
+    /// output buffers as the server can while still performing efficient
+    /// transition to the new buffers and will de-ref the rest asap.  A Sync()
+    /// is not necessary to achieve non-overlap of resource usage to the extent
+    /// efficiently permitted by the formats involved.
+    ///
+    /// If buffer_constraints_action_required is true, the server _must_ not
+    /// deliver more output data until after output buffers have been configured
+    /// (or re-configured) by the client.
+    2: buffer_constraints_action_required bool;
+    3: buffer_constraints StreamBufferConstraints;
+};
+
+type StreamOutputFormat = table {
+    /// A client is permitted to ignore an OnOutputFormat() message even with
+    /// buffer_constraints_action_required true if the client knows the server
+    /// has already been told to discard the remainder of the stream with the
+    /// same stream_lifetime_ordinal or if this stream_lifetime_ordinal field is
+    /// set to 0.  The server is required to re-send needed output config via
+    /// OnOutputConstraints() with new stream_lifetime_ordinal and
+    /// buffer_constraints_action_required true, if the most recent completed
+    /// server-side output config isn't what the server wants/needs yet for the
+    /// new stream.
+    ///
+    /// The server is required to send an OnOutputFormat() before the first
+    /// output packet of a stream.
+    1: stream_lifetime_ordinal uint64;
+
+    /// If format_details.format_details_version_ordinal changes, the client
+    /// should inspect the new format details and determine if it must adjust to
+    /// the new format. The server guarantees that if the format has changed, then
+    /// format_details.format_details_version_ordinal will change, but a change
+    /// to format_details.format_details_version_ordinal does not guarantee that
+    /// the format details actually changed.  Servers are strongly encouraged to
+    /// not change format_details.format_details_version_ordinal other than
+    /// before the first output data of a stream unless there is a real
+    /// mid-stream format change in the stream.  Unnecessary mid-stream format
+    /// changes can cause simpler clients that have no need to handle mid-stream
+    /// format changes to just close the channel.  Format changes before the
+    /// first output data of a stream are not "mid-stream" in this context -
+    /// those can be useful for stream format detection / setup reasons.
+    ///
+    /// Note that in case output buffers don't really need to be re-configured
+    /// despite a format change, a server is encouraged, but not required, to
+    /// set buffer_constraints_action_required false on the message that conveys
+    /// the new format details.  Simpler servers may just treat the whole output
+    /// situation as one big thing and demand output buffer reconfiguration on
+    /// any change in the output situation.
+    ///
+    /// A client may or may not actually handle a new buffer_constraints with
+    /// buffer_constraints_action_required false, but the client should always
+    /// track the latest format_details.
+    ///
+    /// An updated format_details is ordered with respect to emitted output
+    /// packets, and applies to all subsequent packets until the next
+    /// format_details with larger version_ordinal.  A simple client that does
+    /// not intend to handle mid-stream format changes should still keep track
+    /// of the most recently received format_details until the first output
+    /// packet arrives, then lock down the format details, handle those format
+    /// details, and verify that any
+    /// format_details.format_details_version_ordinal received from the server
+    /// is the same as the locked-down format_details, until the client is done
+    /// with the stream.  Even such a simple client must tolerate
+    /// format_details.format_details_version_ordinal changing multiple times
+    /// before the start of data output from a stream (any stream - the first
+    /// stream or a subsequent stream).  This allows a stream processor to
+    /// request that output buffers and output format be configured
+    /// speculatively, and for the output config to be optionally adjusted by
+    /// the server before the first data output from a stream after the server
+    /// knows everything it needs to know to fully establish the initial output
+    /// format details.  This simplifies stream processor server implementation,
+    /// and allows a clever stream processor server to guess it's output config
+    /// for lower latency before any input data, while still being able to fix
+    /// the output config (including format details) if the guess turns out to
+    /// be wrong.
+    ///
+    /// Whether the format_details.format_details_version_ordinal will actually
+    /// change mid-stream is a per-stream-processor and per-stream detail that
+    /// is not specified in comments here, and in most cases also depends on
+    /// whether the format changes on the input to the stream processor.
+    /// Probably it'll be fairly common for a client to use a format which
+    /// technically supports mid-stream format change, but the client happens to
+    /// know that none of the streams the client intends to process will ever
+    /// have a mid-stream format change.
+    2: format_details FormatDetails;
+};
+
+// TODO(dustingreen): Consider renaming this to StreamBufferSettings once that's
+// an option.
+type StreamBufferPartialSettings = resource table {
+    /// Each buffer is associated with a `buffer_lifetime_ordinal` value.
+    ///
+    /// There is a separate buffer_lifetime_ordinal for input vs. output.
+    ///
+    /// Values must be odd. Values must only increase (increasing by more than 2
+    /// is permitted).
+    ///
+    /// When using `SetInputBufferPartialSettings` or
+    /// `SetOutputBufferPartialSettings`, re-use of the same value (considering
+    /// input and output separately) for the new message is not allowed. Using
+    /// these messages, all the buffers of a given buffer_lifetime_ordinal value
+    /// are allocated as one sysmem buffer collection.
+    ///
+    /// When a new buffer_lifetime_ordinal starts, that also automatically
+    /// starts un-registering and releasing any buffers associated with prior
+    /// buffer_lifetime_ordinal values, but does not force them to complete
+    /// un-registration (or release) if they're still used by the codec for
+    /// reference purposes (VP9 can do this across a mid-stream dimensions
+    /// switch). A buffer can still be output by the server (as indicated by an
+    /// output packet) until un-registration completes.
+    ///
+    /// If the client wants the server to drop all buffers quickly, the client
+    /// can send `CloseCurrentStream` with `release_input_buffers` and/or
+    /// `release_output_buffers` set. This of course also stops decode of the
+    /// current stream. Closing the `StreamProcessor` client end is another
+    /// option.
+    1: buffer_lifetime_ordinal uint64;
+
+    /// This value indicates which version of constraints the client is/was
+    /// aware of so far.
+    ///
+    /// For input, this must always be 0 because constraints don't change for
+    /// input (settings can change, but there's no settings vs current
+    /// constraints synchronization issue on input).
+    ///
+    /// For output, this allows the server to know when the client is
+    /// sufficiently caught up before the server will generate any more output.
+    ///
+    /// When there is no active stream, a client is permitted to re-configure
+    /// buffers again using the same buffer_constraints_version_ordinal.
+    2: buffer_constraints_version_ordinal uint64;
+
+    /// The client end of a BufferCollectionToken channel, which the
+    /// StreamProcessor will use to deliver constraints to sysmem and learn of
+    /// buffers allocated by sysmem.
+    ///
+    /// The client guarantees that the token is already known to sysmem (via
+    /// BufferCollectionToken.Sync(), BufferCollection.Sync(), or
+    /// BufferCollectionEvents.OnDuplicatedTokensKnownByServer()).
+    @available(added=23)
+    7: sysmem2_token client_end:fuchsia.sysmem2.BufferCollectionToken;
+    @available(deprecated=23, note="use sysmem2_token")
+    6: sysmem_token client_end:fuchsia.sysmem.BufferCollectionToken;
+
+    @available(deprecated=23, note="fuchsia.sysmem2.BufferCollection.SetConstraints")
+    @deprecated("Ignore. Obsolete.")
+    3: single_buffer_mode bool;
+    @available(deprecated=23, note="fuchsia.sysmem2.BufferCollection.SetConstraints")
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    4: packet_count_for_server uint32;
+    @available(deprecated=23, note="fuchsia.sysmem2.BufferCollection.SetConstraints")
+    @deprecated("Ignore. Use fuchsia.sysmem.BufferCollection.SetConstraints() ")
+    5: packet_count_for_client uint32;
+};
+
+/// PacketHeader
+///
+/// When referring to a free packet, we use PacketHeader alone instead of
+/// Packet, since while a packet is free it doesn't really have meaningful
+/// offset or length etc.
+///
+/// A populated Packet also has a PacketHeader.
+type PacketHeader = table {
+    /// This is which buffer configuration lifetime this header is referring to.
+    ///
+    /// See
+    /// `[fuchsia.mediacodec/StreamBufferPartialSettings.buffer_lifetime_ordinal]`.
+    ///
+    /// For QueueInputPacket(), a server receiving a buffer_lifetime_ordinal
+    /// that isn't the current input buffer_lifetime_ordinal will close the
+    /// channel.
+    ///
+    /// For output packets, this can be an old buffer_lifetime_ordinal only if
+    /// EnableOldOutputBuffers was sent by the client. See also RemoveBuffer to
+    /// determine when it's safe to stop tracking old output buffers (only
+    /// relevant to some video bitstream formats such as VP9, and only relevant
+    /// to decoders). Streams that want to emit old output buffers are rare
+    /// outside of bitstream format test streams.
+    1: buffer_lifetime_ordinal uint64;
+
+    /// When using `SetInputBufferPartialSettings` or
+    /// `SetOutputBufferPartialSettings` to allocate buffers, the valid range of
+    /// `packet_index` is from 0..buffer_count-1, where buffer_count is the
+    /// length of `[fuchsia.sysmem2/BufferCollectionInfo.buffers]`, considering
+    /// input and output separately.
+    ///
+    /// When using `ParticipateInBufferAllocation` and `AddBuffer` to allocate
+    /// and add buffers, the valid range of `packet_index` is unconstrained (any
+    /// uint32 value). The client and server must still ensure that
+    /// `packet_index` values aren't re-used until the other end has indicated
+    /// the `packet_index` value is again available and can be re-used.
+    ///
+    /// The number of concurrently in-flight `packet_index` values is limited
+    /// per port (input vs. output) and `buffer_lifetime_ordinal`. If a client
+    /// never puts the same input buffer in flight using more than one input
+    /// packet concurrently, this inherently ensures the client will conform to
+    /// this limit. Most clients can safely ignore this limit for output from
+    /// the server. The limit is as follows:
+    ///   * When sending a packet, the sender must ensure that the number of
+    ///     concurrently in-flight `packet_index` values under the port (input
+    ///     or output) and `buffer_lifetime_ordinal` does not exceed the
+    ///     high-water-mark number of buffers that have concurrently existed
+    ///     from the server's point of view under the `buffer_lifetime_ordinal`
+    ///     so far. When using `SetInputBufferPartialSettings`, this is
+    ///     buffer_count as defined above.
+    ///   * When using `AddBuffer`, the high-water-mark value is determined
+    ///     slightly differently for input vs. output.
+    ///     * For input, this high-water-mark value is the maximum value so far
+    ///       under the `buffer_lifetime_ordinal` of the total number of
+    ///       `AddBuffer` messages regarding the `buffer_lifetime_ordinal` minus
+    ///       the total number of `RemoveBuffer` messages regarding the
+    ///       `buffer_lifetime_ordinal`.
+    ///       * If a client never puts an input buffer in flight more than once
+    ///         concurrently using multiple different input `packet_index`
+    ///         values, then the client will inherently stay under this limit
+    ///         for input.
+    ///     * For output, this high-water-mark value is the maximum so far under
+    ///       the `buffer_lifetime_ordinal` of the total number of `AddBuffer`
+    ///       messages regarding the `buffer_lifetime_ordinal` minus the total
+    ///       number of completed buffer removals under the
+    ///       `buffer_lifetime_ordinal`. This is without regard to which buffer
+    ///       removals had a corresponding `RemoveBuffer` completion.
+    ///       * If a client wishes to (optionally) validate this server
+    ///         behavior, the client can rely on the server to not complete a
+    ///         `RemoveBuffer` until after completion of buffer removal
+    ///         server-side (else the server is failing to conform to
+    ///         `RemoveBuffer` semantics or failing to conform to this limit).
+    ///
+    /// For input, the client chooses an available `packet_index` value
+    /// arbitrarily when sending an input packet with `QueueInputPacket`, and
+    /// the client doesn't re-use the value until the server has sent
+    /// `OnFreeInputPacket` with that `packet_index` value.
+    ///
+    /// For output, the server chooses an available `packet_index` value
+    /// arbitrarily (among all uint32 values) when sending an output packet with
+    /// `OnOutputPacket`, and doesn't re-use the value until the client has sent
+    /// `RecycleOutputPacket` with that `packet_index` value.
+    ///
+    /// Available `packet_index` values can be queued in arbitrary order.
+    ///
+    /// Both the client and server should validate the packet_index against the
+    /// known bound (if any; see above) and disconnect if it's out of bounds.
+    ///
+    /// The packet_index values don't imply anything about order of use of
+    /// packets. The client should not expect the ordering to remain the same
+    /// over time - the stream processor is free to hold on to an input or
+    /// output packet for a while during which some other packet_index values
+    /// may be re-used multiple times.
+    ///
+    /// For a given properly-functioning StreamProcessor instance, output
+    /// packet_index values will be unique among concurrently-outstanding
+    /// packets.
+    ///
+    /// Servers should validate that a client isn't double-using a packet and
+    /// clients may similarly validate `packet_index` values from the server.
+    2: packet_index uint32;
+};
+
+/// A Packet represents a chunk of input or output data to or from a stream
+/// processor.
+///
+/// stream processor output:
+///
+/// While the Packet is outstanding with the client via OnOutputPacket(), the
+/// stream processor will avoid modifying the referenced output data.  After the
+/// client calls RecycleOutputPacket(packet_index), the stream processor is
+/// notified that the client is again ok with the referenced data changing.
+///
+/// stream processor input:
+///
+/// The client initially has all packet_index(es) available to fill, and later
+/// gets packet_index(s) that are again ready to fill via OnFreeInputPacket().
+/// The client must not modify the referenced data in between QueueInputPacket()
+/// and OnFreeInputPacket().
+type Packet = table {
+    1: header PacketHeader;
+
+    /// Which buffer this packet refers to. A given in-flight interval of a
+    /// packet refers to a specfic buffer using buffer_lifetime_ordinal (in
+    /// PacketHeader) and buffer_index.
+    ///
+    /// A client should be prepared to handle output packets that refer to a
+    /// buffer_lifetime_ordinal that's old (with buffer_index scoped to the old
+    /// buffer_lifetime_ordinal). Streams that do this are not common (in this
+    /// author's experience so far). Some clients may prefer to just ignore
+    /// output packets with an old buffer_lifetime_ordinal, or notice the old
+    /// buffer_lifetime_ordinal and fail the stream client-side. Clients that do
+    /// want to fully handle such streams (for bitstream formats that can do
+    /// this in the first place) can use RemoveBuffer completion to detect when
+    /// each buffer of an old buffer_lifetime_ordinal will never again be
+    /// referenced in any subsequent output packet. If the dimensions of the
+    /// frame in the old buffer are different than the previous output frame,
+    /// OnOutputFormat will be sent in between the output packets (as usual).
+    ///
+    /// A client should be prepared to handle (as in "not crash when") two or
+    /// more output packets reference the same buffer, without the first output
+    /// packet having been recycled back to the StreamProcessor yet. There is
+    /// intentionally no guarantee that packets in-flight with the client will
+    /// all refer to unique buffers, at least due to VP9 show_existing_frame,
+    /// and possibly similar coding tools in other bitstream formats. Some
+    /// layers above the direct client may not support this, in which case
+    /// failing the stream client-side may be acceptable if the client has no
+    /// need to support decode of streams that do this. More sophisticated
+    /// translation strategies in this situation are outside the scope of this
+    /// documentation. Clients intending to handle DRM-protected streams should
+    /// keep in mind that copying frame contents with the CPU is likely not
+    /// possible. To be clear, this author has never seen a DRM-protected stream
+    /// that does this, and the only non-DRM-protected streams that this author
+    /// has seen do this are test streams. Still, client authors should be aware
+    /// that streams "in the wild" can potentially do this.
+    ///
+    /// RemoveBuffer is supported both when using dynamic buffers, and when not
+    /// using dynamic buffers. When using RemoveBuffer with non-dynamic buffers,
+    /// there is no AddBuffer involved or required, as
+    /// SetInputBufferPartialSettings or SetOutputBufferPartialSettings was used
+    /// to add all the buffers of the buffer_lifetime_ordinal. In the case of
+    /// non-dynamic buffers however, the RemoveBuffer won't actaully start the
+    /// removal of a buffer. But it will complete when the buffer is fully done
+    /// removing.
+    ///
+    /// The packet has an associated buffer_lifetime_ordinal and buffer_index
+    /// only while the packet is in-flight, not while the packet is free.
+    ///
+    /// When not using dynamic buffers, this value is the same as the sysmem
+    /// buffer_index.
+    ///
+    /// When using dynamic buffers, this value is not the same as the sysmem
+    /// buffer_index (other than by chance), nor is it guaranteed to be a small
+    /// number.
+    ///
+    /// By default, for output buffers, this buffer_index value is guaranteed to
+    /// be unique among buffers with the same buffer_lifetime_ordinal currently
+    /// in-flight with the client. For decoding bitstream formats that can
+    /// output the same buffer backing different output packets where the
+    /// multiple packets are in the output queue at the same time (possibly with
+    /// different timestamp_ish values), a client can send
+    /// EnableSameOutputBufferConcurrentlyInFlight to indicate that the client
+    /// is prepared to handle more than one output packet concurrently in flight
+    /// referencing the same output buffer. Streams where this makes any
+    /// difference are rare outside of bitstream format tests.
+    2: buffer_index uint32;
+
+    /// The value 1 is the lowest permitted value after stream processor
+    /// creation.  Values sent by the client must be odd.  Values must only
+    /// increase.
+    ///
+    /// A stream_lifetime_ordinal represents the lifetime of a stream.  All
+    /// messages that are specific to a stream have the stream_lifetime_ordinal
+    /// value and the value is the same for all messages relating to a given
+    /// stream.
+    3: stream_lifetime_ordinal uint64;
+
+    /// Which part of the relevant buffer is this packet using.  These are valid
+    /// for input data that's in-flight to the stream processor, and are valid
+    /// for output data from the stream processor.
+    ///
+    /// For compressed formats and uncompressed audio, the data in
+    /// [start_offset, start_offset + valid_length_bytes) is the contiguously
+    /// valid data referred to by this packet.
+    ///
+    /// For uncompressed video frames, FormatDetails is the primary means of
+    /// determining which bytes are relevant.  The offsets in FormatDetails
+    /// are relative to the start_offset here.  The valid_length_bytes must be
+    /// large enough to include the full last line of pixel data, including the
+    /// full line stride of the last line (not just the width in pixels of the
+    /// last line).
+    ///
+    /// Despite these being filled out, some uncompressed video buffers are of
+    /// types that are not readable by the CPU.  These fields being here don't
+    /// imply there's any way for the CPU to read an uncompressed frame.
+    //
+    // TODO(dustingreen): Do we have any reason to require that these be filled
+    // out for opaque uncompressed video frames that the CPU can't read?  In
+    // that case do we want to require them just so they can be potentially
+    // passed on to a HW renderer in case the HW renderer has any use for them?
+    // Or more likely, it may just be that these tend to refer to the whole
+    // size of an uncompressed buffer, with format_details taking care of
+    // specifying which bytes are actually relevant.
+    4: start_offset uint32;
+
+    /// This must be > 0.
+    ///
+    /// The semantics for valid data per packet vary depending on data type as
+    /// follows.
+    ///
+    /// uncompressed video - A video frame can't be split across packets.  Each
+    /// packet is one video frame.
+    ///
+    /// uncompressed audio - Regardless of float or int, linear or uLaw, or
+    /// number of channels, a packet must contain an non-negative number of
+    /// complete audio frames, where a single audio frame consists of data for
+    /// all the channels for the same single point in time.  Any
+    /// stream-processor-specific internal details re. lower rate sampling for
+    /// LFE channel or the like should be hidden by the StreamProcessor server
+    /// implementation.
+    ///
+    /// compressed data input - A packet must contain at least one byte of data.
+    /// See also stream_input_bytes_min.  Splitting AUs at arbitrary byte
+    /// boundaries is permitted, including at boundaries that are in AU headers.
+    ///
+    /// compressed data output - The stream processor is not required to fully
+    /// fill each output packet's buffer.
+    5: valid_length_bytes uint32;
+
+    /// This value is not strictly speaking a timestamp.  It is an arbitrary
+    /// unsigned 64-bit number that, under some circumstances, will be passed by
+    /// a stream processor unmodified from an input packet to the
+    /// exactly-corresponding output packet.
+    ///
+    /// For timestamp_ish values to be propagated from input to output the
+    /// following conditions must be true:
+    ///  * promise_separate_access_units_on_input must be true
+    ///  * has_timestamp_ish must be true for a given input packet, to have that
+    ///    timestamp_ish value (potentially) propagate through to an output
+    ///    packet
+    ///  * the StreamProcessor instance itself decides (async) that the input
+    ///    packet generates an output packet - if a given input never generates
+    ///    an output packet then the timestamp_ish value on the input will never
+    ///    show up on any output packet - depending on the characteristics of the
+    ///    input and output formats, and whether a decoder is willing to join
+    ///    mid-stream, etc this can be more or less likely to occur, but clients
+    ///    should be written to accommodate timestamp_ish values that are fed on
+    ///    input but never show up on output, at least to a reasonable degree
+    ///    (not crashing, not treating as an error).
+    6: timestamp_ish uint64;
+
+    /// If promise_separate_access_units_on_input (TODO(dustingreen): or any
+    /// similar mode for output) is true, this bool must be set appropriately
+    /// depending on whether byte 0 _is_ or _is not_ the start of an access
+    /// unit. The client is required to know, and required to set this boolean
+    /// properly. The server is allowed to infer that when this boolean is
+    /// false, byte 0 is the first byte of a continuation of a
+    /// previously-started AU.  (The byte at start_offset is "byte 0".)
+    ///
+    /// If promise_separate_access_units_on_input is false, this boolean is
+    /// ignored.
+    7: start_access_unit bool;
+
+    /// A client is never required to set this boolean to true.
+    ///
+    /// If promise_separate_access_units_on_input is true, for input data, this
+    /// boolean must be false if this packet does not contain the last byte of
+    /// the up to one AU contained or partially contained in this packet, and
+    /// this boolean _may_ be true if the last byte of the up-to-one AU is in
+    /// this packet. A client delivering one AU at a time that's interested in
+    /// the lowest possible latency via the decoder should set this boolean to
+    /// true when it can be set to true.
+    ///
+    /// If promise_separate_access_units_on_input is false, this boolean is
+    /// ignored.
+    ///
+    /// Some bitstream formats have the concept of an access unit delimiter or
+    /// similar. A client wishing to achieve low latency may choose to inject
+    /// correctly-formed access unit delimiters (or similar) after each access
+    /// unit as an alternate way to signal to a decoder that the access unit has
+    /// ended. However, such a client is encouraged to also set this field to
+    /// true when possible, to ensure that all layers of a decoder notice.
+    /// Injecting an access unit delimiter is allowed but unnecessary (for
+    /// latency reduction purposes) if this is set to true (for a
+    /// properly-functioning decoder). A client never needs to strip away any
+    /// access unit delimiters that are potentially already present in the
+    /// stream - there is no requirement that the setting of this field match
+    /// the existence/non-existence of any access unit delimiter(s).
+    8: known_end_access_unit bool;
+
+    /// Used for compressed video packets. If not present should be assumed to
+    /// be unknown. If false, indicates the packet is not part of a key frame.
+    /// If true, indicates the packet is part of a key frame.
+    9: key_frame bool;
+};
+
+/// Overview of operation:
+///
+/// 1. Create
+///   * create via CodecFactory - see CodecFactory
+///   * create via LicenseSession - see LicenseSession
+/// 2. Get input constraints
+///   * OnInputConstraints() - sent unsolicited by stream processor shortly
+///     after stream processor creation.
+/// 3. Provide input buffers ()
+///   * SetInputBufferPartialSettings()
+///   * or AddBuffer, if StreamProcessor reported support for dynamic buffers
+///     via CodecFactory - in this case, QueueInputFormatDetails and
+///     QueueInputEndOfStream do not require a prior AddBuffer, but
+///     QueueInputPacket still does.
+/// 4. Deliver input data
+///   * QueueInputPacket() + OnFreeInputPacket(), for as long as it takes,
+///     possibly working through all input packets repeatedly before...
+/// 5. Get output constraints and format
+///   * OnOutputConstraints()
+///   * This is not sent until after at least one QueueInput* message is sent by
+///     the client, even if the underlying processor behind the StreamProcessor
+///     doesn't fundamentally need any input data to determine its output
+///     constraints.  This server behavior prevents clients taking an incorrect
+///     dependency on the output constraints showing up before input is
+///     delivered.
+///   * A client must tolerate this arriving as late as after substantial input
+///     data has been delivered, including lots of input packet recycling via
+///     OnFreeInputPacket().
+///   * This message can arrive more than once before the first output data.
+/// 6. Provide output buffers
+///   * SetOutputBufferPartialSettings() / CompleteOutputBufferPartialSettings()
+/// 7. Data flows, with optional EndOfStream
+///   * OnOutputPacket() / RecycleOutputPacket() / QueueInputPacket() /
+///     OnFreeInputPacket() / QueueInputEndOfStream() / OnOutputEndOfStream()
+///
+/// Semi-trusted StreamProcessor server - SW decoders run in an isolate (with
+/// very few capabilities) just in case the decoding SW has a vulnerability
+/// which could be used to take over the StreamProcessor server.  Clients of the
+/// stream processor interface using decoders and processing streams of separate
+/// security contexts, to a greater extent than some other interfaces, need to
+/// protect themselves against invalid server behavior, such as double-free of a
+/// packet_index and any other invalid server behavior.  Having fed in
+/// compressed data of one security context, don't place too much trust in a
+/// single StreamProcessor instance to not mix data among any buffers that
+/// StreamProcessor server has ever been told about.  Instead, create separate
+/// StreamProcessor instances for use by security-separate client-side contexts.
+/// While the picture for HW-based decoders looks somewhat different and is out
+/// of scope of this paragraph, the client should always use separate
+/// StreamProcessor instances for security-separate client-side contexts.
+///
+/// Descriptions of actions taken by methods of this protocol and the states of
+/// things are given as if the methods are synchronously executed by the stream
+/// processor server, but in reality, as is typical of FIDL interfaces, the
+/// message processing is async.  The states described are to be read as the
+/// state from the client's point of view unless otherwise stated.  Events
+/// coming back from the server are of course delivered async, and a client that
+/// processes more than one stream per StreamProcessor instance needs to care
+/// whether a given event is from the current stream vs. some older
+/// soon-to-be-gone stream.
+///
+/// The Sync() method's main purpose is to enable the client to robustly prevent
+/// having both old and new buffers allocated in the system at the same time,
+/// since media buffers can be significantly large, depending. The Sync() method
+/// achieves this by only delivering it's response when all previous calls to
+/// the StreamProcessor protocol have actually taken effect in the
+/// StreamControl ordering domain. Sync() can also be used to wait for the
+/// stream processor server to catch up if there's a possibility that a client
+/// might otherwise get too far ahead of the StreamProcessor server, by for
+/// example requesting creation of a large number of streams in a row.  It can
+/// also be used during debugging to ensure that a stream processor server
+/// hasn't gotten stuck.  Calling Sync() is entirely optional and never required
+/// for correctness - only potentially required to de-overlap resource usage.
+///
+/// It's possible to re-use a StreamProcessor instance for another stream, and
+/// doing so can sometimes skip over re-allocation of buffers. This can be a
+/// useful thing to do for cases like seeking to a new location - at the
+/// StreamProcessor interface that can look like switching to a new stream.
+open protocol StreamProcessor {
+    /// Permit the server to use OnStreamFailed() instead of the server just
+    /// closing the whole StreamProcessor channel on stream failure.
+    ///
+    /// If the server hasn't seen this message by the time a stream fails, the
+    /// server will close the StreamProcessor channel instead of sending
+    /// OnStreamFailed().
+    strict EnableOnStreamFailed();
+
+    /// The stream has failed, but the StreamProcessor instance is still usable
+    /// for a new stream.
+    ///
+    /// This message is only ever sent by the server if the client previously
+    /// sent EnableOnStreamFailed().  If the client didn't send
+    /// EnableOnStreamFailed() then the server closes the StreamProcessor
+    /// channel instead.
+    ///
+    /// StreamProcessor server implementations are encouraged to handle stream
+    /// errors (and ideally to also report them via error_ bools of
+    /// OnOutputPacket() and OnOutputEndOfStream()) without failing the whole
+    /// stream, but if a stream processor server is unable to do that, but still
+    /// can cleanly contain the failure to the stream, the stream processor
+    /// server can (assuming EnableOnStreamFailed() was called) use
+    /// OnStreamFailed() to indicate the stream failure to the client without
+    /// closing the StreamProcessor channel.
+    ///
+    /// An ideal StreamProcessor server handles problems with input data without
+    /// sending this message, but sending this message is preferred vs. closing
+    /// the server end of the StreamProcessor channel if the StreamProcessor
+    /// server can 100% reliably contain the stream failure to the stream,
+    /// without any adverse impact to any later stream.
+    ///
+    /// No further messages will arrive from the server regarding the failed
+    /// stream.  This includes any OnOutputEndOfStream() that the client would
+    /// have otherwise expected.
+    strict -> OnStreamFailed(struct {
+        stream_lifetime_ordinal uint64;
+        error StreamError;
+    });
+
+    /// The server sends this shortly after StreamProcessor creation to indicate
+    /// input buffer constraints.  The "min" and "max" input constraints don't
+    /// change for the life of the StreamProcessor.
+    ///
+    /// The "max" values for buffer size and count are large enough to support
+    /// the most demanding format the server supports on input.  The
+    /// "recommended" values should be workable for use with the input
+    /// FormatDetails conveyed during StreamProcessor creation.  The
+    /// "recommended" values are not necessarily suitable if the client uses
+    /// QueueInputFormatDetails() to change the input format.  In that case it's
+    /// up to the client to determine suitable values, either by creating a new
+    /// StreamProcessor instance instead, or knowing suitable values outside the
+    /// scope of this protocol.
+    ///
+    /// See comments on StreamBufferConstraints.
+    ///
+    /// This message is guaranteed to be sent unsolicited to the StreamProcessor
+    /// client during or shortly after StreamProcessor creation.  Clients should
+    /// not depend on this being the very first message to arrive at the client.
+    ///
+    /// The "min" and "max" input constraints are guaranteed not to change for a
+    /// given StreamProcessor instance.  The "recommended" values may
+    /// effectively change when the server processes QueueInputFormatDetails().
+    /// There is not any way in the protocol short of creating a new
+    /// StreamProcessor instance for the client to get those new "recommended"
+    /// values.
+    ///
+    /// The first buffer_constraints_version_ordinal from the server (for input)
+    /// will always be 1.
+    //
+    // TODO(dustingreen): Maybe provide a way for the client to get updated
+    // "recommended" values for input, maybe only on request rather than via
+    // this event, to keep things simpler for simpler clients.  Maybe separate
+    // the recommendations from the constraints.
+    strict -> OnInputConstraints(struct {
+        input_constraints StreamBufferConstraints;
+    });
+
+    /// When the client is not using dynamic buffers, a single
+    /// SetInputBufferPartialSettings() provides the StreamProcessor with the
+    /// client-specified input settings and a BufferCollectionToken which the
+    /// StreamProcessor will use to convey constraints to sysmem.  Both the
+    /// client and the StreamProcessor will be informed of the allocated buffers
+    /// directly by sysmem via their BufferCollection channel (not via the
+    /// StreamProcessor channel).
+    ///
+    /// The client must not QueueInput...() until after sysmem informs the
+    /// client that buffer allocation has completed and was successful.
+    ///
+    /// The server should be prepared to see QueueInput...() before the server
+    /// has necessarily heard from sysmem that the buffers are allocated - the
+    /// server must tolerate either ordering, as the QueueInput...() and
+    /// notification of sysmem allocation completion arrive on different
+    /// channels, so the client having heard that allocation is complete doesn't
+    /// mean the server knows that allocation is complete yet.  However, the
+    /// server can expect that allocation is in fact complete and can expect to
+    /// get the allocation information from sysmem immediately upon requesting
+    /// the information from sysmem.
+    ///
+    /// Mixing of AddBuffer and SetInputBufferPartialSettings is not allowed
+    /// while there are any buffers still active on the port. To successfully
+    /// switch modes for a port, most clients will want to just start over with
+    /// a new StreamProcessor instance. This can also be done reliably by first
+    /// ensuring that every added buffer under the port up to "now" (including
+    /// those with older buffer_lifetime_ordinal) has completed a RemoveBuffer
+    /// request. Only then is it known ok to switch modes for that port under
+    /// the same StreamProcessor. Most clients will just use one way or the
+    /// other to add buffers and never need to switch to the other way,
+    /// especially within the same StreamProcessor.
+    strict SetInputBufferPartialSettings(resource struct {
+        input_settings StreamBufferPartialSettings;
+    });
+
+    /// This event informs the client of new output constraints.
+    ///
+    /// This message is ordered with respect to other output (such as output
+    /// packets, output format, output end-of-stream).
+    ///
+    /// Before the first OnOutputPacket() of a stream, the server guarantees
+    /// that at least one OnOutputConstraints() and exactly one OnOutputFormat()
+    /// will be sent. The client must tolerate multiple OnOutputConstraints()
+    /// (and 1 OnOutputFormat() message) before the first output packet.  As
+    /// long as the client hasn't moved to a new stream, the server won't send
+    /// another OnOutputConstraints() until after the client has configured
+    /// output buffers.
+    ///
+    /// This message can be sent mid-stream by a server, when the server needs
+    /// new output buffers. The server won't generate more output until the
+    /// client has added new output buffers via SetOutputBufferPartialSettings
+    /// or AddBuffer.
+    ///
+    /// The server will not send any OnOutputPacket() for this stream until
+    /// after the client has configured/re-configured output buffers.
+    ///
+    /// All clients, even those which don't want to support any mid-stream
+    /// output buffer re-config or mid-stream OnOutputFormat() are required to
+    /// deal with 1..multiple OnOutputConstraints() messages before the first
+    /// output packet, and one OnOutputFormat() messages before the first output
+    /// packet.
+    strict -> OnOutputConstraints(struct {
+        output_config StreamOutputConstraints;
+    });
+
+    /// This message is sent by the server before the first output packet of any
+    /// stream, and potentially mid-stream between output packets of the stream,
+    /// ordered with respect to output packets, and ordered with respect to
+    /// OnOutputConstraints().
+    ///
+    /// The server guarantees that the first packet of every stream will be
+    /// preceeded by an OnOutputFormat().
+    ///
+    /// The server guarantees that there will be an OnOutputFormat() between an
+    /// OnOutputConstraints() and an OnOutputPacket().  In other words, the
+    /// client is essentially allowed to forget what the output format is on any
+    /// OnOutputConstraints(), because the server promises a subsequent
+    /// OnOutputFormat() before any OnOutputPacket().
+    ///
+    /// The server won't send OnOutputFormat() (and therefore also won't send
+    /// OnOutputPacket()) until the client has re-configured output buffers.
+    ///
+    /// The server is allowed to send an OnOutputFormat() mid-stream between two
+    /// output packets.
+    ///
+    /// A server won't send two adjacent OnOutputFormat messages without any
+    /// output packet in between.  However an OnOutputFormat message doesn't
+    /// guarantee a subsequent packet, because for example the server could send
+    /// OnOutputEndOfStream or OnStreamFailed instead, or the client can move on
+    /// to a new stream and the server may not send a packet from the old stream
+    /// despite having sent OnOutputFormat.
+    ///
+    /// A client that does not wish to seamlessly handle mid-stream output
+    /// format changes should either ensure that no stream processed by the
+    /// client ever has any mid-stream format change, or the client should
+    /// ensure that any retry of processing starts the new attempt at a point
+    /// logically at or after the point where the old format has ended and the
+    /// new format starts, else the client could just hit the same mid-stream
+    /// format change again.
+    ///
+    /// An example of this message being sent mid-stream is mid-stream change of
+    /// dimensions of video frames output from a video decoder.
+    ///
+    /// Not all servers will support seamless handling of format change.  Those
+    /// that do support seamless handling of format change may require that the
+    /// format change not also require output buffer re-config, in order for the
+    /// handling to be seamless.  See the comment block for
+    /// OnOutputConstraints() for more discussion of how servers and clients
+    /// should behave - in particular when they don't seamlessly handle output
+    /// constraint change and/or output format change.
+    ///
+    /// If this message isn't being sent by the server when expected at the
+    /// start of a stream, the most common reason is that a
+    /// OnOutputConstraints() hasn't been processed by the client (by
+    /// configuring output buffers using SetOutputBufferPartialSettings or
+    /// AddBuffer).
+    strict -> OnOutputFormat(struct {
+        output_format StreamOutputFormat;
+    });
+
+    /// This is the replacement for SetOutputBufferSettings().
+    ///
+    /// When the client is using sysmem to allocate buffers, this message is
+    /// used instead of SetOutputBufferSettings()+AddOutputBuffer(). Instead, a
+    /// single SetOutputBufferPartialSettings() provides the StreamProcessor
+    /// with the client-specified output settings and a BufferCollectionToken
+    /// which the StreamProcessor will use to convey constraints to sysmem. Both
+    /// the client and the StreamProcessor will be informed of the allocated
+    /// buffers directly by sysmem via their BufferCollection channel (not via
+    /// the StreamProcessor channel).
+    ///
+    /// Configuring output buffers is _required_ after OnOutputConstraints() is
+    /// received by the client with buffer_constraints_action_required true and
+    /// stream_lifetime_ordinal equal to the client's current
+    /// stream_lifetime_ordinal (even if there is an active stream), and is
+    /// _permitted_ any time there is no current stream.
+    ///
+    /// Closing the current stream occurs on the StreamControl ordering domain,
+    /// so after a CloseCurrentStream() or FlushEndOfStreamAndCloseStream(), a
+    /// subsequent Sync() completion must be received by the client before the
+    /// client knows that there's no longer a current stream.
+    ///
+    /// Mixing of AddBuffer and SetOutputBufferPartialSettings is not allowed
+    /// while there are any buffers still active on the port. To successfully
+    /// switch modes for a port, most clients will want to just start over with
+    /// a new StreamProcessor instance. This can also be done reliably by first
+    /// ensuring that every added buffer under the port up to "now" (including
+    /// those with older buffer_lifetime_ordinal) has completed a RemoveBuffer
+    /// request. Only then is it known ok to switch modes for that port under
+    /// the same StreamProcessor. Most clients will just use one way or the
+    /// other to add buffers and never need to switch to the other way,
+    /// especially not within the same StreamProcessor instance.
+    ///
+    /// See also CompleteOutputBufferPartialSettings().
+    strict SetOutputBufferPartialSettings(resource struct {
+        output_settings StreamBufferPartialSettings;
+    });
+
+    /// After SetOutputBufferPartialSettings(), the server won't send
+    /// OnOutputConstraints(), OnOutputFormat(), OnOutputPacket(), or
+    /// OnOutputEndOfStream() until after the client sends
+    /// CompleteOutputBufferPartialSettings().
+    ///
+    /// This message isn't permitted after AddBuffer. When using dynamic buffers
+    /// the server can send OnOutputConstraints, OnOutputFormat, OnOutputPacket,
+    /// or OnOutputEndOfStream at any time after the first QueueInputPacket. In
+    /// the case of OnOutputPacket there must also be at least one output buffer
+    /// that's been added but not yet fully removed (RemoveBuffer not yet
+    /// complete).
+    ///
+    /// Some clients may be able to send CompleteOutputBufferPartialSettings()
+    /// immediately after SetOutputBufferPartialSettings() - in that case the
+    /// client needs to be prepared to receive output without knowing the buffer
+    /// count or packet count yet - such clients may internally delay processing
+    /// the received output until the client has heard from sysmem (which is
+    /// when the client will learn the buffer count and packet count).
+    ///
+    /// Other clients may first wait for sysmem to allocate, prepare to receive
+    /// output, and then send CompleteOutputBufferPartialSettings().
+    strict CompleteOutputBufferPartialSettings(struct {
+        buffer_lifetime_ordinal uint64;
+    });
+
+    /// This message is optional; a client isn't required to send this ever.
+    ///
+    /// Terminology note: In the name of this message, "flush" means flush
+    /// through, sometimes called "drain". This messge does not discard. To
+    /// discard, just QueueInputPacket with a new stream_lifetime_ordinal
+    /// without first waiting for OnOutputEndOfStream of the old stream and
+    /// without sending FlushEndOfStreamAndCloseStream.
+    ///
+    /// There is currently no way to cancel the flush effect of this message
+    /// short of the client closing the StreamProcessor channel.
+    ///
+    /// This message is only valid after QueueInputEndOfStream() for this
+    /// stream. The stream_lifetime_ordinal input parameter must match the
+    /// stream_lifetime_ordinal of the QueueInputEndOfStream(), else the server
+    /// will close the channel.
+    ///
+    /// A client can use this message to flush through (drain, not discard) the
+    /// last input data of a stream so that the stream processor server
+    /// generates corresponding output data for all the input data before the
+    /// server moves on to the next stream, without forcing the client to wait
+    /// for OnOutputEndOfStream() before queueing data of another stream.
+    ///
+    /// The difference between QueueInputEndOfStream() and
+    /// FlushEndOfStreamAndCloseStream():  QueueInputEndOfStream() is a promise
+    /// from the client that there will not be any more input data for the
+    /// stream (and this info is needed by some stream processors for the stream
+    /// processor to ever emit the very last output data).  The
+    /// QueueInputEndOfStream() having been sent doesn't prevent the client from
+    /// later completely discarding the rest of the current stream by closing
+    /// the current stream (with or without a stream switch).  In contrast,
+    /// FlushEndOfStreamAndCloseStream() is a request from the client that all
+    /// the previously-queued input data be processed including the logical
+    /// "EndOfStream" showing up as OnOutputEndOfStream() (in success case)
+    /// before moving on to any newer stream - this essentially changes the
+    /// close-stream handling from discard to flush-through for this stream
+    /// only.
+    ///
+    /// A client using this message can start providing input data for a new
+    /// stream without that causing discard of old stream data.  That's the
+    /// purpose of this message - to allow a client to flush through (not
+    /// discard) the old stream's last data (instead of the default when closing
+    /// or switching streams which is discard).
+    ///
+    /// Because the old stream is not done processing yet and the old stream's
+    /// data is not being discarded, the client must be prepared to continue to
+    /// process OnOutputConstraints() messages until the stream_lifetime_ordinal
+    /// is done. The client will know the stream_lifetime_ordinal is done when
+    /// OnOutputEndOfStream(), OnStreamFailed(), or the StreamProcessor channel
+    /// closes.
+    strict FlushEndOfStreamAndCloseStream(struct {
+        stream_lifetime_ordinal uint64;
+    });
+
+    /// This "closes" the current stream, leaving no current stream.  In
+    /// addition, this message can optionally release (and unregister) input
+    /// buffers or output buffers.
+    ///
+    /// If there has never been any active stream, the stream_lifetime_ordinal
+    /// must be zero or the server will close the channel.  If there has been an
+    /// active stream, the stream_lifetime_ordinal must be the most recent
+    /// active stream whether that stream is still active or not.  Else the
+    /// server will close the channel.
+    ///
+    /// Multiple of this message without any new active stream in between is not
+    /// to be considered an error, which allows a client to use this message to
+    /// close the current stream to stop wasting processing power on a stream
+    /// the user no longer cares about, then later decide that buffers should be
+    /// released and send this message again with release_input_buffers and/or
+    /// release_output_buffers true to get the buffers released, if the client
+    /// is interested in trying to avoid overlap in resource usage between old
+    /// buffers and new buffers (not all clients are).
+    ///
+    /// See also Sync().
+    strict CloseCurrentStream(struct {
+        stream_lifetime_ordinal uint64;
+        release_input_buffers bool;
+        release_output_buffers bool;
+    });
+
+    /// On completion, all previous StreamProcessor calls have done what they're
+    /// going to do server-side, _except_ for processing of data queued using
+    /// QueueInputPacket().
+    ///
+    /// The main purpose of this call is to enable the client to wait until
+    /// CloseCurrentStream() with release_input_buffers and/or
+    /// release_output_buffers set to true to take effect, before the client
+    /// allocates new buffers and re-sets-up input and/or output buffers.  This
+    /// de-overlapping of resource usage can be worthwhile for media buffers
+    /// which can consume resource types whose overall pools aren't necessarily
+    /// vast in comparison to resources consumed.  Especially if a client is
+    /// reconfiguring buffers multiple times.
+    ///
+    /// Note that Sync() prior to allocating new media buffers is not alone
+    /// sufficient to achieve non-overlap of media buffer resource usage system
+    /// wide, but it can be a useful part of achieving that.
+    ///
+    /// The Sync() transits the Output ordering domain and the StreamControl
+    /// ordering domain, but not the InputData ordering domain.
+    ///
+    /// This request can be used to avoid hitting kMaxInFlightStreams which is
+    /// presently 10.  A client that stays <= 8 in-flight streams will
+    /// comfortably stay under the limit of 10.  While the protocol permits
+    /// repeated SetInputBufferSettings() and the like, a client that spams the
+    /// channel can expect that the channel will just close if the server or the
+    /// channel itself gets too far behind.
+    strict Sync() -> ();
+
+    /// This is how the stream processor emits an output packet to the stream
+    /// processor client.
+    ///
+    /// Order is significant.
+    ///
+    /// The client should eventually call RecycleOutputPacket() (possibly after
+    /// switching streams multiple times), unless the buffer_lifetime_ordinal
+    /// has moved on.  A stream change doesn't change which packets are busy
+    /// with the client vs. free with the server.
+    ///
+    /// The relevant buffer is always the one specified in the packet's
+    /// buffer_index field.
+    ///
+    /// For low-level buffer types that support it, a StreamProcessor is free to
+    /// emit an output packet before the low-level buffer actually has any
+    /// usable data in the buffer, with the mechanism for signalling the
+    /// presence of data separate from the OnOutputPacket() message.  For such
+    /// low-level buffer types, downstream consumers of data from the emitted
+    /// packet must participate in the low-level buffer signalling mechanism to
+    /// know when it's safe to consume the data.  This is most likely to be
+    /// relevant when using a video decoder and gralloc-style buffers.
+    ///
+    /// The error_ bool(s) allow (but do not require) a StreamProcessor server
+    /// to report errors that happen during an AU or between AUs.
+    ///
+    /// The scope of error_detected_before starts at the end of the last
+    /// delivered output packet on this stream, or the start of stream if there
+    /// were no previous output packets on this stream.  The scope ends at the
+    /// start of the output_packet.
+    ///
+    /// The error_detected_before bool is separate so that discontinuities can
+    /// be indicated separately from whether the current packet is damaged.
+    ///
+    /// The scope of error_detected_during is from the start to the end of this
+    /// output_packet.
+    strict -> OnOutputPacket(struct {
+        output_packet Packet;
+        error_detected_before bool;
+        error_detected_during bool;
+    });
+
+    /// After the client is done with an output packet, the client needs to tell
+    /// the stream processor that the output packet can be re-used for more
+    /// output, using this message.
+    ///
+    /// It's not permitted to recycle an output packet that's already free with
+    /// the stream processor server.
+    ///
+    /// If a client is using EnableOldOutputBuffers, the client must recycle all
+    /// packets when done with them, even those of old buffer_lifetime_ordinal.
+    /// This is also permitted behavior for all clients.
+    ///
+    /// If a client is not using EnableOldOutputBuffers, the client may
+    /// optionally omit this message for packets with an old
+    /// buffer_lifetime_ordinal. In other words, packets from before an explicit
+    /// or implicit output buffer de-configuration don't need to be recycled if
+    /// the client isn't using and won't be using EnableOldOutputBuffers.
+    strict RecycleOutputPacket(struct {
+        available_output_packet PacketHeader;
+    });
+
+    /// After QueueInputEndOfStream() is sent by the StreamProcessor client,
+    /// within a reasonable duration the corresponding OnOutputEndOfStream()
+    /// will be sent by the StreamProcessor server.  Similar to
+    /// QueueInputEndOfStream(), OnOutputEndOfStream() is sent a maximum of once
+    /// per stream.
+    ///
+    /// No more stream data for this stream will be sent after this message.  All
+    /// input data for this stream was processed.
+    ///
+    /// While a StreamProcessor client is not required to
+    /// QueueInputEndOfStream() (unless the client wants to use
+    /// FlushEndOfStreamAndCloseStream()), if a StreamProcessor server receives
+    /// QueueInputEndOfStream(), and the client hasn't closed the stream, the
+    /// StreamProcessor server must generate a corresponding
+    /// OnOutputEndOfStream() if nothing went wrong, or must send
+    /// OnStreamFailed(), or must close the server end of the StreamProcessor
+    /// channel.  An ideal StreamProcessor server would handle and report stream
+    /// errors via the error_ flags and complete stream processing without
+    /// sending OnStreamFailed(), but in any case, the above-listed options are
+    /// the only ways that an OnOutputEndOfStream() won't happen after
+    /// QueueInputEndOfStream().
+    ///
+    /// There will be no more OnOutputPacket() or OnOutputConstraints() messages
+    /// for this stream_lifetime_ordinal after this message - if a server doesn't
+    /// follow this rule, a client should close the StreamProcessor channel.
+    ///
+    /// The error_detected_before bool has the same semantics as the
+    /// error_detected_before bool in OnOutputPacket().
+    strict -> OnOutputEndOfStream(struct {
+        stream_lifetime_ordinal uint64;
+        error_detected_before bool;
+    });
+
+    // TODO(dustingreen): Rename from QueueInputFormatDetails() to
+    // QueueInputFormat().
+    //
+    /// If the input format details are still the same as specified during
+    /// StreamProcessor creation, this message is unnecessary and does not need
+    /// to be sent.
+    ///
+    /// If the stream doesn't exist yet, this message creates the stream.
+    ///
+    /// The server won't send OnOutputConstraints() until after the client has
+    /// sent at least one QueueInput* message.
+    ///
+    /// All servers must permit QueueInputFormatDetails() at the start of a
+    /// stream without failing, as long as the new format is supported by the
+    /// StreamProcessor instance. Technically this allows for a server to only
+    /// support the exact input format set during StreamProcessor creation, and
+    /// that is by design. A client that tries to switch formats and gets a
+    /// StreamProcessor channel failure should try again one more time with a
+    /// fresh StreamProcessor instance created with CodecFactory using the new
+    /// input format during creation, before giving up.
+    ///
+    /// These format details override the format details specified during stream
+    /// processor creation for this stream only. The next stream will default
+    /// back to the format details set during stream processor creation.
+    ///
+    /// This message is permitted at the start of the first stream (just like at
+    /// the start of any stream). The format specified need not match what was
+    /// specified during stream processor creation, but if it doesn't match, the
+    /// StreamProcessor channel might close as described above.
+    strict QueueInputFormatDetails(struct {
+        stream_lifetime_ordinal uint64;
+        format_details FormatDetails;
+    });
+
+    /// This message queues input data to the stream processor for processing.
+    ///
+    /// If the stream doesn't exist yet, this message creates the new stream.
+    ///
+    /// The server won't send OnOutputConstraints() until after the client has
+    /// sent at least one QueueInput* message.
+    ///
+    /// When using dynamic buffers the server can send OnOutputConstraints,
+    /// OnOutputFormat, OnOutputPacket, or OnOutputEndOfStream at any time after
+    /// the first QueueInputPacket. In the case of OnOutputPacket there must
+    /// also be at least one output buffer that's been added but not yet fully
+    /// removed (RemoveBuffer not yet complete).
+    ///
+    /// The client must continue to deliver input data via this message even if
+    /// the stream processor has not yet generated the first
+    /// OnOutputConstraints, and even if the StreamProcessor is generating
+    /// OnFreeInputPacket for previously-queued input packets.  The input data
+    /// must continue as long as there are free packets to be assured that the
+    /// server will ever generate the first OnOutputConstraints.
+    ///
+    /// The server will close the channel if this packet refers to an old
+    /// buffer_lifetime_ordinal. Clients that need to deliver input images of
+    /// different dimensions to a video encoder can either (a) allocate buffers
+    /// large enough to contain the range of needed image sizes and use those to
+    /// deliver all the input images, (b) keep their own sets of buffers used
+    /// for different image dimensions and re-add old buffers with AddBuffer,
+    /// moving to a new buffer_lifetime_ordinal each time image dimensions
+    /// change, or (c) allocate new buffers each time image dimensions change.
+    /// The (a) option is preferred, for clients that have the flexibiilty to
+    /// store images of varying dimensions in a single set of buffers. Clients
+    /// that require each buffer to have a single image size can use option (b)
+    /// or (c).
+    strict QueueInputPacket(struct {
+        packet Packet;
+    });
+
+    /// The server sends this message when the stream processor is done reading
+    /// the data in this packet (but not necessarily done processing its own
+    /// copy of the data). This message is sent regardless of any changes to
+    /// stream_lifetime_ordinal, stream closure, buffer_lifetime_ordinal changes
+    /// (as/when supported), etc.
+    ///
+    /// When a new input buffer_lifetime_ordinal is created, all input packets
+    /// start with the client, and there is no initial OnFreeInputPacket.
+    ///
+    /// On receiving this event, the client can determine which input buffer is
+    /// becoming free for re-use based on a packet_index to buffer_index
+    /// correspondence maintained by the client. This correspondence can be
+    /// fixed or dynamic, depending on client preference.
+    ///
+    /// For video decoders, an OnFreeInputPacket can be relied on to indicate
+    /// that all prior packets are done reading from their input buffers as
+    /// well. However, the client isn't required to track this, as all
+    /// OnFreeInputPacket(s) will be sent by the server (just not necessarily in
+    /// the same order as QueueInputPacket, even for video decoders).
+    ///
+    /// Re-use of input buffer buffer_index values is independent from re-use of
+    /// input packet packet_index values in general, but some clients may choose
+    /// to always set packet_index to the same value as buffer_index.
+    ///
+    /// OnFreeInputPacket() does _not_ imply that the data in the input packet
+    /// has been processed successfully or that processing of the input bytes
+    /// has been attempted yet, only that the input data in the associated input
+    /// buffer is no longer needed by the StreamProcessor. If a client needs to
+    /// know which input data has generated corresponding output, using
+    /// timestamp_ish values for that is recommended.
+    ///
+    /// The order of OnFreeInputPacket is not guaranteed to be the same as the
+    /// order of QueueInputPacket, and OnFreeInputPacket can occur after an
+    /// OnStreamFailed.
+    strict -> OnFreeInputPacket(struct {
+        free_input_packet PacketHeader;
+    });
+
+    /// Inform the server that all QueueInputPacket() messages for this stream
+    /// have been sent.
+    ///
+    /// If the stream isn't closed first (by the client, or by OnStreamFailed(),
+    /// or StreamProcessor channel closing), there will later be a corresponding
+    /// OnOutputEndOfStream().
+    ///
+    /// The corresponding OnOutputEndOfStream() message will be generated only
+    /// if the server finishes processing the stream before the server sees the
+    /// client close the stream (such as by starting a new stream). A way to
+    /// force the server to finish the stream before closing is to use
+    /// FlushEndOfStreamAndCloseStream() after QueueInputEndOfStream() before
+    /// any new stream. Another way to force the server to finish the stream
+    /// before closing is to wait for the OnOutputEndOfStream() before taking
+    /// any action that closes the stream.
+    ///
+    /// In addition to serving as an "EndOfStream" marker to make it obvious
+    /// client-side when all input data has been processed, if a client never
+    /// sends QueueInputEndOfStream, no amount of waiting will necessarily
+    /// result in all input data getting processed through to the output. Some
+    /// stream processors have some internally-delayed data which only gets
+    /// drained (pushed through) by additional input data _or_ by this
+    /// EndOfStream marker. In that sense, this message can be viewed as a drain
+    /// at InputData domain level, but the drain only takes effect if the stream
+    /// processor even gets that far before the stream is just closed at
+    /// StreamControl domain level. This message is not alone sufficient to act
+    /// as an overall drain at StreamControl level. For that, send this message
+    /// first and then send FlushEndOfStreamAndCloseStream (at which point it
+    /// becomes possible to queue input data for a new stream without causing
+    /// discard of this older stream's data). Alternately, the client can wait
+    /// for the OnOutputEndOfStream before closing the current stream.
+    ///
+    /// After a client sends QueueInputEndOfStream for a stream, if the client
+    /// then sends for the same stream any of QueueInputPacket,
+    /// QueueInputFormatDetails, QueueInputEndOfStream, the server will close
+    /// the StreamProcessor channel.
+    strict QueueInputEndOfStream(struct {
+        stream_lifetime_ordinal uint64;
+    });
+
+    /// This message results in channel closure unless supports_dynamic_buffers
+    /// is set to true.
+    ///
+    /// This participates in allocation of buffers to be used with AddBuffer
+    /// later. The client can get VMO handles for these buffers by also
+    /// participating in the sysmem allocation, using the client's own related
+    /// sysmem token (associated with the same logical buffer collection). It's
+    /// up to the client to separately set any constraints needed by the client
+    /// using the client's own related sysmem token, if any.
+    ///
+    /// Some clients may prefer to use SetInputBufferPartialSettings and/or
+    /// SetOutputBufferPartialSettings. Servers must support those messages.
+    ///
+    /// In handling this message, if `allow_single_buffer` is set to true, the
+    /// server must not constrain the number of buffers allocated. The server
+    /// must set min_buffer_count to 1, and must leave max_buffer_count un-set
+    /// or set it to 0xFFFFFFFF, and must leave all min_buffer_count_* fields
+    /// un-set. The sender can set min_buffer_count and max_buffer_count to the
+    /// same value if the intent is to allocate exactly that many buffers. If
+    /// `allow_single_buffer` is un-set or set to false, the server will
+    /// indicate needed buffer counts to sysmem.
+    ///
+    /// The server's BufferCollection channel (created from the passed-in
+    /// sysmem2_token) may see ZX_CHANNEL_PEER_CLOSED at any time, but in
+    /// particular, the server shouldn't expect the BufferCollection channel to
+    /// remain connected to sysmem beyond the server sending SetConstraints. For
+    /// this reason, the server may not be able to call
+    /// WaitForAllBuffersAllocated or similar, so the server should just send
+    /// SetConstraints, Close, then close the server's BufferCollection
+    /// client_end. This means the server in general shouldn't attempt to get
+    /// VMO handles for these buffers while processing this message.
+    ///
+    /// The server should not assume that these buffers will necessarily ever be
+    /// added with AddBuffer to this StreamProcessor instance or any other
+    /// StreamProcessor instance (owned by the server or not). These buffers may
+    /// instead be dropped, or as a less-common example, possibly added to a
+    /// different codec served by a different server implementation which also
+    /// participated in the same sysmem buffer collection allocation.
+    ///
+    /// For input buffers, AddBuffer of the allocated buffer(s) to a different
+    /// StreamProcessor instance of the same codec (same per CodecFactory) is
+    /// likely to work, but using the same StreamProcessor instance is
+    /// recommended when feasible.
+    ///
+    /// In contrast, for output buffers, AddBuffer of the allocated buffer(s) to
+    /// a different StreamProcessor instance of the same codec (same per
+    /// CodecFactory) can't (within reason) be made work in general, especially
+    /// for video decoders. Therefore, for output buffers, the same
+    /// StreamProcessor instance must be used for this message and AddBuffer.
+    /// While a client may currently be able to get away with using different
+    /// StreamProcessor instances for this message and AddBuffer for output
+    /// buffers for some codecs, this may break at any time without it being
+    /// considered a server-side bug.
+    ///
+    /// The allocated buffers can later be added using AddBuffer (piecemeal),
+    /// and can be removed (piecemeal) using RemoveBuffer.
+    ///
+    /// Multiple different ParticipateInBufferAllocation messages can have their
+    /// buffers later added to the same StreamProcessor instance using the same
+    /// buffer_lifetime_ordinal. This can be useful if the client wants to
+    /// allocate buffers incrementally, or dynamically adjust the number of
+    /// buffers, potentially while actively processing. See also the
+    /// `buffer_lifetime_ordinal` field of this message.
+    ///
+    /// Server implementations may use sysmem to help verify buffer
+    /// compatibility later when buffers are added with AddBuffer.
+    @available(added=32)
+    flexible ParticipateInBufferAllocation(resource table {
+        /// Which port (input or output) the buffer(s) are for.
+        ///
+        /// Must be set.
+        1: port Port;
+
+        /// For input, this field must be set to 1, at least for now.
+        ///
+        /// For output, this field must set to the latest known (to the client)
+        /// buffer_constraints_version_ordinal value from the server. If the
+        /// value is less than the latest buffer_constraints_version_ordinal
+        /// created by the server which had action_reqiured true, then the
+        /// server will set generic sysmem constraints (just min_buffer_count 1)
+        /// and otherwise ignore this message. This is intended to allow
+        /// allocation to succeed (to allow simpler client error handling for
+        /// some clients); in this case a new buffer_constraints_version_ordinal
+        /// will reach the client and the client can catch up to the latest.
+        ///
+        /// If this value is a future value, the server will drop the
+        /// sysmem2_token which will cause allocation failure.
+        ///
+        /// Must be set.
+        2: buffer_constraints_version_ordinal uint64;
+
+        /// This sysmem token is used by the server to inform sysmem directly of
+        /// any applicable buffer constraints. These constraints are allowed to
+        /// (and in some cases must) depend on how this StreamProcessor instance
+        /// was created. For example, secure_input_mode/secure_output_mode
+        /// during StreamProcessor creation causes the server to set
+        /// secure_required for input/output respectively (as specified by
+        /// Port.INPUT or Port.OUTPUT respectively).
+        ///
+        /// Must be set.
+        3: sysmem2_token client_end:fuchsia.sysmem2.BufferCollectionToken;
+
+        /// If set, and there's been at least one AddBuffer previously sent with
+        /// this buffer_lifetime_ordinal on the same StreamProcessor instance
+        /// which hasn't yet been removed server-side, the new buffer(s) will be
+        /// allocated with identical SingleBufferSettings, or fail allocation.
+        /// If any of the conditions in this paragraph aren't met, the effect is
+        /// the same as if this field is not set.
+        ///
+        /// If this field is not set, the sysmem constraints set by the server
+        /// will be suitable for a buffer of a new buffer_lifetime_ordinal, and
+        /// the new buffer's SingleBufferSettings might not match any previous
+        /// buffer's SingleBufferSettings.
+        ///
+        /// If the server has a current stream and `port` indicates the output
+        /// port, the constraints set will allow the stream to be correctly
+        /// processed across the switch to new buffer_lifetime_ordinal (assuming
+        /// the client is using a new buffer_lifetime_ordinal and adds the new
+        /// buffer(s) subsequently etc). If port indicates the input port, the
+        /// constraints set will be generic for the input port regardless of any
+        /// current stream.
+        ///
+        /// If this mechanism isn't used, the client must still ensure that all
+        /// AddBuffer with a given StreamProcessor instance, port, and
+        /// buffer_lifetime_ordinal have identical SingleBufferSettings. One way
+        /// to do this is to allocate all the buffers of a
+        /// buffer_lifetime_ordinal under a single sysmem buffer collection.
+        /// Another way is for the client to tell sysmem directly that a new
+        /// buffer collection must match the SingleBufferSettings of a prior
+        /// collection using
+        /// `[fuchsia.sysmem2/BufferCollectionConstraints.must_match_vmo]`
+        /// client-side.
+        ///
+        /// It's not recommended for a client to attempt to force a new
+        /// collecton's SingleBufferSettings to match an old collection's
+        /// SingleBufferSettings without sysmem's help and without
+        /// StreamProcessor's help via this field, because sysmem intentionally
+        /// allows clients participating in the same collection to be using
+        /// different versions of the sysmem interfaces, so the client may not
+        /// have enough information to successfully force the
+        /// SingleBufferSettings to match without using `must_match_vmo`, for
+        /// example if the client is unaware of a new SingleBufferSettings field
+        /// (or similar). The most common StreamProcessor server implementation
+        /// (CodecImpl) will handle this field using `must_match_vmo` on behalf
+        /// of the client as long as there's still at least one buffer of the
+        /// buffer_lifetime_ordinal active in the server. The ability to
+        /// dynamically add more buffers to an existing sysmem collection may be
+        /// added to sysmem at some point; that would give the client another
+        /// way to ensure identical SingleBufferSettings within a
+        /// buffer_lifetime_ordinal, but only if/when all sysmem collection
+        /// participants indicate support for a dynamic sysmem buffer
+        /// collection.
+        ///
+        /// For output, setting this field is strongly recommended if a client
+        /// is adding additional output buffers to an existing
+        /// buffer_lifetime_ordinal using a new/different sysmem buffer
+        /// collection, and setting this field is recommended for all output
+        /// buffer allocations.
+        ///
+        /// For input, if a client is using the same StreamProcessor instance
+        /// for this message and AddBuffer (which is itself recommended when
+        /// feasible), use of this field is recommended for those input buffers.
+        ///
+        /// If set, this value must match the buffer_lifetime_ordinal later sent
+        /// in AddBuffer.
+        ///
+        /// Clients should set this when feasible; see above.
+        4: buffer_lifetime_ordinal uint64;
+
+        /// If set to true, the server will leave all `buffer_count_*` fields
+        /// un-set when sending SetConstraints to sysmem, and will set
+        /// `min_buffer_count` to 1.
+        ///
+        /// If un-set or set to false, the server will fill out buffer count
+        /// fields when sending SetConstraints to sysmem based on the current
+        /// value of `buffer_count_for_server_current`, without any extra slack.
+        /// The client can add slack as desired via its own retained token.
+        ///
+        /// Regardless of whether this field is set to true, it's up to the
+        /// client to `AddBuffer` at least `buffer_count_for_server_current`
+        /// buffers so that processing can make progress.
+        5: allow_single_buffer bool;
+    });
+
+    /// Add buffers previously created with the help of
+    /// ParticipateInBufferAllocation.
+    ///
+    /// For input buffers, the client can send QueueInputFormatDetails or
+    /// QueueInputEndOfStream before any AddBuffer messages. At least one input
+    /// buffer must be added before a valid QueueInputPacket can be sent. Most
+    /// clients will want to continue quickly adding buffers up to at least
+    /// buffer_count_for_server_current to avoid the codec potentially stalling,
+    /// and typically a low number of buffers beyond that to keep the pipeline
+    /// running smoothly. Input buffers beyond the first input buffer can be
+    /// added after the first QueueInputPacket.
+    ///
+    /// Even if buffer_constraints_version_ordinal is current, the server must
+    /// not close the channel if the buffer isn't consistent with the current
+    /// buffer_constraints_version_ordinal (per sysmem GetVmoInfo given
+    /// consistent StreamProcessor constraints). Instead, the server must send a
+    /// new OnOutputConstraints. This simplifies some edge cases for some
+    /// clients, particularly when a client can't reliably detect whether a
+    /// newly-obtained buffer was actually allocated after
+    /// buffer_constraints_version_ordinal changed, or may have been cached from
+    /// before.
+    ///
+    /// The client can add additional buffers to the same port and
+    /// buffer_lifetime_ordinal at any time using this message. If the
+    /// buffer_lifetime_ordinal is no longer the most recent, the message will
+    /// be ignored, the handle to the buffer dropped, and any later RemoveBuffer
+    /// message re. the same buffer will complete immediately.
+    ///
+    /// If dynamic_buffers_input_max or dynamic_buffers_output_max is exceeded
+    /// by the sum of buffers added by all AddBuffer calls with the same
+    /// buffer_lifetime_ordinal, the server may close the channel. Servers are
+    /// required to close the channel in this case if performance degradation or
+    /// un-tested behavior would result from adding too many buffers.
+    ///
+    /// Switching to a new buffer_lifetime_ordinal starts the process of
+    /// removing buffers associated with an old buffer_lifetime_ordinal.
+    /// However, until the remove is complete, those buffers can still be used
+    /// by the codec as normal. See also RemoveBuffer, which can be used to
+    /// detect when removal is complete, regardless of whether the RemoveBuffer
+    /// started the removal (including when not using dynamic buffers).
+    ///
+    /// The buffer stays added until removal later completes. The buffer remains
+    /// added across potentially multiple buffer re-uses. Removal can be
+    /// initiated (and/or confirmed/fenced) by the client using RemoveBuffer.
+    /// The codec server can unilaterally initiate buffer removal; if the server
+    /// does this, it must send a new buffer_constraints_version_ordinal with
+    /// action_required true. Some other client-initiated messages can also
+    /// begin buffer removal, such as CloseCurrentStream with
+    /// release_input_buffers and/or release_output_buffers. The buffers are
+    /// also automatically removed and released if the client closes the
+    /// StreamProcessor client_end or the server closes the StreamProcessor
+    /// server_end.
+    ///
+    /// Mixing of AddBuffer and SetInputBufferPartialSettings /
+    /// SetOutputBufferPartialSettings is not allowed while there are any
+    /// buffers still active on the port. To successfully switch modes for a
+    /// port, most clients will want to just start over with a new
+    /// StreamProcessor instance. This can also be done reliably by first
+    /// ensuring that every added buffer under the port up to "now" (including
+    /// those with older buffer_lifetime_ordinal) has completed a RemoveBuffer
+    /// request. Only then is it known ok to switch modes for that port under
+    /// the same StreamProcessor. Most clients will just use one way or the
+    /// other to add buffers and never need to switch to the other way,
+    /// especially within the same StreamProcessor.
+    ///
+    /// If a client might plausibly "spam" creation of many new
+    /// buffer_lifetime_ordinal values without the buffers seeing any actual
+    /// usage in between, the client should consider starting a Sync every few
+    /// buffer_lifetime_ordinal(s) to fence cleanup of old
+    /// buffer_lifetime_ordinal values, and avoid getting ahead of Sync
+    /// completions by more than 16 buffer_lifetime_ordinal values. Else the
+    /// channel may close from a backlog of new buffer_lifetime_ordinal(s)
+    /// getting too far ahead of closing out old ones. The threshold of 16 is
+    /// well below the enforcement threshold. Clients don't need to Sync if they
+    /// won't be spamming new buffer_lifetime_ordinal values, or if added
+    /// buffers will see at least some actual usage visible to the client before
+    /// being replaced again.
+    ///
+    /// All buffers of the same port and buffer_lifetime_ordinal must share the
+    /// same `[fuchsia.sysmem2/SingleBufferSetttings]`. The client can ensure
+    /// this in various ways. One way is to use ParticipateInBufferAllocation
+    /// then AddBuffer for at least the first buffer, before
+    /// ParticipateInBufferAllocation for any subsequent buffers. Another way is
+    /// to observe a mismatch in `SingleBufferSettings` before sending AddBuffer
+    /// and bump to the next odd buffer_lifetime_ordinal value for the
+    /// AddBuffer.
+    @available(added=32)
+    flexible AddBuffer(resource table {
+        /// Must be set. Which port (input or output) the buffer is for.
+        1: port Port;
+        /// Typically this is the latest buffer_constraints_version_ordinal
+        /// known to the client based on OnInputConstraints/OnOutputConstraints.
+        /// Older values are not harmful to correctness.
+        ///
+        /// The server will ignore this message if the server has already
+        /// created a later buffer_constraints_version_ordinal value that has
+        /// action_required true. If the server ignores this message, a later
+        /// RemoveBuffer for this buffer will complete quickly and without
+        /// creating an error.
+        ///
+        /// A client is not required to ensure that every call to AddBuffer with
+        /// the same buffer_lifetime_ordinal uses the same
+        /// buffer_constraints_version_ordinal, but the client must ensure that
+        /// all buffer_constraints_version_ordinal values which share the same
+        /// buffer_lifetime_ordinal are within the same action_required true
+        /// interval. Each such interval starts with a value that has
+        /// action_required true, and lasts until but not including the next
+        /// value with action_required true, or until the current value if there
+        /// is not yet a next value with action_required true. If this would
+        /// create a problem for a server, that server should set
+        /// action_required true instead of false.
+        2: buffer_constraints_version_ordinal uint64;
+        /// These values are scoped to input/output separately.
+        ///
+        /// The first message from the client with a new (higher)
+        /// buffer_lifetime_ordinal value begins removing all buffers on the
+        /// same port with lower buffer_lifetime_ordinal. However, until removal
+        /// is complete, the older buffers can still be used by the codec.
+        ///
+        /// The AddBuffer message adds the buffer to this
+        /// buffer_lifetime_ordinal.
+        3: buffer_lifetime_ordinal uint64;
+        /// The buffer_index values under a buffer_lifetime_ordinal must be
+        /// unique among all added but not yet fully removed buffers. This value
+        /// is initially allocated/specified by the client using this field, and
+        /// then both the client and the server will then refer to a this added
+        /// buffer uniquely using input vs output, buffer_lifetime_ordinal, and
+        /// the buffer_index (all three parts are needed to unambiguously
+        /// specify this buffer).
+        ///
+        /// See RemoveBuffer doc comments for how to safely remove a buffer and
+        /// potentially re-use a buffer_index value.
+        ///
+        /// In contrast to using
+        /// SetInputBufferPartialSettings/SetOutputBufferPartialSettings, when
+        /// using AddBuffer and RemoveBuffer, the StreamProcessor buffer_index
+        /// value has no relation to the sysmem buffer_index (under the sysmem
+        /// buffer_collection_id). Instead, the StreamProcessor buffer_index is
+        /// specified by this field, not by using sysmem's buffer_index. This
+        /// way, two buffers from two sysmem collections having the same sysmem
+        /// buffer_index (under separate buffer_collection_id(s)) can be
+        /// specified unambiguously in StreamProcessor messages.
+        4: buffer_index uint32;
+        /// This is a VMO handle that the server can use to access the sysmem
+        /// buffer.
+        ///
+        /// This VMO is required to have been provided by sysmem, and required
+        /// to be compatible with the server's sysmem constraints.
+        ///
+        /// The buffer_constraints_version_ordinal check occurs first, and
+        /// failure of that check just silently ignores the remainder of this
+        /// message without checking the buffer field (buffer is just dropped).
+        ///
+        /// If the buffer_constraints_version_ordinal check passes, but `buffer`
+        /// isn't a sysmem-provided VMO or isn't consistent with the server's
+        /// sysmem constraints, the server will close the StreamProcessor
+        /// server_end. The client can avoid triggering this failure case by
+        /// allocating the buffers per the following.
+        ///
+        /// For video decoder input buffers, the client can allocate the buffer
+        /// using sysmem, with participation of this or another instance of the
+        /// same codec implementation, using ParticipateInBufferAllocation with
+        /// Port.INPUT. The same StreamProcessor instance isn't required
+        /// in this case, only the same codec implementation. If using a
+        /// different StreamProcessor instance (but still from the same codec
+        /// implementation), the client should take care to create the two
+        /// StreamProcessor instances with the same requirements specified to
+        /// CodecFactory (for example with secure_input_mode and
+        /// secure_output_mode set the same way). Video decoder server
+        /// implementations with supports_dynamic_buffers true are required to
+        /// support allocating input buffers using one StreamProcessor instance
+        /// then using them with a different StreamProcessor instance (in
+        /// contrast, for output buffers, this is not required).
+        ///
+        /// For video decoder output buffers, this can be achieved by allocating
+        /// the buffer using sysmem, with participation of the same
+        /// StreamProcessor instance, using ParticipateInBufferAllocation with
+        /// Port.OUTPUT.
+        ///
+        /// Servers should verify that this VMO is (a) provided by sysmem, and
+        /// (b) meets the server's current sysmem constraints. The server can
+        /// verify both (a) and (b) by checking the result of sysmem's
+        /// CheckVmoConstraints before using this VMO. If that check fails, the
+        /// server can close the StreamProcessor server_end.
+        5: buffer zx.Handle:VMO;
+    });
+
+    /// When using dynamic buffers, this call removes a buffer as soon as the
+    /// buffer can be removed without adversely impacting any ongoing processing
+    /// or an in-flight output packet referring to the buffer.
+    ///
+    /// If a client wants to remove a buffer with an in-flight output packet
+    /// referring to the buffer, the client must RecycleOutputPacket for that
+    /// in-flight output packet before the RemoveBuffer will complete.
+    ///
+    /// When using SetInputBufferPartialSettings /
+    /// SetOutputBufferPartialSettings, this call doesn't initiate removal of
+    /// the buffer. This call will complete when the buffer is done removing due
+    /// to other reasons, such as a new buffer_lifetime_ordinal starting.
+    ///
+    /// Until RemoveBuffer completes, the codec is still allowed to send
+    /// OnOutputPacket messages referencing the buffer, and the codec may still
+    /// have a VMO handle open to the buffer. After RemoveBuffer completes, the
+    /// codec guarantees that no subsequent output packet will reference the
+    /// buffer, and that the server holds no VMO handles to the buffer.
+    ///
+    /// The client may need to recycle an output packet before the RemoveBuffer
+    /// call can complete. Clients should take care to avoid blocking packet
+    /// recycling while the RemoveBuffer request is in progress, since this
+    /// would create a potential deadlock.
+    ///
+    /// The server closing any VMO handles to the buffer prior to completing
+    /// this call is important for the client's ability to prevent memory usage
+    /// spikes.
+    ///
+    /// If the client has "paused" processing by not providing any more input,
+    /// the client will potentially need to send CloseCurrentStream before
+    /// RemoveBuffer will complete. When using dynamic buffers, setting
+    /// release_input_buffers or release_output_buffers to true is not
+    /// necessary; the RemoveBuffer is explicitly telling the codec to release a
+    /// specific buffer. When not using dynamic buffers, the client will need to
+    /// set release_input_buffers or release_output_buffers to true, since
+    /// RemoveBuffer alone doesn't initiate removal when not using dynamic
+    /// buffers. A current "paused" stream needs to be stopped because frames
+    /// can be held as reference frames, and codecs are never reqiured to copy
+    /// their output data.
+    ///
+    /// For any video decoder output buffers being removed while there's an
+    /// active stream (being fed input or not), it's typically best for the
+    /// client to assume that removal of a video decoder output buffer may take
+    /// a very long duration. This is because bitstreams, especially
+    /// non-standard-compliant bitstreams, but in some cases potentially even
+    /// standard-compliant bitstreams, can keep a video decoder output buffer in
+    /// the set of active reference frames (aka DPB) indefinitely. The server is
+    /// not required to notice that a stream is not conforming to a bitstream
+    /// standard in this regard.
+    ///
+    /// In the case of h.264 decode, a standard-complient bitstream will limit
+    /// the reorder delay to no longer than the max DPB occupancy. However, a
+    /// server is not required to detect or reject non-compliant streams that
+    /// potentially keep a frame in the DPB for longer.
+    ///
+    /// For HEVC, the situation is similar to h.264 (IIUC).
+    ///
+    /// In the case of VP9, there is nothing in the bitstream spec that limits
+    /// the reorder delay (IIUC), meaning a frame can potentially stay in VP9's
+    /// set of 8 reference frames (aka DPB) indefinitely. The server is not
+    /// required to detect or mitigate this.
+    ///
+    /// Until this call completes, the server may still be using the buffer. For
+    /// output buffers, the server can still send OnOutputPacket message(s) that
+    /// references this buffer, but only up until the RemoveBuffer completion
+    /// message is sent by the server. The client must continue to
+    /// RecycleOutputPacket for packets that reference the buffer, until
+    /// RemoveBuffer completes.
+    ///
+    /// When using dynamic buffers, upon receiving this message, the server will
+    /// stop selecting the buffer for any new usage (as in, for any usage that
+    /// moves the buffer from "free" to "not free" within the server). This
+    /// applies even if the server has no other buffers available for use (aka
+    /// no other "free" buffers). Any existing usage of the buffer is not ended
+    /// early by this call alone.
+    ///
+    /// When not using dynamic buffers, upon receiving this message, the server
+    /// will just remember to complete this call shortly after the buffer has
+    /// completed removal triggered by some other cause (removal is not
+    /// triggered/caused by this call).
+    ///
+    /// For video decoders, when using dynamic buffers, typically the client
+    /// should take care to avoid removing too many output buffers for continued
+    /// decode to be possible. If this occurs, the decoder will wait until the
+    /// client adds another output buffer with AddBuffer. This can be a deadlock
+    /// if the client never sends that AddBuffer. Due to DPB mechanism(s) and
+    /// frame reordering, sending a single AddBuffer doesn't necessarily
+    /// guarantee another OnOutputPacket, since additional output buffers can be
+    /// needed before the server can send OnOutputPacket.
+    ///
+    /// The client must not call RemoveBuffer on the same buffer more than once,
+    /// whether overlapping in time or not. The server should enforce this when
+    /// not enforcing would require tracking additional concurrent requests. The
+    /// server is not required to enforce this when enforcing would use more
+    /// server memory.
+    ///
+    /// The server is allowed to complete this request quickly with success for
+    /// buffer_lifetime_ordinal and buffer_index combinations that were never
+    /// real buffers, but must close the channel if the buffer_lifetime_ordinal
+    /// hasn't been started by the client yet (no removing potential future
+    /// buffers).
+    ///
+    /// When using dynamic buffers, a buffer_lifetime_ordinal and buffer_index
+    /// combination may be re-used after completion of RemoveBuffer, but only if
+    /// the buffer_lifetime_ordinal is the current buffer_lifetime_ordinal. In
+    /// other words, no adding buffers under an old buffer_lifetime_ordinal.
+    ///
+    /// Assuming a valid historical buffer is specified, successful completion
+    /// of this call means the buffer has been fully released by the server and
+    /// won't be referenced in any subsequent OnOutputPacket.
+    @available(added=32)
+    flexible RemoveBuffer(resource table {
+        /// Must be set. Which port (input or output) the buffer is for.
+        1: port Port;
+        /// Scoped to input or output, this is the buffer_lifetime_ordinal under
+        /// which the buffer_index is meaningful.
+        2: buffer_lifetime_ordinal uint64;
+        /// The buffer_index of the buffer previously established (and most
+        /// recently established) by AddBuffer, or by
+        /// SetInputBufferPartialSettings / SetOutputBufferPartialSettings. The
+        /// scope of this value is under input vs. output and under the
+        /// buffer_lifetime_ordinal value.
+        ///
+        /// When using dynamic buffers, the buffer_index values that are between
+        /// AddBuffer starting and RemoveBuffer completing (the active
+        /// buffer_index values) must be unique for a given Port value and
+        /// buffer_lifetime_ordinal value.
+        ///
+        /// Clients using dynamic buffers may wish to not re-use a buffer_index
+        /// value quickly upon completion of RemoveBuffer just to make
+        /// debugging/diagnosing easier, but technically re-use of buffer_index
+        /// in a subsequent AddBuffer is permitted as soon as RemoveBuffer
+        /// completes (from the StreamProcessor point of view - the client may
+        /// have its own reasons to not re-use that quickly). AddBuffer under an
+        /// old (not current) buffer_lifetime_ordinal is never allowed.
+        3: buffer_index uint32;
+    }) -> ();
+
+    /// This informs the StreamProcessor that the client is prepared to handle
+    /// output packets that specify a buffer with buffer_lifetime_ordinal older
+    /// than the most recent buffer_lifetime_ordinal.
+    ///
+    /// If the client doesn't send this message, the StreamProcessor will omit
+    /// any such output, even if
+    /// DetailedCodecDescription.supports_dynamic_buffers is true. For relevant
+    /// decoders such as VP9 decoders, not sending this message can result in
+    /// output that isn't bistream spec compliant, and the output can be
+    /// visually different than intended by the bitstream.
+    ///
+    /// Such streams are only possible with some bitstream formats (such as
+    /// VP9), and are rare, but can happen and can be valid per the bitstream
+    /// spec. For example, this can be specified by a VP9 bitstream using
+    /// show_existing_frame to output an old-dimensions buffer after having
+    /// already output a new-dimensions buffer.
+    ///
+    /// Most clients that send this message will also want to use RemoveBuffer
+    /// to know when it becomes safe to stop tracking an old buffer.
+    ///
+    /// Most of the time this makes no difference as most bitstreams don't
+    /// actually emit old buffers, even if the bitstream spec would allow it.
+    /// Old output buffers are especially rare for RTC streams which typically
+    /// don't have any frame reordering in the first place.
+    ///
+    /// In most video streaming scenarios that use dimension switching as part
+    /// of their bitrate control strategy (among those that I've observed), at
+    /// the StreamProcessor layer the new dimensions are part of a new stream
+    /// instead of being spliced together as a continuation of the old stream.
+    /// That said, using a continuation of the old stream is also a completely
+    /// valid way to implement dimension switching. When a stream switch occurs
+    /// as part of dimension switching, the decoder state is not retained and
+    /// there won't be any old buffer(s) emitted after new buffer(s), since the
+    /// new stream doesn't know anything about old buffers filled by the old
+    /// stream.
+    ///
+    /// Clients which haven't tested their ability to handle old output buffers
+    /// should not send this message. Clients decoding bitstreams like VP9 for
+    /// decoder compliance testing purposes should send this message (and use a
+    /// VP9 decoder with DetailedCodecDescrption.supports_dynamic_buffers true).
+    /// Clients which are required to support old output frames and/or fully
+    /// comply with a relevant bitstream spec should/must send this message, and
+    /// should test using a test stream that outputs packets referencing an old
+    /// output buffer.
+    ///
+    /// Sending this message more than once closes the channel. If sent, this
+    /// message must be sent prior to the client establishing the first output
+    /// buffer_lifetime_ordinal. This requirement avoids ambiguity re. free/busy
+    /// status of packets of old buffer_lifetime_ordinal(s), as the server can
+    /// auto-recycle packets with old buffer_lifetime_ordinal on behalf of the
+    /// client when this message was not sent by the client.
+    ///
+    /// This message is only permitted when
+    /// `[fuchsia.mediacodec/CodecFactory.DetailedCodecDescription.supports_dynamic_buffers]`
+    /// is true.
+    @available(added=32)
+    flexible EnableOldOutputBuffers();
+
+    /// This informs the StreamProcessor that the client is prepared to handle
+    /// output packets that specify the same buffer as another packet that's
+    /// also concurrently in flight to the client (not yet recycled).
+    ///
+    /// Most bitstream formats don't do this. In formats that can do this such
+    /// as VP9, most actual bitstreams don't do this.
+    ///
+    /// As an example, in VP9, a stream can cause the same output buffer to be
+    /// used by another emitted output packet/frame by using show_existing_frame
+    /// on the same VP9 reference/held frame slot more than once without
+    /// decoding a new frame into that slot in between.
+    ///
+    /// Clients that need to achieve full bitstream spec compliance for such a
+    /// bitstream format must send this message.
+    ///
+    /// If this message is not in effect, the server will omit any such output,
+    /// which can result in output that is not compliant to the relevant
+    /// bitstream spec, and which can be visually different than the stream
+    /// intended.
+    ///
+    /// Sending this message more than once closes the channel. If sent, this
+    /// message must be sent prior to the client establishing the first output
+    /// buffer_lifetime_ordinal.
+    ///
+    /// This message is only permitted when
+    /// `[fuchsia.mediacodec/CodecFactory.DetailedCodecDescription.supports_dynamic_buffers]`
+    /// is true.
+    @available(added=32)
+    flexible EnableSameOutputBufferConcurrentlyInFlight();
+
+    /// For video decoders, this forces the output buffers to be reallocated if
+    /// the image size needs to change. This is wasteful as it forces extra
+    /// buffer reallocations given typical video bitrate control strategies
+    /// (applicable to both streaming and RTC) involving shifting the image
+    /// dimensions up and down repeatedly as a logical video/stream plays,
+    /// sometimes even if network conditions remain fairly stable. This extra
+    /// buffer reallocation cost is incurred vs. baseline whether the dimension
+    /// switching is achieved within a single StreamProcessor stream or by using
+    /// a new StreamProcessor stream for new dimensions.
+    ///
+    /// A client should not send this message unless the client really must
+    /// force the output buffers to be reallocated every time the output image
+    /// size changes.
+    ///
+    /// Sending this message more than once closes the channel. If sent, this
+    /// message must be sent prior to any SetInputBufferPartialSettings,
+    /// SetOutputBufferPartialSettings, ParticipateInBufferAllocation, or
+    /// AddBuffer.
+    ///
+    /// This message is only permitted if this StreamProcessor is a video
+    /// decoder.
+    ///
+    /// This message is only permitted when
+    /// `[fuchsia.mediacodec/CodecFactory.DetailedCodecDescription.supports_dynamic_buffers]`
+    /// is true.
+    @available(added=32)
+    flexible EnableForceOutputBuffersFixedImageSize();
+
+    /// Most clients can ignore the `OnOutputTimestampHasNoOutput` message.
+    ///
+    /// `OnOutputTimestampHasNoOutput` is only sent by `StreamProcessor` servers
+    /// with `supports_dynamic_buffers` true.
+    ///
+    /// When the server determines that a previous input packet with a given
+    /// `timestamp_ish` value will never generate any output, the server will
+    /// send this message with the `timestamp_ish` value.
+    ///
+    /// This message can be thought of as a stand-in for `OnOutputPacket` when
+    /// the server eventually determines that the timestamp will never generate
+    /// any output; this is why the name starts with "OnOutput". Similar to
+    /// messages indicating output, the server will not send this message when
+    /// there is an in-progress stream-driven output re-config in progress (as
+    /// occurs starting with `OnOutputConstraints`).
+    ///
+    /// While servers should send this message as soon as allowed, feasible, and
+    /// practical, there is no specific timeliness guarantee regarding when this
+    /// message will be sent by a server. For some input packets that don't
+    /// generate any output, the server may send this message fairly soon after
+    /// consuming the corresponding input packet. For other input packets that
+    /// don't generate any output, the server may not send this message until
+    /// the server can prove that the corresponding input packet will never
+    /// generate any output via delayed means such as, for example, logic
+    /// involving `max_num_reorder_frames`, or any relevant
+    /// bitstream-format-specific logic. The server is allowed to not send this
+    /// message until substantially more input is received and processed by the
+    /// server. The client must not attempt to wait on reception of this message
+    /// before sending more input, as that would create a potential deadlock.
+    ///
+    /// When sent, this message will be sent at some time after the
+    /// `OnFreeInputPacket` message for the corresponding input packet that had
+    /// the same `timestamp_ish` value. The client must not delay re-use of the
+    /// input buffer until after reception of `OnOutputTimestampHasNoOutput`
+    /// because that would create a potential deadlock.
+    ///
+    /// When sent, this message will be sent before the `OnOutputEndOfStream`
+    /// message for the `stream_lifetime_ordinal` stream. A server is not
+    /// required to send `OnOutputTimestampHasNoOutput` for all unresolved (in
+    /// terms of output yes/no) input timestamp_ish values prior to sending
+    /// `OnOutputEndOfStream`, and the `OnOutputEndOfStream` unambiguously
+    /// resolves the (output yes/no) status of any remaining input timestamp_ish
+    /// values tracked by the client.
+    ///
+    /// The server must not output the indicated timestamp_ish value in a later
+    /// OnOutputPacket, unless the client is not ensuring that timestamp_ish
+    /// values are unique and the client is re-using the timestamp_ish value on
+    /// another input packet. The server-side mechanism to achieve this robustly
+    /// can be bitstream format specific and codec implementation specific.
+    ///
+    /// This message is not required to be sent by the server when the reason
+    /// for an input packet not generating output is the client switching to a
+    /// new stream without FlushEndOfStreamAndCloseStream, stream failure, or
+    /// codec failure.
+    ///
+    /// If the client is ensuring that all input packets with a given
+    /// `stream_lifetime_ordinal` have unique `timestamp_ish` values, then the
+    /// client can use this message to determine which input packet will never
+    /// generate any output.
+    ///
+    /// If the client is not ensuring that all input packets have a unique
+    /// timestamp_ish value, then the client should always ignore this message,
+    /// as the protocol makes no particular gaurantees regarding this message in
+    /// this case (it may not be possible for any such client to disambiguate
+    /// which input packet is meant, the server may not send this message as
+    /// many times as there were input packets with the same `timestamp_ish`
+    /// value, the server may not send this message at all once it notices any
+    /// non-unique `timestamp_ish` values, etc).
+    ///
+    /// Effective and robust use of this message may require the client to
+    /// assign timestamp_ish values as sequential unsigned 64 bit numbers, and
+    /// keep any corresponding real timestamps locally in the client.
+    ///
+    /// If a client doesn't have any specific reason to pay attention to this
+    /// event, the client should ignore this event. Most clients can completely
+    /// ignore this event with no adverse impact.
+    @available(added=32)
+    flexible -> OnOutputTimestampHasNoOutput(table {
+        /// All servers will set this field. This is the
+        /// `stream_lifetime_ordinal` value from the input `Packet` that will
+        /// never generate any output packet.
+        1: stream_lifetime_ordinal uint64;
+        /// All servers will set this field. This is the `timestamp_ish` value
+        /// from the input `Packet` that will never generate any output packet
+        /// under the `stream_lifetime_ordinal` having this `timestamp_ish`
+        /// value.
+        2: timestamp_ish uint64;
+    });
+};
+
+/// Deprecated.  Use SetStreamBufferPartialSettings() and
+/// StreamBufferPartialSettings instead.
+@deprecated("Ignore. Use SetStreamBufferPartialSettings instead.")
+type StreamBufferSettings = table {
+    @deprecated("Ignore. Use SetStreamBufferPartialSettings instead.")
+    1: buffer_lifetime_ordinal uint64;
+    @deprecated("Ignore. Use SetStreamBufferPartialSettings instead.")
+    2: buffer_constraints_version_ordinal uint64;
+    @deprecated("Ignore. Use SetStreamBufferPartialSettings instead.")
+    3: packet_count_for_server uint32;
+    @deprecated("Ignore. Use SetStreamBufferPartialSettings instead.")
+    4: packet_count_for_client uint32;
+    @deprecated("Ignore. Use SetStreamBufferPartialSettings instead.")
+    5: per_packet_buffer_bytes uint32;
+    @deprecated("Ignore. Use SetStreamBufferPartialSettings instead.")
+    6: single_buffer_mode bool;
+};

@@ -1,0 +1,166 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.net.routes.admin;
+
+using fuchsia.net.routes;
+using zx;
+
+/// Error type returned when failing to authenticate an interface for a route
+/// set.
+type AuthenticateForInterfaceError = flexible enum {
+    /// The provided
+    /// [`fuchsia.net.resources/ProofOfinterfaceAuthorization`] was invalid.
+    /// This may happen if:
+    ///   - the provided proof's `interface_id' is unknown to the system,
+    ///   - the provided proof's `token` is unknown to the system, or
+    ///   - the provided proof`s `token` is not associated with the proof's
+    ///     `interface_id` (e.g., the `token` authenticates a different
+    ///     interface).
+    INVALID_AUTHENTICATION = 1;
+};
+
+/// Error type returned when failing to get a local route table for an interface.
+type GetInterfaceLocalTableError = flexible enum {
+    /// The provided
+    /// [`fuchsia.net.resources/ProofOfinterfaceAuthorization`] was invalid.
+    /// This may happen if:
+    ///   - the provided proof's `interface_id' is unknown to the system,
+    ///   - the provided proof's `token` is unknown to the system, or
+    ///   - the provided proof`s `token` is not associated with the proof's
+    ///     `interface_id` (e.g., the `token` authenticates a different
+    ///     interface).
+    INVALID_AUTHENTICATION = 1;
+    /// The interface does not have a local route table.
+    NO_LOCAL_ROUTE_TABLE = 2;
+};
+
+/// Error type returned when failing to authenticate a route table for a
+/// rules set.
+type AuthenticateForRouteTableError = flexible enum {
+    /// The provided authentication proof is invalid.
+    /// This may happen if:
+    ///   - the provided proof's `table_id' is unknown to the system,
+    ///   - the provided proof's `token` is unknown to the system, or
+    ///   - the provided proof`s `token` is not associated with the
+    ///     `table_id` (e.g., the `token` authenticates a different
+    ///     route table).
+    INVALID_AUTHENTICATION = 1;
+};
+
+/// Error type returned when failing to manipulate a route set.
+type RouteSetError = flexible enum {
+    /// The route set attempted to add/remove a route that uses an
+    /// unauthenticated interface. Clients must first authenticate the route set
+    /// for a particular interface by calling `AuthenticateForInterface`, before
+    /// managing routes over the interface.
+    UNAUTHENTICATED = 1;
+    /// This route specified a destination subnet that is invalid.
+    /// E.g. the prefixlen was invalid, or the subnet's host bits were set.
+    INVALID_DESTINATION_SUBNET = 2;
+    /// This route specified a target whose next-hop address is invalid.
+    /// Next-hop addresses must be unicast addresses.
+    INVALID_NEXT_HOP = 3;
+    /// The route set attempted to add/remove a route with an unsupported
+    /// `RouteAction` variant.
+    UNSUPPORTED_ACTION = 4;
+    /// The route set attempted to add/remove a route that uses an interface
+    /// that was previously authenticated, but no longer exists.
+    PREVIOUSLY_AUTHENTICATED_INTERFACE_NO_LONGER_EXISTS = 5;
+    /// The route set attempted to add/remove a route that was missing required
+    /// specified properties.
+    MISSING_ROUTE_PROPERTIES = 6;
+    /// The route set attempted to add/remove a route that was missing a
+    /// metric.
+    MISSING_METRIC = 7;
+};
+
+/// Common base for `RouteTable` protocol that is IP version agnostic. This
+/// helps reduce FIDL duplication.
+closed protocol BaseRouteTable {
+    /// Gets the table ID for this table.
+    strict GetTableId() -> (struct {
+        table_id fuchsia.net.routes.TableId;
+    });
+
+    /// Detaches the lifetime of the route table from the lifetime of the
+    /// client end of the channel.
+    ///
+    /// After this method is called, the route table will not be removed
+    /// if the client end is closed. It's a no-op if called on the main table.
+    strict Detach();
+
+    /// Removes the route table explicitly.
+    ///
+    /// This method cannot be called on the main table or an interface-local
+    /// table, an error will be returned if called. The server will close the
+    /// channel after this method successfully returns.
+    strict Remove() -> () error flexible enum : uint32 {
+        INVALID_OP = 1;
+    };
+
+    /// Gets an authentication credential for this table.
+    ///
+    /// The credential contains a [`zx::handle::EVENT`], whose duplicate is
+    /// held by the server. This credential can be passed into
+    /// `fuchsia.net.routes.admin` API calls to prove ownership of this route
+    /// table. The `EVENT` is stable throughout the lifetime of the route table.
+    /// Clients may duplicate this `EVENT` to make multiple API calls, or
+    /// transfer the `EVENT` to other clients.
+    ///
+    /// - response `credential` the authorization credential for this table.
+    strict GetAuthorizationForRouteTable() -> (resource struct {
+        credential @generated_name("GrantForRouteTableAuthorization") resource struct {
+            /// The ID of the table this credential is authenticating.
+            table_id fuchsia.net.routes.TableId;
+            /// The `EVENT` providing authentication over this route table.
+            token zx.Handle:<EVENT, zx.Rights.TRANSFER | zx.Rights.DUPLICATE>;
+        };
+    });
+};
+
+/// Common base for `RuleSet` protocol that is IP version agnostic. This
+/// helps reduce FIDL duplication.
+closed protocol BaseRuleSet {
+    /// Authenticates for a route table that will be used in an action.
+    strict AuthenticateForRouteTable(@generated_name("ProofOfRouteTableAuthorization") resource struct {
+        table fuchsia.net.routes.TableId;
+        // TODO(https://fxbug.dev/42079239): We want to restrict the rights to None, but currently
+        // there are issues in FIDL or zither preventing us from naming the constant.
+        token zx.Handle:<EVENT, 0>;
+    }) -> () error AuthenticateForRouteTableError;
+
+    /// Removes a rule from this rule set.
+    ///
+    /// If the client tries to remove from an index that does not have a rule,
+    /// the error `RULE_DOES_NOT_EXIST` will be returned.
+    ///
+    /// + request `index` the index of the rule.
+    strict RemoveRule(struct {
+        index fuchsia.net.routes.RuleIndex;
+    }) -> () error RuleSetError;
+
+    /// Removes all rules in the rule set and the underlying channel will be
+    /// closed after the rules are removed.
+    ///
+    /// This method provides a way for synchronous closure.
+    strict Close();
+};
+
+/// Possible errors for operating the rule set.
+type RuleSetError = flexible enum : uint32 {
+    /// Tried to install a rule referencing a route table that was not authorized
+    /// through `AuthenticateForRouteTable`.
+    UNAUTHENTICATED = 1;
+    /// The action is invalid, for example, the action contains an invalid route
+    /// table.
+    INVALID_ACTION = 2;
+    /// Tried to install a rule at an index that already has an existing rule.
+    RULE_ALREADY_EXISTS = 3;
+    /// Tried to remove a rule at an index that does not have an existing rule.
+    RULE_DOES_NOT_EXIST = 4;
+    /// The matcher is invalid, there are parts of the matcher that are invalid
+    /// on their own or mutually exclusive.
+    INVALID_MATCHER = 5;
+};

@@ -1,0 +1,227 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/test.gni")
+import("//src/storage/testing/driver_test_realm.gni")
+import("//src/storage/volume_image/fvm/generate_fvm.gni")
+
+source_set("options") {
+  public = [ "options.h" ]
+  public_deps = [ "//src/storage/volume_image:volume-descriptor" ]
+}
+
+source_set("fvm-descriptor") {
+  sources = [ "fvm_descriptor.cc" ]
+  public = [ "fvm_descriptor.h" ]
+  public_deps = [
+    ":options",
+    "//sdk/lib/fit-promise",
+    "//src/storage/fvm",
+    "//src/storage/volume_image:partition",
+  ]
+  deps = [ "//src/storage/volume_image/utils:block-utils" ]
+}
+
+source_set("fvm-metadata") {
+  sources = [ "fvm_metadata.cc" ]
+  public = [ "fvm_metadata.h" ]
+  public_deps = [
+    "//sdk/lib/fit-promise",
+    "//src/storage/fvm",
+    "//src/storage/volume_image/utils:io-interfaces",
+  ]
+  deps = [ "//zircon/system/ulib/fbl" ]
+}
+
+source_set("fvm-image-extend") {
+  sources = [ "fvm_image_extend.cc" ]
+  public = [ "fvm_image_extend.h" ]
+  public_deps = [
+    ":options",
+    "//src/storage/volume_image/utils:io-interfaces",
+  ]
+  deps = [ ":fvm-metadata" ]
+}
+
+source_set("fvm-sparse-image") {
+  sources = [
+    "fvm_sparse_image.cc",
+    "fvm_sparse_image_reader.cc",
+  ]
+  public = [
+    "fvm_sparse_image.h",
+    "fvm_sparse_image_reader.h",
+  ]
+  public_deps = [
+    ":fvm-descriptor",
+    "//sdk/lib/fit-promise",
+    "//src/storage/fvm",
+    "//src/storage/volume_image/utils:compression-interfaces",
+    "//src/storage/volume_image/utils:io-interfaces",
+  ]
+  deps = [
+    "//src/storage/volume_image/utils:block-utils",
+    "//src/storage/volume_image/utils:lz4-compression",
+    "//src/storage/volume_image/utils:lz4-decompress-reader",
+  ]
+}
+
+source_set("fvm-unpack") {
+  sources = [ "fvm_unpack.cc" ]
+  public = [ "fvm_unpack.h" ]
+  public_deps = [
+    "//sdk/lib/fit-promise",
+    "//src/storage/fvm",
+    "//src/storage/volume_image/utils:io-interfaces",
+  ]
+  deps = [
+    ":fvm-metadata",
+    "//src/storage/volume_image/utils:fd-io",
+    "//zircon/system/ulib/fbl",
+  ]
+}
+
+# This source set is included in the volume image test package in the directory
+# above.
+source_set("fvm-test") {
+  testonly = true
+  sources = [
+    "fvm_descriptor_test.cc",
+    "fvm_image_extend_test.cc",
+    "fvm_sparse_image_test.cc",
+    "fvm_unpack_test.cc",
+  ]
+  deps = [
+    ":fvm-descriptor",
+    ":fvm-image-extend",
+    ":fvm-sparse-image",
+    ":fvm-unpack",
+    "//src/lib/json_parser",
+    "//src/storage/fvm",
+    "//src/storage/volume_image/serialization:schema",
+    "//src/storage/volume_image/utils:block-utils",
+    "//src/storage/volume_image/utils:guid",
+    "//src/storage/volume_image/utils:lz4-compression",
+    "//third_party/googletest:gmock",
+    "//third_party/googletest:gtest",
+    "//third_party/lz4",
+  ]
+}
+
+test_data_image_path = "$target_out_dir/test_data.blk"
+test_blob_image_path = "$target_out_dir/test_blob.blk"
+
+compiled_action("test_data.blk") {
+  testonly = true
+  visibility = [ ":*" ]
+  tool = "//src/storage/minfs/tools:minfs"
+  outputs = [ test_data_image_path ]
+  args = [
+    rebase_path(test_data_image_path, root_build_dir),
+    "create",
+  ]
+}
+
+compiled_action("test_blob.blk") {
+  testonly = true
+  visibility = [ ":*" ]
+  tool = "//src/storage/blobfs/tools:blobfs"
+  outputs = [ test_blob_image_path ]
+  args = [
+    rebase_path(test_blob_image_path, root_build_dir),
+    "create",
+  ]
+}
+
+test_fvm_data_partition = {
+  type = "data"
+  dep = ":test_data.blk"
+  minimum_inodes =
+      "600000"  # Deliberately chosen so that partition is expanded.
+  minimum_data_bytes = "10M"
+  maximum_bytes = "218103808"
+}
+
+test_fvm_blob_partition = {
+  type = "blob"
+  dep = ":test_blob.blk"
+}
+
+generate_fvm("test_fvm.sparse.blk") {
+  testonly = true
+  output_name = "$target_out_dir/test_fvm.sparse.blk"
+  deps = [
+    ":test_blob.blk",
+    ":test_data.blk",
+  ]
+  args = [
+    "sparse",
+    "--compress",
+    "lz4",
+    "--slice",
+    "8388608",
+  ]
+
+  partitions = [
+    # Place blobfs first, since it is A/B enabled (thus allocates extra slices
+    # for B-copies of some metadata) and bugs are likely to be detected in
+    # partitions added after this partition.
+    test_fvm_blob_partition,
+    test_fvm_data_partition,
+  ]
+}
+
+resource("test_fvm.sparse.blk-resource") {
+  testonly = true
+  sources = [ "$target_out_dir/test_fvm.sparse.blk" ]
+  outputs = [ "data/{{source_file_part}}" ]
+  deps = [ ":test_fvm.sparse.blk" ]
+}
+
+test("fvm_sparse_image_reader_test") {
+  testonly = true
+  sources = [ "fvm_sparse_image_reader_test.cc" ]
+  deps = [
+    ":fvm-sparse-image",
+    "//sdk/lib/component/incoming/cpp",
+    "//sdk/lib/device-watcher/cpp",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/predicates",
+    "//src/storage/lib/block_client/cpp",
+    "//src/storage/lib/fs_management",
+    "//src/storage/testing:storage_driver_test_support",
+    "//src/storage/volume_image/ftl:ftl-image",
+    "//src/storage/volume_image/utils:fd-io",
+    "//third_party/googletest:gtest",
+    "//zircon/system/ulib/fbl",
+  ]
+}
+
+storage_driver_test_realm_component("fvm-sparse-image-reader-tests-component") {
+  component_name = "fvm-sparse-image-reader-tests"
+  manifest = "sparse-image-reader-tests.cml"
+  deps = [
+    ":fvm_sparse_image_reader_test",
+    ":test_fvm.sparse.blk-resource",
+  ]
+}
+
+fuchsia_test_package("fvm-sparse-image-reader-tests") {
+  test_specs = {
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+  test_components = [ ":fvm-sparse-image-reader-tests-component" ]
+  deps = [
+    "//src/storage/blobfs/bin:component",
+    "//src/storage/minfs/bin:minfs-component",
+  ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [ ":fvm-sparse-image-reader-tests" ]
+}

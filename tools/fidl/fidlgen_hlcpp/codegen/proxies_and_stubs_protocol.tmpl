@@ -1,0 +1,619 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "ProtocolForwardDeclaration/ProxiesAndStubs" }}
+{{ EnsureNamespace . }}
+{{- IfdefFuchsia -}}
+{{- .Docs }}
+using {{ .Name }}Ptr = ::fidl::InterfacePtr<{{ .Name }}>;
+class {{ .Proxy.Name }};
+class {{ .Stub.Name }};
+class {{ .EventSender.Name }};
+class {{ .SyncInterface.Name }};
+using {{ .Name }}SyncPtr = ::fidl::SynchronousInterfacePtr<{{ .Name }}>;
+class {{ .SyncProxy.Name }};
+
+{{ range .Methods }}
+{{- EnsureNamespace .OrdinalName }}
+constexpr uint64_t {{ .OrdinalName.Name }} = {{ .Ordinal | printf "%#x" }}lu;
+{{- EnsureNamespace .DynamicFlagsName }}
+constexpr ::fidl::MessageDynamicFlags {{ .DynamicFlagsName.Name }} = {{ .DynamicFlags }};
+{{- end }}
+
+{{- EndifFuchsia -}}
+{{- end }}
+
+{{- define "Params" -}}
+  {{- range $index, $param := . -}}
+    {{- if $index }}, {{ end -}}{{ $param.Type }} {{ $param.Name }}
+  {{- end -}}
+{{ end }}
+
+{{- define "OutParams" -}}
+  {{- range $index, $param := . -}}
+    {{- if $index }}, {{ end -}}{{ $param.Type }}* out_{{ $param.Name }}
+  {{- end -}}
+{{ end }}
+
+{{- define "ParamTypes" -}}
+  {{- range $index, $param := . -}}
+    {{- if $index }}, {{ end -}}{{ $param.Type }}
+  {{- end -}}
+{{ end }}
+
+{{- define "RequestMethodSignature" -}}
+  {{- if .HasResponse -}}
+{{ .Name }}({{ template "Params" .RequestArgs }}{{ if .RequestArgs }}, {{ end }}{{ .CallbackType }} callback)
+  {{- else -}}
+{{ .Name }}({{ template "Params" .RequestArgs }})
+  {{- end -}}
+{{ end -}}
+
+{{- define "EventMethodSignature" -}}
+{{ .Name }}({{ template "Params" .ResponseArgs }})
+{{- end -}}
+
+{{- define "SyncRequestMethodSignature" -}}
+  {{- if .ResponseArgs -}}
+{{ .Name }}({{ template "Params" .RequestArgs }}{{ if .RequestArgs }}, {{ end }}{{ template "OutParams" .ResponseArgs }})
+  {{- else -}}
+{{ .Name }}({{ template "Params" .RequestArgs }})
+  {{- end -}}
+{{ end -}}
+
+{{- define "ProtocolDeclaration/ProxiesAndStubs" }}
+{{- IfdefFuchsia -}}
+
+{{- .Docs }}
+class {{ .Name }} {
+ public:
+  using Proxy_ = {{ .Proxy }};
+  using Stub_ = {{ .Stub }};
+  using EventSender_ = {{ .EventSender }};
+  using Sync_ = {{ .SyncInterface }};
+  {{- if .DiscoverableName }}
+  static const char Name_[];
+  {{- end }}
+  virtual ~{{ .Name }}();
+
+  {{- range .Methods }}
+    {{- if .HasResponse }}
+  using {{ .CallbackType }} =
+      fit::function<void({{ template "ParamTypes" .ResponseArgs }})>;
+    {{- end }}
+    {{- if .HasRequest }}
+      {{ .Docs }}
+  virtual void {{ template "RequestMethodSignature" . }} = 0;
+    {{- end }}
+  {{- end }}
+
+  {{ if .HandlesOneWayUnknownInteractions -}}
+ protected:
+  // Allow the stub to access the handle_unknown_method method.
+  friend class {{ .Stub.Name }};
+
+  {{ if .HandlesTwoWayUnknownInteractions -}}
+  virtual void handle_unknown_method(uint64_t ordinal, bool method_has_response) = 0;
+  {{ else -}}
+  virtual void handle_unknown_method(uint64_t ordinal) = 0;
+  {{- end }}
+  {{- end }}
+};
+
+class {{ .RequestDecoder.Name }} {
+ public:
+  {{ .RequestDecoder.Name }}() = default;
+  virtual ~{{ .RequestDecoder.Name }}() = default;
+  static const fidl_type_t* GetType(uint64_t ordinal, bool* out_needs_response, bool* is_known);
+
+  {{- range .Methods }}
+    {{- if .HasRequest }}
+  virtual void {{ .Name }}({{ template "Params" .RequestArgs }}) = 0;
+    {{- end }}
+  {{- end }}
+};
+
+class {{ .ResponseDecoder.Name }} {
+ public:
+  {{ .ResponseDecoder.Name }}() = default;
+  virtual ~{{ .ResponseDecoder.Name }}() = default;
+  static const fidl_type_t* GetType(uint64_t ordinal);
+
+  {{- range .Methods }}
+    {{- if .HasResponse }}
+  virtual void {{ .Name }}({{ template "Params" .ResponseArgs }}) = 0;
+    {{- end }}
+  {{- end }}
+};
+
+class {{ .EventSender.Name }} {
+ public:
+  virtual ~{{ .EventSender.Name }}();
+
+  {{- range .Methods }}
+    {{- if not .HasRequest }}
+      {{- if .HasResponse }}
+  virtual void {{ template "EventMethodSignature" . }} = 0;
+      {{- end }}
+    {{- end }}
+  {{- end }}
+};
+
+class {{ .SyncInterface.Name }} {
+ public:
+  using Proxy_ = {{ .SyncProxy }};
+  virtual ~{{ .SyncInterface.Name }}();
+
+  {{- range .Methods }}
+    {{- if .HasRequest }}
+  virtual zx_status_t {{ template "SyncRequestMethodSignature" . }} = 0;
+    {{- end }}
+  {{- end }}
+};
+
+class {{ .Proxy.Name }} final : public ::fidl::internal::Proxy, public {{ .Name }} {
+ public:
+  explicit {{ .Proxy.Name }}(::fidl::internal::ProxyController* controller);
+  ~{{ .Proxy.Name }}() override;
+
+  zx_status_t Dispatch_(::fidl::HLCPPIncomingMessage message) override;
+
+  {{- range .Methods }}
+    {{- if .HasRequest }}
+  {{ .CtsMethodAnnotation }}
+  void {{ template "RequestMethodSignature" . }} override;
+    {{- else if .HasResponse }}
+  {{ .CallbackType }} {{ .Name }};
+    {{- end }}
+  {{- end }}
+
+  {{ if .HandlesOneWayUnknownInteractions -}}
+  fit::function<void(uint64_t)> handle_unknown_event;
+
+ protected:
+  {{ if .HandlesTwoWayUnknownInteractions -}}
+  void handle_unknown_method(uint64_t ordinal, bool method_has_response) override {
+    // This method is only provided to satisfy the base interface. It's
+    // protected and should never be called by generated code on the client
+    // side, so it should never be called.
+    ZX_PANIC("Unreachable: {{ .Proxy.Name }}::handle_unknown_method should not be callable");
+  }
+  {{ else -}}
+  void handle_unknown_method(uint64_t ordinal) override {
+    // This method is only provided to satisfy the base interface. It's
+    // protected and should never be called by generated code on the client
+    // side, so it should never be called.
+    ZX_PANIC("Unreachable: {{ .Proxy.Name }}::handle_unknown_method should not be callable");
+  }
+  {{- end }}
+  {{- end }}
+
+
+ private:
+  {{ .Proxy.Name }}(const {{ .Proxy }}&) = delete;
+  {{ .Proxy.Name }}& operator=(const {{ .Proxy }}&) = delete;
+
+  ::fidl::internal::ProxyController* controller_;
+};
+
+class {{ .Stub.Name }} final : public ::fidl::internal::Stub, public {{ .EventSender }} {
+ public:
+  typedef class {{ . }} {{ .InterfaceAliasForStub.Self }};
+  explicit {{ .Stub.Name }}({{ .InterfaceAliasForStub }}* impl);
+  ~{{ .Stub.Name }}() override;
+
+  zx_status_t Dispatch_(::fidl::HLCPPIncomingMessage message,
+                        ::fidl::internal::PendingResponse response) override;
+
+  {{- range .Methods }}
+    {{- if not .HasRequest }}
+      {{- if .HasResponse }}
+  void {{ template "EventMethodSignature" . }} override;
+      {{- end }}
+    {{- end }}
+  {{- end }}
+
+ private:
+  {{ .InterfaceAliasForStub }}* impl_;
+};
+
+class {{ .SyncProxy.Name }} : public {{ .SyncInterface }} {
+ public:
+  explicit {{ .SyncProxy.Name }}(::zx::channel channel);
+  ~{{ .SyncProxy.Name }}() override;
+
+  {{- range .Methods }}
+    {{- if .HasRequest }}
+  {{ .CtsMethodAnnotation }}
+  zx_status_t {{ template "SyncRequestMethodSignature" . }} override;
+    {{- end }}
+  {{- end }}
+
+  private:
+  ::fidl::internal::SynchronousProxy proxy_;
+  friend class ::fidl::SynchronousInterfacePtr<{{ .Name }}>;
+};
+
+{{- EndifFuchsia -}}
+{{- end }}
+
+{{- define "ProtocolDefinition" }}
+{{- IfdefFuchsia -}}
+
+{{- range .Methods }}
+  {{ EnsureCodingTableDecl .Request.HlCodingTable }}
+  {{ EnsureCodingTableDecl .Response.HlCodingTable }}
+{{- end }}
+
+{{ EnsureNamespace . }}
+{{ .Name }}::~{{ .Name }}() = default;
+
+{{- if .DiscoverableName }}
+const char {{ .Name }}::Name_[] = {{ .DiscoverableName }};
+{{- end }}
+
+const fidl_type_t* {{ .RequestDecoder }}::GetType(uint64_t ordinal, bool* out_needs_response, bool* out_is_known) {
+  *out_needs_response = false;
+  *out_is_known = false;
+  switch (ordinal) {
+    {{- range .Methods }}
+      {{- if .HasRequest }}
+    case {{ .OrdinalName }}:
+      *out_is_known = true;
+        {{- if .HasResponse }}
+      *out_needs_response = true;
+        {{- end }}
+        {{- if .HasRequestPayload }}
+      return &{{ .Request.HlCodingTable }};
+        {{ else }}
+      return nullptr;
+        {{ end -}};
+      {{- end }}
+    {{- end }}
+    default:
+      return nullptr;
+  }
+}
+
+const fidl_type_t* {{ .ResponseDecoder.Name }}::GetType(uint64_t ordinal) {
+  switch (ordinal) {
+    {{- range .Methods }}
+      {{- if .HasResponse }}
+    case {{ .OrdinalName }}:
+        {{- if .HasResponsePayload }}
+      return &{{ .Response.HlCodingTable }};
+        {{ else }}
+      return nullptr;
+        {{ end -}};
+      {{- end }}
+    {{- end }}
+    default:
+      return nullptr;
+  }
+}
+
+{{ .EventSender.Name }}::~{{ .EventSender.Name }}() = default;
+
+{{ .SyncInterface.Name }}::~{{ .SyncInterface.Name }}() = default;
+
+{{ .Proxy.Name }}::{{ .Proxy.Name }}(::fidl::internal::ProxyController* controller)
+    : controller_(controller) {
+  (void)controller_;
+}
+
+{{ .Proxy.Name }}::~{{ .Proxy.Name }}() = default;
+
+zx_status_t {{ .Proxy.Name }}::Dispatch_(::fidl::HLCPPIncomingMessage message) {
+  zx_status_t status = ZX_OK;
+  switch (message.ordinal()) {
+    {{- range .Methods }}
+      {{- if not .HasRequest }}
+        {{- if .HasResponse }}
+    case {{ .OrdinalName }}: {
+      if (!{{ .Name }}) {
+        status = ZX_OK;
+        break;
+      }
+      {{- if .HasResponsePayload }}
+      const char* error_msg = nullptr;
+      status = message.Decode(&{{ .Response.HlCodingTable }}, &error_msg);
+      if (status != ZX_OK) {
+        FIDL_REPORT_DECODING_ERROR(message, &{{ .Response.HlCodingTable }}, error_msg);
+        break;
+      }
+        {{- if .ResponseArgs }}
+      ::fidl::Decoder decoder(std::move(message));
+        {{- end }}
+      {{- end }}
+      {{ .Name }}(
+        {{- range $index, $param := .ResponseArgs -}}
+          {{- if $index }}, {{ end }}::fidl::DecodeAs<{{ .Type }}>(&decoder, {{ .OffsetV2 }} + sizeof(fidl_message_header_t))
+        {{- end -}}
+      );
+      break;
+    }
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    default: {
+      {{- if .HandlesOneWayUnknownInteractions }}
+      auto txid = message.txid();
+      auto is_flexible = message.is_flexible();
+      auto ordinal = message.ordinal();
+      // To satisfy RFC-0138, move the message so it is destructed before
+      // calling the unknown event handler.
+      { auto message_ = std::move(message); }
+      if (txid == 0 && is_flexible) {
+        handle_unknown_event(ordinal);
+        break;
+      }
+      {{- end }}
+      status = ZX_ERR_NOT_SUPPORTED;
+      break;
+    }
+  }
+  return status;
+}
+
+{{ range .Methods }}
+  {{- if .HasRequest }}
+    {{- if .HasResponse }}
+namespace {
+
+::std::unique_ptr<::fidl::internal::SingleUseMessageHandler>
+{{- /* Note: fidl::internal::SingleUseMessageHandler assumes that the lambda captures a single */}}
+{{- /* fit::function. When changing CallbackType, make sure to update SingleUseMessageHandler. */}}
+{{ .ResponseHandlerType }}({{ $.Name }}::{{ .CallbackType }}&& callback) {
+  ZX_DEBUG_ASSERT_MSG(callback,
+                      "Callback must not be empty for {{ $.Name }}::{{ .Name }}\n");
+  return ::std::make_unique<::fidl::internal::SingleUseMessageHandler>(
+      [callback_ = std::move(callback)](::fidl::HLCPPIncomingMessage&& message) {
+      {{- if .ResponseArgs }}
+        ::fidl::Decoder decoder(std::move(message));
+      {{- end }}
+        callback_(
+      {{- range $index, $param := .ResponseArgs -}}
+        {{- if $index }}, {{ end }}::fidl::DecodeAs<{{ .Type }}>(&decoder, {{ .OffsetV2 }} + sizeof(fidl_message_header_t))
+      {{- end -}}
+        );
+        return ZX_OK;
+      }, {{ if .HasResponsePayload }}&{{ .Response.HlCodingTable }}{{ else }}nullptr{{ end }});
+}
+
+}  // namespace
+{{- end }}
+void {{ $.Proxy.Name }}::{{ template "RequestMethodSignature" . }} {
+  ::fidl::MessageEncoder _encoder({{ .OrdinalName }}, {{ .DynamicFlagsName }});
+  const fidl_type_t* req_type =
+    {{- if .HasRequestPayload -}}
+      &{{ .Request.HlCodingTable }};
+    {{- else -}}
+      nullptr;
+    {{- end }}
+  controller_->Send(req_type, {{ $.RequestEncoder }}::{{ .Name }}(&_encoder
+  {{- range $index, $param := .RequestArgs -}}
+    , &{{ $param.Name }}
+  {{- end -}}
+  )
+  {{- if .HasResponse -}}
+    , {{ .ResponseHandlerType }}(std::move(callback))
+  {{- else -}}
+    , nullptr
+  {{- end -}}
+  );
+}
+  {{- end }}
+{{- end }}
+
+{{ .Stub.Name }}::{{ .Stub.Name }}({{ .InterfaceAliasForStub }}* impl) : impl_(impl) {
+  (void)impl_;
+}
+
+{{ .Stub.Name }}::~{{ .Stub.Name }}() = default;
+
+namespace {
+{{- range .Methods }}
+  {{- if .HasRequest }}
+    {{- if .HasResponse }}
+
+class {{ .ResponderType }} final {
+ public:
+  {{ .ResponderType }}(::fidl::internal::PendingResponse response)
+      : response_(std::move(response)) {}
+
+  void operator()({{ template "Params" .ResponseArgs }}) {
+    ::fidl::MessageEncoder _encoder({{ .OrdinalName }}, {{ .DynamicFlagsName }});
+    const fidl_type_t* resp_type =
+    {{- if .HasResponsePayload -}}
+      &{{ .Response.HlCodingTable }};
+    {{- else -}}
+      nullptr;
+    {{- end }}
+    {{- if .HasFrameworkError }}
+    ZX_ASSERT_MSG(!{{ .TheResponseArg.Name }}.is_framework_err(), "Applications must not explicitly send framework_err for flexible methods.");
+    {{- end }}
+    response_.Send(resp_type, {{ $.ResponseEncoder }}::{{ .Name }}(&_encoder
+  {{- range $index, $param := .ResponseArgs -}}
+    , &{{ $param.Name }}
+  {{- end -}}
+  ));
+  }
+
+ private:
+  ::fidl::internal::PendingResponse response_;
+};
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+}  // namespace
+
+zx_status_t {{ .Stub.Name }}::Dispatch_(
+    ::fidl::HLCPPIncomingMessage message,
+    ::fidl::internal::PendingResponse response) {
+  bool needs_response;
+  bool is_known;
+  const fidl_type_t* request_type = {{ .RequestDecoder }}::GetType(message.ordinal(), &needs_response, &is_known);
+
+  if (!is_known) {
+    {{- if .HandlesOneWayUnknownInteractions }}
+    auto is_flexible = message.is_flexible();
+    auto ordinal = message.ordinal();
+    // To satisfy RFC-0138, move the message so it is destructed before sending
+    // a reply or calling the unknown method handler.
+    { auto message_ = std::move(message); }
+    if (is_flexible) {
+      {{- if .HandlesTwoWayUnknownInteractions }}
+      if (response.needs_response()) {
+        ::fidl::MessageEncoder encoder(ordinal, ::fidl::MessageDynamicFlags::kFlexibleMethod);
+        const fidl_type_t* resp_type = &kFidlInternalUnknownMethodResponseTable;
+        response.Send(resp_type, ::fidl::internal::EncodeUnknownMethodResponse(&encoder));
+        impl_->handle_unknown_method(ordinal, true);
+      } else {
+        impl_->handle_unknown_method(ordinal, false);
+      }
+      return ZX_OK;
+      {{- else }}
+      if (!response.needs_response()) {
+        impl_->handle_unknown_method(ordinal);
+        return ZX_OK;
+      }
+      {{- end }}
+    }
+    {{- end }}
+    return ZX_ERR_NOT_SUPPORTED;
+  }
+
+  if (!message.has_only_header()) {
+    if (request_type == nullptr) {
+      return ZX_ERR_NOT_SUPPORTED;
+    }
+    const char* error_msg = nullptr;
+    zx_status_t status = message.Decode(request_type, &error_msg);
+    if (status != ZX_OK) {
+      FIDL_REPORT_DECODING_ERROR(message, request_type, error_msg);
+      return status;
+    }
+  }
+
+  if (response.needs_response() != needs_response) {
+    if (needs_response) {
+      FIDL_REPORT_DECODING_ERROR(message, request_type, "Message needing a response with no txid");
+    } else {
+      FIDL_REPORT_DECODING_ERROR(message, request_type, "Message not needing a response with a txid");
+    }
+    return ZX_ERR_INVALID_ARGS;
+  }
+
+  uint64_t ordinal = message.ordinal();
+  switch (ordinal) {
+    {{- range .Methods }}
+      {{- if .HasRequest }}
+    case {{ .OrdinalName }}:
+    {
+        {{- if .RequestArgs }}
+      ::fidl::Decoder decoder(std::move(message));
+        {{- end }}
+      impl_->{{ .Name }}(
+        {{- range $index, $param := .RequestArgs -}}
+          {{- if $index }}, {{ end }}::fidl::DecodeAs<{{ .Type }}>(&decoder, {{ .OffsetV2 }} + sizeof(fidl_message_header_t))
+        {{- end -}}
+        {{- if .HasResponse -}}
+          {{- if .RequestArgs }}, {{ end -}}{{ .ResponderType }}(std::move(response))
+        {{- end -}}
+      );
+      break;
+    }
+      {{- end }}
+    {{- end }}
+    default: {
+      // Unknown ordinals are handled at the beginning of dispatching, so this
+      // should be unreachable.
+      ZX_PANIC("Unreachable: unknown ordinals handled earlier.");
+    }
+  }
+  return ZX_OK;
+}
+
+{{- range .Methods }}
+  {{- if not .HasRequest }}
+    {{- if .HasResponse }}
+void {{ $.Stub.Name }}::{{ template "EventMethodSignature" . }} {
+  ::fidl::MessageEncoder _encoder({{ .OrdinalName }}, {{ .DynamicFlagsName }});
+  const fidl_type_t* resp_type =
+    {{- if .HasResponsePayload -}}
+      &{{ .Response.HlCodingTable }};
+    {{- else -}}
+      nullptr;
+    {{- end -}}
+  sender_()->Send(resp_type, {{ $.ResponseEncoder }}::{{ .Name }}(&_encoder
+  {{- range $index, $param := .ResponseArgs -}}
+    , &{{ $param.Name }}
+  {{- end -}}
+  ));
+}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+{{ .SyncProxy.Name }}::{{ .SyncProxy.Name }}(::zx::channel channel)
+    : proxy_(::std::move(channel)) {}
+
+{{ .SyncProxy.Name }}::~{{ .SyncProxy.Name }}() = default;
+
+{{- range .Methods }}
+  {{- if .HasRequest }}
+
+zx_status_t {{ $.SyncProxy.Name }}::{{ template "SyncRequestMethodSignature" . }} {
+  ::fidl::MessageEncoder _encoder({{ .OrdinalName }}, {{ .DynamicFlagsName }});
+    {{- if .HasResponse }}
+  ::fidl::IncomingMessageBuffer buffer_;
+  ::fidl::HLCPPIncomingMessage response_ = buffer_.CreateEmptyIncomingMessage();
+  const fidl_type_t* req_type =
+  {{- if .HasRequestPayload -}}
+    &{{ .Request.HlCodingTable }};
+  {{- else -}}
+    nullptr;
+  {{- end }}
+  const fidl_type_t* resp_type =
+  {{- if .HasResponsePayload -}}
+    &{{ .Response.HlCodingTable }};
+  {{- else -}}
+    nullptr;
+  {{- end }}
+  zx_status_t status_ = proxy_.Call(req_type, resp_type, {{ $.RequestEncoder }}::{{
+  .Name }}(&_encoder {{- range $index, $param := .RequestArgs -}}
+    , &{{ $param.Name }}
+  {{- end -}}
+  ), &response_);
+  if (status_ != ZX_OK)
+    return status_;
+      {{- if .ResponseArgs }}
+  ::fidl::Decoder decoder_(std::move(response_));
+        {{- range $index, $param := .ResponseArgs }}
+  *out_{{ .Name }} = ::fidl::DecodeAs<{{ .Type }}>(&decoder_, {{ .OffsetV2 }} + sizeof(fidl_message_header_t));
+        {{- end }}
+      {{- end }}
+  return ZX_OK;
+    {{- else }}
+    const fidl_type_t* req_type =
+    {{- if .HasRequestPayload -}}
+      &{{ .Request.HlCodingTable }};
+    {{- else -}}
+      nullptr;
+    {{- end }}
+  return proxy_.Send(req_type, {{ $.RequestEncoder }}::{{ .Name }}(&_encoder
+  {{- range $index, $param := .RequestArgs -}}
+    , &{{ $param.Name }}
+  {{- end -}}
+  ));
+    {{- end }}
+}
+  {{- end }}
+{{- end }}
+
+{{- EndifFuchsia -}}
+{{ end }}

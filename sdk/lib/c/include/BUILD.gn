@@ -1,0 +1,642 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_action.gni")
+import("//build/python/python_binary.gni")
+import("//build/python/python_library.gni")
+import("//build/testing/golden_files.gni")
+import("../libc.gni")
+import("libc_headers.gni")
+
+# See README.md for a full explanation.
+#
+# This file (with libc_headers.gni) manages all the public libc header files.
+# These go into the "sysroot" built by //zircon/public/sysroot; that's used to
+# compile most Fuchsia user code, and it goes into the SDK.
+#
+# Any changes to these files require manual API review approval via update of
+# the sysroot.api file.  Some of these files come from llvm-libc.  But the
+# auto-roller that updates the llvm-libc code will never update sysroot.api; so
+# llvm-libc header changes always require a manual roll that includes the
+# sysroot.api update along with the //manifests update in a single commit.
+#
+# The libc_headers.include_dirs list drives everything done here.  For each
+# source directory ${set.dir} there with generated headers in `.yaml` files,
+# there is a JSON file in _this_ directory (named by its ${set.json_file}, its
+# data already read into ${set.json_data} by libc_headers.gni).  Those files
+# get regenerated here using the golden_files() mechanism.  However, the golden
+# JSON files in the source tree are what drive the libc_headers.gni lists that
+# everything else uses.  After changing this list, the next build with
+# update_goldens=true will update the JSON file in the sources; that will
+# necessitate another build to pick up the new lists and generate the headers
+# correctly so that the sysroot can be updated.
+
+# Directory holding the hdrgen Python sources.
+hdrgen_dir = "$llvm_libc/utils/hdrgen"
+
+# This target is in an sdk.deps list in sysroot_entries, to ensure that the
+# generated headers are in place.  This checking only ever happens in the
+# $default_toolchain and is not repeated elsewhere.
+group("include") {
+  public_deps = [ ":check-golden($default_toolchain)" ]
+  foreach(set, libc_headers.include_dirs) {
+    if (defined(set.json_file)) {
+      # Each set of generated headers has these targets defined below.
+      public_deps += [
+        ":check-${set.json_file}($default_toolchain)",
+        ":hdrgen-${set.json_file}($default_toolchain)",
+        ":hdrgen.deps-${set.json_file}($default_toolchain)",
+      ]
+    }
+  }
+}
+
+if (current_toolchain == default_toolchain) {
+  # This is where the golden files of generated headers go.  They are
+  # eventually copied from here by SDK construction.  They are used from here
+  # via proxy headers doing `#include "../..."` with precise relative paths
+  # from the constructed sysroot used by $default_toolchain compilations.
+  golden_gen_dir = libc_headers.golden_gen_dir
+
+  # This is the $target_gen_dir corresponding to that.  This is where things
+  # are generated _specifically_ to populate _that_ directory per se.  The
+  # headers generated from YAML don't go here; they go other places where they
+  # are used directly by the :headers target below, and $golden_gen_dir is
+  # populated with golden copies of _those_ files.  This directory contains the
+  # proxy headers that must sit in $golden_gen_dir so that the files there can
+  # use `#include` with relative paths as if from their installed location to
+  # the installed locations of llvm-libc-types/*.h et al.  Those are only fit
+  # to be _used_ from $golden_gen_dir, but they can't be generated directly
+  # there--only copied by the `update_goldens=true` mode of golden_files().
+  golden_gen_target_gen_dir = get_label_info(golden_gen_dir, "target_gen_dir")
+
+  golden_comparisons = []
+  golden_deps = []
+  reified_sets = []
+  foreach(set, libc_headers.include_dirs) {
+    if (defined(set.json_file)) {
+      # Fill out some derived data from the set.
+      set.gen_dir = get_label_info(set.dir, "target_gen_dir")
+      set.yaml = filter_include(set.public, [ "*.yaml" ])
+      set.generated_public = []
+      foreach(header, set.yaml) {
+        header_dir = get_path_info(header, "dir")
+        header_name = get_path_info(header, "name")
+        if (header_dir == ".") {
+          header_dir = ""
+        } else {
+          header_dir += "/"
+        }
+        assert(header == "$header_dir$header_name.yaml")
+        _header_relative_path = "$header_dir$header_name.h"
+        _header_gen_path = "${set.gen_dir}/$_header_relative_path"
+        set.generated_public += [ _header_gen_path ]
+        golden_comparisons += [
+          {
+            candidate = _header_gen_path
+            golden = "$golden_gen_dir/$_header_relative_path"
+          },
+        ]
+      }
+
+      # Accumulate all the header dependencies from the JSON data for the set.
+      set.generated_sources = []
+      foreach(header, set.json_data) {
+        header.relative_includes = filter_exclude(header.includes, [ "<*>" ])
+        set.generated_sources += header.relative_includes
+        set.generated_sources -= header.relative_includes
+        set.generated_sources += header.relative_includes
+      }
+
+      # This generates the public header files for each `.yaml` file listed.
+      # The single "foreach" target generates independent per-file targets for
+      # each `.h` file depending only on its particular `.yaml` file.
+      python_action_foreach("hdrgen-${set.json_file}") {
+        binary_label = ":hdrgen"
+        mnemonic = "HDRGEN(.h)"
+
+        # Each `.yaml` in $sources produces the corresponding `.h` in $outputs.
+        sources = rebase_path(set.yaml, ".", set.dir)
+
+        # This is evaluated only in $default_toolchain, where $root_gen_dir is
+        # the prefix of ${set.gen_dir} before the full source-relative path
+        # in ${set.dir}.  This isn't simpler because the action_foreach() path
+        # expansion logic only does a few fixed things, and it can't be used to
+        # distinguish the directory prefix that's part of the header name
+        # (e.g. sys/) from the rest of the path to the sources or outputs
+        # directory.
+        outputs = [
+          "$root_gen_dir/{{source_root_relative_dir}}/{{source_name_part}}.h",
+        ]
+
+        # That should wind up the same as "${set.gen_dir}/header" for each one.
+        _processed_sources = process_file_template(sources, outputs)
+        assert(_processed_sources == set.generated_public,
+               "process_file_template($sources, $outputs) => " +
+                   "$_processed_sources != ${set.generated_public} in $set")
+
+        depfile = "${outputs[0]}.d"
+        args = [
+          "--output=" + rebase_path(outputs[0], root_build_dir),
+          "--depfile=" + rebase_path(depfile, root_build_dir),
+          "--write-if-changed",
+          "{{source}}",
+        ]
+
+        metadata = {
+          # Populate build_api("generated_sources") to ensure all the headers
+          # are present for analysis.
+          generated_sources = rebase_path(set.generated_public, root_build_dir)
+        }
+      }
+
+      # The header dependencies are referenced as `#include "..."` with
+      # relative paths to those internal headers from the referrer _as they
+      # will be installed_.  But within the build, the _generated_ referrer
+      # is not in the same root "include" directory ${set.dir} as the
+      # referents--it's in ${set.gen_dir} instead.  That is, unless it actually
+      # exists in a _previous_ set (i.e. $llvm_libc/include) instead.  So each
+      # set must be checked in order for the one that has the real intended
+      # target of that relative `#include` path.
+      set.redirects = []
+      foreach(header, set.generated_sources) {
+        foreach(previous, reified_sets) {
+          # There is no `break` in GN's `foreach`, so `header = false` will
+          # indicate the loop is done.
+          if (header != false && previous.generated_sources + [ header ] -
+                                 [ header ] != previous.generated_sources) {
+            set.redirects += [
+              {
+                dir = previous.dir
+                file = header
+
+                # This redirect is just a proxy for another set.
+                proxy = true
+              },
+            ]
+            header = false  # No need to consult more sets.
+          }
+        }
+        if (header != false) {
+          # It's not from a previous set, so it's from this one.
+          set.redirects += [
+            {
+              dir = set.dir
+              file = header
+
+              # This redirect is from this very set.
+              proxy = false
+            },
+          ]
+        }
+      }
+
+      # Now generate a redirecting `#include` file at the expected relative
+      # path in ${set.gen_dir} leading to whatever ${some_set.dir} has it.
+      # Likewise, such to go into golden_gen_dir.
+      set.redirect_labels = []
+      set.gen_count = 0
+      foreach(redirect, set.redirects) {
+        redirect.source = "${redirect.dir}/${redirect.file}"
+
+        set.gen_count = set.gen_count + 1
+        _label = "hdrgen.redirect.${set.gen_count}-${set.json_file}"
+        set.redirect_labels += [ ":$_label" ]
+
+        redirect.where = [
+          {
+            dir = set.gen_dir  # Where it's used from.
+            root_dir = root_build_dir  # What that's canonically relative to.
+            gen_dir = dir  # Where it's actually generated.
+            label = _label  # Target label.
+          },
+        ]
+
+        if (!redirect.proxy) {
+          # This is the first redirect for this header, so it can be the one to
+          # handle the unified golden_gen_dir.
+          redirect.where += [
+            {
+              dir = golden_gen_dir
+              root_dir = "//"
+              gen_dir = golden_gen_target_gen_dir
+              label = "$_label.golden"
+            },
+          ]
+          golden_deps += [ ":$_label.golden" ]
+          golden_comparisons += [
+            {
+              golden = "$golden_gen_dir/${redirect.file}"
+              candidate = "$golden_gen_target_gen_dir/${redirect.file}"
+            },
+          ]
+        }
+
+        foreach(where, redirect.where) {
+          where.gen = "${where.gen_dir}/${redirect.file}"
+          where.redirect = "${where.dir}/${redirect.file}"
+          where.redirect_dir = get_path_info(where.redirect, "dir")
+          where.path = rebase_path(where.redirect, where.root_dir)
+          where.source_path = rebase_path(redirect.source, where.root_dir)
+          where.relative_source_path =
+              rebase_path(redirect.source, where.redirect_dir)
+          generated_file(where.label) {
+            visibility = [ ":*" ]
+            output_conversion = "list lines"
+            outputs = [ where.gen ]
+            deps = [ ":hdrgen-${set.json_file}" ]
+            contents = [
+              # The comment lines make each file's contents unique.  This works
+              # around an issue where RBE hard-links identical input files
+              # together and Clang generates differing depfile output based on
+              # whether two identical files are hard links or separate files.
+              "// ${where.path} ->",
+              "// ${where.source_path}",
+              "#include \"${where.relative_source_path}\" " +
+                  " // IWYU pragma: export",
+            ]
+            metadata = {
+              # Each target rolls up its own build_api("generated_sources")
+              # data.
+              generated_sources = rebase_path(outputs, root_build_dir)
+            }
+          }
+        }
+      }
+
+      # This reaches all the generated_file() targets (and their metadata),
+      # to ensure they are all generated when they're needed.
+      group("hdrgen.deps-${set.json_file}") {
+        visibility = [ ":*" ]
+        public_deps = set.redirect_labels
+      }
+
+      # Stash the elaborated set for later reference.  The next iteration will
+      # consult this to define its redirects.
+      reified_sets += [ set ]
+
+      # This regenerates the JSON file itself, in a $target_gen_dir location.
+      # This shows what the checked-in ${set.json_file} _should_ contain based
+      # on current libc_headers.include_dirs specs and `.yaml` file contents.
+      python_action(set.json_file) {
+        visibility = [ ":*" ]
+        binary_label = ":hdrgen"
+        mnemonic = "HDRGEN(.json)"
+
+        sources =
+            rebase_path(filter_include(set.public, [ "*.yaml" ]), ".", set.dir)
+        outputs = [ "$target_gen_dir/$target_name" ]
+        depfile = "${outputs[0]}.d"
+        args = [
+                 "--output=" + rebase_path(outputs[0], root_build_dir),
+                 "--depfile=" + rebase_path(depfile, root_build_dir),
+                 "--write-if-changed",
+                 "--json",
+               ] + rebase_path(sources, root_build_dir)
+      }
+
+      # This ensures that the checked-in file matches the regenerated file.
+      # The "golden" file is the source of truth for the rest of the build
+      # (i.e. for populating the sysroot), but what it's generated from is the
+      # source of truth for this directory's GN rules.
+      golden_files("check-${set.json_file}") {
+        visibility = [ ":*" ]
+        deps = [ ":${set.json_file}" ]
+        _json_outputs = get_target_outputs(deps[0])
+        comparisons = [
+          {
+            golden = set.json_file
+            candidate = _json_outputs[0]
+          },
+        ]
+      }
+
+      # Each JSON file gets that separate golden_files() target rather than
+      # just an addition to the golden_comparisons list.  Along with that, the
+      # main check-golden target below also depends on these targets.  This
+      # ensures that all the JSON files must be actually up to date in the
+      # source tree before the check-golden target will even attempt to look at
+      # the golden files for the headers themselves.  The dependency means that
+      # an error in updating the per-set (JSON) target will prevent the build
+      # from even getting to the check-golden target (and anything that depends
+      # on it, like compilations).  With `update_goldens=true`, a repeated
+      # build will then pick up now-correct JSON files so that the instructions
+      # to the check-golden target will be current.
+      golden_deps += [ ":check-${set.json_file}" ]
+    }
+  }
+
+  # If the comparisons list goes directly into golden_files() as a list of
+  # scopes, then each golden file will be an input and Ninja will insist
+  # that it already exist before running anything.  With the list in a JSON
+  # file, the golden_files() action gets a chance to run and create new
+  # files in the source tree when update_goldens=true.
+  generated_file("golden-comparisons.json") {
+    visibility = [ ":check-golden" ]
+    outputs = [ "$target_gen_dir/$target_name" ]
+    output_conversion = "json"
+
+    # The golden_comparison list uses GN paths, so turn those into the
+    # appropriate relative paths in the JSON.
+    contents = []
+    foreach(comparison, golden_comparisons) {
+      contents += [
+        {
+          golden = rebase_path(comparison.golden, "//")
+          candidate = rebase_path(comparison.candidate, root_build_dir)
+        },
+      ]
+    }
+  }
+
+  golden_files("check-golden") {
+    visibility = [ ":*" ]
+    dir = golden_gen_dir
+    message = "Changes to generated headers will require API review." +
+              " Build with `update_goldens=true`." +
+              " This will update both checked-in generated headers" +
+              " and API summary files."
+    deps = [ ":golden-comparisons.json" ] + golden_deps
+    _outputs = get_target_outputs(deps[0])
+    comparisons = _outputs[0]
+  }
+}
+
+# This reaches all the public libc headers (ones that will be installed)
+# directly at the source of truth.  It's only used for compiling libc code.
+# Note this includes the libc unit test code, as well as the hermetic partial
+# libc bits built for special environments.
+#
+# source_set() is actually a template that injects additional deps...that
+# reach back here.  So this must use basic_source_set() to have only the
+# direct effects spelled out here and nothing else implicit.
+basic_source_set("headers") {
+  visibility = [
+    "../*",
+    "//build/config/zircon:user_deps",
+    "//zircon/kernel/lib/userabi/userboot/*",
+    "//zircon/system/ulib/ldmsg/*",
+    "//zircon/system/utest/core/threads/*",
+    "//zircon/third_party/scudo/*",
+    "//zircon/third_party/ulib/musl/*",
+  ]
+
+  # Make sure no set_defaults() configs contribute anything that might
+  # propagate up from here.
+  configs = []
+
+  public_configs = [ ":headers.config" ]
+  public_deps = [ "//zircon/system/public" ]
+
+  deps = []
+  public = []
+  sources = []
+  foreach(set, libc_headers.include_dirs) {
+    public +=
+        rebase_path(filter_exclude(set.public, [ "*.yaml" ]), ".", set.dir)
+    sources += rebase_path(set.sources, ".", set.dir)
+
+    if (defined(set.json_file)) {
+      public_deps += [ ":hdrgen-${set.json_file}($default_toolchain)" ]
+      deps += [ ":hdrgen.deps-${set.json_file}($default_toolchain)" ]
+      set.gen_dir =
+          get_label_info("${set.dir}($default_toolchain)", "target_gen_dir")
+      foreach(header, filter_include(set.public, [ "*.yaml" ])) {
+        header_dir = get_path_info(header, "dir")
+        header_name = get_path_info(header, "name")
+        if (header_dir == ".") {
+          header_dir = ""
+        } else {
+          header_dir += "/"
+        }
+        assert(header == "$header_dir$header_name.yaml")
+        public += [ "${set.gen_dir}/$header_dir$header_name.h" ]
+      }
+    }
+  }
+}
+
+config("headers.config") {
+  visibility = [ ":*" ]
+
+  dirs = []
+  foreach(set, libc_headers.include_dirs) {
+    dirs += [ set.dir ]
+    if (defined(set.json_file)) {
+      dirs +=
+          [ get_label_info("${set.dir}($default_toolchain)", "target_gen_dir") ]
+    }
+  }
+
+  # The llvm-libc set is first in libc_headers.include_dirs so that its
+  # llvm-libc-*/... files are considered first when deciding where such deps of
+  # generated files will come from.  But $llvm_libc/include itself must be last
+  # in the list because it includes non-generated header files that would
+  # preempt ones still being used from musl.
+  dirs -= [ "$llvm_libc/include" ]
+  dirs += [ "$llvm_libc/include" ]
+
+  cflags = []
+  foreach(dir, dirs) {
+    cflags += [
+      "-idirafter",
+      rebase_path(dir, root_build_dir),
+    ]
+  }
+  asmflags = cflags
+}
+
+python_binary("hdrgen") {
+  visibility = [ ":*" ]
+
+  main_source = "$hdrgen_dir/main.py"
+  deps = [ ":hdrgen.library" ]
+
+  enable_mypy = false
+}
+
+python_library("hdrgen.library") {
+  visibility = [ ":*" ]
+
+  library_name = "hdrgen"
+  source_root = "$hdrgen_dir/hdrgen"
+  sources = [
+    "__init__.py",
+    "enumeration.py",
+    "function.py",
+    "header.py",
+    "macro.py",
+    "main.py",
+    "object.py",
+    "symbol.py",
+    "type.py",
+    "yaml_to_classes.py",
+  ]
+  library_deps = [ "//third_party/pyyaml:yaml" ]
+
+  enable_mypy = false
+}
+
+# Generate standlaone "#include <foo.h>" compile-time tests for each public
+# header file, and compile them in every known language mode.
+header_test_stdc = [
+  # TODO(https://fxbug.dev/376333113): musl vs llvm-libc repeated typedefs are
+  # invalid in C<11.
+  #
+  #89, 99,
+  11,
+  17,
+  23,
+]
+header_test_stdcxx = [
+  # These can be either integers or strings, doesn't matter.  But GN doesn't
+  # allow (nor would anything else preserve) a leading 0 on an integer and the
+  # result must be exactly "03", not "3".
+  # TODO(https://fxbug.dev/376333113): libc++ headers are not C++03 clean!
+  #"03",
+  11,
+  14,
+  17,
+  20,
+  23,
+  26,
+]
+
+header_test_c_deps = []
+header_test_c_sources = []
+header_test_cxx_deps = []
+header_test_cxx_sources = []
+header_test_zircon_c_deps = []
+header_test_zircon_c_sources = []
+header_test_zircon_cxx_deps = []
+header_test_zircon_cxx_sources = []
+foreach(header, libc_headers.all_public_headers) {
+  header_target = string_replace(header, "/", "-")
+  foreach(extension,
+          [
+            "c",
+            "cc",
+          ]) {
+    generated_file("$header_target.$extension") {
+      visibility = [ ":*" ]
+      testonly = true
+      output_conversion = "list lines"
+      outputs = [ "$target_gen_dir/header-tests/$header.$extension" ]
+      contents = [
+        "/* Generated by" +
+            get_label_info(":target_name", "label_no_toolchain") +
+            ". DO NOT EDIT! */",
+        "#include <$header>",
+      ]
+    }
+  }
+
+  # The <zircon/*.h> headers go in a separate list that isn't tested in C89.
+  if (get_path_info(header, "dir") == "zircon") {
+    header_test_zircon_c_deps += [ ":$header_target.c" ]
+    header_test_zircon_c_sources += get_target_outputs(":$header_target.c")
+    header_test_zircon_cxx_deps += [ ":$header_target.cc" ]
+    header_test_zircon_cxx_sources += get_target_outputs(":$header_target.cc")
+  } else {
+    header_test_c_deps += [ ":$header_target.c" ]
+    header_test_c_sources += get_target_outputs(":$header_target.c")
+    header_test_cxx_deps += [ ":$header_target.cc" ]
+    header_test_cxx_sources += get_target_outputs(":$header_target.cc")
+  }
+}
+
+unittest_deps = []
+foreach(version, header_test_stdc) {
+  foreach(prefix,
+          [
+            "c",
+            "gnu",
+          ]) {
+    unittest_deps += [ ":header-tests.$prefix$version" ]
+    libc_test("header-tests.$prefix$version") {
+      sources = header_test_c_sources
+      deps = header_test_c_deps
+
+      # The <zircon/*.h> headers (and their transitive dependencies on syscall
+      # headers) don't all support strict -std=c89 mode, though they do support
+      # -std=gnu89 mode.
+      if ("$prefix$version" != "c89") {
+        sources += header_test_zircon_c_sources
+        deps += header_test_zircon_c_deps
+      }
+
+      deps += [ ":headers" ]
+      configs = [
+        ":test.$prefix$version",
+        "//build/config:Wsystem-headers",
+      ]
+    }
+
+    config("test.$prefix$version") {
+      visibility = [ ":*" ]
+      cflags_c = [ "-std=$prefix$version" ]
+    }
+  }
+}
+
+foreach(version, header_test_stdcxx) {
+  foreach(prefix,
+          [
+            "c",
+            "gnu",
+          ]) {
+    # libc++ provides wrapper headers that interpose on various libc headers.
+    # Those will be found implicitly in preference to the libc headers, unless
+    # -nostdinc++ is used.  The libc headers should be usable and warning-clean
+    # when used in C++ language modes directly without the libc++ wrappers;
+    # they won't be standard C++ library compatible with `std::` namespace
+    # declarations and such, but they should not get compilation errors.
+    #
+    # The libc headers should also be usable (and warning-clean) when used via
+    # libc++'s wrapper headers.  So test both ways.
+    foreach(libcxx,
+            [
+              "",
+              "-libcxx",
+            ]) {
+      unittest_deps += [ ":header-tests.${prefix}xx$version$libcxx" ]
+      libc_test("header-tests.${prefix}xx$version$libcxx") {
+        sources = header_test_cxx_sources
+        deps = header_test_cxx_deps
+
+        # The <zircon/*.h> headers (and their transitive dependencies on
+        # syscall headers) don't need to support C++ < 17.
+        if (version != "03" && version >= 17) {
+          sources += header_test_zircon_cxx_sources
+          deps += header_test_zircon_cxx_deps
+        }
+
+        deps += [ ":headers" ]
+        configs = [ ":test.$prefix++$version" ]
+        if (libcxx == "") {
+          # Don't use the libc++ headers.
+          configs += [ "//build/config:no-libc++-include" ]
+          remove_configs = [ "//build/config:libc++-include" ]
+
+          # The libc++ headers are not warning-clean, and instead rely on the
+          # system-headers exemption from warnings.  This is an unfortunate and
+          # counterproductive choice by the libc++ maintainers and it should be
+          # changed, but it is unlikely to change soon.  If it ever does
+          # change, then this should be added unconditionally.
+          configs += [ "//build/config:Wsystem-headers" ]
+        }
+      }
+    }
+
+    config("test.$prefix++$version") {
+      visibility = [ ":*" ]
+      cflags_cc = [ "-std=$prefix++$version" ]
+    }
+  }
+}
+
+libc_test("unittests") {
+  sources = []
+  deps = unittest_deps
+}

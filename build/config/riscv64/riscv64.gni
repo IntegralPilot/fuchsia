@@ -1,0 +1,355 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/compiler_config.gni")
+import("//build/toolchain/toolchain_environment.gni")
+
+declare_args() {
+  # Whether to enable the use of RISC-V vector instructions.
+  riscv64_enable_vector = true
+}
+
+# These are the formal definitions of the profiles. RV32 details are omitted
+# here.  cf https://github.com/riscv/riscv-profiles/blob/main/profiles.adoc
+#
+# Each member of the scope is itself a scope, with members `u64` and `s64`,
+# each of which has these members:
+#
+#  * u64_mandatory_letters, s64_mandatory_letters
+#     - Required: List of the mandatory, single-letter extensions within the
+#       profile.
+#     - Type: list(string)
+#
+#  * u64_mandatory, s64_mandatory
+#     - Required: List of the other mandatory extensions within the profile.
+#     - Type: list(string)
+#
+#  * u64_optional_letters, s64_optional_letters
+#     - Required: List of the optional, single-letter extensions within the
+#       profile.
+#     - Type: list(string)
+#
+#  * u64_optional, s64_optional
+#     - Required: List of the other optional extensions within the profile.
+#     - Type: list(string)
+#
+# **Note:** Extensions that Clang doesn't parse in `-march` syntax are
+# commented out from u64_*, but here for reference and documentation purposes.
+# The extension lists are kept in the order found in the riscv-profiles spec.
+#
+riscv_profiles = {
+  rvi20 = {
+    u64_mandatory_letters = [ "i" ]
+    u64_mandatory = []
+    u64_optional_letters = [
+      "m",
+      "a",
+      "f",
+      "d",
+      "c",
+    ]
+    u64_optional = [
+      "zifencei",
+      "zicntr",
+      "zihpm",
+    ]
+
+    # There is no RVI20S64 profile.
+  }
+
+  rva20 = {
+    u64_mandatory_letters = [
+      "g",  # G = IMAFD + Zicsr + Zifencei
+      "c",
+    ]
+    u64_mandatory = [
+      # These are mandatory extensions, but they're implied by G.
+      #
+      # "zicsr"
+      # "zifencei"
+
+      # These are in the official profile list, but Clang doesn't handle them
+      # as "_<feature>" in the `-march` syntax because they don't add new
+      # opcodes, only new CSRs.  The compiler doesn't use those at all, and
+      # the assembler always accepts the known CSR names (and the
+      # pseudo-instructions that translate to reads of them) without feature
+      # checks.
+      #
+      # "zicntr",
+
+      # These are just characteristics of how the CPU behaves, not new
+      # instructions or CSRs (e.g. memory and cache semantics).
+      #
+      # "ziccif",
+      # "ziccrse",
+      # "ziccamoa",
+      # "za128rs",
+      # "zicclsm",
+    ]
+    u64_optional_letters = []
+    u64_optional = [
+      # Clang doesn't understand this, but it's just CSRs.
+      "zihpm",
+    ]
+
+    # The s64 details aren't relevant to the compiler, since they are all just
+    # CSRs, features in CSRs, or characteristics of CPU behavior.
+    s64_mandatory_letters = u64_mandatory_letters
+    s64_mandatory = [
+      "zifencei",
+      "ss1p11",
+      "svbare",
+      "sv39",
+      "svade",
+      "ssccptr",
+      "sstvecd",
+      "sstvala",
+    ]
+    s64_optional_letters = []
+    s64_optional = [
+      "zihpm",
+      "sv48",
+      "ssu64xl",
+    ]
+  }
+
+  rva22 = {
+    u64_mandatory_letters = rva20.u64_mandatory_letters
+    u64_mandatory = rva20.u64_mandatory + [
+                      "zihintpause",
+                      "zba",
+                      "zbb",
+                      "zbs",
+                      "zicbom",
+                      "zicbop",
+                      "zicboz",
+                      "zfhmin",
+                      "zkt",
+                    ]
+    u64_optional_letters = [ "v" ]
+    u64_optional = rva20.u64_optional + u64_mandatory - u64_mandatory + [
+                     "zfh",
+                     "zkn",
+                     "zks",
+                   ]
+
+    s64_mandatory_letters = u64_mandatory_letters
+    s64_mandatory = [
+      "zifencei",
+      "ss1p12",
+      "svbare",
+      "sv39",
+      "svade",
+      "ssccptr",
+      "sstvecd",
+      "sstvala",
+      "sscounternw",
+      "svpbmt",
+      "svinval",
+    ]
+    s64_optional_letters = []
+    s64_optional = [
+      "sv48",
+      "sv57",
+      "svnapot",
+      "ssu64xl",
+      "sstc",
+      "sscofpmf",
+      "zkr",
+      "h",
+      "ssstateen",  # This is mandatory when H is implemented.
+      "shcounterenw",
+      "shvstvala",
+      "shtvala",
+      "shvstvecd",
+      "shvsatpa",
+      "shgatpa",
+    ]
+  }
+}
+
+# This is the profile matching Fuchsia's policy for riscv64 user code.
+# `-march` strings are generated from this.
+fuchsia_riscv_profile = riscv_profiles.rva22
+
+# This list is also added into the `-march` string (less redundancies).
+# These are features that, even if they aren't actually supported by the
+# hardware, are guaranteed harmless to use.
+fuchsia_riscv_implicit_feature_letters = []
+fuchsia_riscv_implicit_features = []
+
+# Additional standard ISA extensions to be added to the `-march` string
+# (although care must be taken to list these in the string before non-standard
+# extensions).
+fuchsia_riscv_extra_feature_letters = []
+if (riscv64_enable_vector) {
+  fuchsia_riscv_extra_feature_letters += [ "v" ]
+}
+fuchsia_riscv_extra_features = []
+
+# This is the basic machine ABI that's standard for fuchsia-riscv64 user code.
+# This sets the `-mabi` string.
+fuchsia_riscv_abi = "lp64d"
+
+# Define a config that adds the necessary riscv compiler flags. Individual
+# targets can use this to override any of the default riscv features.
+#
+# Parameters:
+#
+#   * abi
+#     - Optional: Value for `-mabi=...`.
+#     - Type: string
+#     - Default: fuchsia_riscv_abi
+#
+#   * exclude_letters
+#     - Optional: A list of riscv feature extension letters to exclude from
+#     `-march=...`.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * extra_features
+#     - Optional: Additional (non-letter) extension features to enable.  The
+#     profile lists and the fuchsia_riscv_extra_features are always enabled.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * extra_letters
+#     - Optional: Additional feature extension letters to enable.  The profile
+#     lists and the fuchsia_riscv_extra_feature_letters are always enabled,
+#     subject to removal via exclude_letters.
+#     - Type: list(string)
+#     - Default: []
+#
+template("riscv64_abi_config") {
+  compiler_config(target_name) {
+    forward_variables_from(invoker, [ "visibility" ])
+
+    _extra_features =
+        fuchsia_riscv_implicit_features + fuchsia_riscv_extra_features
+    _features = fuchsia_riscv_profile.u64_mandatory
+    _features += _extra_features
+    _features -= _extra_features
+    _features += _extra_features
+    if (defined(invoker.extra_features)) {
+      _features += invoker.extra_features
+      _features -= invoker.extra_features
+      _features += invoker.extra_features
+    }
+
+    _extra_feature_letters = fuchsia_riscv_implicit_feature_letters +
+                             fuchsia_riscv_extra_feature_letters
+    _letters = fuchsia_riscv_profile.u64_mandatory_letters
+    _letters += _extra_feature_letters
+    _letters -= _extra_feature_letters
+    _letters += _extra_feature_letters
+    if (defined(invoker.extra_letters)) {
+      _letters += invoker.extra_letters
+      _letters -= invoker.extra_letters
+      _letters += invoker.extra_letters
+    }
+
+    _exclude_letters = []
+    if (defined(invoker.exclude_letters)) {
+      _exclude_letters = invoker.exclude_letters
+    }
+
+    # These letters are always present in this exact order when they are
+    # present, so normalize their order.  The loop is in the inverse order of
+    # how they will wind up: each iteration makes sure *its* letter is first.
+    # So the last will become first and the first will become last, but all of
+    # them still before all the others outside the elect.
+    foreach(letter,
+            [
+              "c",
+              "a",
+              "m",
+              "i",
+              "g",
+            ]) {
+      letter = [ letter ]
+      if (_letters + letter - letter != _letters) {
+        _letters -= letter
+        letter += _letters
+        _letters = []
+        _letters = letter
+      }
+    }
+
+    # Remove any positive additions that should be excluded.
+    _letters += _exclude_letters
+    _letters -= _exclude_letters
+
+    # Elide those from the explicit negative additions.
+    _exclude_letters += _letters
+    _exclude_letters -= _letters
+
+    _march = "rv64" + string_join("", _letters)
+    foreach(feature, _features) {
+      _march += "_$feature"
+    }
+
+    if (defined(invoker.abi)) {
+      _mabi = invoker.abi
+    } else {
+      _mabi = fuchsia_riscv_abi
+    }
+
+    c_family_flags = [
+      "-march=$_march",
+      "-mabi=$_mabi",
+    ]
+
+    rust_target_features = []
+    foreach(feature, _letters + _features) {
+      if (feature == "g") {  # Rust wants G exploded out, but eliding I.
+        rust_target_features += [
+          "+m",
+          "+a",
+          "+f",
+          "+d",
+          "+zicsr",
+        ]
+      } else {
+        rust_target_features += [ "+$feature" ]
+      }
+    }
+    foreach(feature, _exclude_letters + [ "g" ] - [ "g" ]) {
+      rust_target_features += [ "-$feature" ]
+    }
+
+    # TODO(https://fxbug.dev/42086180): The linker flags below are required to
+    # avoid code generation bugs during LTO.  They can be removed once LTO
+    # properly handles target features.
+    linker_llvm_flags = []
+    foreach(attr, rust_target_features + [ "+relax" ]) {
+      linker_llvm_flags += [ "-mattr=$attr" ]
+    }
+
+    if (toolchain_environment == "kernel") {
+      rust_target_edits = [
+        {
+          key = "llvm-abiname"
+          action = "set"
+          value = _mabi
+        },
+      ]
+    } else {
+      # When not using the custom target, these are implicit in the base set
+      # anyway but rustc complains about them being "unstable" when they are
+      # enabled explicitly, so just don't mention them.
+      _implicit_features = [
+        "+f",
+        "+d",
+        "+zfhmin",
+      ]
+      if (is_fuchsia) {
+        _implicit_features += [ "+v" ]
+      }
+      rust_target_features += _implicit_features
+      rust_target_features -= _implicit_features
+
+      rust_llvm_flags = [ "--target-abi=$_mabi" ]
+    }
+  }
+}

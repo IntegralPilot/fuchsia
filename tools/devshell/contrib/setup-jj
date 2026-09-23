@@ -1,0 +1,79 @@
+#!/bin/bash
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Developer Tools
+### sets up the jj tool (if installed) for use with Fuchsia.
+## Will also set up the watchman config file if watchman is installed and
+## a watchman config file does not exist already.
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh || exit $?
+fx-config-read
+
+if ! command -v jj &> /dev/null; then
+  fx-error "jj is not installed. Please install it first (e.g., 'cargo install jj-cli')."
+  exit 1
+fi
+
+ref_format="$(git -C "$FUCHSIA_DIR" rev-parse --show-ref-format 2>/dev/null || git -C "$FUCHSIA_DIR" config --get extensions.refstorage 2>/dev/null || echo "files")"
+if [[ "$ref_format" == "reftable" ]]; then
+  fx-error "The git repository in $FUCHSIA_DIR is using the 'reftable' ref storage format."
+  fx-error "jj does not currently support git reftables (see https://github.com/jj-vcs/jj/issues/9358)."
+  fx-error ""
+  if [[ ! -d "$FUCHSIA_DIR/.jj" ]]; then
+    fx-error "Before initializing jj, you must migrate this checkout to the 'files' format:"
+    fx-error "  git -C \"$FUCHSIA_DIR\" refs migrate --ref-format files"
+    fx-error ""
+    fx-error "After migrating, re-run 'fx setup-jj'."
+  else
+    fx-error "An existing .jj directory was detected in a reftable repository."
+    fx-error "jj cannot read reftables and may have written conflicting files into .git/refs/."
+    fx-error "Migrating to the 'files' format ('git refs migrate --ref-format files') may fail"
+    fx-error "unless conflicting jj refs in .git/ are cleaned up. Be aware that removing or"
+    fx-error "resetting .jj will lose uncommitted jj state, so ensure any work is backed up."
+  fi
+  fx-error ""
+  fx-error "Tip: To prevent future clones from defaulting to reftables, run:"
+  fx-error "  git config --global init.defaultRefFormat files"
+  exit 1
+fi
+
+if [[ ! -d "$FUCHSIA_DIR/.jj" ]]; then
+  fx-info "Initializing jj in $FUCHSIA_DIR..."
+  if ! jj git init --colocate "$FUCHSIA_DIR"; then
+    fx-error "Failed to initialize jj in $FUCHSIA_DIR"
+    exit 1
+  fi
+fi
+
+# NOTE: at some point in the future `jj` will be migrating to "Secure Config"
+# aka "Configuration that is stored outside of the repository structure"
+#
+# See: https://docs.jj-vcs.dev/latest/design/secure-config/ for details
+#
+# As such, assuming the path to the configuration file is
+# ${FUCHSIA_DIR}/.jj/repo/config.toml is bound to break at some point.
+# When the migration happens there may be some intermittent breakage where
+# users may need to re-run this script.
+JJ_CONFIG_FILE=$(jj config path --repo)
+JJ_CONFIG_DIR=$(dirname "$JJ_CONFIG_FILE")
+mkdir -p "$JJ_CONFIG_DIR"
+
+fx-info "Linking tools/jj/config.toml to $JJ_CONFIG_FILE..."
+# Use a relative (-r) symbolic (-s) link so that if FUCHSIA_DIR ever gets
+# moved the link doesnt break. Use -f to force creation.
+if ! (ln -sfr "$FUCHSIA_DIR/tools/jj/config.toml" "$JJ_CONFIG_FILE"); then
+  fx-error "Failed to create jj config symlink."
+  exit 1
+fi
+
+if ! command -v watchman &> /dev/null; then
+  fx-warn "Watchman is not installed. It is recommended for better performance with jj."
+  fx-warn "See https://facebook.github.io/watchman/docs/install.html for installation instructions."
+else
+  if [[ ! -f "$FUCHSIA_DIR/.watchmanconfig" ]]; then
+    fx-info ".watchmanconfig not found. Running gen-watchman-config..."
+    fx-command-run gen-watchman-config || fx-warn "gen-watchman-config failed. jj may be slower as a result."
+  fi
+fi

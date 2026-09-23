@@ -1,0 +1,225 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.net.dhcp;
+
+using fuchsia.net;
+using zx;
+
+/// The configurable server parameters.
+type Parameter = flexible union {
+    /// The IP addresses to which the server is bound. The vector bound has been
+    /// arbitrarily selected as a generous upper limit.
+    1: ip_addrs vector<fuchsia.net.Ipv4Address>:256;
+    /// The pool of addresses managed by a DHCP server and from which leases are
+    /// supplied.
+    ///
+    /// The pool is valid iff all of the following are true:
+    ///   1) All fields are present.
+    ///   2) The stop address is larger than the start address.
+    ///   3) The prefix length is large enough to fit the full range of
+    ///      addresses.
+    ///
+    /// For example, a pool of 4 addresses with a 24 bit subnet mask could be
+    /// specified as:
+    ///   {
+    ///     prefix_length: 24,
+    ///     range_start: 192.168.1.2,
+    ///     range_stop: 192.168.1.5,
+    ///   }
+    ///
+    /// Changing the address pool will not cancel existing leases because the
+    /// DHCP protocol does not provide a mechanism for doing so. Administrators
+    /// should take care when changing the address pool for a server with active
+    /// leases.
+    2: address_pool table {
+        /// The prefix length (in bits) of the address pool's subnet mask.
+        1: prefix_length uint8;
+        /// The starting address, inclusive, of the range of addresses which the
+        /// DHCP server will lease to clients.
+        2: range_start fuchsia.net.Ipv4Address;
+        /// The ending address, exclusive, of the range of addresses which the
+        /// server will lease to clients.
+        3: range_stop fuchsia.net.Ipv4Address;
+    };
+    /// The duration of leases offered by the server.
+    3: lease @generated_name("LeaseLength") table {
+        /// The default lease length to be issued to clients. This field must
+        /// have a value.
+        1: default Duration;
+        /// The maximum lease length value which the server will issue to
+        /// clients who have requested a specific lease length. If omitted, the
+        /// max lease length is equivalent to the default lease length.
+        2: max Duration;
+    };
+    /// The client MAC addresses which the server will issue leases to. By
+    /// default, the server will not have a permitted MAC list, in which case it
+    /// will attempt to issue a lease to every client which requests one. If
+    /// permitted_macs has a non-zero length then the server will only respond
+    /// to lease requests from clients with  MAC in the list. The vector bound
+    /// has been arbitrarily selected as a generous upper limit.
+    4: permitted_macs vector<fuchsia.net.MacAddress>:256;
+    /// Addresses statically assigned to specific hosts or devices. Typically, a
+    /// network administrator will statically assign addresses to always-on
+    /// network devices which should always have the same IP address, such as
+    /// network printers. The vector bound has been arbitrarily selected as a
+    /// generous upper limit.
+    5: statically_assigned_addrs vector<@generated_name("StaticAssignment") table {
+        /// The MAC address of the host or device which will have the static IP
+        /// address assignment.
+        1: host fuchsia.net.MacAddress;
+        /// The IP address which the host or device will always be assigned the
+        /// server.
+        2: assigned_addr fuchsia.net.Ipv4Address;
+    }>:256;
+    /// Enables server behavior where the server ARPs an IP address prior to
+    /// issuing it in a lease. If the server receives a response, the server
+    /// will mark the address as in-use and try again with a different address.
+    6: arp_probe bool;
+    /// The names of the interface to which the server will listen. If this
+    /// vector is empty, the server will listen on all interfaces and will
+    /// process incoming DHCP messages regardless of the interface on which they
+    /// arrive. If this vector is not empty, then the server will only listen
+    /// for incoming DHCP messages on the named interfaces contained by this
+    /// vector. The string and vectors bounds have been arbitrarily selected as
+    /// generous upper limits.
+    7: bound_device_names vector<string:256>:256;
+};
+
+/// The name of the Parameter to be retrieved by Server.GetParameter().
+type ParameterName = strict enum {
+    IP_ADDRS = 0;
+    ADDRESS_POOL = 1;
+    LEASE_LENGTH = 2;
+    PERMITTED_MACS = 3;
+    STATICALLY_ASSIGNED_ADDRS = 4;
+    ARP_PROBE = 5;
+    BOUND_DEVICE_NAMES = 6;
+};
+
+/// Provides methods for DHCP Server configuration.
+@discoverable
+closed protocol Server {
+    /// Starts serving DHCP leases.
+    ///
+    /// Starts the DHCP server with the current set of parameters.
+    ///
+    /// On error the server remains in the stopped state. If the server is
+    /// already serving, `StartServing` is a no-op.
+    ///
+    /// *error a zx.Status indicating why the server could not be started.
+    strict StartServing() -> () error zx.Status;
+
+    /// Stops serving DHCP leases.
+    ///
+    /// Stopping causes all the listening ports to be closed.
+    ///
+    /// Configuring parameters on the DHCP server is only allowed when the
+    /// server is stopped.
+    ///
+    /// If the server is not currently serving, `StopServing` is a no-op.
+    strict StopServing() -> ();
+
+    /// Returns whether or not the server is serving DHCP leases.
+    strict IsServing() -> (struct {
+        enabled bool;
+    });
+
+    /// Returns the requested Option if it is supported.
+    ///
+    /// + request `code` the code of an Option whose value has been requested.
+    /// - response `value` the value of the requested Option.
+    /// * error a zx.Status indicating why the value could not be retrieved.
+    strict GetOption(struct {
+        code OptionCode;
+    }) -> (struct {
+        value Option;
+    }) error zx.Status;
+
+    /// Returns the requested Parameter if it is supported.
+    ///
+    /// + request `name` the name of a Parameter whose value has been requested.
+    /// - response `value` the value of the requested Parameter.
+    /// * error a zx.Status indicating why the value could not be retrieved.
+    strict GetParameter(struct {
+        name ParameterName;
+    }) -> (struct {
+        value Parameter;
+    }) error zx.Status;
+
+    /// Sets the Option to the argument. On success, a SetOption will take
+    /// effect immediately.
+    ///
+    /// + request `value` an Option whose value will be set to the value of this
+    /// argument.
+    /// * error a zx.Status indicating the cause of failure.
+    strict SetOption(struct {
+        value Option;
+    }) -> () error zx.Status;
+
+    /// Sets the Parameter to the argument. On success, the new parameter value
+    /// can be queried by GetParameter or ListParameter immediately. However,
+    /// the server may require a restart in order for the new Parameter value to
+    /// take effect.
+    ///
+    /// Setting parameters is only allowed if the server is stopped.
+    /// `ZX_ERR_BAD_STATE` is returned otherwise.
+    ///
+    /// + request `value` a Parameter whose value will be set to the value of
+    /// this argument.
+    /// * error a zx.Status indicating the cause of failure.
+    strict SetParameter(struct {
+        value Parameter;
+    }) -> () error zx.Status;
+
+    /// Lists all DHCP options for which the Server has a value. Any option
+    /// which does not have a value will be omitted from the returned list.
+    /// ListOptions provides administrators a means to print a server's
+    /// configuration as opposed to querying the value of a single Option.
+    ///
+    /// - response `options` a vector containing all of the options for which
+    /// the Server has a value. Bounded to 256 as options are identified by a 1
+    /// octet code and 256 is the maximum number of such codes.
+    /// * error a zx.Status indicating the cause of failure.
+    strict ListOptions() -> (struct {
+        options vector<Option>:256;
+    }) error zx.Status;
+
+    /// Lists all DHCP server parameters. ListParameters provides administrators
+    /// a means to print a server's configuration as opposed to querying the
+    /// value of a single Parameter.
+    ///
+    /// - response `parameter` a vector containing the values of all of the
+    /// Server's parameters. Bounded to 256 to provide a generous upper limit
+    /// on the number of server parameters while being of the same size as
+    /// ListOptions.
+    /// * error a zx.Status indicating the cause of failure.
+    strict ListParameters() -> (struct {
+        parameters vector<Parameter>:256;
+    }) error zx.Status;
+
+    /// Resets all DHCP options to have no value. On success, ResetOptions will
+    /// take effect immediately.
+    ///
+    /// * error a zx.Status indicating the cause of failure.
+    strict ResetOptions() -> () error zx.Status;
+
+    /// Resets all DHCP server parameters to their default value. On success,
+    /// the reset parameter values can be queried immediately with GetParameter
+    /// or ListParameters. However, the server must be restarted before all new
+    /// parameter values take effect.
+    ///
+    /// Setting parameters is only allowed if the server is stopped.
+    /// `ZX_ERR_BAD_STATE` is returned otherwise.
+    ///
+    /// * error a zx.Status indicating the cause of failure.
+    strict ResetParameters() -> () error zx.Status;
+
+    /// Clears all leases maintained by the Server. On success, ClearLeases will
+    /// take effect immediately. Server administrators should take care when
+    /// calling this method as the DHCP protocol does not provide a mechanism by
+    /// which a Server can notify a client that its lease has been cleared.
+    ///
+    /// * error a zx.Status indicating the cause of failure.
+    strict ClearLeases() -> () error zx.Status;
+};

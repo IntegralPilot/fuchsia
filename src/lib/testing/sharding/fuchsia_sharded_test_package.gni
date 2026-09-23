@@ -1,0 +1,249 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/dist/generated_resource.gni")
+import(
+    "//src/lib/testing/expectation/fuchsia_test_component_with_expectations.gni")
+
+# This is very ugly, but GN only has `foreach` loops over arrays. It doesn't
+# support looping over a range from 0 to n.
+# Because of this, we instead pre-declare an array that we can `foreach` loop
+# over in order to emulate bounded iteration.
+# An alternative would be to use `exec_script` to generate an arbitrarily long
+# array to iterate over, but this has the drawback of worsening `fx gen`
+# performance as it blocks ninja generation on executing the script
+# synchronously.
+_array_containing_a_number_of_elements_equal_to_the_maximum_possible_number_of_shards = [
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+]
+
+_max_possible_shards = 0
+foreach(
+    _elem,
+    _array_containing_a_number_of_elements_equal_to_the_maximum_possible_number_of_shards) {
+  _max_possible_shards += 1
+}
+
+# Defines a fuchsia_test_package in which the test components are themselves
+# sharded into multiple random test components that each run a subset of the
+# original component's test cases.
+#
+# Parameters
+#
+#   test_components (required)
+#     Type: list of scopes
+#     A list of scopes in which each scope contains the arguments for a
+#     `fuchsia_test_component`. Additionally, each scope contains the following:
+#         name (required)
+#         Type: string
+#           The target name to use for the `fuchsia_test_component`.
+#
+#         num_shards (required)
+#         Type: number
+#           The number of shards into which the component's test cases should
+#           be divided.
+#
+#         shard_part_regex (optional)
+#         Type: string
+#           A regex that specifies a portion of each test case to use as the
+#           part to be sharded. The regex must match every test case name, and
+#           must have a single capture group that successfully matches within
+#           every test case name.
+#           Note that backslashes in the regex will be escaped for you,
+#           so e.g. "capture_just_based_on_number_(\d+)" will work without
+#           additional escaping.
+#
+#         expectations (optional)
+#         Type: path
+#           The path to a //src/lib/testing/expectation test expectations JSON5
+#           file. If set, a `fuchsia_test_component_with_expectations` is
+#           emitted instead of a `fuchsia_test_component`.
+#
+#         generated_expectations (optional)
+#         Type: target
+#           A `//src/lib/testing/expectation/generated_expectations_file.gni`
+#           dep to use instead of a static `expectations` file. Only one of
+#           `expectations` or `generated_expectations` can be set.
+#
+#         treatment_of_cases_with_error_logs (optional)
+#         Type: string
+#           Identifies how test cases that are expected to generate error logs
+#           should be run. Only can be set if `expectations` or
+#           `generated_expectations` is set.
+#           Type: string
+#           Options:
+#             - "SKIP_CASES_WITH_ERROR_LOGS" indicates that tests expected to
+#               generate error logs should be skipped.
+#             - "RUN_ONLY_CASES_WITH_ERROR_LOGS" indicates that only those tests
+#               expected to generate error logs should be run.
+#             - By default, all test cases will be run.
+#
+#   The rest of the parameters are the same as `fuchsia_test_package`.
+template("fuchsia_sharded_test_package") {
+  assert(
+      defined(invoker.test_components) && invoker.test_components != [],
+      "`test_components` must be specified when calling fuchsia_sharded_test_package($target_name)")
+
+  _all_shards = []
+  _all_shard_configs = []
+
+  foreach(test_component, invoker.test_components) {
+    assert(
+        !defined(test_component.expectations) ||
+            !defined(test_component.generated_expectations),
+        "test_components can have either `expectations` or `generated_expectations` or neither")
+
+    assert(defined(test_component.manifest),
+           "test_components must have `manifest`s")
+    assert(defined(test_component.num_shards),
+           "test_components must have `num_shard`s")
+    assert(defined(test_component.name), "test_components must have `name`s")
+    assert(
+        test_component.num_shards <= _max_possible_shards,
+        "due to GN limitations, the maximum possible number of test shards is hard-coded in //src/lib/testing/sharding/fuchsia_sharded_test_package.gni and must be raised to allow this.")
+
+    _shard_index = 0
+    foreach(
+        _shard,
+        _array_containing_a_number_of_elements_equal_to_the_maximum_possible_number_of_shards) {
+      if (_shard_index < test_component.num_shards) {
+        _shard_target_name = "${test_component.name}_shard_${_shard_index}_of_${test_component.num_shards}"
+        _target_prefix = "${_shard_target_name}_testshard"
+
+        _testshard_config_filepath =
+            "data/testshards/${_target_prefix}/config.json5"
+
+        _testshard_config_resource_target =
+            "${_target_prefix}_generated_resource"
+        generated_resource(_testshard_config_resource_target) {
+          outputs = [ _testshard_config_filepath ]
+          output_conversion = "json"
+          contents = {
+            num_shards = test_component.num_shards
+            shard_index = _shard_index
+            if (defined(test_component.shard_part_regex)) {
+              shard_part_regex = test_component.shard_part_regex
+            }
+          }
+        }
+
+        _all_shard_configs += [ ":${_testshard_config_resource_target}" ]
+
+        _testshard_config_offer_cml_shard_target =
+            "${_target_prefix}_offer_cml_shard"
+        _testshard_config_offer_cml_shard_file =
+            "${target_gen_dir}/${_target_prefix}_config_offer.shard.cml"
+        generated_file(_testshard_config_offer_cml_shard_target) {
+          outputs = [ _testshard_config_offer_cml_shard_file ]
+          output_conversion = "json"
+          contents = {
+            offer = [
+              {
+                directory = "pkg"
+                from = "framework"
+                as = "testshard"
+                to = "#sharder"
+                subdir = "data/testshards/${_target_prefix}"
+              },
+            ]
+          }
+          deps = []
+        }
+
+        _merged_cml_target = "${_target_prefix}_merged_cml"
+        _merged_cml_file_name = "${_target_prefix}_merged.cml"
+
+        cmc_merge(_merged_cml_target) {
+          testonly = true
+          deps = [ ":${_testshard_config_offer_cml_shard_target}" ]
+          if (defined(invoker.deps)) {
+            deps += invoker.deps
+          }
+          sources = [
+            _testshard_config_offer_cml_shard_file,
+            test_component.manifest,
+          ]
+          output_name = _merged_cml_file_name
+        }
+
+        _cmc_merge_outputs = []
+        _cmc_merge_outputs = get_target_outputs(":${_merged_cml_target}")
+        _merged_cml_file = _cmc_merge_outputs[0]
+
+        _test_cmp_args = {
+        }
+        _test_cmp_args = {
+          forward_variables_from(test_component,
+                                 "*",
+                                 [
+                                   "deps",
+                                   "manifest",
+                                   "num_shards",
+                                   "target_name",
+                                 ])
+
+          deps = [ ":${_merged_cml_target}" ]
+          manifest = _merged_cml_file
+
+          if (defined(test_component.deps)) {
+            deps += test_component.deps
+          }
+        }
+
+        if (defined(test_component.expectations) ||
+            defined(test_component.generated_expectations)) {
+          fuchsia_test_component_with_expectations(_shard_target_name) {
+            forward_variables_from(_test_cmp_args, "*")
+
+            if (defined(invoker.treatment_of_cases_with_error_logs)) {
+              treatment_of_cases_with_error_logs =
+                  invoker.treatment_of_cases_with_error_logs
+            }
+          }
+        } else {
+          fuchsia_test_component(_shard_target_name) {
+            forward_variables_from(_test_cmp_args, "*")
+          }
+        }
+
+        _shard_index += 1
+        _all_shards += [ ":${_shard_target_name}" ]
+      }
+    }
+  }
+
+  fuchsia_test_package(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "test_components",
+                             "deps",
+                           ])
+    test_components = _all_shards
+    deps = _all_shard_configs + [ "//src/lib/testing/sharding:sharder" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+}

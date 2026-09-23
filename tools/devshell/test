@@ -1,0 +1,104 @@
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Test
+### Entry point for all Fuchsia tests (host, target, and end-to-end)
+
+## Usage: fx test [testName ...]
+##
+## This is an incomplete list of options. Run 'fx test --help' for the complete set of options.
+## Options:
+## -h, --help
+##     --test-filter                     Runs specific test cases in v2 suite. Can be specified multiple
+##                                       times to pass in multiple patterns.
+##                                       example: --test-filter glob1 --test-filter glob2
+##     --agent-output                    Force machine-readable JSON output and log isolation for AI agents.
+##     --no-agent-output                 Disable agent output and run in standard human-readable mode (default, unless in an agent environment).
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/metrics.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/host_symbolizer.sh || exit $?
+fx-config-read
+
+# Set an environment variable so that child processes can know they were invoked (directly or
+# indirectly) by fx test. For example, build metrics need this information.
+export FUCHSIA_FX_TEST_RUN=1
+
+# Identify options without modifying or shifting "$@"
+is_test_execution=true
+host_tests_only=false
+
+for arg in "$@"; do
+  if [[ "$arg" == "--" ]]; then
+    break
+  elif [[ "$arg" == "--help" || "$arg" == "-h" || "$arg" == "--info" || "$arg" == "--dry" || "$arg" == "--prev"* || "$arg" == "-pr" ]]; then
+    is_test_execution=false
+  elif [[ "$arg" == "--host" ]]; then
+    host_tests_only=true
+  fi
+done
+
+# Fast path for non-test invocations (help, info, prev queries)
+if [[ "${is_test_execution}" == false ]]; then
+  fx-command-run host-tool test "$@"
+  exit $?
+fi
+
+fx-command-run host-tool --print symbolizer > /dev/null
+if [[ "$host_tests_only" == false ]]; then
+  fx-command-run host-tool --print ffx > /dev/null
+fi
+
+# Request that fx test write the resolved log path to a private temporary file
+# for background telemetry. If logging is disabled (via CLI or config), the file remains empty.
+extra_args=()
+log_path_out=""
+if [[ -n "${FUCHSIA_BUILD_DIR}" ]]; then
+  log_path_out=$(mktemp "${FUCHSIA_BUILD_DIR}/.fxtest_logpath.XXXXXX" 2>/dev/null || mktemp -t fxtest_logpath.XXXXXX)
+  extra_args+=("--save-log-path-to-file" "${log_path_out}")
+fi
+
+start_time="${EPOCHREALTIME/./}"
+test_status=0
+
+# Execute host-tool directly through find_executable because fx-wait-ignoring-signals
+# invokes `exec` inside a subshell, which cannot execute shell functions like fx-command-run.
+host_tool_cmd="$(find_executable host-tool)"
+fx-wait-ignoring-signals "fx-test" \
+  "${host_tool_cmd}" test "${extra_args[@]}" "$@" || test_status=$?
+
+end_time="${EPOCHREALTIME/./}"
+
+# Post-execution analytics (survives Ctrl+C, executes fully in background with zero delay to user)
+log_file=""
+if [[ -n "${log_path_out}" && -s "${log_path_out}" ]]; then
+  log_file=$(<"${log_path_out}")
+fi
+
+if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+  metrics-read-config
+  if [[ "${METRICS_LEVEL}" -gt 0 ]] && metrics-is-internal-user; then
+    was_aborted=0
+    if [[ "${test_status}" -eq 130 || "${test_status}" -eq 143 ]]; then
+      was_aborted=1
+    fi
+    (
+      rm -f "${log_path_out}"
+      stats_json=$(fx-command-run host-tool --no-build test --prev stats-analytics --logpath "${log_file}" 2>/dev/null || true)
+      if [[ -n "${stats_json}" ]]; then
+        if [[ "${stats_json}" =~ \"a\":[[:space:]]*1 ]]; then
+          was_aborted=1
+        fi
+        track-test-event "${start_time}" "${end_time}" "${test_status}" "${was_aborted}" "${stats_json}" "${FUCHSIA_BUILD_DIR}"
+      fi
+    ) </dev/null >/dev/null 2>&1 &
+  else
+    rm -f "${log_path_out}"
+  fi
+else
+  rm -f "${log_path_out}"
+fi
+
+exit "${test_status}"

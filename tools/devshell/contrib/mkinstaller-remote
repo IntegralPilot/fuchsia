@@ -1,0 +1,84 @@
+#!/bin/bash
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Software delivery
+### make a Fuchsia installer image from a remote build host
+
+## usage: fx mkinstaller-remote [<host> [<host_dir>]] <mkinstaller args>
+##  host      Remote build host name; defaults to the last-used host.
+##  host_dir  Fuchsia root dir on the remote build host; defaults to the last-used dir or ~/fuchsia.
+##
+##  Use --help to get a full list of mkinstaller args.
+
+set -e
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/fx-remote.sh || exit $?
+fx-config-read
+
+# First scan for --help and if found just pass it directly and exit. This is
+# necessary because next we're going to use --print-host-args-only to extract
+# the host-related args, and trying to handle the --help case there is more
+# complicated.
+if echo "$@" | grep -w -q -- "--help"; then
+  fx-command-run mkinstaller "$@"
+  exit $?
+fi
+
+# Extract the |host| and |host_dir| args.
+host_args=$(fx-command-run mkinstaller "$@" --print-host-args-only)
+read host host_dir <<< ${host_args}
+
+if cached=( $(load_remote_info "${host}") ); then
+  host="${cached[0]}"
+  host_dir="${cached[1]}"
+fi
+
+if [[ -z "${host}" ]]; then
+  fx-error "host must be specified"
+  fx-command-help
+  exit 1
+fi
+
+if [[ -z "${host_dir}" ]]; then
+  if ssh "${host}" ls "\${HOME}/fuchsia/.jiri_root/bin/fx" > /dev/null; then
+    host_dir="\${HOME}/fuchsia"
+  else
+    fx-error "failed to find \${HOME}/fuchsia on ${host}, please specify host dir"
+    fx-command-help
+    exit 1
+  fi
+fi
+
+save_remote_info "${host}" "${host_dir}"
+
+# Create the image on the remote and grab the path from stdout.
+if ! remote_path=$(ssh "${host}" \
+                       "cd \"${host_dir}\" && \
+                       .jiri_root/bin/fx mkinstaller $@ --temp-remote-image-only"); then
+  fx-error "failed to create image on ${host}"
+  fx-error "if due to unrecognized arguments, you may need to 'jiri update' one or both machines"
+  exit 1
+fi
+
+local_image_dir="${FUCHSIA_DIR}/out/fetched"
+if ! mkdir -p ${local_image_dir}; then
+  fx-error "failed to create directory for the fetched installer image"
+  exit 1
+fi
+
+local_path="${local_image_dir}/installer.img"
+
+fx-info "Copying installer image to local host"
+rsync --compress --partial --progress "${host}:${remote_path}" "${local_path}"
+
+# Clean up the remote temp dir.
+remote_dir=$(dirname "${remote_path}")
+ssh "${host}" rm -rf \"${remote_dir}\"
+
+# Now write the image to the final requested location.
+# We could just `dd` here, but mkinstaller has some safety-checks for the
+# output path that we want to retain.
+fx-command-run mkinstaller "$@" --from-image "${local_path}"

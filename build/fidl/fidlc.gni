@@ -1,0 +1,140 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/fidl/toolchain.gni")
+
+# LINT.IfChange(fidlc)
+
+# Runs the FIDL compiler.
+#
+# Parameters (see //build/fidl/fidl_ir.gni for descriptions):
+#
+#   available (required)
+#   fidl_library_name (required)
+#   fidl_target_name (required)
+#   gen_dir (required)
+#   json_representation (required)
+#   sources (required)
+#   experimental_flags
+#   non_fidl_deps
+#   public_deps
+#   testonly
+#   versioned
+#   visibility
+#
+template("fidlc") {
+  assert(defined(invoker.available), "available is required")
+  assert(defined(invoker.fidl_library_name), "fidl_library_name is required")
+  assert(defined(invoker.fidl_target_name), "fidl_target_name is required")
+  assert(defined(invoker.gen_dir), "gen_dir is required")
+  assert(defined(invoker.json_representation),
+         "json_representation is required")
+  assert(defined(invoker.sources), "sources is required")
+  assert(!defined(invoker.deps), "Use `public_deps` or `non_fidl_deps`")
+
+  experimental_flags = []
+  if (defined(invoker.experimental_flags)) {
+    experimental_flags += invoker.experimental_flags
+  }
+
+  main_target_name = target_name
+  fidl_target_name = invoker.fidl_target_name
+
+  generated_binding_dir = "${invoker.gen_dir}/${fidl_target_name}/c"
+  fidlc_depfile_path = "$generated_binding_dir/${invoker.fidl_library_name}.d"
+
+  libraries_file = "${invoker.gen_dir}/${fidl_target_name}.libraries"
+  response_file = "${invoker.gen_dir}/${fidl_target_name}.args"
+  response_file_target_name = "${main_target_name}_response_file"
+  action(response_file_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "public_deps",
+                             "testonly",
+                           ])
+    visibility = [ ":*" ]
+
+    script = "//build/fidl/gen_response_file.py"
+
+    outputs = [
+      response_file,
+      libraries_file,
+    ]
+
+    args = [
+             "--out-response-file",
+             rebase_path(response_file, root_build_dir),
+             "--out-libraries",
+             rebase_path(libraries_file, root_build_dir),
+             "--json",
+             rebase_path(invoker.json_representation, root_build_dir),
+             "--name",
+             invoker.fidl_library_name,
+             "--depfile",
+             rebase_path(fidlc_depfile_path, root_build_dir),
+             "--sources",
+           ] + rebase_path(invoker.sources, root_build_dir)
+
+    if (defined(invoker.public_deps)) {
+      inputs = []
+      foreach(dep, invoker.public_deps) {
+        # Note: We are using the .libraries file from the dependency's
+        # target_gen_dir, even though this template invocation may have received
+        # a custom gen_dir for API compatibility testing. This is OK since the
+        # .libraries file will be identical for all target API levels (imports
+        # are not versioned, i.e. @available is not allowed on `using`).
+        _dep_gen_dir = get_label_info(dep, "target_gen_dir")
+        _dep_name = get_label_info(dep, "name")
+        inputs += [ "$_dep_gen_dir/$_dep_name.libraries" ]
+      }
+      args += [ "--dep-libraries" ] + rebase_path(inputs, root_build_dir)
+    }
+
+    if (defined(invoker.versioned)) {
+      args += [
+        "--versioned",
+        invoker.versioned,
+      ]
+    }
+    foreach(available, invoker.available) {
+      args += [
+        "--available",
+        available,
+      ]
+    }
+    foreach(flag, experimental_flags) {
+      args += [
+        "--experimental",
+        flag,
+      ]
+    }
+  }
+
+  compiled_action(main_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "sources",
+                             "testonly",
+                             "visibility",
+                             "validations",
+                           ])
+    tool = "//tools/fidl/fidlc:fidlc"
+    inputs = [ response_file ]
+    depfile = fidlc_depfile_path
+    outputs = [ invoker.json_representation ]
+    mnemonic = "FIDLC"
+    args = [ "@" + rebase_path(response_file, root_build_dir) ]
+    if (defined(invoker.non_fidl_deps)) {
+      deps = invoker.non_fidl_deps
+    }
+    public_deps = [ ":$response_file_target_name" ]
+    if (defined(invoker.public_deps)) {
+      public_deps += invoker.public_deps
+    }
+  }
+}
+# LINT.ThenChange(//build/bazel/rules/fidl/fidl_ir.bzl)

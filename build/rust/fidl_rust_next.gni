@@ -1,0 +1,398 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/fidl/toolchain.gni")
+import("//build/rust/config.gni")
+import("//build/rust/rustc_library.gni")
+
+# LINT.IfChange
+# The new Rust bindings are currently in a phased rollout. This allowlist
+# controls where in the tree generated bindings may be used from.
+fidl_rust_next_allowlist = [
+  "//examples/*",
+  "//examples/fidl/new/key_value_store/use_generic_values/rust_next/*",
+  "//examples/fidl/rust_next/*",
+  "//sdk/fidl/*",
+  "//sdk/lib/async/*",
+  "//sdk/lib/driver/*",
+  "//src/bringup/lib/userboot/*",
+  "//src/connectivity/bluetooth/*",
+  "//src/connectivity/overnet/*",
+  "//src/connectivity/wlan/*",
+  "//src/devices/*",
+  "//src/graphics/*",
+  "//src/lib/fdomain/*",
+  "//src/lib/fidl/rust_next/*",
+  "//src/lib/fuchsia-component/*",
+  "//src/tests/fidl/conformance_suite/*",
+  "//src/ui/input/*",
+  "//src/ui/lib/input_pipeline/*",
+  "//src/ui/tools/print-input-report-new/*",
+  "//tools/fidl/*",
+  "//vendor/google/*",
+  "//zircon/kernel/lib/userabi/userboot/*",
+]
+
+# LINT.ThenChange(fidl_rust_next.bzl)
+
+# Generates next-generation Rust bindings for a FIDL library.
+#
+# Parameters
+#
+#  * library_name
+#    - Required: The name of the FIDL library.
+#    - Type: string
+#
+#  * fidl_gen_dir
+#    - Required: The directory under which bindings should be generated.
+#    - Type: path
+#
+#  * fidl_ir_json
+#    - Required: The path to the associated FIDL IR JSON file.
+#    - Type: path
+#
+#  * fidl_ir_target
+#    - Required: The label of the target that generates the FIDL IR JSON file.
+#    - Type: label
+#
+#  * deps
+#    - Optional: Dependencies added unaltered to the deps for this library.
+#         Used only to set non-fidl rust bindings. The use of public_deps
+#         instead of deps is strongly advised.
+#
+#  * testonly, visibility, public_deps
+#    - Optional: Usual GN meanings.
+#
+#  * common
+#    - Optional: If true, build a "common" crate that contains only POD types.
+#
+#  * common_lib
+#    - Optional: If specified, gives the *crate name* of a "common" crate that
+#      has all the POD types for this library. This crate will re-export POD
+#      types from the common lib instead of generating them. The actual build
+#      path for the common crate should appear in `deps` as well.
+#
+#  * contains_drivers
+#    - Optional: Whether to enable driver-specific code.
+#
+template("fidl_rust_next") {
+  assert(defined(invoker.library_name),
+         "fidl_rust_next(\"$target_name\") must define `library_name`")
+  assert(defined(invoker.fidl_gen_dir),
+         "fidl_rust_next(\"$target_name\") must define `fidl_gen_dir`")
+  assert(defined(invoker.fidl_ir_json),
+         "fidl_rust_next(\"$target_name\") must define `fidl_ir_json`")
+  assert(defined(invoker.fidl_ir_target),
+         "fidl_rust_next(\"$target_name\") must define `fidl_ir_target`")
+  assert(
+      !defined(invoker.common_lib) || !defined(invoker.common),
+      "fidl_rust_next(\"$target_name\") cannot both be and use the common crate")
+  assert(!defined(invoker.common) || !defined(invoker.fdomain),
+         "Only one of `common` and `fdomain` should be used at a time")
+
+  fdomain = defined(invoker.fdomain) && invoker.fdomain
+  common = defined(invoker.common) && invoker.common
+
+  generation_target = "${target_name}_generate"
+
+  forward_variables_from(invoker,
+                         [
+                           "fidl_gen_dir",
+                           "library_name",
+                         ])
+  _prefix = "fidl"
+
+  if (fdomain) {
+    _prefix = "fdomain"
+  }
+
+  _common_prefix = ""
+  if (common) {
+    _common_prefix = "_common"
+  }
+
+  _crate_name = "${_prefix}_next${_common_prefix}_" +
+                string_replace(library_name, ".", "_")
+  file_stem = "${fidl_gen_dir}/${_crate_name}"
+
+  if (is_fidl_toolchain) {
+    filename = "$file_stem.rs"
+    compiled_action(generation_target) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "fidl_ir_json",
+                               "fidl_ir_target",
+                             ])
+      visibility = [
+        ":*",
+        "//tools/fidl/fidlgen_rust_next:*",
+      ]
+
+      tool = "//tools/fidl/fidlgen_rust_next"
+      mnemonic = "FIDLGEN"
+
+      inputs = [
+        fidl_ir_json,
+        "//rustfmt.toml",
+        "$rustc_prefix/bin/rustfmt",
+        rustc_version_file,
+      ]
+
+      outputs = [ filename ]
+
+      args = [
+        "--json",
+        rebase_path(fidl_ir_json, root_build_dir),
+        "--output-filename",
+        rebase_path(filename, root_build_dir),
+        "--rustfmt",
+        "$rebased_rustc_prefix/bin/rustfmt",
+        "--rustfmt-config",
+        rebase_path("//rustfmt.toml", root_build_dir),
+      ]
+      if (defined(invoker.common_lib)) {
+        args += [
+          "--common-lib",
+          invoker.common_lib,
+        ]
+      }
+      if (fdomain) {
+        inputs += [ "//tools/fidl/fidlgen_rust_next/configs/fdomain.json" ]
+        args += [
+          "--config",
+          rebase_path("//tools/fidl/fidlgen_rust_next/configs/fdomain.json",
+                      root_build_dir),
+        ]
+      } else if (common) {
+        inputs += [ "//tools/fidl/fidlgen_rust_next/configs/common.json" ]
+        args += [
+          "--config",
+          rebase_path("//tools/fidl/fidlgen_rust_next/configs/common.json",
+                      root_build_dir),
+        ]
+      } else {
+        inputs += [ "//tools/fidl/fidlgen_rust_next/configs/fuchsia.json" ]
+        args += [
+          "--config",
+          rebase_path("//tools/fidl/fidlgen_rust_next/configs/fuchsia.json",
+                      root_build_dir),
+        ]
+      }
+
+      deps = [ fidl_ir_target ]
+
+      metadata = {
+        generated_sources = rebase_path(outputs, root_build_dir)
+      }
+    }
+    not_needed(invoker,
+               [
+                 "deps",
+                 "public_deps",
+                 "visibility",
+                 "disable_rustdoc",
+                 "contains_drivers",
+               ])
+  } else {
+    not_needed(invoker,
+               [
+                 "fidl_ir_json",
+                 "fidl_ir_target",
+                 "common_lib",
+               ])
+
+    rustc_library(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "visibility",
+                               "disable_rustdoc",
+                             ])
+
+      name = _crate_name
+      output_dir = "$target_out_dir/$target_name"
+      version = "0.1.0"
+      edition = "2024"
+      disable_clippy = true
+
+      deps = [
+        "//src/lib/fidl/rust_next/fidl_next:fidl_next_internal",
+        "//third_party/rust_crates:static_assertions",
+      ]
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+      if (fdomain) {
+        deps += [ "//src/lib/fdomain/client" ]
+      }
+
+      # TODO(https://fxbug.dev/42055130): Avoid this suppression. At the time of
+      # writing it is needed because this target might depend on another FIDL
+      # library *only* for type aliases; the generated Rust code will not
+      # reference this external alias, producing an unused crate dependency. We
+      # cannot know here whether that's the case or not, so we just suppress
+      # the warning.
+      configs += [ "//build/config/rust/lints:allow_unused_crate_dependencies" ]
+
+      if (defined(invoker.public_deps)) {
+        foreach(dep, invoker.public_deps) {
+          label = get_label_info(dep, "label_no_toolchain")
+          if (label == "//zircon/vdso/zx:zx") {
+            deps += [ "//sdk/rust/zx-types" ]
+          } else if (common) {
+            deps += [ "${label}_rust_next_common_internal" ]
+          } else if (fdomain) {
+            deps += [ "${label}_rust_fdomain_next_internal" ]
+          } else {
+            deps += [ "${label}_rust_next_internal" ]
+          }
+        }
+      }
+
+      non_rust_deps = [ ":$generation_target($fidl_toolchain)" ]
+      source_root = "$file_stem.rs"
+      sources = [ "$file_stem.rs" ]
+
+      configs += [ "//build/config/rust/lints:deny_unused_results" ]
+
+      features = []
+      if (is_fuchsia) {
+        features += [ "fuchsia" ]
+      }
+      if (defined(invoker.contains_drivers) && invoker.contains_drivers) {
+        features += [ "driver" ]
+        deps += [ "//sdk/lib/driver/runtime/rust/fidl" ]
+      } else {
+        not_needed([ "contains_drivers" ])
+      }
+    }
+  }
+}
+
+template("fidl_rust_next_convert") {
+  assert(defined(invoker.library_name),
+         "fidl_rust_next_convert(\"$target_name\") must define `library_name`")
+  assert(defined(invoker.fidl_gen_dir),
+         "fidl_rust_next_convert(\"$target_name\") must define `fidl_gen_dir`")
+  assert(defined(invoker.fidl_ir_json),
+         "fidl_rust_next_convert(\"$target_name\") must define `fidl_ir_json`")
+  assert(
+      defined(invoker.fidl_ir_target),
+      "fidl_rust_next_convert(\"$target_name\") must define `fidl_ir_target`")
+  assert(defined(invoker.rust_crate),
+         "fidl_rust_next_convert(\"$target_name\") must define `rust_crate`")
+  assert(
+      defined(invoker.rust_next_crate),
+      "fidl_rust_next_convert(\"$target_name\") must define `rust_next_crate`")
+
+  forward_variables_from(invoker,
+                         [
+                           "fidl_gen_dir",
+                           "library_name",
+                         ])
+
+  generation_target = "${target_name}_generate"
+  _crate_name = "fidl_next_convert_" + string_replace(library_name, ".", "_")
+  file_stem = "${fidl_gen_dir}/${_crate_name}"
+
+  if (is_fidl_toolchain) {
+    filename = "$file_stem.rs"
+    compiled_action(generation_target) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "fidl_ir_json",
+                               "fidl_ir_target",
+                               "rust_crate",
+                               "rust_next_crate",
+                             ])
+      visibility = [
+        ":*",
+        "//tools/fidl/fidlgen_rust_next/convert:*",
+      ]
+
+      tool = "//tools/fidl/fidlgen_rust_next/convert:fidlgen_rust_next_convert"
+      mnemonic = "FIDLGEN"
+
+      inputs = [
+        fidl_ir_json,
+        "//rustfmt.toml",
+        "$rustc_prefix/bin/rustfmt",
+        rustc_version_file,
+      ]
+
+      outputs = [ filename ]
+
+      args = [
+        "--json",
+        rebase_path(fidl_ir_json, root_build_dir),
+        "--output-filename",
+        rebase_path(filename, root_build_dir),
+        "--rustfmt",
+        "$rebased_rustc_prefix/bin/rustfmt",
+        "--rustfmt-config",
+        rebase_path("//rustfmt.toml", root_build_dir),
+        "--rust-crate",
+        "$rust_crate",
+        "--rust-next-crate",
+        "$rust_next_crate",
+      ]
+
+      deps = [ fidl_ir_target ]
+
+      metadata = {
+        generated_sources = rebase_path(outputs, root_build_dir)
+      }
+    }
+    not_needed(invoker,
+               [
+                 "deps",
+                 "visibility",
+                 "disable_rustdoc",
+                 "contains_drivers",
+               ])
+  } else {
+    rustc_library(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "visibility",
+                               "disable_rustdoc",
+                             ])
+
+      name = _crate_name
+      output_dir = "$target_out_dir/$target_name"
+      version = "0.1.0"
+      edition = "2024"
+      disable_clippy = true
+
+      deps = []
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+
+      non_rust_deps = [ ":$generation_target($fidl_toolchain)" ]
+      source_root = "$file_stem.rs"
+      sources = [ "$file_stem.rs" ]
+
+      configs += [ "//build/config/rust/lints:deny_unused_results" ]
+
+      features = []
+      if (is_fuchsia) {
+        features += [ "fuchsia" ]
+      }
+    }
+    not_needed(invoker,
+               [
+                 "rust_crate",
+                 "rust_next_crate",
+               ])
+  }
+}

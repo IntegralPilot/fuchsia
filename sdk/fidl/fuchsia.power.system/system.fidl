@@ -1,0 +1,413 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// The system activity governor (SAG) is a subsystem of the power framework
+/// that manages the execution and suspend state of the hardware platform. It
+/// also allows observers to watch for suspend/resume transitions of the
+/// platform.
+///
+/// Other components can create dependencies on SAG's power elements with
+/// [`fuchsia.power.broker/ElementControl`] to influence SAG's behavior
+/// including preventing system suspension.
+///
+/// The power elements that SAG creates and manages are as follows:
+/// * [`fuchsia.power.system/ExecutionState`]
+/// * [`fuchsia.power.system/ApplicationActivity`]
+/// * [`fuchsia.power.system/Cpu`]
+///
+/// # Internal Dependency Diagram
+/// ```
+///                +--------------------+                  +---------------------------------+
+///                | **ExecutionState** |                  |     **ApplicationActivity**     |
+///                +--------------------+                  +---------------------------------+
+///                |       ACTIVE       |<-----------------|             ACTIVE              |
+///                +--------------------+                  +---------------------------------+
+/// +--------------|     SUSPENDING     |                  |            INACTIVE             |
+/// |              |                    |                  +---------------------------------+
+/// |              +--------------------+
+/// |              |      INACTIVE      |
+/// |              +--------------------+
+/// |
+/// |    +---------------------------------+
+/// |    |             **CPU**             |
+/// |    +---------------------------------+
+/// +--->|             ACTIVE              |
+///      +---------------------------------+
+///      |            INACTIVE             |
+///      +---------------------------------+
+/// ```
+///
+/// # Usage
+///
+/// To prevent system suspension, a component can create an assertive dependency
+/// using the `assertive_dependency_token` from `ApplicationActivity`. If the
+/// dependency causes the power level of `ApplicationActivity` to be raised to
+/// [`fuchsia.power.system/ApplicationActivityPowerLevel.ACTIVE`], SAG  will not
+///  trigger system suspension until their power levels drop to `INACTIVE`.
+///
+/// If a component is managing a power element that requires the platform to be
+/// in a specific state, an opportunistic dependency can be created on
+/// `ExecutionState`. When `ExecutionState` changes its power level, all
+/// dependent power elements will power down first. Ideally, this forces the
+/// entire system into a configuration with a lower power consumption as the
+/// power level of `ExecutionState` decreases.
+@available(added=26)
+library fuchsia.power.system;
+
+using fuchsia.power.broker;
+using zx;
+
+// TODO(https://fxbug.dev/339474151): Update this when EventPair is the standard
+// token for leases in Power Broker.
+@available(added=26)
+alias LeaseToken = zx.Handle:<EVENTPAIR, zx.Rights.TRANSFER | zx.Rights.DUPLICATE | zx.Rights.WAIT>;
+
+@available(added=26)
+const MAX_ELEMENT_NAME_LEN uint8 = 64;
+
+/// Errors returned by `ActivityGovernor/AcquireWakeLease`.
+@available(added=26)
+type AcquireWakeLeaseError = flexible enum : uint32 {
+    /// The service encountered an error while attempting to issue a wake lease.
+    INTERNAL = 1;
+    /// The name for the wake lease is empty or invalid.
+    INVALID_NAME = 2;
+};
+
+/// Execution state power levels
+///
+/// Elements should take an opportunistic dependency on `ExecutionStateLevel::ACTIVE`
+/// to ensure that the element will be suspended when the rest of the system
+/// suspends.
+///
+/// Drivers can take an opportunistic dependency on either
+/// `ExecutionStateLevel::SUSPENDING` or `ExecutionStateLevel::ACTIVE` and
+/// request a persistent lease on this state to ensure that their element's
+/// power level is always activated when the system comes out of a suspend
+/// state.
+@available(added=HEAD)
+type ExecutionStateLevel = flexible enum : uint8 {
+    INACTIVE = 0;
+    SUSPENDING = 1;
+    ACTIVE = 2;
+};
+
+/// Holds tokens to the CPU power element.
+///
+/// [`fuchsia.power.system/CpuLevel`] defines the power levels supported by this power element.
+@available(added=HEAD)
+type Cpu = resource table {
+    1: assertive_dependency_token fuchsia.power.broker.DependencyToken;
+};
+
+/// Holds the dependency token for the Execution State power element.
+@available(added=HEAD)
+type ExecutionState = resource table {
+    1: dependency_token fuchsia.power.broker.DependencyToken;
+};
+
+/// CPU power levels
+///
+/// Elements should take an assertive dependency on `CpuLevel::ACTIVE`
+/// to ensure that the element will be suspended before the CPU suspends.
+@available(added=HEAD)
+type CpuLevel = flexible enum : uint8 {
+    INACTIVE = 0;
+    ACTIVE = 1;
+};
+
+/// Holds tokens to the application activity power element.
+///
+/// [`fuchsia.power.system/ApplicationActivityLevel`] defines the power levels supported by this power element.
+@available(added=HEAD)
+type ApplicationActivity = resource table {
+    1: assertive_dependency_token fuchsia.power.broker.DependencyToken;
+};
+
+/// Application activity power levels
+///
+/// Elements that need to keep the system from suspending should take an assertive
+/// dependency on `ApplicationActivityLevel::ACTIVE`. When these components are
+/// performing work, they should request a lease to ensure the system remains
+/// active, and drop the lease when they are done.
+@available(added=HEAD)
+type ApplicationActivityLevel = flexible enum : uint8 {
+    INACTIVE = 0;
+    ACTIVE = 1;
+};
+
+/// A collection of power elements that are managed by the activity governor.
+@available(added=HEAD)
+type PowerElements = resource table {
+    3: application_activity ApplicationActivity;
+};
+
+/// Error codes for responses from `AddExecutionStateDependency` in
+/// [`fuchsia.power.system/CpuElementManager`].
+@available(added=HEAD)
+type AddExecutionStateDependencyError = flexible enum {
+    /// Required arguments are either not given or are not valid.
+    INVALID_ARGS = 1;
+    /// The server is not in a state to handle the request.
+    BAD_STATE = 2;
+};
+
+/// Error codes for responses from `AddApplicationActivityDependency` in
+/// [`fuchsia.power.system/ActivityGovernor`].
+@available(added=HEAD)
+type AddApplicationActivityDependencyError = flexible enum {
+    /// The dependency already exists.
+    ALREADY_EXISTS = 1;
+    /// Required arguments are either not given or are not valid.
+    INVALID = 2;
+    /// The service encountered an error while attempting to add the dependency.
+    INTERNAL = 3;
+};
+
+/// Error codes for responses from `RegisterSuspendBlocker` in
+/// [`fuchsia.power.system/ActivityGovernor`].
+@available(added=27)
+type RegisterSuspendBlockerError = flexible enum {
+    /// The service encountered an error while attempting to issue a wake lease.
+    INTERNAL = 1;
+    /// Required arguments are either not given or are not valid.
+    INVALID_ARGS = 2;
+};
+
+/// An entity that blocks suspend until it handles transitions across hardware
+/// platform suspend and resume.
+@available(added=27)
+open protocol SuspendBlocker {
+    /// Called after system activity governor begins operations to suspend the
+    /// hardware platform.
+    ///
+    /// The server is expected to respond once it has performed the operations
+    /// it needs to prepare itself for suspend, if any. All dependencies of
+    /// `ExecutionStateLevel::SUSPENDING` are guaranteed to be satisified for
+    /// the duration of this call and may be revoked once the server replies.
+    ///
+    /// Operations to suspend the hardware platform may vary between different
+    /// hardware platforms and product configurations. At a minimum, the client
+    /// and server MUST assume that general code execution continues
+    /// until a reply to this call is received by the client. If the
+    /// SuspendBlocker wants to preempt suspend operations, it MUST call
+    /// `ActivityGovernor.AcquireWakeLease` before replying to this call.
+    ///
+    /// ExecutionState will be at its SUSPENDING level for the duration of this
+    /// call. Consequently, a SuspendBlocker MUST NOT call
+    /// `ActivityGovernor.TakeApplicationActivityLease` nor perform any other
+    ///  action that blocks on Execution State reaching a level other than
+    /// INACTIVE. Doing so will result in a deadlock. (However, AcquireWakeLease
+    /// does _not_ block in this way and is safe to call.)
+    flexible BeforeSuspend() -> ();
+
+    /// Called after system activity governor is aware that the hardware
+    /// platform has resumed.
+    ///
+    /// For the duration of this call, ExecutionState is at level INACTIVE,
+    /// but all dependencies of `ExecutionStateLevel::SUSPENDING` are guaranteed
+    /// be satisified.
+    ///
+    /// Consequently, a SuspendBlocker MUST NOT call
+    /// `ActivityGovernor.TakeApplicationActivityLease` nor perform any other
+    ///  action that blocks on Execution State reaching a level other than
+    /// INACTIVE. Doing so will result in a deadlock. (However, AcquireWakeLease
+    /// does _not_ block in this way and is safe to call.)
+    flexible AfterResume() -> ();
+};
+
+/// A service for exposing events and power elements managed by the system
+/// activity governor (SAG).
+///
+/// SAG is responsible for managing the execution state of the hardware
+/// platform. The hardware platform consists of the components required to
+/// execute code on the device. This typically includes the CPU, memory,
+/// operating system, and other components required for these components to
+/// function (clock trees, power domains, etc.).
+@available(added=26)
+@discoverable
+open protocol ActivityGovernor {
+    // TODO(b/315994898): Provide tokens more granularly once client usage
+    // patterns are better understood.
+
+    /// Gets the power elements owned by the activity governor.
+    ///
+    /// If an error occurs while the server is registering a power element with
+    /// the power broker or an error occurs while creating a token for a power
+    /// element, then the channel to `ActivityGovernor` will be closed by the
+    /// server and no response will be returned.
+    @available(added=HEAD)
+    flexible GetPowerElements() -> (PowerElements);
+
+    /// Creates a lease that blocks suspension of the hardware platform.
+    ///
+    /// The hardware platform will not suspend as long as a valid
+    /// [`LeaseToken`] exists.
+    @available(added=26)
+    flexible AcquireWakeLease(struct {
+        /// The name of the lease.
+        ///
+        /// The name cannot be empty but is not required to be globally unique.
+        name string:MAX_ELEMENT_NAME_LEN;
+    }) -> (resource struct {
+        /// The token that blocks hardware platform suspension.
+        token LeaseToken;
+    }) error AcquireWakeLeaseError;
+
+
+    /// Creates an unmonitored lease that blocks suspension of the hardware platform.
+    ///
+    /// The hardware platform will not suspend as long as a valid
+    /// [`LeaseToken`] exists.
+    ///
+    /// This is intended for leases expected to be held for extended periods.
+    /// Unlike normal wake leases, the server does not monitor the duration
+    /// of an unmonitored wake lease and will not file a crash report if it exceeds
+    /// preconfigured alert thresholds.
+    @available(added=HEAD)
+    flexible AcquireUnmonitoredWakeLease(struct {
+        /// The name of the lease.
+        ///
+        /// The name cannot be empty but is not required to be globally unique.
+        name string:MAX_ELEMENT_NAME_LEN;
+    }) -> (resource struct {
+        /// The token that blocks hardware platform suspension.
+        token LeaseToken;
+    }) error AcquireWakeLeaseError;
+
+    /// Creates a lease that blocks suspension of the hardware platform.
+    /// WARNING: Suspension can only be considered blocked after the client
+    /// receives the response to this call. This means, for example, an
+    /// interrupt should only be ack'ed or a different wake lease dropped only
+    /// **after** getting an error-free response.
+    ///
+    /// The hardware platform will remain resumed until `server_token` observes
+    /// `PEER_CLOSED`, indicating all handles to the client side of the
+    /// `LeaseToken` are closed.
+    @available(added=HEAD)
+    flexible AcquireWakeLeaseWithToken(resource struct {
+        /// The name of the lease.
+        ///
+        /// The name cannot be empty but is not required to be globally unique.
+        name string:MAX_ELEMENT_NAME_LEN;
+
+        /// The server side of the token that blocks hardware platform
+        /// suspension. The caller should give out handles to the client side
+        /// of the `LeaseToken` which is peered to this `server_token`.
+        server_token LeaseToken;
+    }) -> () error AcquireWakeLeaseError;
+
+    /// Creates a lease that blocks the system from dropping below the Application
+    /// Activity 'Active' state. In particular, this blocks suspension of the
+    /// hardware platform.
+    ///
+    /// This method is _not_ safe to call during SuspendBlocker.BeforeSuspend.
+    ///
+    /// If an error occurs while creating a token for the activity lease, then the
+    /// channel to `ActivityGovernor` will be closed by the server and no
+    /// response will be returned.
+    @available(added=HEAD)
+    flexible TakeApplicationActivityLease(struct {
+        /// The name of the lease.
+        ///
+        /// The name is not required to be globally unique.
+        name string:fuchsia.power.broker.MAX_ELEMENT_NAME_LEN;
+    }) -> (resource struct {
+        /// The token that blocks application activity from dropping below the
+        /// 'Active' state.
+        token LeaseToken;
+    });
+
+    /// Registers a suspend blocker.
+    ///
+    /// On successful registration, a wake lease token is returned. This token
+    /// prevents hardware platform suspension while it exists. Clients are
+    /// expected to perform any initialization of the given `suspend_blocker`
+    /// server while holding this token. Additionally, this means the first call
+    /// `suspend_blocker` will get is `BeforeSuspend`.
+    ///
+    /// To unregister, close the `SuspendBlocker` channel.
+    ///
+    /// If any required field of the table is missing, the error
+    /// [`RegisterSuspendBlockerError.INVALID_ARGS`] is returned.
+    ///
+    /// If an error occurs while registering `suspend_blocker`, it will be
+    /// dropped, closing the channel.
+    @available(added=27)
+    flexible RegisterSuspendBlocker(resource table {
+        /// The client end of the SuspendBlocker service.
+        ///
+        /// Required.
+        1: suspend_blocker client_end:SuspendBlocker;
+        /// The name of the suspend blocker.
+        ///
+        /// Required.
+        ///
+        /// The name cannot be empty but is not required to be globally unique.
+        2: name string:MAX_ELEMENT_NAME_LEN;
+    }) -> (resource struct {
+        /// The token that blocks hardware platform suspension.
+        token LeaseToken;
+    }) error RegisterSuspendBlockerError;
+};
+
+/// A service for exposing execution state management capabilities.
+@available(added=HEAD)
+@discoverable
+open protocol ExecutionStateManager {
+    /// Gets the dependency token for the execution state power element. This will block if SAG
+    /// is not fully initialized.
+    flexible GetExecutionStateDependencyToken() -> (ExecutionState);
+
+    /// Adds a dependency from the Application Activity power element to the target
+    /// power element identified by [`dependency_token`] at [`power_level`].
+    /// Be aware of the following client-side conditions:
+    ///  - If SAG is not fully initialized, the call blocks until initialization is complete.
+    ///  - The call may block as required by `fuchsia.power.broker/ElementControl.AddDependency`,
+    ///    which at time of writing may call `fuchsia.power.ElementControl.SetLevel` on the
+    ///    associated power element.
+    flexible AddApplicationActivityDependency(resource table {
+        /// The dependency token representing the target power element of this dependency.
+        /// Required.
+        1: dependency_token fuchsia.power.broker.DependencyToken;
+        /// The power level of the target power element.
+        /// Required.
+        2: power_level fuchsia.power.broker.PowerLevel;
+    }) -> () error AddApplicationActivityDependencyError;
+};
+
+/// A service that processes notification about the system boot state.
+@discoverable
+open protocol BootControl {
+    /// Notify the SAG that the system has booted. SAG will not suspend the
+    /// hardware platform until this method is called at least once per boot.
+    flexible SetBootComplete() -> ();
+};
+
+/// A service that provides access to CPU-related power elements.
+@available(added=HEAD)
+@discoverable
+open protocol CpuElementManager {
+    /// Gets the assertive dependency token for the CPU power element.
+    flexible GetCpuDependencyToken() -> (Cpu);
+
+    /// Adds a dependency from the Execution State power element to the target
+    /// power element identified by [`dependency_token`] at [`power_level`].
+    ///
+    /// Once the Execution State power element is created, future calls will
+    /// return [`fuchsia.power.system/AddExecutionStateDependencyError.BAD_STATE`]
+    /// and no changes to Execution State dependencies will be made.
+    ///
+    /// If any required entries in the request are missing, the server will
+    /// return [`fuchsia.power.system/AddExecutionStateDependencyError.INVALID_ARGS`].
+    flexible AddExecutionStateDependency(resource table {
+        /// The assertive dependency token representing the target power element
+        /// of the dependency.
+        /// Required.
+        1: dependency_token fuchsia.power.broker.DependencyToken;
+        /// The power level of the target power element.
+        /// Required.
+        2: power_level fuchsia.power.broker.PowerLevel;
+    }) -> () error AddExecutionStateDependencyError;
+};

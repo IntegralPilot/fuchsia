@@ -1,0 +1,157 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_build_action.gni")
+
+# Get the host_tools_dir var, but don't expose it (or any other variables
+# or templates in host.gni) to any other files that import this one.
+_temp = {
+  import("//build/host.gni")
+}
+_host_tools_dir = _temp.host_tools_dir
+
+# bazel_host_tool() is a wrapper around bazel_build_action that provides
+# the tool_paths metadata that BUILDCONFIG.gn provides for GN executable
+# targets.
+#
+#
+# Params
+#  bazel_target: (label) the label of the bazel target to build
+#
+#  output_name: (string, optional) name of the output binary.
+#    Defaults to 'target_name'.
+#
+#  bazel_output_path: (path, required) see documentation for
+#     `<bazel_path>` in `bazel_build_action()`.
+#
+#  install_host_tool: (bool, optional) if true, the binary will also be
+#     copied to the `host_tools_dir` - see //build/host.gni.
+#
+#  All other bazel_build_action() inputs *except* 'copy_outputs'
+#     are forwarded to bazel_build_action().  The template creates
+#     the 'copy_outputs' list itself.
+#
+template("bazel_host_tool") {
+  # This needs to be called in a host toolchain, so that the outputs can be
+  # copied to the correct `root_out_dir` folder for variant toolchains.
+  assert(is_host, "bazel_host_tool() can only be called in a host toolchain.")
+
+  assert(!defined(invoker.copy_outputs),
+         "This template creates copy_outputs, don't provide it.")
+
+  if (defined(invoker.output_name)) {
+    _output_name = invoker.output_name
+  } else {
+    _output_name = target_name
+  }
+
+  if (current_toolchain == toolchain_variant.base) {
+    # If in the base toolchain, copy the Bazel outputs as normal. Variant
+    # toolchains need to be handled separately (see the else case below)
+
+    bazel_build_action(target_name) {
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "output_name",
+                               "bazel_output_path",
+                               "install_host_tool",
+
+                               # standard "deep-forwarded" params
+                               "testonly",
+                               "visibility",
+                             ])
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+
+      bazel_config = "host"
+
+      # We want to copy the binary to `//out/default/host_x64/my_tool` but
+      # the 'ninja_base_dir' defaults to `target_out_dir`, which is
+      # `//out/default/host_x64/some/path/`.
+      # Set `ninja_base_dir` to `root_build_dir` (ie, `//out/default`), so that
+      # here we can use an output path that's relative to the root of the build.
+      # This also allows us to install files in `host_tools_dir` if requested,
+      # which `root_out_dir` would not support.
+      ninja_base_dir = root_build_dir
+
+      # In base host toolchains, root *out* dir is always
+      # `//out/default/host_<arch>`.
+      _output_path = "${root_out_dir}/${_output_name}"
+
+      copy_outputs = [
+        {
+          bazel = invoker.bazel_output_path
+
+          # We want to copy the binary to `//out/default/host_x64/my_tool` but
+          # the default 'ninja_base_dir' is `//out/default/host_x64/some/path/`
+          # and so above we forcibly set the `ninja_base_dir` to
+          # `//out/default`, so that here we can use an output path that's
+          # relative to the root of the build.
+          ninja = rebase_path(_output_path, root_build_dir)
+        },
+      ]
+
+      # Add an additional copy in the host tools outdir if requested,
+      if (defined(invoker.install_host_tool) && invoker.install_host_tool &&
+          # but only in the "real" host toolchain.
+          current_toolchain == host_toolchain) {
+        copy_outputs += [
+          {
+            bazel = invoker.bazel_output_path
+
+            # The use of 'root_build_dir' as 'ninja_base_dir' is why we can
+            # also copy to the `host_tools_dir` here, as it's also able to
+            # be expressed relative to the root_build_dir.
+            ninja = rebase_path("${_host_tools_dir}/${_output_name}",
+                                root_build_dir)
+          },
+        ]
+      }
+
+      metadata = {
+        tool_paths = [
+          {
+            cpu = current_cpu
+            label = get_label_info(":${target_name}", "label_with_toolchain")
+            name = _output_name
+            os = current_os
+            path = rebase_path(_output_path, root_build_dir)
+          },
+        ]
+      }
+    }
+  } else {
+    # If in a variant toolchain, the expectation is to find the host binary
+    # in the _variant_'s toolchain outdir.  For non-Bazel targets, this is
+    # where they are compiled to, and then they're copied to the base
+    # toolchain location.  However, we need to do the opposite and copy it
+    # to the variant toolchain outdir.
+    #
+    # If `host_out_dir` would point at the non-variant path, then we could
+    # use that and avoid this copy.  Actions that are using `host_out_dir`
+    # to locate the binary for compiled_action() expect to find the
+    # binary at the variant path, so we need this copy.  If they used the
+    # copy in the non-variant location, then we could do a group with public
+    # deps here instead of the copy().
+
+    base_target = ":${target_name}(${toolchain_variant.base})"
+    base_target_outdir = get_label_info(base_target, "root_out_dir")
+    copy(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      sources = [ "${base_target_outdir}/${_output_name}" ]
+      outputs = [ "${root_out_dir}/{{source_file_part}}" ]
+      deps = [ base_target ]
+    }
+    not_needed(invoker, "*")
+    not_needed([ "_output_path" ])
+  }
+}

@@ -1,0 +1,419 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_inputs.gni")
+import("//build/compiled_action.gni")
+import("//build/group_with_inputs.gni")
+import("//build/info/info.gni")
+import("//build/python/python_action.gni")
+
+# Creates a Board Input Bundle, which provides packages and drivers to
+# assembly to provide support for some piece of hardware (such as a board, or a
+# peripheral used by multiple boards).
+#
+# NOTE: This template DOES NOT use GN metadata, all labels for packages must be
+# the actual target that creates the package.
+#
+# Parameters
+#
+#  Main Board Input Bundle
+#
+#   drivers (optional)
+#     [list, GN scopes] A list of GN scopes that hold the driver packages to
+#     include. Packages listed will be included automatically in the specified
+#     package set.
+#
+#     The scope must have the following fields:
+#      - `package_target` pointing to the GN target of the fuchsia_package
+#      - `package_set` naming the appropriate set for the package, which is one
+#         of the following:
+#           - base
+#           - bootfs
+#      - `driver_components` containing a list of relative paths to driver
+#        components provided by the package, e.g. "meta/driver.cm"
+#
+#     Example:
+#
+#     {
+#       package_target = "//path/to/package:target"
+#       package_set = "base"
+#       driver_components = [ "meta/my_driver" ]
+#     }
+#
+#  base_packages, bootfs_packages
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the base or bootfs package set (respectively).
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a package target, it will cause an error
+#    like:
+#      "no dependency provides the input <package_name>/package_manifest.json"
+#
+#  bootfs_or_base_packages
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to include
+#    in the bootfs_or_base package set, which means the package will go in the
+#    base package set if the product has it, or bootfs if not. Products with the
+#    `standard` or `utility` feature set have base packages while `embeddable`
+#    or `bootstrap` do not.
+#
+#  kernel_cmdline (optional: default: [])
+#    [list of strings] Kernel cmdline arguments.
+#
+#  configuration (optional: default: {})
+#    [GN scope] A scope of fields of configuration files provided by this board
+#    input bundle.  All are optional.
+#
+#    Fields:
+#    - cpu_manager: configuration for the cpu_manager system.
+#    - power_manager: configuration for the power_manager system.
+#    - power_metrics_recorder: configuration for power_metrics_recorder system.
+#    - system_power_mode: configuration of the system power modes.
+#    - thermal: configuration of the thermal management system.
+#    - energy_model: configuration of the energy model for processor power
+#      management.
+#    - thread_roles: files defining thread roles
+#    - sysmem_format_costs: configuration of format costs for sysmem. This is a
+#      list of build targets. Each outputs a .format_costs_persistent_fidl
+#      file (one file per target). These targets are compiled_action(s) with an
+#      output filename of the form
+#      {target_out_dir}/{target_name}.format_costs_persistent_fidl.
+#
+#  include_in (optional; default=all)
+#    [string] Which build types to include this BIB.
+#    Options: all, eng, user_and_userdebug
+#
+#  version (optional)
+#    [string] String representing the release version for this board config.
+#    Either this field or "version_file" must be set.
+#
+#  version_file (optional)
+#    [string] Path to a file containing the release version for this config.
+#    Either this field or "version" must be set.
+#
+#  Outputs
+#    A directory structure and manifest
+#
+#   manifest path:
+#     $target_out_dir/$target_name/board_input_bundle.json
+#
+# GN usual meanings
+#  testonly, visibility
+#
+template("board_input_bundle") {
+  labels = {
+    main_target = target_name
+
+    driver_packages = "${target_name}.driver_packages"
+    driver_packages_list = "${target_name}.driver_packages.list"
+
+    bazel_inputs = "${target_name}.bazel_inputs"
+  }
+
+  files = {
+    # The directory where the board input bundle contents are written to.
+    bundle_dir = "${target_out_dir}/${target_name}"
+
+    # The "official" output
+    bundle_file = "${bundle_dir}/board_input_bundle.json"
+
+    # The files that we create as book-keeping between our tasks.
+    depfile = "${target_out_dir}/${target_name}.d"
+
+    # Intermediate Files
+    _gen_files = "${target_gen_dir}/${target_name}"
+    driver_packages_list = "${_gen_files}.driver_packages.list"
+  }
+
+  creation_deps = []
+  creation_inputs = []
+  creation_args = []
+
+  include_in = "all"
+  if (defined(invoker.include_in)) {
+    include_in = invoker.include_in
+  }
+  creation_args += [
+    "--include-in",
+    include_in,
+  ]
+
+  assert(
+      defined(invoker.version) || defined(invoker.version_file),
+      "board_input_bundle(\"target_name\") must define `version` or `version_file`")
+  if (defined(invoker.version) && invoker.version != "") {
+    creation_args += [
+      "--version",
+      invoker.version,
+    ]
+  }
+  if (defined(invoker.version_file) && invoker.version_file != "") {
+    creation_inputs += [ invoker.version_file ]
+    creation_args += [
+      "--version-file",
+      rebase_path(invoker.version_file, root_build_dir),
+    ]
+  }
+
+  creation_args += [
+    "--repo",
+    "fuchsia",
+  ]
+
+  # Iterate over any provided drivers, and add them to the bundle, validating
+  # that they are package targets using a group_with_inputs().
+  #
+  if (defined(invoker.drivers) && invoker.drivers != []) {
+    # The list of package dependencies
+    _package_targets = []
+
+    # The driver manifest entries for creating the bundle with
+    _manifest_entries = []
+
+    # The list of package manifest files, for validating that the package
+    # targets are all actually package targets.
+    _package_manifests = []
+
+    foreach(details, invoker.drivers) {
+      assert(defined(details.package_target),
+             "A target must be defined for each driver package.")
+      assert(defined(details.package_set),
+             "A package set to place the driver in must be specified.")
+      assert(defined(details.driver_components),
+             "driver_components must be specified for driver targets")
+
+      # add the label to the list of package labels to use as dependencies
+      _package_targets += [ details.package_target ]
+
+      # calculate the path to the package manifest for this label
+      _package_out_dir =
+          get_label_info(details.package_target, "target_out_dir")
+      _package_name = get_label_info(details.package_target, "name")
+      _manifest_path =
+          "${_package_out_dir}/${_package_name}/package_manifest.json"
+      _package_manifests += [ _manifest_path ]
+
+      _manifest_path_rebased = rebase_path(_manifest_path, root_build_dir)
+
+      # This needs to match the 'DriverInformation' struct defined in:
+      # //src/developer/ffx/plugins/assembly/src/operations/board.rs
+      # LINT.IfChange
+      _manifest_entries += [
+        {
+          package = _manifest_path_rebased
+          set = details.package_set
+          components = details.driver_components
+        },
+        # LINT.ThenChange(//src/developer/ffx/plugins/assembly/src/operations/board.rs)
+      ]
+    }
+
+    group_with_inputs(labels.driver_packages) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":${labels.driver_packages_list}" ]
+      inputs = _package_manifests
+      deps = _package_targets
+    }
+
+    # Generate the list of driver packages, for handing off to the board input
+    # bundle creator
+    generated_file(labels.driver_packages_list) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":${labels.main_target}" ]
+
+      deps = [ ":${labels.driver_packages}" ]
+
+      outputs = [ files.driver_packages_list ]
+      output_conversion = "json"
+
+      # This needs to match the 'DriversHelper' struct defined in:
+      # //src/developer/ffx/plugins/assembly/src/operations/board.rs
+      # LINT.IfChange
+      contents = {
+        drivers = _manifest_entries
+      }
+
+      # LINT.ThenChange(//src/developer/ffx/plugins/assembly/src/operations/board.rs)
+    }
+    creation_deps += [ ":${labels.driver_packages_list}" ]
+    creation_inputs += [ files.driver_packages_list ]
+    creation_args += [
+      "--drivers",
+      rebase_path(files.driver_packages_list, root_build_dir),
+    ]
+  }
+
+  foreach(package_set,
+          [
+            "base_packages",
+            "bootfs_packages",
+            "bootfs_or_base_packages",
+          ]) {
+    if (defined(invoker[package_set])) {
+      # The list of package manifest files, for validating that the package
+      # targets are all actually package targets.
+      _package_manifests = []
+
+      # Calculate the path to the package manifest for each label
+      foreach(package, invoker[package_set]) {
+        _package_out_dir = get_label_info(package, "target_out_dir")
+        _package_name = get_label_info(package, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+        _package_manifests += [ _manifest_path ]
+      }
+
+      # Create a group that depends on each package-creating label, and lists
+      # each computed package manifest path as an input file.  This allows the
+      # template to enforce that the labels used are instantiations of the
+      # `fuchsia_package()` template.
+      group_with_inputs("${target_name}.${package_set}") {
+        forward_variables_from(invoker, [ "testonly" ])
+        visibility = [ ":${labels.main_target}" ]
+        deps = invoker[package_set]
+        inputs = _package_manifests
+      }
+
+      # Add the group to the deps of the bundle.
+      creation_deps += [ ":${target_name}.${package_set}" ]
+
+      # Add all the package manifests to the creation args.
+      foreach(_package_manifest, _package_manifests) {
+        creation_args += [
+          string_replace("--${package_set}", "_", "-"),
+          rebase_path(_package_manifest, root_build_dir),
+        ]
+      }
+
+      # Because of a bug in GN, where using `invoker[package_set]` doesn't mark
+      # invoker.base_packages (etc.) as having been used...
+      not_needed(invoker, [ package_set ])
+    }
+  }
+
+  # Add any kernel boot arguments that the input bundle needs to pass to
+  # configure the drivers being used.
+  if (defined(invoker.kernel_cmdline)) {
+    foreach(kernel_arg, invoker.kernel_cmdline) {
+      creation_args += [
+        "--kernel-boot-args",
+        kernel_arg,
+      ]
+    }
+  }
+
+  # If configuration files for platform subsystems have been provided, then
+  # add them to the creation inputs and args.
+  if (defined(invoker.configuration)) {
+    configuration = invoker.configuration
+
+    if (defined(configuration.cpu_manager)) {
+      creation_inputs += [ configuration.cpu_manager ]
+      creation_args += [
+        "--cpu-manager-config",
+        rebase_path(configuration.cpu_manager, root_build_dir),
+      ]
+    }
+
+    if (defined(configuration.energy_model)) {
+      creation_inputs += [ configuration.energy_model ]
+      creation_args += [
+        "--energy-model-config",
+        rebase_path(configuration.energy_model, root_build_dir),
+      ]
+    }
+
+    if (defined(configuration.power_manager)) {
+      creation_inputs += [ configuration.power_manager ]
+      creation_args += [
+        "--power-manager-config",
+        rebase_path(configuration.power_manager, root_build_dir),
+      ]
+    }
+
+    if (defined(configuration.power_metrics_recorder)) {
+      creation_inputs += [ configuration.power_metrics_recorder ]
+      creation_args += [
+        "--power-metrics-recorder-config",
+        rebase_path(configuration.power_metrics_recorder, root_build_dir),
+      ]
+    }
+
+    if (defined(configuration.system_power_mode)) {
+      creation_inputs += [ configuration.system_power_mode ]
+      creation_args += [
+        "--system-power-mode-config",
+        rebase_path(configuration.system_power_mode, root_build_dir),
+      ]
+    }
+
+    if (defined(configuration.thermal)) {
+      creation_inputs += [ configuration.thermal ]
+      creation_args += [
+        "--thermal-config",
+        rebase_path(configuration.thermal, root_build_dir),
+      ]
+    }
+
+    if (defined(configuration.thread_roles)) {
+      creation_inputs += configuration.thread_roles
+      foreach(thread_roles_file, configuration.thread_roles) {
+        creation_args += [
+          "--thread-roles",
+          rebase_path(thread_roles_file, root_build_dir),
+        ]
+      }
+    }
+
+    if (defined(configuration.sysmem_format_costs)) {
+      foreach(format_costs_target, configuration.sysmem_format_costs) {
+        _format_costs_persistent_fidl =
+            get_label_info(format_costs_target, "target_out_dir") + "/" +
+            get_label_info(format_costs_target, "name") +
+            ".format_costs_persistent_fidl"
+        creation_deps += [ format_costs_target ]
+        creation_inputs += [ _format_costs_persistent_fidl ]
+        creation_args += [
+          "--sysmem-format-costs-config",
+          rebase_path(_format_costs_persistent_fidl, root_build_dir),
+        ]
+      }
+    }
+  }
+
+  compiled_action(labels.main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    tool = "//build/assembly/tools/assembly_config"
+    tool_output_name = "assembly_config"
+
+    # The contents of these folders are dynamic, and managed entirely by this
+    # action.  Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    hermetic_action_ignored_prefixes = [ "${files.bundle_dir}" ]
+
+    inputs = creation_inputs
+    outputs = [ files.bundle_file ]
+    depfile = files.depfile
+    deps = creation_deps
+    args = [
+             "generate",
+             "board-input-bundle",
+             "--name",
+             target_name,
+             "--output",
+             rebase_path(files.bundle_dir, root_build_dir),
+             "--depfile",
+             rebase_path(depfile, root_build_dir),
+           ] + creation_args
+  }
+
+  bazel_input_directory(labels.bazel_inputs) {
+    generator = ":${labels.main_target}"
+    output_directory = files.bundle_dir
+  }
+}

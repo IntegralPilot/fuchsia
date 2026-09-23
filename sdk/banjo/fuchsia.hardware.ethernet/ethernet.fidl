@@ -1,0 +1,175 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.ethernet;
+
+using zx;
+
+const ETH_MAC_SIZE uint32 = 6; // bytes
+const ETH_MTU_SIZE uint32 = 1500; // bytes
+const ETH_FRAME_MAX_HDR_SIZE uint32 = 18; // bytes. MAC Dest(6) + MAC Src(6) + 802.1Q tag(4) + Ethertype(2)
+const ETH_FRAME_MAX_SIZE uint32 = 1518;
+
+/// The ethernet interface supports both synchronous and asynchronous transmissions using the
+/// proto->queue_tx() and ifc->complete_tx() methods.
+///
+/// Receive operations are supported with the ifc->recv() interface.
+///
+/// The FEATURE_WLAN flag indicates a device that supports wlan operations.
+///
+/// The FEATURE_SYNTH flag indicates a device that is not backed by hardware.
+///
+/// The FEATURE_DMA flag indicates that the device can copy the buffer data using DMA and will ensure
+/// that physical addresses are provided in netbufs.
+///
+/// The FEATURE_WLAN_AP flag indicates a device operating in wlan SoftAP mode.
+/// When FEATURE_WLAN_AP is enabled, the FEATURE_WLAN flag is ignored and
+/// assumed to be on.
+// TODO: implement netbuf-based receive operations by implementing proto->queue_rx() and
+// ifc->complete_rx()
+type EthernetFeature = strict enum : uint32 {
+    WLAN = 0x1;
+    SYNTH = 0x2;
+    DMA = 0x4;
+    WLAN_AP = 0x8;
+};
+
+const ETHERNET_STATUS_ONLINE uint32 = 0x1;
+
+type EthernetInfo = struct {
+    features uint32;
+    mtu uint32;
+    mac array<uint8, ETH_MAC_SIZE>;
+    reserved0 array<uint8, 2>;
+    netbuf_size uint64;
+    reserved1 array<uint32, 2>;
+};
+
+/// Note that this struct may have a private section encoded after it. Allocator much call parent
+/// device's |Query| to get the correct size.
+type EthernetNetbuf = struct {
+    /// Provided by the generic ethernet driver.
+    @buffer
+    data vector<uint8>:MAX;
+    /// Only used if ETHERNET_FEATURE_DMA is available.
+    phys uint64;
+    reserved uint16;
+    flags uint32;
+};
+
+@transport("Banjo")
+@banjo_layout("ddk-interface")
+closed protocol EthernetIfc {
+    /// Value with bits set from the |ETHERNET_STATUS_*| flags
+    strict Status(struct {
+        status uint32;
+    }) -> ();
+
+    strict Recv(struct {
+        @buffer
+        data vector<uint8>:MAX;
+        flags uint32;
+    }) -> ();
+};
+
+/// Indicates that additional data is available to be sent after this call finishes. Allows an ethernet
+/// driver to batch tx to hardware if possible.
+const ETHERNET_TX_OPT_MORE uint32 = 1;
+
+/// SETPARAM_ values identify the parameter to set. Each call to set_param()
+/// takes an int32_t |value| and uint8_t* |data| which have meaning specific to
+/// the parameter being set.
+///
+/// |value| is bool. |data| is unused.
+const ETHERNET_SETPARAM_PROMISC uint32 = 1;
+
+/// |value| is bool. |data| is unused.
+const ETHERNET_SETPARAM_MULTICAST_PROMISC uint32 = 2;
+
+const ETHERNET_MULTICAST_FILTER_OVERFLOW int32 = -1;
+
+/// |value| is number of addresses, or ETHERNET_MULTICAST_FILTER_OVERFLOW for "too many to count."
+/// |data| is |value|*6 bytes of MAC addresses. Caller retains ownership.
+/// If |value| is _OVERFLOW, |data| is ignored.
+const ETHERNET_SETPARAM_MULTICAST_FILTER uint32 = 3;
+
+const ETHERNET_SETPARAM_DUMP_REGS uint32 = 4;
+
+/// The ethernet midlayer will never call ethermac_protocol
+/// methods from multiple threads simultaneously, but it
+/// can call send() methods at the same time as non-send
+/// methods.
+@transport("Banjo")
+@banjo_layout("ddk-protocol")
+closed protocol EthernetImpl {
+    /// Obtain information about the ethermac device and supported features
+    /// Safe to call at any time.
+    strict Query(struct {
+        options uint32;
+    }) -> (struct {
+        s zx.Status;
+        info EthernetInfo;
+    });
+
+    /// Shut down a running ethermac
+    /// Safe to call if the ethermac is already stopped.
+    strict Stop() -> ();
+
+    /// Start ethermac running with ifc_virt
+    /// Callbacks on ifc may be invoked from now until stop() is called
+    strict Start(resource struct {
+        ifc client_end:EthernetIfc;
+    }) -> (struct {
+        s zx.Status;
+    });
+
+    /// Request transmission of the packet in netbuf. The driver takes ownership of the netbuf and
+    /// must call the completion callback passed in to return it once the enqueue is complete.
+    /// The callback may be used to return the packet before transmission itself completes, and may
+    /// called from within the queue_tx() implementation itself.
+    ///
+    /// |QueueTx| may be called at any time after start() is called including from multiple threads
+    /// simultaneously.
+    ///
+    /// Return status indicates queue state:
+    ///   ZX_OK: Packet has been enqueued.
+    ///   Other: Packet could not be enqueued.
+    /// Upon a return of ZX_OK, the packet has been enqueued, but no information is returned as to
+    /// the completion state of the transmission itself.
+    @async
+    strict QueueTx(struct {
+        options uint32;
+        @in_out
+        netbuf EthernetNetbuf;
+    }) -> (struct {
+        status zx.Status;
+        @mutable
+        netbuf EthernetNetbuf;
+    });
+
+    /// Request a settings change for the driver. Return status indicates disposition:
+    ///   ZX_OK: Request has been handled.
+    ///   ZX_ERR_NOT_SUPPORTED: Driver does not support this setting.
+    ///   Other: Error trying to support this request.
+    ///
+    /// |value| and |data| usage are defined for each |param|; see comments above.
+    ///
+    /// set_param() may be called at any time after start() is called including from multiple threads
+    /// simultaneously.
+    strict SetParam(struct {
+        param uint32;
+        value int32;
+        @buffer
+        data vector<uint8>:MAX;
+    }) -> (struct {
+        s zx.Status;
+    });
+
+    /// Get the BTI handle (needed to pin DMA memory) for this device.
+    /// This method is only valid on devices that advertise ETHERNET_FEATURE_DMA
+    /// The caller takes ownership of the BTI handle.
+    strict GetBti() -> (resource struct {
+        bti zx.Handle:BTI;
+    });
+};

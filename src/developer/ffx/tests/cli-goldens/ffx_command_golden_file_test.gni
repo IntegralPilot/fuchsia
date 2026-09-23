@@ -1,0 +1,146 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/testing/golden_files.gni")
+
+template("ffx_command_golden_file_test") {
+  # golden file comparison to make sure the list of golden files
+  # matches the expected output of the golden file generation.
+
+  command_name = invoker.command_name
+  golden_processor_tool = invoker.golden_processor_tool
+  if (defined(invoker.visible_label)) {
+    _visible_label = invoker.visible_label
+  }
+
+  visibility = [ ":*" ]
+  if (defined(invoker.visibility)) {
+    visibility += invoker.visibility
+  }
+
+  _deps = [
+    "//src/developer/ffx:ffx_build_dir_config_file($default_toolchain)",
+    "//src/developer/ffx:host(//build/toolchain:host_x64)",
+  ]
+  if (defined(invoker.deps)) {
+    _deps += invoker.deps
+  }
+
+  assert(
+      defined(invoker.golden_source_dir),
+      "golden_source_dir is required as the path to the golden files checked in.")
+  golden_source_dir = invoker.golden_source_dir
+
+  _ffx_path = invoker.ffx_path
+  _tool_list = invoker.tool_list
+  _golden_dir = "${target_out_dir}/goldens"
+  _golden_filelist = "${golden_source_dir}/${command_name}_filelist.txt"
+  _candidate_filelist = "${_golden_dir}/${command_name}_filelist.txt"
+  _comparisons_file = "${_golden_dir}/${command_name}_comparisons.json"
+  _name = target_name
+
+  golden_files("${_name}-manifest") {
+    testonly = true
+    if (defined(_visible_label)) {
+      visible_label = _visible_label
+    }
+    comparisons = [
+      {
+        golden = _golden_filelist
+        candidate = _candidate_filelist
+      },
+    ]
+    deps = [ ":describe_ffx_${command_name}_cli_goldens" ] + _deps
+  }
+
+  compiled_action("describe_ffx_${command_name}_cli_goldens") {
+    testonly = true
+    depfile = "${target_out_dir}/$target_name.d"
+    inputs = [
+      "$root_build_dir/ffx-config.json",
+      _ffx_path,
+      _tool_list,
+    ]
+
+    # Avoid using the host tool coming from previous builds.
+    can_use_previously_built_tool = false
+    tool = golden_processor_tool
+
+    outputs = [
+      _comparisons_file,
+      _candidate_filelist,
+    ]
+    args = [
+      "--describe-only",
+      "--out-dir",
+      rebase_path(_golden_dir, root_build_dir),
+      "--golden-file-list",
+      rebase_path(_candidate_filelist, root_build_dir),
+      "--base-golden-src-dir",
+      rebase_path(golden_source_dir, "//"),
+      "--gen-comparisons",
+      rebase_path(_comparisons_file, root_build_dir),
+      "--filter-command",
+      command_name,
+      "--ffx-path",
+      rebase_path(_ffx_path, root_build_dir),
+      "--tool-list",
+      rebase_path(_tool_list, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+    deps = _deps
+  }
+
+  compiled_action("invoke_ffx_${command_name}_cli_goldens") {
+    testonly = true
+    depfile = "${target_out_dir}/$target_name.d"
+    inputs = [
+      "$root_build_dir/ffx-config.json",
+      _ffx_path,
+      _tool_list,
+    ]
+
+    # Avoid using prebuilt versions of the host
+    # tool coming from previous builds.
+    can_use_previously_built_tool = false
+    tool = golden_processor_tool
+    outputs = []
+    _golden_filename_list = read_file(_golden_filelist, "list lines")
+    foreach(f, _golden_filename_list) {
+      outputs += [ "${_golden_dir}/${f}" ]
+    }
+
+    args = [
+      "--out-dir",
+      rebase_path(_golden_dir, root_build_dir),
+      "--filter-command",
+      command_name,
+      "--ffx-path",
+      rebase_path(_ffx_path, root_build_dir),
+      "--tool-list",
+      rebase_path(_tool_list, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+
+    deps = [
+             ":${_name}-manifest",
+             ":describe_ffx_${command_name}_cli_goldens",
+           ] + _deps
+  }
+
+  golden_files(target_name) {
+    testonly = true
+    if (defined(_visible_label)) {
+      visible_label = _visible_label
+    }
+    comparisons = _comparisons_file
+    deps = [
+             ":describe_ffx_${command_name}_cli_goldens",
+             ":invoke_ffx_${command_name}_cli_goldens($host_toolchain)",
+           ] + _deps
+  }
+}

@@ -1,0 +1,152 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/compiler.gni")
+import("//build/host.gni")
+import("//build/python/python_host_test.gni")
+import("//build/python/python_library.gni")
+import("//build/test.gni")
+import("//build/testing/environments.gni")
+import("//build/testing/symbols_dir_test_data.gni")
+import("//src/developer/ffx/config.gni")
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":dap_framework_test($host_toolchain)",
+    ":dap_symbol_unittest($host_toolchain)",
+  ]
+}
+
+group("e2e_tests") {
+  testonly = true
+
+  # TODO(https://fxbug.dev/42074048): Remove riscv64 exclusion when debug_agent is ported.
+  # dap_integration_test depends on debug_agent, which is empty on riscv64.
+  # Even if unreachable, python_host_test generates validation actions that run
+  # at `gn gen` time and fail if dependencies are missing.
+  if (has_board && target_cpu != "riscv64") {
+    deps = [ ":dap_integration_test($host_toolchain)" ]
+  }
+}
+
+if (is_host) {
+  python_library("dap_test_framework") {
+    library_name = "dap_test_framework"
+    sources = [
+      "__init__.py",
+      "dap_test_framework.py",
+    ]
+    deps = [
+      "//scripts/lib/async_utils",
+      "//scripts/lib/ffx_cmd",
+      "//src/lib/debug/dap/python:lib",
+      "//src/lib/debug/dap/python/zxdb:zxdb_dap",
+      "//third_party/python_portpicker:portpicker",
+    ]
+  }
+
+  python_host_test("dap_framework_test") {
+    main_source = "tests/dap_framework_test.py"
+    deps = [
+      ":dap_test_framework",
+      "//prebuilt/third_party/pydantic-core:test_data",
+      "//src/lib/debug/dap/python:lib",
+    ]
+  }
+}
+
+if (is_host && has_board) {
+  # DAP_E2E_TESTS_SYMBOL_DIR describes the relative path from $root_out_dir
+  # (where host binaries like zxdb live) to the symbol directory.
+  DAP_E2E_TESTS_SYMBOL_DIR = "test_data/dap_e2e_tests/build-id"
+
+  symbols_dir_test_data("dap_e2e_symbols") {
+    output_dir = "$root_out_dir/$DAP_E2E_TESTS_SYMBOL_DIR"
+    deps = [
+      "//src/developer/debug/e2e_tests/inferiors:zxdb_e2e_inferiors($target_toolchain)",
+      "//src/developer/forensics/crasher:crasher($target_toolchain)",
+      "//src/developer/forensics/crasher:crasher_test($target_toolchain)",
+    ]
+  }
+
+  test("dap_symbol_unittest") {
+    sources = [ "symbol_unittest.cc" ]
+    defines = [
+      # C++ test binaries use $root_out_dir/DAP_E2E_TESTS_SYMBOL_DIR at runtime
+      # to locate symbol files.
+      "DAP_E2E_TESTS_SYMBOL_DIR=\"" + DAP_E2E_TESTS_SYMBOL_DIR + "\"",
+    ]
+    deps = [
+      ":dap_e2e_symbols(${toolchain_variant.base})",
+      "//src/developer/debug/zxdb/common",
+      "//src/developer/debug/zxdb/symbols",
+      "//src/lib/fxl/test:gtest_main",
+      "//third_party/googletest:gtest",
+    ]
+  }
+
+  host_test_data("zxdb_test_data") {
+    testonly = true
+    deps = [ "//src/developer/debug/zxdb:zxdb_host_tool" ]
+    sources = [ "${host_tools_dir}/zxdb" ]
+  }
+
+  if (target_cpu != "riscv64") {
+    python_host_test("dap_integration_test") {
+      main_source = "dap_integration_test.py"
+      main_callable = "main"
+      environments = all_fuchsia_envs
+
+      # Most host tools don't support arm64.
+      if (board_name == "arm64" || board_name == "qemu-arm64") {
+        environments -= [ emu_env ]
+      }
+      package_deps = [
+        "//src/developer/debug/debug_agent",
+        "//src/developer/debug/e2e_tests/inferiors:zxdb_e2e_inferiors",
+        "//src/developer/forensics/crasher",
+        "//src/developer/forensics/crasher:crasher_test",
+      ]
+      deps = [
+        ":dap_test_framework",
+        "//scripts/lib/ffx_cmd",
+        "//scripts/lib/package_server",
+        "//src/lib/debug/dap/python:lib",
+      ]
+
+      # dap_test_framework.py uses root_build_dir / <relative-path> to locate
+      # dependencies.
+      _ffx_test_data_path =
+          rebase_path(ffx_test_host_tools_out_dir, root_build_dir)
+      _dap_e2e_tests_symbol_path =
+          rebase_path("$root_out_dir/$DAP_E2E_TESTS_SYMBOL_DIR", root_build_dir)
+
+      _is_lto = select_variant + [ "lto" ] - [ "lto" ] != select_variant
+      _is_thinlto =
+          select_variant + [ "thinlto" ] - [ "thinlto" ] != select_variant
+
+      build_type =
+          "optimize=$optimize:target_cpu=$target_cpu:is_lto=$_is_lto:" +
+          "is_thinlto=$_is_thinlto:is_asan=$is_asan:is_coverage=$is_coverage"
+
+      extra_args = [
+        "--DAP_E2E_TESTS_FFX_TEST_DATA",
+        _ffx_test_data_path,
+        "--DAP_E2E_TESTS_SYMBOL_DIR",
+        _dap_e2e_tests_symbol_path,
+        "--DAP_E2E_TESTS_BUILD_TYPE",
+        build_type,
+      ]
+
+      test_data_deps = [
+        ":dap_e2e_symbols",
+        ":zxdb_test_data",
+        "//prebuilt/third_party/pydantic-core:test_data",
+        "//src/developer/ffx:test_data",
+        "//src/developer/ffx/plugins/debug:ffx_debug_plugin_tool_test_data",
+      ]
+    }
+  }
+}

@@ -1,0 +1,44 @@
+// Copyright 2019 The Fuchsia Authors
+//
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT
+
+#include <new>
+
+// Placement new operators are inlined in the <new> header.
+// No linkage definitions are required.
+// Vanilla allocating new operators are not allowed in the kernel.
+// AllocChecker new operators are defined in <fbl/alloc_checker.h>.
+
+#include <cstdlib>
+
+void operator delete(void* p) { free(p); }
+
+void operator delete[](void* p) { free(p); }
+
+void operator delete(void* p, size_t s) { sized_free(p, s); }
+
+void operator delete[](void* p, size_t s) { sized_free(p, s); }
+
+void operator delete(void* p, std::align_val_t align) { free(p); }
+
+void operator delete[](void* p, std::align_val_t align) { free(p); }
+
+void operator delete(void* p, std::size_t s, std::align_val_t align) { sized_free(p, s); }
+
+void operator delete[](void* p, std::size_t s, std::align_val_t align) { sized_free(p, s); }
+
+// These are the mangled names of all the functions above.  Because these
+// functions are magical in the language, the compiler insists on making
+// default-visibility definitions regardless of all the ways to tell it to use
+// hidden visibility.  So there is nothing left but to go around the compiler's
+// back and force them to .hidden via assembler directives.
+__asm__(".hidden _ZdaPv");
+__asm__(".hidden _ZdaPvm");
+__asm__(".hidden _ZdlPv");
+__asm__(".hidden _ZdlPvm");
+__asm__(".hidden _ZdlPvSt11align_val_t");
+__asm__(".hidden _ZdaPvSt11align_val_t");
+__asm__(".hidden _ZdlPvmSt11align_val_t");
+__asm__(".hidden _ZdaPvmSt11align_val_t");

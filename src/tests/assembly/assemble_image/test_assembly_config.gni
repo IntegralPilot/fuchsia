@@ -1,0 +1,215 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/product_assembly_configuration.gni")
+import("//build/python/python_action.gni")
+import("//build/python/python_binary.gni")
+import("//build/testing/host_test.gni")
+
+# Runs ffx assembly with the given parameters as an integration test
+#
+# Arguments
+#   base_packages (optional)
+#     [list of labels] The packages to include in the base package set.
+#
+#   additional_args (optional)
+#     [list of string arguments] Additional arguments to pass to the test runner
+#
+#   additional_deps (optional)
+#     [list of labels] config files or other generated inputs to be used by assembly
+#
+#   platform (optional)
+#     contents of the product assembly config platform configuration.
+#     Passed through to the product_assembly_configuration() template
+#
+#   product (optional)
+#     contents of the product assembly config product configuration.
+#     Passed through to the product_assembly_configuration() template
+#
+#   base_driver_package (optional)
+#     [list, GN scopes] A list of GN scopes containing base driver packages.
+#     Passed through to the product_assembly_configuration() template.
+#     See the documentation for product_assembly_configuration().
+#
+template("test_assembly_config") {
+  base_packages_param = []
+  if (defined(invoker.base_packages)) {
+    base_packages_param += invoker.base_packages
+  }
+
+  additional_args_param = []
+  if (defined(invoker.additional_args)) {
+    additional_args_param += invoker.additional_args
+  }
+
+  additional_deps_param = []
+  if (defined(invoker.additional_deps)) {
+    additional_deps_param += invoker.additional_deps
+  }
+
+  labels = {
+    ffx_tool = "//src/developer/ffx/plugins/assembly:ffx_assembly_tool_versioned($host_toolchain)"
+  }
+
+  files = {
+    ffx_tool = get_label_info(labels.ffx_tool, "root_out_dir") + "/ffx-assembly"
+  }
+
+  if (is_host) {
+    # These are all evaluated only in the host toolchain
+
+    group("${target_name}") {
+      forward_variables_from(invoker, [ "deps" ])
+      if (!defined(deps)) {
+        deps = []
+      }
+      testonly = true
+      deps += [
+        # Assembly should only be performed in the default toolchain, so depend
+        # on that task in the default toolchain.
+        ":${target_name}($default_toolchain)",
+      ]
+    }
+
+    # The binary needs to be in the host toolchain.
+    python_binary("bin") {
+      testonly = true
+      main_source =
+          "//src/tests/assembly/assemble_image/test_assembled_config.py"
+      sources = []
+      deps = [ "//src/tests/assembly/lib/run_assembly" ]
+    }
+
+    not_needed([
+                 # When this test is moved to a host_test(), these will then be
+                 # used.
+                 "files",
+                 "labels",
+
+                 # Args which are used in the is_fuchsia section
+                 "base_packages_param",
+                 "additional_deps_param",
+                 "additional_args_param",
+                 "config_json_param",
+               ])
+    not_needed(invoker,
+               [
+                 "product",
+                 "platform",
+                 "base_driver_packages",
+               ])
+  }
+
+  if (is_fuchsia) {
+    fuchsia_labels = {
+      board_config = "${target_name}.board_config"
+    }
+    fuchsia_files = {
+      assembly_config = "${target_out_dir}/${target_name}_product_config/product_assembly_config"
+      assembly_config_file = "${assembly_config}/product_configuration.json"
+      board_config = "${target_out_dir}/${target_name}_board"
+      board_config_file = "${board_config}/board_configuration.json"
+    }
+
+    generated_file(fuchsia_labels.board_config) {
+      outputs = [ fuchsia_files.board_config_file ]
+      output_conversion = "json"
+      contents = {
+        name = "test board"
+        arch = "x64"
+        provided_features = []
+        release_info = {
+          info = {
+            name = "test board"
+            repository = "test repository"
+            version = "test version"
+          }
+          bib_sets = []
+        }
+      }
+    }
+
+    product_config_label = "${target_name}_product_config"
+    product_assembly_configuration(product_config_label) {
+      testonly = true
+      forward_variables_from(invoker,
+                             [
+                               "product",
+                               "platform",
+                               "base_driver_packages",
+                             ])
+      if (base_packages_param != []) {
+        base_packages = []
+        foreach(package, base_packages_param) {
+          base_packages += [
+            {
+              package_target = package
+            },
+          ]
+        }
+      }
+    }
+
+    # This is an action rather than a host test because enumerating all the
+    # inputs to assembly for the host_test_data() template is very difficult
+    # right now.
+    # TODO(https://fxbug.dev/42179042) archive the AIB into a tgz for host_test_data()
+    #
+    # NOTE:  This action should only occur in the target toolchain, not in the
+    # host toolchain.
+    stamp = "$target_out_dir/test_assembled_config.passed"
+    platform_bundles_target = "//bundles/assembly:platform($default_toolchain)"
+
+    platform_bundles_dir =
+        get_label_info(platform_bundles_target, "target_out_dir") + "/" +
+        get_label_info(platform_bundles_target, "name") + "/platform_artifacts"
+    outdir = "$target_out_dir/outdir"
+    gendir = "$target_out_dir/gendir"
+    image_assembly_config = "$outdir/image_assembly.json"
+    python_action(target_name) {
+      forward_variables_from(invoker, [ "deps" ])
+      if (!defined(deps)) {
+        deps = []
+      }
+      testonly = true
+
+      # This will not be resolved except by moving to Bazel.
+      hermetic_deps = false
+      binary_label = ":bin"
+      args = [
+               "--ffx-bin",
+               rebase_path(files.ffx_tool, root_build_dir),
+               "--product-assembly-config",
+               rebase_path(fuchsia_files.assembly_config, root_build_dir),
+               "--board-config",
+               rebase_path(fuchsia_files.board_config, root_build_dir),
+               "--platform-artifacts",
+               rebase_path(platform_bundles_dir, root_build_dir),
+               "--outdir",
+               rebase_path(outdir, root_build_dir),
+               "--gendir",
+               rebase_path(gendir, root_build_dir),
+               "--stamp",
+               rebase_path(stamp, root_build_dir),
+             ] + additional_args_param
+      deps += [
+                ":${fuchsia_labels.board_config}",
+                ":${product_config_label}",
+                labels.ffx_tool,
+                platform_bundles_target,
+              ] + additional_deps_param
+      inputs = [
+        files.ffx_tool,
+        fuchsia_files.assembly_config_file,
+        fuchsia_files.board_config_file,
+      ]
+      outputs = [
+        stamp,
+        image_assembly_config,
+      ]
+
+      not_needed(invoker, [ "test_runner_source" ])
+    }
+  }
+}

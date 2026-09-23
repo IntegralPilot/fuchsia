@@ -1,0 +1,149 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/fidl/fidl.gni")
+import("//build/fidl/toolchain.gni")
+import("//build/host.gni")
+import("//build/python/python_host_test.gni")
+import("//build/testing/environments.gni")
+import("//build/testing/host_test_data.gni")
+
+if (is_host) {
+  python_host_test("fidlcat_e2e_tests") {
+    main_source = "fidlcat_e2e_tests.py"
+    extra_args = [ "-v" ]
+
+    deps = [
+      ":runtime_deps",
+      "//src/developer/ffx:test_data",
+      "//src/developer/ffx/plugins/debug:ffx_debug_plugin_tool_test_data",
+    ]
+    package_deps = [
+      "//src/developer/debug/debug_agent",
+      "//src/testing/fidl/echo_realm_placeholder",
+    ]
+
+    # Runs on "main" builders (try and ci) in QEMU environments, but only on
+    # x64, as we don't support running host test on arm64 host.
+    # TODO(https://fxbug.dev/42051651): fix the timeout issue with asan on.
+    # TODO: enable the test on other arm64 targets.
+    if (target_cpu == "x64" && !is_asan) {
+      environments = [ emu_env ]
+    } else {
+      build_only = true
+    }
+  }
+}
+
+# Extract the symbols for the given ELF file from the .build-id directory.
+template("generate_symbols") {
+  assert(defined(invoker.library_label), "Must define 'library_label'")
+  assert(defined(invoker.library_path), "Must define 'library_path'")
+  assert(defined(invoker.output), "Must define 'output'")
+
+  action(target_name) {
+    deps = [ invoker.library_label ]
+    inputs = [
+      invoker.library_path,
+      "//build/python/modules/elf/elfinfo.py",
+    ]
+    outputs = [ invoker.output ]
+
+    script = "generate_debug.sh"
+    depfile = "${invoker.output}.d"
+
+    args = [
+      "--python-path",
+      rebase_path(python_exe_src, root_build_dir),
+      "--build-id-dir",
+      rebase_path("$root_build_dir/.build-id", root_build_dir),
+      "--build-id-script",
+      rebase_path("//build/python/modules/elf/elfinfo.py", root_build_dir),
+      "--binary",
+      rebase_path(invoker.library_path, root_build_dir),
+      "--output",
+      rebase_path(invoker.output, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+  }
+}
+
+generate_symbols("echo_client_sym") {
+  library_label = "//src/testing/fidl/echo_realm_placeholder/echo_client:bin($target_toolchain)"
+  library_path = "$root_build_dir/echo_client_placeholder"
+  output = "$target_gen_dir/echo_realm_placeholder/echo_client.debug"
+}
+
+# Examples FIDL library required by save/replay .proto tests recorded against
+# legacy FIDL examples
+fidl("echo") {
+  testonly = true
+  name = "fidl.examples.echo"
+  visibility = [ ":*" ]
+  sources = [ "echo.test.fidl" ]
+}
+
+if (is_host) {
+  host_test_data("test_data") {
+    sources = [
+      # We have to list all required FIDL IR explicitly here or they will not be
+      # present when we execute the test.
+      # This must be kept in sync with the list of FIDL IR in the test itself.
+      "$root_build_dir/fidling/gen/sdk/fidl/fuchsia.io/fuchsia.io.fidl.json",
+      "$root_build_dir/fidling/gen/sdk/fidl/fuchsia.mem/fuchsia.mem.fidl.json",
+      "$root_build_dir/fidling/gen/src/testing/fidl/placeholders.fidl.json",
+      "$root_build_dir/fidling/gen/src/tests/end_to_end/fidlcat/echo.fidl.json",
+
+      # Debug symbol
+      "$target_gen_dir/echo_realm_placeholder/echo_client.debug",
+
+      # Previous saved test data.
+      "//src/tests/end_to_end/fidlcat/echo.pb",
+      "//src/tests/end_to_end/fidlcat/echo_client.pb",
+      "//src/tests/end_to_end/fidlcat/echo_client_sync.pb",
+      "//src/tests/end_to_end/fidlcat/echo_sync_crash.pb",
+      "//src/tests/end_to_end/fidlcat/unknown.pb",
+    ]
+
+    outputs =
+        [ "$root_out_dir/test_data/fidlcat_e2e_tests/{{source_file_part}}" ]
+
+    deps = [
+      ":echo($fidl_toolchain)",
+      ":echo_client_sym",
+      "//sdk/fidl/fuchsia.io($fidl_toolchain)",
+      "//sdk/fidl/fuchsia.mem($fidl_toolchain)",
+      "//src/testing/fidl:placeholders($fidl_toolchain)",
+    ]
+  }
+
+  host_test_data("test_tools") {
+    sources = [
+      "$root_out_dir/ffx",
+      "$root_out_dir/fidlcat",
+    ]
+
+    deps = [
+      "//src/developer/ffx:ffx_bin",
+      "//tools/fidlcat",
+    ]
+  }
+
+  group("runtime_deps") {
+    testonly = true
+    deps = [
+      ":test_data",
+      ":test_tools",
+      "//src/developer/debug/debug_agent($target_toolchain)",
+      "//src/testing/fidl/echo_realm_placeholder($target_toolchain)",
+    ]
+  }
+}
+
+group("tests") {
+  testonly = true
+
+  deps = [ ":fidlcat_e2e_tests($host_toolchain)" ]
+}

@@ -1,0 +1,201 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/python_interpreter.gni")
+import("//build/fidl/fidl.gni")
+import("//build/python/host.gni")
+import("//build/python/python_host_test.gni")
+import("//build/python/python_library.gni")
+import("//build/python/python_wheel.gni")
+import("//build/rust/rustc_staticlib.gni")
+import("//sdk/categories/compatibility.gni")
+import("//src/tests/fidl/conformance_suite/gidl-conformance-suite.gni")
+import("//tools/fidl/gidl/gidl.gni")
+
+assert(is_host, "The fuchsia-controller framework is for host tools only")
+
+rustc_staticlib("lib") {
+  output_name = "fuchsia_controller"
+  edition = "2024"
+  with_unit_tests = true
+
+  deps = [
+    "//sdk/fidl/fuchsia.developer.remotecontrol:fuchsia.developer.remotecontrol_rust_fdomain",
+    "//sdk/fidl/fuchsia.device:fuchsia.device_rust_fdomain",
+    "//sdk/rust/zx-types",
+    "//src/developer/ffx/config:lib",
+    "//src/developer/ffx/lib/discovery:lib",
+    "//src/developer/ffx/lib/errors:lib",
+    "//src/developer/ffx/lib/logging:lib",
+    "//src/developer/ffx/lib/rcs:lib",
+    "//src/developer/ffx/lib/target:lib",
+    "//src/developer/ffx/lib/timeout:lib",
+    "//src/developer/ffx/plugins/target/wait:ffx_wait",
+    "//src/developer/ffx/plugins/target/wait:ffx_wait_args",
+    "//src/lib/fdomain/client",
+    "//src/lib/fdomain/local",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia-async",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:async-channel",
+    "//third_party/rust_crates:async-lock",
+    "//third_party/rust_crates:camino",
+    "//third_party/rust_crates:futures-lite",
+    "//third_party/rust_crates:log",
+    "//third_party/rust_crates:signal-hook",
+    "//third_party/rust_crates:thiserror",
+    "//third_party/rust_crates:tokio",
+  ]
+
+  test_deps = [
+    "//sdk/fidl/fuchsia.fdomain:fuchsia.fdomain_rust",
+    "//sdk/rust/zx-status",
+    "//third_party/rust_crates:byteorder",
+    "//third_party/rust_crates:futures-test",
+    "//third_party/rust_crates:serde_json",
+    "//third_party/rust_crates:tempfile",
+  ]
+
+  sources = [
+    "src/commands.rs",
+    "src/compat.rs",
+    "src/env_context.rs",
+    "src/ext_buffer.rs",
+    "src/fdomain.rs",
+    "src/lib.rs",
+    "src/lib_context.rs",
+    "src/logging.rs",
+    "src/waker.rs",
+  ]
+}
+
+python_library("fuchsia_controller_py") {
+  library_name = "fuchsia_controller_py"
+  source_root = "python/fuchsia_controller_py"
+  library_deps = [
+    "cpp:fuchsia_controller_internal",
+    "//src/testing/end_to_end/mobly_base_tests/fuchsia_async_extension",
+  ]
+  sources = [ "__init__.py" ]
+
+  # Ensure all FIDL dependencies meet the compatibility and stability
+  # requirements.
+  # There are currently exceptions - see https://fxbug.dev/42081073.
+  # Host tools in the IDK can depend on SDK categories up to "host_tool".
+  assert_no_deps = markers_partner_idk_host_tools_must_not_depend_on
+}
+
+python_library("fidl_bindings") {
+  library_name = "fidl"
+  source_root = "python/fidl"
+  library_deps = [ ":fuchsia_controller_py" ]
+  sources = [
+    "__init__.py",
+    "_async_channel.py",
+    "_async_socket.py",
+    "_client.py",
+    "_decoder.py",
+    "_encoder.py",
+    "_fidl_common.py",
+    "_ipc.py",
+    "_ir.py",
+    "_registry.py",
+    "_server.py",
+  ]
+}
+
+static_conformance_test_source = "$target_gen_dir/static_conformance_test.py"
+
+gidl("static_conformance_tests_py") {
+  type = "conformance"
+  language = "python"
+  inputs = conformance_suite_gidl_files
+  fidl = conformance_suite_fidl_target
+  output = static_conformance_test_source
+}
+
+python_host_test("fuchsia_controller_static_conformance_tests") {
+  libraries = [ ":fuchsia_controller_py" ]
+  deps = [
+    ":static_conformance_tests_py",
+    "//src/tests/fidl/conformance_suite:conformance_fidl_python",
+  ]
+  main_source = static_conformance_test_source
+}
+
+group("fuchsia-controller") {
+  testonly = true
+  deps = [
+    ":fuchsia_controller_py",
+    ":fuchsia_controller_wheel",
+  ]
+}
+
+group("tests") {
+  testonly = true
+
+  deps = [ ":lib_test" ]
+
+  # TODO(https://fxbug.dev/42078138): These tests fail on mac builders. This is most likely
+  # because of the infra machines running OSX 10.15
+  if (host_os != "mac") {
+    deps += [
+      ":fuchsia_controller_static_conformance_tests",
+      "tests:fuchsia_controller_encode_test",
+      "tests:fuchsia_controller_errors_test",
+      "tests:fuchsia_controller_fidl_channel_test",
+      "tests:fuchsia_controller_fidl_common_test",
+      "tests:fuchsia_controller_interruption_test",
+      "tests:fuchsia_controller_isolate_directory_test",
+      "tests:fuchsia_controller_socket_test",
+    ]
+  }
+}
+
+group("host_tests") {
+  testonly = true
+  deps = []
+
+  # TODO(https://fxbug.dev/42078138): These tests fail on mac builders. This is most likely
+  # because of the infra machines running OSX 10.15
+  if (host_os != "mac") {
+    # TODO(https://fxbug.dev/42080013): Re-enable when the corrupt profile header
+    # issue is fixed.
+    if (!is_coverage) {
+      deps += [ "tests:fuchsia_controller_e2e_test" ]
+    }
+  }
+}
+
+python_wheel("fuchsia_controller_wheel") {
+  deps = [
+    ":fidl_bindings",
+    ":fuchsia_controller_py",
+  ]
+  pyproject_toml = "pyproject.toml"
+  version = "0.1.0"
+  package_name = "fuchsia-controller"
+  packages = [
+    "fuchsia_controller_py",
+    "fuchsia_controller_internal",
+    "fidl",
+  ]
+
+  _python_version_tag = "cp" + string_replace(python_version, ".", "")
+  if (current_os == "linux") {
+    if (current_cpu == "x64") {
+      wheel_tags = "${_python_version_tag}-${_python_version_tag}-linux_x86_64"
+    } else if (current_cpu == "arm64") {
+      wheel_tags = "${_python_version_tag}-${_python_version_tag}-linux_aarch64"
+    }
+  } else if (current_os == "mac") {
+    if (current_cpu == "x64") {
+      wheel_tags =
+          "${_python_version_tag}-${_python_version_tag}-macosx_10_9_x86_64"
+    } else if (current_cpu == "arm64") {
+      wheel_tags =
+          "${_python_version_tag}-${_python_version_tag}-macosx_11_0_arm64"
+    }
+  }
+}

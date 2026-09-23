@@ -1,0 +1,406 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+// Draft Prototype of Protocols to be used by Power Broker.
+// None of these protocols should be considered fully baked at this time
+// and should be expected to change in the future as we gain information
+// through this prototype testbed about coverage and usability.
+@available(added=HEAD)
+library fuchsia.power.broker;
+
+using zx;
+
+/// Used to describe the power level of an element.
+/// Could extend this further to support additional types of power
+/// levels, such as ACPI.
+alias PowerLevel = uint8;
+
+/// BinaryPowerLevel is a well-known set of PowerLevels with only two
+/// states: OFF and ON.
+type BinaryPowerLevel = strict enum : PowerLevel {
+    OFF = 0;
+    ON = 1;
+};
+
+const MAX_ELEMENT_NAME_LEN uint8 = 64;
+
+/// A token that represents the right to add a dependency upon another
+/// element. Should first be registered with Power Broker via
+/// ElementControl.RegisterDependencyToken of the required element.
+alias DependencyToken = zx.Handle:EVENT;
+
+/// Describes a dependency from one power element's level on another power
+/// element's level.
+/// For example if element `PowerElement_A` has a level `PowerLevel_A3` which
+/// depends on an element `PowerElement_B` being at `PowerLevel_B2` then we would
+/// fill out the struct to convey the meaning:
+///   - `dependent_level` = `PowerLevel_A3`
+///   - `requires_token` = `PowerElement_B`
+///   - `requires_level_by_preference` = `[PowerLevel_B2]`
+/// (Note the values above are only *symbolic*, eg. `dependent_level` requires
+/// an integer value, not a string.)
+///
+/// The dependent Element's identity is not specified in this struct and must
+/// be specified as a separate argument in a request or be inferred, perhaps
+/// because a channel is scoped to the dependent element.
+type LevelDependency = resource table {
+    /// The power element level that this `LevelDependency` struct declaration
+    /// supports. This is level that has a dependency on
+    /// `requires_level_by_preference`.
+    1: dependent_level PowerLevel;
+    /// Must supply a token registered via the RegisterDependencyToken call of
+    /// the required element's ElementControl protocol.
+    2: requires_token DependencyToken;
+    /// A list of levels in decreasing preferential order that power broker
+    /// should attempt to make required for this dependency to be satisfied.
+    /// The first level in list that is a valid level will become the required
+    /// level.
+    ///
+    /// Platform clients can use this list to keep backwards compatibility with
+    /// dependencies by providing multiple levels that the dependency may have
+    /// implemented in older API levels.
+    3: requires_level_by_preference vector<PowerLevel>:MAX_VALID_POWER_LEVELS;
+    /// If true, this dependency will be automatically removed if/when the
+    /// required element is removed.
+    4: remove_with_required_element bool;
+};
+
+/// This is the primary initial protocol used by Power Element Owners to
+/// communicate with Power Broker. Power Element Owners should add the
+/// elements they own to the Power Topology through AddElement. All further
+/// interactions with Power Broker are done through channels opened by the
+/// AddElement call, which are scoped to the added element.
+@discoverable
+open protocol Topology {
+    /// Called by a Power Element owner to register a new Power Element and
+    /// open control channels for that element.
+    flexible AddElement(ElementSchema) -> () error AddElementError;
+
+    /// Called by a client to directly open a lease on the given dependencies
+    /// without the need for creating and managing a new element.
+    flexible Lease(LeaseSchema) -> () error LeaseError;
+};
+
+/// Passed to Topology.AddElement.
+type ElementSchema = resource table {
+    /// Human-readable name for logging and debug purposes.
+    1: element_name string:MAX_ELEMENT_NAME_LEN;
+    /// The initial current power level of the element.
+    /// To be used with `initial_lease_token`, see note below.
+    2: initial_current_level PowerLevel;
+    /// All power levels that are valid for this element. Any level not
+    /// specified here will be treated as invalid.
+    ///
+    /// Levels must be listed in ascending order from low to high. Note, levels are enums and their
+    /// integer values do not have an inherent meaning. For example, *theoretically* a binary
+    /// (off, on) could be represented with (0, 1), (1, 0), (17, 19) or any combination of two
+    /// two numbers. (But please use BinaryPowerLevel above!)
+    3: valid_levels vector<PowerLevel>:MAX_VALID_POWER_LEVELS;
+    /// List of dependencies for this element's power levels.
+    /// Note: dependencies UPON this element's levels cannot be added here.
+    4: dependencies vector<LevelDependency>:MAX_DEPENDENCIES_IN_ADD_ELEMENT;
+    /// REMOVED: 7: level_control_channels, use `element_runner` instead (see below).
+    ///
+    /// DEPRECATED. Use `Topology.Lease` instead.
+    /// Optional. If passed, Leases for this element can be requested via this
+    /// channel.
+    8: lessor_channel server_end:Lessor;
+    /// Caller-provided ElementControl channel to be passed to Power Broker.
+    /// When this channel is dropped, the element will be removed from the
+    /// topology. All channels associated with this element will be
+    /// closed and all tokens registered to this element will be
+    /// unregistered.
+    9: element_control server_end:ElementControl;
+    /// The client-end that Power Broker should use to set the power level of this element.
+    /// The server_end of this should be retained and the ElementRunner
+    /// protocol implemented by the element's runner.
+    10: element_runner client_end:ElementRunner;
+    /// If `initial_lease_token` is set, a lease will be immediately taken at
+    /// `initial_current_level` and all SetLevel calls prior to reaching
+    /// `initial_current_level` will be suppressed. The first SetLevel call
+    /// will be for `initial_current_level`.
+    /// The client should pass here the half of an eventpair to be held by
+    /// Power Broker. The other half of the pair should be retained by the
+    /// client.
+    /// Note: this lease will likely not be SATISFIED when returned, as that
+    /// would require the ElementRunner server to already have received and
+    /// responded to a SetLevel request from Power Broker.
+    /// Clients can listen for `LEASE_SIGNAL_SATISFIED` to know when the
+    /// lease has been `SATISFIED`.
+    11: initial_lease_token LeaseToken;
+};
+
+/// Passed to Topology.Lease.
+type LeaseSchema = resource table {
+    /// The half of an eventpair to be held by the Power Broker. The other
+    /// half of the pair should be retained by the client. See `LeaseToken`
+    /// below for more usage details.
+    1: lease_token LeaseToken;
+    /// Human-readable name for logging and debug purposes.
+    2: lease_name string:MAX_ELEMENT_NAME_LEN;
+    /// List of dependencies for this lease.
+    3: dependencies vector<LeaseDependency>:MAX_DEPENDENCIES_IN_ADD_ELEMENT;
+    /// (Optional) By default, `Topology.Lease` will wait until the lease is
+    /// `SATISFIED` before returning. If `should_return_pending_lease` is true,
+    /// it will instead return as soon as the lease has been granted by Power
+    /// Broker but it may still be `PENDING`. Clients can listen for
+    /// `LEASE_SIGNAL_SATISFIED` to know when the lease has been `SATISFIED`.
+    4: should_return_pending_lease bool;
+};
+
+type LeaseDependency = resource table {
+    /// Must supply a token registered via the RegisterDependencyToken call of
+    /// the required element's ElementControl protocol.
+    1: requires_token DependencyToken;
+    /// Level of the element required. Most clients will want to use this, but
+    /// for forward compatibility, requires_level_by_preference may be used
+    /// instead.
+    2: requires_level PowerLevel;
+
+    /// Advanced Options
+    ///
+    /// (Optional) For forward compatibility, the list of levels in decreasing
+    /// preferential order that power broker should attempt to make required for
+    /// this dependency to be satisfied. The first level in list that is a valid
+    /// level will become the required level. If this is set, `requires_level`
+    /// will be ignored.
+    ///
+    /// Platform clients can use this list to keep backwards compatibility with
+    /// dependencies by providing multiple levels that the dependency may have
+    /// implemented in older API levels.
+    3: requires_level_by_preference vector<PowerLevel>:MAX_VALID_POWER_LEVELS;
+};
+
+/// A token that represents an open lease. The client's handle should be
+/// dropped to indicate the lease should be closed. This handle may be
+/// duplicated if the lease will be shared; the lease will remain open
+/// until the last handle is dropped.
+const LEASE_TOKEN_RIGHTS zx.Rights
+        = zx.Rights.TRANSFER | zx.Rights.DUPLICATE | zx.Rights.WAIT | zx.Rights.SIGNAL_PEER;
+alias LeaseToken = zx.Handle:<EVENTPAIR, LEASE_TOKEN_RIGHTS>;
+
+/// Signal sent by Power Broker on the LeaseToken when the lease is satisfied.
+const LEASE_SIGNAL_SATISFIED zx.Signals = 0x01000000; // Maps to ZX_USER_SIGNAL_0
+
+// Limitations on vector length for the sake of bounding request size.
+const MAX_DEPENDENCIES_IN_ADD_ELEMENT uint16 = 128;
+const MAX_TOKENS_IN_ADD_ELEMENT uint16 = 128;
+const MAX_VALID_POWER_LEVELS uint16 = 256;
+
+type AddElementError = flexible enum {
+    INVALID = 1;
+    NOT_AUTHORIZED = 2;
+};
+
+/// Provides element-scoped access to an element previously added via
+/// Topology.AddElement.
+open protocol ElementControl {
+    /// Register a new Status channel on which Power Broker will send
+    /// read-only updates of the element's current power level. This method
+    /// is intended to allow element owners to give read-only access to the
+    /// element's current power level to clients by opening and transferring
+    /// this channel.
+    flexible OpenStatusChannel(resource struct {
+        status_channel server_end:Status;
+    });
+
+    /// Register a token which will permit the bearer to add either a
+    /// dependency upon this element.
+    flexible RegisterDependencyToken(resource struct {
+        token DependencyToken;
+    }) -> () error RegisterDependencyTokenError;
+
+    /// Unregister a token previously registered via RegisterDependencyToken.
+    flexible UnregisterDependencyToken(resource struct {
+        token DependencyToken;
+    }) -> () error UnregisterDependencyTokenError;
+
+    /// Add a new dependency to an existing element.
+    /// If any open leases would incorporate this dependency, the required
+    /// element and any transitively required elements must complete all
+    /// necessary transitions (via ElementRunner.SetLevel calls) before this
+    /// method will return.
+    flexible AddDependency(LevelDependency) -> () error ModifyDependencyError;
+};
+
+/// The runner or operator of an element.
+/// This should be implemented by all element owners.
+/// The client end is passed to Power Broker via ElementSchema.element_runner.
+/// Power Broker calls SetLevel initially, and then whenever the required level
+/// of the element changes.
+@discoverable
+open protocol ElementRunner {
+    /// Sets the level of the power element.
+    ///
+    /// The server blocks while making the level transition. It returns
+    /// once the transition to the new required level is complete.
+    /// If the element cannot transition to the new required level and
+    /// it cannot retry, the channel will be closed.
+    flexible SetLevel(struct {
+        level PowerLevel;
+    }) -> ();
+};
+
+type ModifyDependencyError = flexible enum {
+    ALREADY_EXISTS = 1;
+    INVALID = 2;
+    NOT_AUTHORIZED = 3;
+    NOT_FOUND = 4;
+};
+
+type RegisterDependencyTokenError = flexible enum {
+    ALREADY_IN_USE = 1;
+    INTERNAL = 2;
+};
+
+type UnregisterDependencyTokenError = flexible enum {
+    NOT_AUTHORIZED = 1;
+    NOT_FOUND = 2;
+};
+
+/// Element Permissions
+type Permissions = strict bits : uint32 {
+    MODIFY_DEPENDENT = 0b00000001;
+    MODIFY_DEPENDENCY = 0b00000100;
+};
+
+/// DEPRECATED. Use `Topology.Lease` instead.
+/// Provides element-scoped access to request leases to raise the levels of an
+/// element previously added via Topology.AddElement.
+open protocol Lessor {
+    /// Request made to indicate the client wants the element raised to the given
+    /// level. When the call returns, this **does** **not** mean the
+    /// corresponding element is at the requested level, only that the requested
+    /// level is valid and request is being worked on.
+    ///
+    /// Fulfilling the request will raise the level of all the level's direct
+    /// and transitive power dependencies to their required levels. When
+    /// `LeaseControl.WatchStatus` reports `LeaseStatus::SATISFIED` this means
+    /// given element is at the level specified by the lease.
+    ///
+    /// Requesting an invalid level returns `LeaseError::INVALID_LEVEL`.
+    flexible Lease(resource struct {
+        /// Power level of this element to be raised to.
+        level PowerLevel;
+    }) -> (resource struct {
+        /// Channel for actions to be taken on the lease.
+        /// When this channel is closed, the lease will be dropped.
+        lease_control client_end:LeaseControl;
+    }) error LeaseError;
+};
+
+type LeaseError = flexible enum {
+    INTERNAL = 1;
+    NOT_AUTHORIZED = 2;
+    INVALID_LEVEL = 3;
+    INVALID_ARGUMENT = 4;
+};
+
+type LeaseStatus = flexible enum {
+    UNKNOWN = 0;
+    /// The lease has been received by Power Broker, and the upward power
+    /// transition has begun, but has not yet completed. That is, one or more
+    /// dependencies of the leased `PowerLevel` are not yet at their required
+    /// levels.
+    PENDING = 1;
+    /// All dependencies required by the leased `PowerLevel` are at their
+    /// required `PowerLevel`s, and the leased `PowerElement` has transitioned
+    /// to the requested level.
+    SATISFIED = 2;
+    /// The lease has been dropped by the client and acknowledged by Power
+    /// Broker, and the downward power transition has begun, but has not yet
+    /// completed.
+    POWERING_DOWN = 3;
+    /// The lease has been removed, and all resulting power transitions have
+    /// been completed.
+    VACATED = 4;
+};
+
+/// Provides lease-scoped access to actions that can be taken on a lease
+/// previously acquired via Lessor.Lease. Closing this control channel drops
+/// the lease.
+/// TODO(https://fxbug.dev/339474151): Switch from a protocol to an eventpair.
+open protocol LeaseControl {
+    /// Get the current status of the lease.
+    /// If last_status is UNKNOWN, the call will return immediately
+    /// with the current status. Otherwise, the call will block
+    /// until the current status differs from last_status.
+    // TODO(b/333947976): Remove this method once unused.
+    @available(added=HEAD)
+    flexible WatchStatus(struct {
+        last_status LeaseStatus;
+    }) -> (struct {
+        status LeaseStatus;
+    });
+};
+
+/// Provides read-only access to the current PowerLevel of an element and the
+/// ability to watch changes to an element's power level. A new channel to
+/// this protocol can be obtained by calling OpenStatus on the element's
+/// ElementControl channel (and passed to other clients who need access
+/// to the element's current power level).
+open protocol Status {
+    /// Returns the current power level for this element. The first call on
+    /// this channel will return immediately. Subsequent calls will block until
+    /// the current power level has changed.
+    flexible WatchPowerLevel() -> (resource struct {
+        current_level PowerLevel;
+    }) error StatusError;
+};
+
+type StatusError = flexible enum {
+    UNKNOWN = 1;
+};
+
+/// PowerLevel name lengths are limited to reduce Inspect space usage
+const MAX_LEVEL_NAME_LEN uint16 = 16;
+
+/// Status client endpoint and a plaintext name for a specific Power Element. Names are
+/// expected to be unique between elements and persistent across reboots of the same build,
+/// but consistency is not guaranteed between different builds.
+type ElementStatusEndpoint = resource table {
+    1: identifier string:MAX_ELEMENT_NAME_LEN;
+    2: status client_end:Status;
+};
+
+/// Mapping of a plaintext name to a PowerLevel. Names are expected to be unique between
+/// elements and persistent across reboots of the same build, but consistency is not
+/// guaranteed between different builds.
+type PowerLevelName = table {
+    1: level PowerLevel;
+    2: name string:MAX_LEVEL_NAME_LEN;
+};
+
+/// Mapping of a vector of [`fuchsia.power.broker/PowerLevelName`] to a Power Element via
+/// its plaintext name. Names are expected to be unique between elements and persistent
+/// across reboots of the same build, but consistency is not guaranteed between different builds.
+type ElementPowerLevelNames = table {
+    1: identifier string:MAX_ELEMENT_NAME_LEN;
+    2: levels vector<PowerLevelName>:MAX_VALID_POWER_LEVELS;
+};
+
+/// Provides an interface to retrieve information about PowerElements managed by a component.
+@discoverable
+open protocol ElementInfoProvider {
+    /// Returns mappings of PowerLevels to plaintext names for each element managed
+    /// by a component. Returns an error if no mappings can be returned.
+    flexible GetElementPowerLevelNames() -> (resource struct {
+        level_names vector<ElementPowerLevelNames>:MAX;
+    }) error ElementInfoProviderError;
+
+    /// Returns available Status client endpoints and stable identifiers for each
+    /// element managed by a component. Returns an error if no endpoints can be
+    /// returned (i.e. no elements were able to implement the Status channel).
+    flexible GetStatusEndpoints() -> (resource struct {
+        endpoints vector<ElementStatusEndpoint>:MAX;
+    }) error ElementInfoProviderError;
+};
+
+type ElementInfoProviderError = flexible enum {
+    UNKNOWN = 0;
+    FAILED = 1;
+};
+
+service ElementInfoProviderService {
+    status_provider client_end:ElementInfoProvider;
+};

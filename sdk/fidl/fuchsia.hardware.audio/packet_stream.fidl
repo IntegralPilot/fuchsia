@@ -1,0 +1,322 @@
+// Copyright 2026 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// This file defines the PacketStream protocols, which are used for streaming
+/// packet-based (e.g. encoded) audio, for both playback and capture.
+library fuchsia.hardware.audio;
+
+using zx;
+
+@available(added=HEAD)
+alias VmoId = uint64;
+
+@available(added=HEAD)
+const MAX_INLINE_TRANSFER_SIZE uint64 = 8192; // Defined based on fuchsia.io/file.fidl
+
+/// The maximum number of VMOs that can be registered or allocated.
+@available(added=HEAD)
+const VMO_VECTOR_MAX uint32 = 256;
+
+/// Properties of the packet-stream. These values don't change once the packet-stream is created.
+@available(added=HEAD)
+type PacketStreamProperties = table {
+    /// When set to true, indicates that the packet-stream runs in a different cache coherency
+    /// domain. Clients must ensure data writes are flushed to main memory (during output)
+    /// or invalidated before reading (during input).
+    ///
+    /// When set to false, the server and client are in the same coherency domain.
+    /// Synchronization (e.g., fences) is still required to order reads and writes.
+    ///
+    /// Required.
+    1: needs_cache_flush_or_invalidate bool;
+
+    /// The buffer methods supported by this driver.
+    ///
+    /// Required.
+    2: supported_buffer_types BufferType;
+
+
+    // TODO(https://fxbug.dev/470161557): Might have to add more properties to
+    // convey buffer size contraints if any.
+};
+
+/// Types of buffer ownership/transfer supported by the stream.
+/// Multiple values can be supported by the driver.
+@available(added=HEAD)
+type BufferType = flexible bits : uint64 {
+    /// The client allocates the VMO and registers it with the driver.
+    CLIENT_OWNED = 0x1;
+
+    /// The driver allocates the VMO and passes handles to the client.
+    DRIVER_OWNED = 0x2;
+
+    /// Data is sent inline within the FIDL message.
+    /// This can be used exclusively (standalone) without allocating or registering VMOs,
+    /// or mixed in-stream with packets of other buffer types.
+    INLINE = 0x4;
+};
+
+@available(added=HEAD)
+type AllocateVmosConfig = table {
+    /// The minimum size required for each VMO, in bytes.
+    ///
+    /// Required.
+    1: min_vmo_size uint64;
+
+    /// The number of VMOs to allocate.
+    ///
+    /// Required.
+    2: vmo_count uint32;
+};
+
+@available(added=HEAD)
+type RegisterVmosConfig = resource table {
+    /// The list of VMOs to register with the driver.
+    ///
+    /// Required.
+    1: vmo_infos VmoInfos;
+};
+
+/// VMO information for registering VMOs. Used in `RegisterVmos` and `AllocateVmos` to pair
+/// a VMO handle with a unique ID.
+@available(added=HEAD)
+type VmoInfo = resource table {
+    /// ID corresponding to the VMO.
+    ///
+    /// Required.
+    1: id VmoId;
+
+    /// Handle to the VMO.
+    ///
+    /// Required.
+    2: vmo zx.Handle:VMO;
+};
+
+@available(added=HEAD)
+alias VmoInfos = vector<VmoInfo>:VMO_VECTOR_MAX;
+
+
+/// Data to be transferred. There are two supported ways data may be conveyed, corresponding to the
+/// two members of the DataTransfer union:
+///
+/// 1) vmo_transfer: A region within a VMO previously known to the driver. This VMO must have been
+///    established via `PacketStreamControl.RegisterVmos` (if client-allocated) or
+///    `PacketStreamControl.AllocateVmos` (if driver-allocated). Future requests refer to this
+///    buffer by the unique `vmo_id`. Because VMOs are reused across requests, the one-time
+///    cost of pinning/mapping is amortized.
+///
+/// 2) data: The payload is provided directly within the message. This mode is intended for
+///    small transfers or control information, not high-throughput streaming.
+@available(added=HEAD)
+type DataTransfer = flexible resource union {
+    /// Data is stored in a region of a registered VMO.
+    /// Requires `PacketStreamProperties.supported_buffer_types` to include `CLIENT_OWNED`
+    /// or `DRIVER_OWNED`.
+    1: vmo_transfer VmoTransfer;
+
+    /// Embedded data buffer.
+    /// Requires `PacketStreamProperties.supported_buffer_types` to include `INLINE`.
+    2: inline_data vector<uint8>:MAX_INLINE_TRANSFER_SIZE;
+};
+
+/// This describes a VMO section containing audio data.
+@available(added=HEAD)
+type VmoTransfer = resource table {
+    /// ID of a VMO that was previously registered or allocated.
+    ///
+    /// Required.
+    1: vmo_id VmoId;
+
+    /// Offset into the VMO to start reading or writing.
+    /// This is relative to the start of that VMO.
+    ///
+    /// Required.
+    2: vmo_offset uint64;
+
+    /// Number of bytes to read/write from/to this VMO region.
+    ///
+    /// Required.
+    3: payload_size uint64;
+};
+
+/// Control protocol for establishing and managing the packet stream.
+@available(added=HEAD)
+open protocol PacketStreamControl {
+    /// Accessor for top level static properties.
+    flexible GetProperties() -> (struct {
+        properties PacketStreamProperties;
+    });
+
+    /// Request the driver to allocate VMOs for data transfer.
+    /// Returns the allocated VMOs and their assigned IDs.
+    ///
+    /// The returned VMO handle must include ZX_RIGHT_TRANSFER, ZX_RIGHT_READ and ZX_RIGHT_MAP.
+    /// If the packet stream is an output stream, then the handle must also include
+    /// ZX_RIGHT_WRITE.
+    ///
+    /// Returns `ZX_ERR_INVALID_ARGS` if `min_vmo_size` is zero or `vmo_count` is zero.
+    /// Returns `ZX_ERR_NO_MEMORY` if the driver cannot allocate the requested VMOs.
+    /// Returns `ZX_ERR_BAD_STATE` if VMOs are already allocated or registered, or if the
+    /// stream is already started. Call `DeallocateVmos` or `UnregisterVmos` first to
+    /// reconfigure.
+    flexible AllocateVmos(AllocateVmosConfig) -> (resource struct {
+        vmos VmoInfos;
+    }) error zx.Status;
+
+    /// Releases all VMOs previously allocated via `AllocateVmos`.
+    /// This also occurs automatically when the `PacketStreamControl` channel is closed.
+    ///
+    /// Returns `ZX_ERR_BAD_STATE` if VMOs are not currently allocated, or if the stream is
+    /// not stopped.
+    flexible DeallocateVmos() -> () error zx.Status;
+
+    /// Registers client-allocated VMOs with the driver.
+    ///
+    /// The registered VMO handle must include ZX_RIGHT_TRANSFER, ZX_RIGHT_READ and ZX_RIGHT_MAP.
+    /// If the packet stream is an input stream, then the handle must also include
+    /// ZX_RIGHT_WRITE.
+    ///
+    /// Returns `ZX_ERR_INVALID_ARGS` if `vmo_infos` is empty, or if any VMO handle is invalid,
+    /// or if duplicate `vmo_id`s are found.
+    /// Returns `ZX_ERR_ACCESS_DENIED` if any VMO does not have the required rights.
+    /// Returns `ZX_ERR_BAD_STATE` if VMOs are already registered or allocated, or if the
+    /// stream is already started. Call `UnregisterVmos` or `DeallocateVmos` first to
+    /// reconfigure.
+    flexible RegisterVmos(RegisterVmosConfig) -> () error zx.Status;
+
+    /// Unregisters all VMOs previously registered via `RegisterVmos`.
+    /// This also occurs automatically when the `PacketStreamControl` channel is closed.
+    ///
+    /// Returns `ZX_ERR_BAD_STATE` if VMOs are not currently registered, or if the stream is
+    /// not stopped.
+    flexible UnregisterVmos() -> () error zx.Status;
+
+    /// Connects to the data sink implemented by the driver.
+    /// This is used for audio **Output** where the driver consumes data.
+    ///
+    /// Flow:
+    /// 1. App writes audio data to a registered VMO.
+    /// 2. App flushes the cache for the written region (if `needs_cache_flush_or_invalidate` is
+    ///    true).
+    /// 3. App calls `PacketStreamSink.PutPacket` with the location of the data.
+    /// 4. Driver consumes the data.
+    ///
+    /// If this method is called multiple times, the previous `PacketStreamSink` channel is closed,
+    /// and any pending requests on that channel are discarded. The new channel replaces the old
+    /// one.
+    ///
+    /// Returns `ZX_ERR_NOT_SUPPORTED` if the stream is an input stream, or if the driver does
+    /// not support this method.
+    flexible GetPacketStreamSink() -> (resource table {
+        1: stream client_end:PacketStreamSink;
+    }) error zx.Status;
+
+    // TODO(https://fxbug.dev/474262514): Revisit and do a thorough review of capture feature.
+    /// Provides a data sink to the driver.
+    /// This is used for audio **Input** where the driver produces data.
+    ///
+    /// Flow:
+    /// 1. Driver writes audio data to a registered VMO.
+    /// 2. Driver calls `PacketStreamSink.PutPacket` with the location of the data.
+    /// 3. App receives `PutPacket`.
+    /// 4. App invalidates the cache for the region (if `needs_cache_flush_or_invalidate` is
+    ///    true).
+    /// 5. App reads the data.
+    ///
+    /// If this method is called multiple times, the driver closes the previous `PacketStreamSink`
+    /// channel. The new channel replaces the old one.
+    ///
+    /// Returns `ZX_ERR_NOT_SUPPORTED` if the stream is an output stream, or if the driver does
+    /// not support this method.
+    flexible SetPacketStreamSink(resource table {
+        1: stream client_end:PacketStreamSink;
+    }) -> () error zx.Status;
+
+    /// Start the packet-stream.
+    ///
+    /// Returns `ZX_ERR_BAD_STATE` if:
+    /// * Buffers have not been allocated (if `DRIVER_OWNED` was specified)
+    ///   and/or registered (if `CLIENT_OWNED` was specified). This is not applicable if
+    ///   `INLINE` is supported.
+    /// * The stream is already started.
+    flexible Start() -> () error zx.Status;
+
+    /// Stop the packet-stream.
+    ///
+    /// Once the response is received, the stream is halted.
+    ///
+    /// Behavior depends on the stream direction:
+    /// * **Output**: The driver stops consuming packets. Any pending `PacketStreamSink.PutPacket`
+    ///   requests will remain pending until `Start` is called again. Clients may call
+    ///   `PacketStreamSink.FlushPackets` after `Stop` to discard these pending packets.
+    /// * **Input**: The driver stops producing packets. No further `PacketStreamSink.PutPacket`
+    ///   calls will be made by the driver until `Start` is called again.
+    ///
+    /// Note that since `PacketStreamSink` uses a separate channel, there is no strict ordering
+    /// guarantee between `Stop` and `PacketStreamSink.PutPacket`:
+    /// * For **Output**, some in-flight `PacketStreamSink.PutPacket` calls may
+    ///   complete successfully after `Stop` has returned.
+    /// * For **Input**, some in-flight `PacketStreamSink.PutPacket` calls may
+    ///   arrive at the client after `Stop` has returned.
+    ///
+    /// Returns `ZX_ERR_BAD_STATE` if the stream is not started.
+    flexible Stop() -> () error zx.Status;
+};
+
+/// The protocol for streaming packet-based audio data.
+/// This protocol functions as a data sink. The "server" of this protocol consumes packets,
+/// and the "client" produces packets.
+///
+/// This protocol can be used in two directions:
+/// 1. **Output (Client -> Driver)**: The Driver implements `PacketStreamSink`. The Client (App)
+///    calls `PutPacket`.
+/// 2. **Input (Driver -> Client)**: The Client (App) implements `PacketStreamSink`. The Driver
+///    calls `PutPacket`.
+@available(added=HEAD)
+open protocol PacketStreamSink {
+
+    /// Submits a packet to be processed by the server.
+    ///
+    /// The client may queue multiple packets by calling `PutPacket` repeatedly.
+    /// Packets are processed in the order they were submitted. This call
+    /// blocks until the payload is processed. When this call returns, the
+    /// buffer region is guaranteed to be available for reuse.
+    ///
+    /// Returns `ZX_ERR_BAD_STATE` if the stream is not started or configured.
+    /// Returns `ZX_ERR_CANCELED` if `FlushPackets` was called.
+    /// Returns `ZX_ERR_INVALID_ARGS` if the packet is invalid. This includes:
+    /// * The payload is missing.
+    /// * `inline_data` is used but `supported_buffer_types` does not include `INLINE`.
+    /// * `vmo_transfer` is used but `supported_buffer_types` does not include `CLIENT_OWNED` or
+    ///   `DRIVER_OWNED`.
+    /// * `vmo_id` is unrecognized, or `vmo_offset` + `payload_size` exceeds the VMO size.
+    ///
+    /// Note: The server is not required to detect if a VMO region is currently in use by a
+    /// previous pending packet. Clients are responsible for managing buffer usage.
+    flexible PutPacket(resource table {
+        /// Location of the payload for this packet.
+        ///
+        /// Required.
+        1: payload DataTransfer;
+
+        // TODO(https://fxbug.dev/470157894): Add fields for render/capture
+        // timestamp and flags. Flags could include things like end of stream.
+    }) -> (table {
+            // TODO(https://fxbug.dev/470157894): Add fields for completion
+            // timestamp. We also need a way to communicate the number of frames
+            // processed (Perhaps in a dedicated encode/decode element type?)
+            // TODO(https://fxbug.dev/474262514): Revisit and do a thorough review of capture feature.
+            }) error zx.Status;
+
+    /// Flushes all packets currently pending without processing them.
+    /// This call waits until all pending packets are completed or canceled.
+    ///
+    /// Note: A packet may be partially processed (e.g. if it contains multiple
+    /// audio frames, or if the data does not align with encoded frame boundaries)
+    /// before it is canceled.
+    flexible FlushPackets() -> () error zx.Status;
+
+    // TODO(https://fxbug.dev/470150414): Add support for handling stream
+    // events like end of stream, decode error etc.
+};

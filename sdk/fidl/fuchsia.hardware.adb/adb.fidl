@@ -1,0 +1,123 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.adb;
+
+using zx;
+
+/// ADB USB interface status flags.
+type StatusFlags = flexible bits : uint32 {
+    ONLINE = 0x1;
+};
+
+/// Max length of arguments passed in adb OPEN message.
+const MAX_ARGS_LENGTH uint64 = 1024;
+
+/// USB ADB implementation protocol. The USB ADB driver would start serving this interface on the
+/// server endpoint passed to a driver during Device::Start.
+closed protocol UsbAdbImpl {
+    /// Request transmission of the packet in |data|.
+    ///
+    /// Return status indicates queue state:
+    ///   ZX_OK: Packet has been enqueued.
+    ///   Other: Packet could not be enqueued.
+    /// Upon a return of ZX_OK, the packet has been enqueued, but no information is returned as to
+    /// the completion state of the transmission itself.
+    strict QueueTx(struct {
+        data vector<uint8>:MAX;
+    }) -> () error zx.Status;
+
+    /// Request to receive data. This method ensures flow control by allowing the client to queue
+    /// |Receive| requests proactively. The driver will complete the requests only when data is
+    /// available.
+    ///
+    /// Return data or error.
+    ///    ZX_OK: Success. data is valid.
+    ///    ZX_ERR_BAD_STATE: Subsequent requests will not succeed as well.
+    /// Other error codes are from underlying subsystem and the caller should retry |Receive| in
+    /// that case.
+    strict Receive() -> (struct {
+        data vector<uint8>:MAX;
+    }) error zx.Status;
+
+    /// Event triggered when USB ADB interface status changes.
+    strict -> OnStatusChanged(struct {
+        status StatusFlags;
+    });
+};
+
+/// Device interface for USB ADB. The device manages the USB endpoints needed for ADB.
+@discoverable
+closed protocol Device {
+    /// Start USB ADB protocol with |interface|.
+    strict StartAdb(resource struct {
+        interface server_end:UsbAdbImpl;
+    }) -> () error zx.Status;
+
+    /// Stops USB ADB protocol.
+    strict StopAdb() -> () error zx.Status;
+};
+
+/// A Provider is a provider for one service which interacts with the adb component to implement
+/// a particular service such as shell, file-sync, or ffx.
+/// The interaction between the adb component and a service Provider (e.g. shell) is as follows:
+///    - adb component is started eagerly by core.cml. Note that the adb component does not
+///      implement any adb FIDL protocols.
+///    - When a request for a service (e.g. shell) comes in, adb daemon starts up a lazy
+///      component for the corresponding requested service (adb-shell-component) exposing the
+///      Provider protocol and calls ConnectToService, creating a connection between the adb
+///      component and the service provider component (adb-shell-component) through the socket.
+///    - If the service (adb-shell-component) has already been started, it opens that service
+///      and hands it the socket.
+///    - adb component and service Provider component (adb-shell) communicate over the socket.
+@discoverable
+closed protocol Provider {
+    /// Connect `socket` to the service (called in response to adb OPEN message).
+    /// `args` provides additional arguments passed by the client if any.
+    strict ConnectToService(resource struct {
+        socket zx.Handle:SOCKET;
+        args string:<MAX_ARGS_LENGTH, optional>;
+    }) -> () error zx.Status;
+};
+
+// Added to allow service connection to replace devfs
+service Service {
+    adb client_end:Device;
+};
+
+/// Control the state of ADB.
+@discoverable
+@available(added=HEAD)
+open protocol StateController {
+    /// Set the current system type of ADB (e.g. device, recovery, sideload).
+    /// This method updates the system type string sent to the host and initiates a reset
+    /// of the USB ADB connection so that the host can discover the device again with the
+    /// new system type state.
+    flexible SetSystemType(struct {
+        system_type SystemType;
+    }) -> () error zx.Status;
+};
+
+/// Represents the device's system type sent during the ADB connection handshake (A_CNXN).
+/// This identifies the mode the device is currently operating in to the ADB host.
+///
+/// The connection string in ADB, sent during the A_CNXN handshake, is structured as
+/// `<systemtype>:<serialno>:<banner>`.
+/// -  `<systemtype>`: Identifies the device's mode and corresponds to the values in `SystemType`.
+/// -  `<serialno>`: The device's serial number. This field is commonly empty.
+/// -  `<banner>`: Contains metadata about the device, such as properties like product name, model,
+///    and supported features (e.g., "ro.product.name=...", "features=...").
+@available(added=HEAD)
+type SystemType = flexible enum : uint32 {
+    /// The device is in normal boot.
+    DEVICE = 1;
+    /// The device is in recovery.
+    RECOVERY = 2;
+    /// The device is in recovery sideload mode.
+    SIDELOAD = 3;
+    /// The device is in recovery rescue mode.
+    RESCUE = 4;
+    /// The device is in bootloader.
+    BOOTLOADER = 5;
+};

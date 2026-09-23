@@ -1,0 +1,231 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/host.gni")
+import("//build/python/python_binary.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/testing/host_test.gni")
+import("//build/testing/host_test_data.gni")
+import("//src/developer/ffx/config.gni")
+
+# Declares a host-side antlion test.
+#
+# Parameters
+#
+#  main_source
+#    The .py file defining the antlion test.
+#    Type: path
+#
+#  sources (optional)
+#    Other files that are used in the test.
+#    Type: list(path)
+#    Default: empty list
+#
+#  test_params (optional)
+#    Path to a YAML file with additional test parameters. This will be provided
+#    to the test in the antlion config under the "test_params" key.
+#    Type: string
+#
+#  test_cases (optional)
+#    List of test cases to run. Defaults to running all test cases.
+#    Type: list(string)
+#
+#  test_data_deps (optional)
+#    List of test data GN targets that are needed at runtime.
+#    Type: list(string)
+#    Default: empty list
+#
+#  package_deps (optional)
+#    List of Fuchsia packages that need to be available to the test on the target.
+#    Type: list(string)
+#    Default: empty list
+#
+#   deps
+#   environments
+#   visibility
+template("antlion_host_test") {
+  assert(defined(invoker.main_source), "main_source is required")
+
+  #
+  # Define antlion test python_binary().
+  #
+  _python_binary_name = "${target_name}.pyz"
+  _python_binary_target = "${target_name}_python_binary"
+  python_binary(_python_binary_target) {
+    forward_variables_from(invoker,
+                           [
+                             "enable_mypy",
+                             "main_source",
+                             "sources",
+                             "data_sources",
+                             "data_package_name",
+                           ])
+    output_name = _python_binary_name
+    main_callable = "test_runner.main"  # Mobly-specific entry point.
+    deps = [
+      "//src/testing/end_to_end/antlion",
+      "//src/testing/end_to_end/mobly_base_tests:fuchsia_wlan_base_test",
+    ]
+    if (defined(invoker.test_data_deps)) {
+      deps += invoker.test_data_deps
+    }
+    if (defined(invoker.libraries)) {
+      deps += invoker.libraries
+    }
+    testonly = true
+    visibility = [ ":*" ]
+  }
+
+  _test_dir = "${root_out_dir}/test_data/" + get_label_info(target_name, "dir")
+
+  #
+  # Define antlion test host_test_data().
+  #
+  _host_test_data_target = "${target_name}_test_data"
+  host_test_data(_host_test_data_target) {
+    testonly = true
+    visibility = [ ":*" ]
+    sources = [ get_label_info(":${_python_binary_target}", "target_out_dir") +
+                "/${_python_binary_name}" ]
+    outputs = [ "${_test_dir}/${_python_binary_name}" ]
+    deps = [ ":${_python_binary_target}" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+
+  #
+  # Define SSH binary host_test_data().
+  #
+  _host_test_data_ssh = "${target_name}_test_data_ssh"
+  host_test_data(_host_test_data_ssh) {
+    testonly = true
+    visibility = [ ":*" ]
+    sources = [
+      "//prebuilt/third_party/openssh-portable/${host_os}-${host_cpu}/bin/ssh",
+    ]
+    outputs = [ "${_test_dir}/ssh" ]
+  }
+
+  #
+  # Define Mobly test params YAML host_test_data().
+  #
+  if (defined(invoker.test_params)) {
+    _host_test_data_test_params = "${target_name}_test_data_test_params"
+    host_test_data(_host_test_data_test_params) {
+      testonly = true
+      visibility = [ ":*" ]
+      sources = [ invoker.test_params ]
+      outputs = [ "${_test_dir}/${invoker.test_params}" ]
+    }
+  }
+
+  #
+  # Define FFX binary host_test_data().
+  #
+  _host_test_data_ffx = "${target_name}_test_data_ffx"
+  host_test_data(_host_test_data_ffx) {
+    testonly = true
+    visibility = [ ":*" ]
+    sources = [ "${host_tools_dir}/ffx" ]
+    if (ffx_build_dual_mode_plugins_as_subtools) {
+      sources += [
+        "${host_tools_dir}/ffx-component",
+        "${host_tools_dir}/ffx-component.json",
+      ]
+    }
+    outputs = [ "${_test_dir}/{{source_file_part}}" ]
+    deps = [
+      "//src/developer/ffx:host",
+      "//src/developer/ffx:suite_test_data",
+    ]
+    if (ffx_build_dual_mode_plugins_as_subtools) {
+      deps += [
+        "//src/developer/ffx/plugins/component:ffx_component_tool_host_tool",
+      ]
+    }
+  }
+
+  #
+  # Define antlion-runner host_test_data().
+  #
+  _host_test_data_antlion_runner = "${target_name}_test_data_antlion_runner"
+  host_test_data(_host_test_data_antlion_runner) {
+    testonly = true
+    visibility = [ ":*" ]
+    sources = [ "${root_out_dir}/antlion-runner" ]
+    deps = [ "//src/testing/end_to_end/antlion/runner" ]
+  }
+
+  #
+  # Define the antlion host_test() using antlion-runner.
+  #
+  host_test(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "build_only",
+                             "environments",
+                             "isolated",
+                             "package_deps",
+                             "product_bundle",
+                             "timeout_secs",
+                             "visibility",
+                           ])
+
+    # Antlion E2E tests are target-bound and communicate with the device over
+    # SSH. Therefore, they always require expects_ssh = true.
+    expects_ssh = true
+
+    binary_path = get_label_info("//tools/mobly_test_parser", "root_out_dir") +
+                  "/mobly_test_parser"
+
+    args = [
+      rebase_path("${root_out_dir}/antlion-runner", root_build_dir),
+      "--python-bin",
+      rebase_path(python_exe_src, root_build_dir),
+      "--antlion-pyz",
+      rebase_path("${_test_dir}/${_python_binary_name}", root_build_dir),
+      "--out-dir",
+      rebase_path("${_test_dir}", root_build_dir),
+      "--ffx-binary",
+      rebase_path("${_test_dir}/ffx", root_build_dir),
+      "--ffx-subtools-search-path",
+      rebase_path(_test_dir, root_build_dir),
+      "--ssh-binary",
+      rebase_path("${_test_dir}/ssh", root_build_dir),
+    ]
+
+    if (defined(invoker.test_cases)) {
+      args += invoker.test_cases
+    }
+
+    data_deps = [
+      "//src/developer/ffx:suite_test_data",
+      "//src/testing/end_to_end/honeydew:honeydew_ffx_tool_deps",
+      "//src/testing/end_to_end/honeydew:honeydew_ffx_tool_test_deps",
+    ]
+
+    deps = [
+      ":${_host_test_data_antlion_runner}",
+      ":${_host_test_data_ffx}",
+      ":${_host_test_data_ssh}",
+      ":${_host_test_data_target}",
+      "//build/python:interpreter",
+      "//src/testing/end_to_end/honeydew",
+      "//tools/mobly_test_parser",
+    ]
+
+    if (defined(invoker.test_params)) {
+      args += [
+        "--test-params",
+        rebase_path("${_test_dir}/${invoker.test_params}", root_build_dir),
+      ]
+      deps += [ ":${_host_test_data_test_params}" ]
+    }
+
+    if (defined(invoker.test_data_deps)) {
+      deps += invoker.test_data_deps
+    }
+  }
+}

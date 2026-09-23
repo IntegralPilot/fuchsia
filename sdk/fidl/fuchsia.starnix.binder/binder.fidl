@@ -1,0 +1,348 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.starnix.binder;
+
+using zx;
+using fuchsia.io;
+using fuchsia.posix;
+using fuchsia.unknown;
+
+const MAX_PATH_LENGTH uint64 = 4095;
+const MAX_REQUEST_COUNT uint64 = 16;
+const MAX_HANDLE_COUNT uint64 = 4;
+const MAX_FILE_COUNT uint64 = 16;
+const MAX_IOCTL_READ_COUNT uint64 = 16;
+const MAX_IOCTL_WRITE_COUNT uint64 = 16;
+const MAX_WRITE_BYTES uint64 = 32768;
+
+alias Fd = int32;
+
+/// The flags associated with an opened file.
+type FileFlags = flexible bits : uint64 {
+    // Permissions
+    /// The owner can read the file.
+    RIGHT_READABLE = 0b1;
+    /// The owner can write to fhe file.
+    RIGHT_WRITABLE = 0b10;
+    // Skipping bits for exec and suid bits and for group and other mode if
+    // they are needed in the future.
+
+    // File type
+    /// The file is a directory.
+    DIRECTORY = 0b1000000000000;
+};
+
+/// The representation of an open file that can be transferred between the
+/// binder device driver and the client.
+type FileHandle = resource table {
+    /// The handle connecting to the file protocol. If not present, the file
+    /// should behave as it is was a null file: all read must succeed with empty
+    /// content and all write must succeed. See `fdio_fd_create_null()`.
+    1: handle zx.Handle;
+
+    /// Optional. The flags associated with the opened file.
+    3: flags FileFlags;
+
+    /// Optional. The file descriptor to help with translation between processes.
+    4: fd Fd;
+
+    /// Optional. An opaque bag of handles associated with the file.
+    ///
+    /// If this field is set, handle must not be set.
+    ///
+    /// In Fuchsia, there is an expectation that there is a 1:1 mapping between a file descriptor
+    /// and a handle. In general, we do not want to violate that rule. This field is intended to
+    /// used in very limited circumstances (compatibility with Linux and Binder), where we need to
+    /// violate rule.
+    ///
+    /// When this field is used, the composite_fd library will be used to create the file descriptor
+    /// in a Fuchsia component. Such file descriptors do not support regular operations and must be
+    /// handled using the composite_fd library.
+    5: bag vector<zx.Handle>:MAX_HANDLE_COUNT;
+};
+
+/// Protocol that gives the binder driver access to the client process'
+/// resources.
+open protocol ProcessAccessor {
+    /// Writes the contents of `content` to `address` in the process memory,
+    /// using the vmo content size to determine the number of bytes to write.
+    flexible WriteMemory(resource struct {
+        address uint64;
+        content zx.Handle:VMO;
+    }) -> () error fuchsia.posix.Errno;
+
+    /// Writes the contents of `bytes` to `address` in the process memory.
+    /// `WriteBytes` is functionally equivalent to `WriteMemory`, but is
+    /// optimized for small writes of less than `MAX_WRITE_BYTES`.
+    flexible WriteBytes(resource struct {
+        address uint64;
+        bytes vector<uint8>:MAX_WRITE_BYTES;
+    }) -> () error fuchsia.posix.Errno;
+
+    /// Execute the given `request` and returns the associated `response`. Any
+    /// failure will interrupt further processing and fail this operation and
+    /// the associated errno will be then returned.
+    /// The implementator of this protocol should handle these requests as best
+    /// it can so that a failure doesn't have visible side-effects.
+    flexible FileRequest(@generated_name("FileRequest") resource table {
+        /// The list of file descriptor the client must close.
+        1: close_requests vector<Fd>:MAX_REQUEST_COUNT;
+        /// The list of file descriptor the client must duplicate and transfer to
+        /// the binder driver.
+        2: get_requests vector<Fd>:MAX_REQUEST_COUNT;
+        /// The list of open file the client must add to its fd table, returning
+        /// the new minted file descriptors.
+        3: add_requests vector<FileHandle>:MAX_REQUEST_COUNT;
+    }) -> (@generated_name("FileResponse") resource table {
+        // (No ordinal 1 since there is no response for the close operation.)
+        /// The list of open file retriever for the `get_requests`.
+        2: get_responses vector<FileHandle>:MAX_REQUEST_COUNT;
+        /// The list of file descriptors minted for the `add_requests`.
+        3: add_responses vector<Fd>:MAX_REQUEST_COUNT;
+    }) error fuchsia.posix.Errno;
+};
+
+/// Give access to the binder nodes.
+@discoverable
+open protocol DevBinder {
+    /// Open the binder device node.
+    flexible Open(resource table {
+        /// The path to the binder device in the starnix process.
+        /// Mandatory
+        1: path vector<uint8>:MAX_PATH_LENGTH;
+
+        /// The service giving the binder driver access to the resources of the client process.
+        2: process_accessor client_end:ProcessAccessor;
+
+        /// The handle to the process that will use the binder driver. It is
+        /// used by the driver to read the data sent to the driver.
+        /// Mandatory
+        3: process zx.Handle:PROCESS;
+
+        /// The request to the Binder protocol implementation.
+        /// Mandatory
+        4: binder server_end:Binder;
+    });
+
+    /// Close the binder device node, previously opened with `Open`. The handle
+    /// is passed back to the service so that it can identify the device being
+    /// closed.
+    flexible Close(resource table {
+        /// The Binder protocol opened previously.
+        1: binder client_end:Binder;
+    });
+};
+
+
+/// Protocol that allows a binder server to request changes to the container's power state.
+@discoverable
+open protocol ContainerPowerController {
+    /// This requests that the container wakes up to service requests.
+    flexible Wake(resource table {
+        /// (Optional): This represents a wake lease that the binder server has.
+        /// The container will ensure that this wake lease will be kept alive until
+        /// The container takes its wake lease.
+        1: power_baton zx.Handle;
+
+        /// (Optional): This creates a wake lock associated with this event pair.
+        /// The container will not go back to sleep until the other end of this event pair has been
+        /// closed.
+        /// If this does not exist, then the container can sleep when it chooses after handling the
+        /// Wake call.
+        ///
+        /// The container will signal the pair of wake_lock with USER_0 when the lock has been created
+        /// in the kernel.
+        2: wake_lock zx.Handle:EVENTPAIR;
+    });
+
+    /// Registers an eventpair that will be signaled when the container is suspended or resumed.
+    /// The signals are ASLEEP(USER_1) and AWAKE(USER_0).
+    ///
+    /// The kernel returns AWAKE upon initial registration of the eventpair.
+    flexible RegisterWakeWatcher(resource table {
+        1: watcher zx.Handle:EVENTPAIR;
+    }) -> ();
+};
+
+/// Protocol that allows Starnix to control binder servers and clients in other
+/// Fuchsia components.
+@discoverable
+open protocol RemoteController {
+    /// Called by the Starnix kernel when it requires the remote Fuchsia
+    /// component to start servicing the binder protocol.
+    flexible Start(resource table {
+        1: dev_binder client_end:DevBinder;
+        2: lutex_controller client_end:LutexController;
+        3: container_power_controller client_end:ContainerPowerController;
+    });
+};
+
+/// Protocol that allows a Fuchsia component to interact with the Linux futexes
+/// of a process running inside starnix.
+@discoverable
+open protocol LutexController {
+    /// FUTEX_WAIT_BITSET command
+    flexible WaitBitset(@generated_name("WaitBitsetRequest") resource table {
+        /// The vmo containing the shared address of the futex.
+        /// Mandatory
+        1: vmo zx.Handle:VMO;
+        /// The offset in the vmo where the shared address of the futex is.
+        /// Mandatory
+        2: offset uint64;
+        /// The expected value of the futex.
+        /// Mandatory
+        3: value uint32;
+        /// The bit mask.
+        /// Optional. If not present, as mask with all bits present will be used.
+        4: mask uint32;
+        /// The deadline for the wait operation.
+        /// Optional. If not present, the operation can block indefinitely.
+        5: deadline zx.Time;
+    }) -> () error fuchsia.posix.Errno;
+
+    /// FUTEX_WAKE_BITSET command
+    flexible WakeBitset(@generated_name("WakeBitsetRequest") resource table {
+        /// The vmo containing the shared address of the futex.
+        /// Mandatory
+        1: vmo zx.Handle:VMO;
+        /// The offset in the vmo where the shared address of the futex is.
+        /// Mandatory
+        2: offset uint64;
+        /// Maximum number of waiter to wake.
+        /// Mandatory
+        3: count uint32;
+        /// The bit mask.
+        /// Optional. If not present, as mask with all bits present will be used.
+        4: mask uint32;
+    }) -> (@generated_name("WakeResponse") resource table {
+        /// The number of waiters that were woken up.
+        1: count uint64;
+    }) error fuchsia.posix.Errno;
+
+    /// FUTEX_CMP_REQUEUE and FUTEX_REQUEUE commands
+    flexible CmpRequeue(@generated_name("CmpRequeueRequest") resource table {
+        /// The vmo containing the first futex's word.
+        /// Mandatory
+        1: first_vmo zx.Handle:VMO;
+        /// The offset in first_vmo of the first futex's word.
+        /// Mandatory
+        2: first_offset uint64;
+        /// The vmo containing the second futex's word.
+        /// Optional. If not present, the first_vmo is also used as the
+        /// second_vmo.
+        3: second_vmo zx.Handle:VMO;
+        /// The offset in second_vmo of the second futex's word.
+        /// Mandatory
+        4: second_offset uint64;
+        /// Maximum number of waiters to wake. Waiters beyond this count are
+        /// moved to be waiting on the second futex instead, up to
+        /// max_requeue_count.
+        /// Mandatory
+        5: wake_count uint32;
+        /// Maximum number of waiters to re-queue (among those which were not
+        /// woken) on the second futex. In other words, maximum number of
+        /// waiters which get changed from waiting on the first futex to waiting
+        /// on the second futex instead. Waiters beyond this are left waiting on
+        /// the first futex.
+        /// Mandatory
+        6: requeue_count uint32;
+        /// Value that must match the uint32_t at first_vmo first_offset for the
+        /// requeue to occur, else no requeue occurs and error will be EAGAIN.
+        /// Optional. If not present, the requeue proceeds regardless of the
+        /// value of the uint32_t at first_vmo first_offset. In other words,
+        /// this field set/un-set chooses FUTEX_CMP_REQUEUE/FUTEX_REQUEUE
+        /// semantics respectively. In addition, this controls the semantics of
+        /// the "count" field in a success response, per differing semantics of
+        /// FUTEX_CMP_REQUEUE and FUTEX_REQUEUE return values.
+        7: cmp_val uint32;
+    }) -> (@generated_name("CmpRequeueResponse") resource table {
+        /// The number of waiters that were woken up plus the number re-queued.
+        1: count uint64;
+    }) error fuchsia.posix.Errno;
+};
+
+/// The location and size of reads or writes for an ioctl.
+type IoctlReadWrite = struct {
+    /// Address in the process.
+    address uint64;
+    /// Offset into the VMO.
+    offset uint64;
+    /// Length of the buffer within the VMO.
+    length uint64;
+};
+
+/// An opened connection to a binder driver.
+open protocol Binder {
+    /// Set the VMO to used as a share resource between the driver and the
+    /// client. `mapped_address` is the address where the vmo is mapped in the
+    /// client address space.
+    flexible SetVmo(resource struct {
+        vmo zx.Handle:VMO;
+        mapped_address uint64;
+    });
+    /// Processes a Binder ioctl. This message returns writes for the calling thread
+    /// that must be processed to correctly handle the ioctl.
+    flexible Ioctl(resource struct {
+        /// Thread ID for the thread calling the ioctl.
+        tid zx.Koid;
+        /// The ioctl being called.
+        request uint32;
+        /// Optional argument for the ioctl.
+        arg uint64;
+        /// The VMO to return writes for this ioctl through.
+        vmo zx.Handle:VMO;
+        /// The reads gathered for the ioctl.
+        ioctl_reads vector<IoctlReadWrite>:MAX_IOCTL_READ_COUNT;
+        /// The files being transfered by the ioctl.
+        files vector<FileHandle>:MAX_FILE_COUNT;
+    }) -> (struct {
+        ioctl_writes vector<IoctlReadWrite>:MAX_IOCTL_WRITE_COUNT;
+    }) error fuchsia.posix.Errno;
+};
+
+/// The flags when reading from an unix domain socket
+type ReadFlags = flexible bits : uint64 {
+    /// When set, the data must not be removed from the queue and the next read
+    /// must resend the same data.
+    PEEK = 0b1;
+};
+
+/// A Unix Domain Socket
+///
+/// This protocol is used to implement a unix domain socket in a Fuchsia
+/// Component that will be able to communicate with a socket in Starnix. That
+/// socket will be able to transmit file descriptors.
+@discoverable
+open protocol UnixDomainSocket {
+    compose fuchsia.unknown.Cloneable;
+    compose fuchsia.unknown.Closeable;
+    compose fuchsia.unknown.Queryable;
+
+    /// Returns an EventPair that will allow Starnix to wait on the socket. This event must use:
+    /// - `fio.FileSignal.READABLE` to signal that a message is available.
+    /// - `fio.FileSignal.WRITABLE` to signal that it can accept a new message.
+    /// - `ZX_EVENTPAIR_PEER_CLOSED` to signal that it is closed.
+    flexible GetEvent(table {}) -> (resource table {
+        1: event zx.Handle:<EVENTPAIR, zx.Rights.TRANSFER | zx.Rights.SIGNAL | zx.Rights.WAIT>;
+    }) error zx.Status;
+
+    /// Read a message from the socket.
+    flexible Read(table {
+        1: count uint64;
+        2: flags ReadFlags;
+    }) -> (resource table {
+        1: data fuchsia.io.Transfer;
+        2: data_original_length uint64;
+        3: handles vector<zx.Handle>:MAX_HANDLE_COUNT;
+    }) error zx.Status;
+
+    /// Write a message to the socket.
+    flexible Write(resource table {
+        1: data fuchsia.io.Transfer;
+        2: handles vector<zx.Handle>:MAX_HANDLE_COUNT;
+    }) -> (table {
+        1: actual_count uint64;
+    }) error zx.Status;
+};

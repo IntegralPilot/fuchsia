@@ -1,0 +1,85 @@
+#!/bin/bash
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Source tree
+### Syncs BUILD.gn and BUILD.bazel for targets that are dual-building in both.
+
+## usage: fx bazel2gn [-d|--directory <path/to/dir>]... [-h|--help] [--no-build]
+##
+##   -h|--help       Print out this message.
+##   -d|--directory  Directory to sync, repeatable.
+##   --no-build      Skip building required dependencies.
+##
+## Updates BUILD.gn listed in this script based on the BUILD.bazel files in
+## their directories.
+
+set -eo pipefail
+
+_script_dir="${BASH_SOURCE[0]%/*}";
+if [[ "${_script_dir}" == "${BASH_SOURCE[0]}" ]]; then _script_dir="."; fi
+readonly _script_dir
+
+# shellcheck source=/dev/null
+source "${_script_dir}/../lib/vars.sh" || exit $?
+fx-config-read
+
+# shellcheck source=/dev/null
+source "${_script_dir}/../lib/bazel_utils.sh" || exit $?
+
+declare -r BAZEL2GN_TARGET="//build/tools/bazel2gn"
+
+BAZEL2GN_BIN="$(fx-get-bazel-workspace)/bazel-bin/build/tools/bazel2gn/bazel2gn_/bazel2gn"
+readonly BAZEL2GN_BIN
+
+function main {
+  local build=true
+  local directories=()
+  local dir_list_file
+  while [[ "${#}" -ge 1 ]]; do
+    case "${1}" in
+      -d|--directory)
+        shift
+        directories+=("${1}")
+        ;;
+      -h|--help)
+        fx-command-help
+        exit 0
+        ;;
+      --no-build)
+        build=false
+        ;;
+      *)
+        fx-error "Unexpected command line arg ${1}"
+        fx-command-help
+        exit 1
+    esac
+    shift
+  done
+
+  if [[ "${#directories[@]}" -eq 0 ]]; then
+    fx-gen # To make sure `dir_list_file` below is up-to-date.
+    dir_list_file="${FUCHSIA_BUILD_DIR}/bazel2gn_dir_list"
+  else
+    # Write the directories to a temporary file.
+    dir_list_file="$(mktemp /tmp/bazel2gn-dirlist-XXXXXX)"
+    for directory in "${directories[@]}"; do
+        printf "%s\n" "${directory}" >> "${dir_list_file}"
+    done
+    trap 'rm -f "${dir_list_file}"' EXIT
+  fi
+
+  # This Bazel build needs to run after `fx-gen`, which can clear out the symlinks in bazel-bin.
+  if [[ "${build}" == "true" ]]; then
+    fx-run-bazel false "$(fx-get-bazel)" build --config=host "${BAZEL2GN_TARGET}"
+  fi
+
+  "${BAZEL2GN_BIN}" \
+    --directory_list "${dir_list_file}" \
+    --fuchsia_dir "${FUCHSIA_DIR}" \
+    --gn_bin "${PREBUILT_GN}" \
+    --buildifier_bin "${PREBUILT_BUILDIFIER}"
+}
+
+main "$@"

@@ -1,0 +1,536 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+assert(is_fuchsia, "component manager is for the Fuchsia toolchain only")
+
+import("//build/assembly/bootfs_files_for_assembly.gni")
+import("//build/component/component_id_index.gni")
+import("//build/component/config.gni")
+import("//build/components.gni")
+import("//build/dist/renamed_binary.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/testing/environments.gni")
+import("//build/toolchain/concurrent_jobs.gni")
+import("//build/tools/json_merge/json_merge.gni")
+import("//tools/fidl/measure-tape/measure_tape.gni")
+
+config("optimize-for-size") {
+  # "opt-level=z" saves 400 KiB compared to "s" on component framework binary
+  # On arm64 release build, component_manager size goes from 4216440 to 3884664
+  # bytes.
+
+  rustflags = [
+    "-Copt-level=z",
+    "-Cpanic=abort",
+  ]
+}
+
+_component_manager_bin = {
+  with_unit_tests = true
+  edition = "2024"
+
+  configs_to_add = [
+    "//build/config/rust:bootfs",
+    ":optimize-for-size",
+  ]
+
+  # As this is a large binary that uses many resources to compile (and takes
+  # minutes when LTO is enabled, shift it to the large RBE worker pool)
+  _concurrent_jobs = concurrent_jobs.rust_highmem
+  configs_to_add += _concurrent_jobs.configs
+  forward_variables_from(_concurrent_jobs.vars, "*")
+
+  deps = [
+    ":dispatcher_config",
+    ":measure_tape_for_events",
+    ":measure_tape_for_instance",
+    "lib/errors",
+    "lib/router_error",
+    "//sdk/fidl/fuchsia.boot:fuchsia.boot_rust",
+    "//sdk/fidl/fuchsia.component:fuchsia.component_rust",
+    "//sdk/fidl/fuchsia.component.decl:fuchsia.component.decl_rust",
+    "//sdk/fidl/fuchsia.component.internal:fuchsia.component.internal_rust",
+    "//sdk/fidl/fuchsia.component.resolution:fuchsia.component.resolution_rust",
+    "//sdk/fidl/fuchsia.component.runner:fuchsia.component.runner_rust",
+    "//sdk/fidl/fuchsia.component.runtime:fuchsia.component.runtime_rust",
+    "//sdk/fidl/fuchsia.component.sandbox:fuchsia.component.sandbox_rust",
+    "//sdk/fidl/fuchsia.data:fuchsia.data_rust",
+    "//sdk/fidl/fuchsia.hardware.power.statecontrol:fuchsia.hardware.power.statecontrol_rust",
+    "//sdk/fidl/fuchsia.inspect:fuchsia.inspect_rust",
+    "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+    "//sdk/fidl/fuchsia.kernel:fuchsia.kernel_rust",
+    "//sdk/fidl/fuchsia.logger:fuchsia.logger_rust",
+    "//sdk/fidl/fuchsia.mem:fuchsia.mem_rust",
+    "//sdk/fidl/fuchsia.memory.attribution:fuchsia.memory.attribution_rust",
+    "//sdk/fidl/fuchsia.pkg:fuchsia.pkg_rust",
+    "//sdk/fidl/fuchsia.process:fuchsia.process_rust",
+    "//sdk/fidl/fuchsia.process.lifecycle:fuchsia.process.lifecycle_rust",
+    "//sdk/fidl/fuchsia.sys2:fuchsia.sys2_rust",
+    "//sdk/fidl/fuchsia.time:fuchsia.time_rust",
+    "//sdk/rust/zx",
+    "//sdk/rust/zx-status",
+    "//src/devices/bin/devfs:lib",
+    "//src/lib/async-utils",
+    "//src/lib/diagnostics/inspect/runtime/rust:unchecked_includes",
+    "//src/lib/diagnostics/inspect/rust",
+    "//src/lib/diagnostics/log/rust",
+    "//src/lib/directed_graph",
+    "//src/lib/error/clonable_error",
+    "//src/lib/fdio/rust:fdio",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia-async",
+    "//src/lib/fuchsia-component",
+    "//src/lib/fuchsia-fs",
+    "//src/lib/fuchsia-runtime",
+    "//src/lib/fuchsia-sync",
+    "//src/lib/fuchsia-url",
+    "//src/lib/include_bytes_from_working_dir",
+    "//src/lib/trace/rust:trace",
+    "//src/lib/versioning/version-history/rust",
+    "//src/lib/versioning/version-history/rust/data",
+    "//src/performance/memory/scudo:rust",
+    "//src/power/shutdown-shim:lib",
+    "//src/storage/lib/vfs/rust:vfs",
+    "//src/sys/component_manager/lib/builtins",
+    "//src/sys/component_manager/lib/diagnostics",
+    "//src/sys/component_manager/lib/hooks",
+    "//src/sys/component_manager/lib/logger",
+    "//src/sys/component_manager/lib/serve_processargs",
+    "//src/sys/component_manager/lib/util",
+    "//src/sys/lib/capability_source",
+    "//src/sys/lib/cm_config",
+    "//src/sys/lib/cm_fidl_validator",
+    "//src/sys/lib/cm_graph",
+    "//src/sys/lib/cm_rust",
+    "//src/sys/lib/cm_types",
+    "//src/sys/lib/component_id_index",
+    "//src/sys/lib/config_encoder",
+    "//src/sys/lib/elf_runner",
+    "//src/sys/lib/fidl-fuchsia-component-abi-ext",
+    "//src/sys/lib/fuchsia-bootfs",
+    "//src/sys/lib/fuchsia-zbi",
+    "//src/sys/lib/mem_util",
+    "//src/sys/lib/moniker",
+    "//src/sys/lib/namespace",
+    "//src/sys/lib/routing",
+    "//src/sys/lib/runner",
+    "//src/sys/lib/runtime_capabilities",
+    "//src/sys/pkg/fidl/fuchsia.update.verify:fuchsia.update.verify_rust",
+    "//src/sys/pkg/lib/context-authenticator",
+    "//src/sys/pkg/lib/fuchsia-pkg",
+    "//src/sys/pkg/lib/package-directory",
+    "//src/sys/pkg/lib/system-image",
+    "//src/sys/service-broker:lib",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:async-trait",
+    "//third_party/rust_crates:derivative",
+    "//third_party/rust_crates:flyweights",
+    "//third_party/rust_crates:futures",
+    "//third_party/rust_crates:itertools",
+    "//third_party/rust_crates:log",
+    "//third_party/rust_crates:num-traits",
+    "//third_party/rust_crates:rand",
+    "//third_party/rust_crates:thiserror",
+  ]
+
+  test_deps = [
+    "//examples/components/routing/fidl:echo_rust",
+    "//sdk/fidl/fuchsia.component:fuchsia.component_rust",
+    "//sdk/fidl/fuchsia.component.runner:fuchsia.component.runner_rust",
+    "//sdk/fidl/fuchsia.data:fuchsia.data_rust",
+    "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+    "//sdk/fidl/fuchsia.kernel:fuchsia.kernel_rust",
+    "//src/lib/diagnostics/testing/diagnostics-assertions/rust:diagnostics-assertions",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-async",
+    "//src/sys/lib/cm_config",
+    "//src/sys/lib/cm_rust/testing",
+    "//src/sys/lib/component_id_index",
+    "//src/sys/lib/fuchsia-bootfs:testdata_bootfs",
+    "//src/sys/lib/routing/testing:routing_test_helpers",
+    "//third_party/rust_crates:assert_matches",
+    "//third_party/rust_crates:async-trait",
+    "//third_party/rust_crates:camino",
+    "//third_party/rust_crates:futures",
+    "//third_party/rust_crates:log",
+    "//third_party/rust_crates:maplit",
+    "//third_party/rust_crates:tempfile",
+    "//third_party/rust_crates:test-case",
+    "//third_party/rust_crates:thiserror",
+  ]
+
+  sources = [
+    "src/bootfs.rs",
+    "src/builtin/boot_controller.rs",
+    "src/builtin/builtin_resolver.rs",
+    "src/builtin/builtin_runner.rs",
+    "src/builtin/crash_introspect.rs",
+    "src/builtin/dispatcher.rs",
+    "src/builtin/fuchsia_boot_resolver.rs",
+    "src/builtin/log.rs",
+    "src/builtin/mod.rs",
+    "src/builtin/ota_health_verification.rs",
+    "src/builtin/realm_builder.rs",
+    "src/builtin/runner.rs",
+    "src/builtin/svc_stash_provider.rs",
+    "src/builtin/system_controller.rs",
+    "src/builtin/time.rs",
+    "src/builtin_environment.rs",
+    "src/capability.rs",
+    "src/framework/binder.rs",
+    "src/framework/capabilities.rs",
+    "src/framework/capability_store.rs",
+    "src/framework/component_sandbox_retriever.rs",
+    "src/framework/config_override.rs",
+    "src/framework/controller.rs",
+    "src/framework/introspector.rs",
+    "src/framework/lifecycle_controller.rs",
+    "src/framework/mod.rs",
+    "src/framework/namespace.rs",
+    "src/framework/pkg_dir.rs",
+    "src/framework/realm.rs",
+    "src/framework/realm_query.rs",
+    "src/framework/route_validator.rs",
+    "src/main.rs",
+    "src/model/actions/coordinator.rs",
+    "src/model/actions/destroy.rs",
+    "src/model/actions/mod.rs",
+    "src/model/actions/resolve.rs",
+    "src/model/actions/set.rs",
+    "src/model/actions/shutdown.rs",
+    "src/model/actions/start.rs",
+    "src/model/actions/stop.rs",
+    "src/model/actions/unresolve.rs",
+    "src/model/component/instance.rs",
+    "src/model/component/manager.rs",
+    "src/model/component/mod.rs",
+    "src/model/context.rs",
+    "src/model/escrow.rs",
+    "src/model/event_logger.rs",
+    "src/model/events/hook_observer.rs",
+    "src/model/events/mod.rs",
+    "src/model/events/use_router.rs",
+    "src/model/logger.rs",
+    "src/model/mod.rs",
+    "src/model/model.rs",
+    "src/model/namespace.rs",
+    "src/model/program/component_controller.rs",
+    "src/model/program/mod.rs",
+    "src/model/resolver.rs",
+    "src/model/routing/aggregate_router.rs",
+    "src/model/routing/mod.rs",
+    "src/model/routing/service.rs",
+    "src/model/start.rs",
+    "src/model/storage/admin_protocol.rs",
+    "src/model/storage/mod.rs",
+    "src/model/testing/echo_service.rs",
+    "src/model/testing/mocks.rs",
+    "src/model/testing/mod.rs",
+    "src/model/testing/out_dir.rs",
+    "src/model/testing/routing_test_helpers.rs",
+    "src/model/testing/test_helpers.rs",
+    "src/model/testing/test_hook.rs",
+    "src/model/tests/availability.rs",
+    "src/model/tests/config.rs",
+    "src/model/tests/diagnostics.rs",
+    "src/model/tests/dictionary.rs",
+    "src/model/tests/directory.rs",
+    "src/model/tests/lifecycle.rs",
+    "src/model/tests/mod.rs",
+    "src/model/tests/policy.rs",
+    "src/model/tests/rights.rs",
+    "src/model/tests/routing.rs",
+    "src/model/tests/storage.rs",
+    "src/model/tests/storage_admin.rs",
+    "src/model/token.rs",
+    "src/root_input_builder.rs",
+    "src/root_stop_notifier.rs",
+    "src/runner.rs",
+    "src/sandbox_util.rs",
+    "src/startup.rs",
+  ]
+
+  # Add the compiled manifest of the ELF runner as a dependency, such that it
+  # may later be included into the binary via
+  # `include_bytes_from_working_dir_env`.
+  #
+  # Note: get_target_outputs would have been more robust, but that function does
+  # not support querying targets in other toolchains. component_manager may get
+  # built in e.g. asan toolchain.
+  elf_runner_cm_out_dir =
+      get_label_info(":elf_runner_cm($default_toolchain)", "target_out_dir")
+  elf_runner_cm = "$elf_runner_cm_out_dir/cml/elf_runner_cm/elf_runner.cm"
+  elf_runner_cm_path = rebase_path(elf_runner_cm, root_build_dir)
+  inputs = [ elf_runner_cm ]
+  deps += [ ":elf_runner_cm($default_toolchain)" ]
+  rustenv = [ "ELF_RUNNER_CM_PATH=$elf_runner_cm_path" ]
+
+  dispatcher_cm_out_dir =
+      get_label_info(":dispatcher_cm($default_toolchain)", "target_out_dir")
+  dispatcher_cm = "$dispatcher_cm_out_dir/cml/dispatcher_cm/dispatcher.cm"
+  dispatcher_cm_path = rebase_path(dispatcher_cm, root_build_dir)
+  inputs += [ dispatcher_cm ]
+  deps += [ ":dispatcher_cm($default_toolchain)" ]
+  rustenv += [ "DISPATCHER_CM_PATH=$dispatcher_cm_path" ]
+
+  # component_manager should not depend on json5
+  assert_no_deps = [
+    # regex crate is large
+    "//third_party/rust_crates:regex",
+
+    # component_manager should not depend on json
+    # Allow build tools to depend on JSON by limiting this restriction to the
+    # current toolchain.
+    # TODO(https://fxbug.dev/302204241): Uncomment when component_manager no longer
+    # depends on serde_json (it does through version-history, at least)
+    # "//third_party/rust_crates:serde_json",
+    "//third_party/rust_crates:serde_json5($current_toolchain)",
+  ]
+
+  exclude_toolchain_tags = [ "heapdump" ]
+}
+
+_deps_for_tracing = [
+  "//sdk/fidl/fuchsia.tracing.provider:fuchsia.tracing.provider_rust",
+  "//src/lib/trace/rust:trace-provider",
+]
+
+rustc_binary("bin") {
+  output_name = "component_manager"
+  forward_variables_from(_component_manager_bin, "*")
+  configs += configs_to_add
+  assert_no_deps += [
+    # For tracing support, :bin_with_tracing is required
+    "//src/lib/trace/rust:trace-provider",
+  ]
+  test_deps += [
+    "//src/lib/test_util",
+    "//src/sys/pkg/lib/fuchsia-pkg-testing",
+    "//third_party/rust_crates:paste",
+    "//third_party/rust_crates:pretty_assertions",
+    "//third_party/rust_crates:proptest",
+  ]
+}
+
+rustc_test("src_model_tests") {
+  output_name = "component_manager_src_model_tests"
+  forward_variables_from(_component_manager_bin, "*")
+  source_root = "src/main.rs"
+  rustflags = [ "--cfg=feature=\"src_model_tests\"" ]
+  configs += configs_to_add
+  test_deps += [
+    "//sdk/fidl/fuchsia.component:fuchsia.component_rust",
+    "//src/lib/diagnostics/hierarchy/rust",
+    "//src/lib/diagnostics/testing/diagnostics-assertions/rust:diagnostics-assertions",
+  ]
+  assert_no_deps += [
+    # For tracing support, :bin_with_tracing is required
+    "//src/lib/trace/rust:trace-provider",
+  ]
+}
+
+rustc_binary("bin_with_tracing") {
+  output_name = "component_manager_with_tracing"
+  forward_variables_from(_component_manager_bin, "*")
+  configs += configs_to_add
+  features = [ "tracing" ]
+  deps += _deps_for_tracing
+}
+
+rustc_binary("bin_with_tracing_and_heapdump") {
+  output_name = "component_manager_with_tracing_and_heapdump"
+  forward_variables_from(_component_manager_bin, "*")
+  configs += configs_to_add
+  features = [
+    "heapdump",
+    "tracing",
+  ]
+  deps += _deps_for_tracing
+  deps += [ "//src/performance/memory/heapdump/instrumentation:rust" ]
+}
+
+# This v2 component bundles component manager with a config suitable for running
+# a nested component manager inside of realm builder.
+fuchsia_component("component-manager-realm-builder-cmp") {
+  testonly = true
+  deps = [
+    ":bin_with_tracing",
+    ":component_manager_realm_builder_config",
+  ]
+  component_name = "component_manager"
+  manifest = "meta/component_manager.cml"
+}
+
+# This v2 component bundles component manager with a debug config suitable for
+# running a nested component manager inside of realm builder.
+fuchsia_component("component-manager-realm-builder-debug-cmp") {
+  testonly = true
+  deps = [
+    ":bin_with_tracing",
+    ":component_id_index_for_debug_config",
+    ":component_manager_realm_builder_debug_config",
+  ]
+  component_name = "component_manager"
+  manifest = "meta/component_manager.cml"
+}
+
+# This is a low-level action that compiles `elf_runner.cml`
+# without also adding the compiled `.cm` as a `resource`, which would
+# otherwise get funneled into bootfs.
+cm("elf_runner_cm") {
+  output_name = "cml/elf_runner_cm/elf_runner.cm"
+  manifest = "meta/elf_runner.cml"
+}
+
+cm("dispatcher_cm") {
+  output_name = "cml/dispatcher_cm/dispatcher.cm"
+  manifest = "meta/dispatcher.cml"
+  restricted_features = [ "dynamic_dictionaries" ]
+}
+
+fuchsia_structured_config_rust_lib("dispatcher_config") {
+  cm_label = ":dispatcher_cm"
+}
+
+fuchsia_component("elf_runner") {
+  component_name = "elf_runner"
+  manifest = "meta/elf_runner.cml"
+}
+
+resource("component_manager_tests_invalid_manifest") {
+  sources = [ "meta/component_manager_tests.invalid_cm" ]
+  outputs = [ "meta/{{source_file_part}}" ]
+}
+
+fuchsia_test_component("model-tests-cmp") {
+  deps = [ ":src_model_tests" ]
+  component_name = "component_manager_src_model_tests"
+  manifest = "meta/component_manager_src_model_tests.cml"
+}
+
+fuchsia_test_component("component-manager-tests-cmp") {
+  deps = [ ":bin_test" ]
+  component_name = "component_manager_tests"
+  manifest = "meta/component_manager_tests.cml"
+  test_type = "system"
+}
+
+fuchsia_test_package("component-manager-tests") {
+  # Many tests generate routing errors.
+  test_specs = {
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+  test_components = [
+    ":component-manager-tests-cmp",
+    ":model-tests-cmp",
+  ]
+  deps = [
+    ":component_manager_tests_invalid_manifest",
+    "testing/signal_then_hang",
+    "tests/crash_introspect:panic_on_start",
+    "//examples/hello_world/rust:hello-world-rust-component",
+    "//src/sys/component_manager/testing/echo_server",
+    "//src/sys/component_manager/testing/lifecycle",
+  ]
+}
+
+measure_tape("measure_tape_for_events") {
+  target_binding = "rust"
+  target_types = [ "fuchsia.component/Event" ]
+  fidls = [
+    "//sdk/fidl/fuchsia.component",
+    "//sdk/fidl/fuchsia.io",
+  ]
+}
+
+measure_tape("measure_tape_for_instance_info") {
+  target_binding = "rust"
+  target_types = [ "fuchsia.sys2/InstanceInfo" ]
+  fidls = [ "//sdk/fidl/fuchsia.sys2" ]
+}
+
+measure_tape("measure_tape_for_instance") {
+  target_binding = "rust"
+  target_types = [ "fuchsia.sys2/Instance" ]
+  fidls = [ "//sdk/fidl/fuchsia.sys2" ]
+}
+
+group("tests") {
+  testonly = true
+
+  deps = [
+    ":component-manager-tests",
+    ":hermetic_tests",
+    "lib:non_hermetic_tests",
+    "tests:non_hermetic_tests",
+  ]
+}
+
+group("hermetic_tests") {
+  testonly = true
+
+  deps = [
+    "lib:hermetic_tests",
+    "stress_tests",
+    "stress_tests_alt:component-manager-stress-tests-short",
+    "tests:hermetic_tests",
+  ]
+}
+
+bootfs_files_for_assembly("bootfs") {
+  deps = [ ":bin" ]
+}
+
+renamed_binary("renamed_bin_with_tracing") {
+  dest = "bin/component_manager"
+  source = "$root_out_dir/component_manager_with_tracing"
+  source_deps = [ ":bin_with_tracing" ]
+}
+
+bootfs_files_for_assembly("bootfs_with_tracing") {
+  deps = [ ":renamed_bin_with_tracing" ]
+}
+
+renamed_binary("renamed_bin_with_tracing_and_heapdump") {
+  dest = "bin/component_manager"
+  source = "$root_out_dir/component_manager_with_tracing_and_heapdump"
+  source_deps = [ ":bin_with_tracing_and_heapdump" ]
+}
+
+bootfs_files_for_assembly("bootfs_with_tracing_and_heapdump") {
+  deps = [ ":renamed_bin_with_tracing_and_heapdump" ]
+}
+
+component_config("component_manager_realm_builder_config") {
+  sources = [
+    "configs/no_debug.json5",
+    "configs/test_config.base.json5",
+  ]
+  dest = "data/component_manager_config"
+}
+
+component_config("component_manager_realm_builder_debug_config") {
+  sources = [
+    "configs/debug.json5",
+    "configs/test_config.base.json5",
+  ]
+  dest = "data/component_manager_config"
+}
+
+component_config("component_manager_bootfs_config") {
+  build_type = "eng"
+  dest = "config/component_manager"
+}
+
+component_id_index("component_id_index_for_debug") {
+  source = "configs/component_id_index_for_debug.json5"
+}
+
+component_id_index_config("component_id_index_for_debug_config") {
+  deps = [ ":component_id_index_for_debug" ]
+}

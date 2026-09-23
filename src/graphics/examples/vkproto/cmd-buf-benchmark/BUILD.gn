@@ -1,0 +1,152 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/dist/packaged_shared_library.gni")
+import("//build/packages/sdk_fuchsia_package.gni")
+import("//src/graphics/examples/vkproto/common/common.gni")
+import("//src/lib/vulkan/layers.gni")
+import("//src/lib/vulkan/vulkan.gni")
+
+resource("shaders") {
+  sources = [
+    "../common/shaders/frag.spv",
+    "../common/shaders/vert.spv",
+  ]
+  outputs = [ "data/shaders/{{source_file_part}}" ]
+}
+
+packaged_shared_library("libvulkan") {
+  library = "//third_party/Vulkan-Loader:libvulkan"
+}
+
+fuchsia_component_manifest("cmd-buf-benchmark-child-manifest") {
+  component_name = "cmd-buf-benchmark-test-child"
+  manifest = "meta/cmd-buf-benchmark-test-child.cml"
+}
+
+fuchsia_component("cmd-buf-benchmark-test-child-component") {
+  component_name = "cmd-buf-benchmark-test-child"
+  cm_label = ":cmd-buf-benchmark-child-manifest"
+  deps = [
+    ":bin",
+    ":libvulkan",
+    ":shaders",
+    "//src/lib/vulkan/validation_layers",
+  ]
+}
+
+fuchsia_structured_config_values("default_config") {
+  cm_label = ":cmd-buf-benchmark-child-manifest"
+  values = {
+    gpu_vendor_id = 0
+    disabled_test_pattern = ""
+  }
+}
+
+fuchsia_package("cmd-buf-benchmark-test-child") {
+  package_name = "cmd-buf-benchmark-test"
+  deps = [
+    ":cmd-buf-benchmark-test-child-component",
+    ":default_config",
+  ]
+}
+
+if (current_toolchain == default_toolchain) {
+  sdk_fuchsia_package("cmd-buf-benchmark-test-sdk") {
+    distribution_name = "cmd-buf-benchmark-test"
+    category = "partner"
+    package_label = ":cmd-buf-benchmark-test-child"
+    api_level_added = 19
+    expected_files_exact = [ "meta/cmd-buf-benchmark-test-child.cm" ]
+  }
+}
+
+config("vulkan_sdk_linux_config") {
+  # Specify the include/lib dirs and linked libraries for use with the
+  # downloaded LunarG Vulkan SDK.
+  vulkan_sdk = "//prebuilt/third_party/vulkansdk/linux/x86_64"
+  include_dirs = [ "$vulkan_sdk/include" ]
+  lib_dirs = [ "$vulkan_sdk/lib" ]
+  libs = [ "vulkan" ]
+}
+
+executable("bin") {
+  output_name = "cmd-buf-benchmark"
+  sources = [ "main.cc" ]
+
+  include_dirs = [ "//src/graphics/examples/vkproto/common" ]
+
+  defines = [ "VULKAN_HPP_NO_EXCEPTIONS" ]
+
+  if (is_fuchsia) {
+    include_dirs += [ "//src/graphics/examples/vkproto/fuchsia" ]
+
+    deps = [
+      # TODO(https://fxbug.dev/42180987): workaround for toolchain issues, see bug
+      "//build/config/fuchsia:uses-outline-atomics-fxbug98632",
+      "//src/graphics/examples/vkproto/common:config_query",
+      "//src/lib/vulkan",
+      "//src/lib/vulkan/swapchain",
+    ]
+
+    sources += [
+      "../fuchsia/fuchsia_surface.cc",
+      "../fuchsia/fuchsia_surface.h",
+    ]
+  } else {
+    include_dirs += [ "//src/graphics/examples/vkproto/glfw" ]
+
+    sources += [
+      "../glfw/glfw_surface.cc",
+      "../glfw/glfw_surface.h",
+    ]
+
+    deps = [
+      "..:spirv_copy",
+      "//third_party/glfw",
+    ]
+
+    if (is_linux) {
+      configs += [ ":vulkan_sdk_linux_config($host_toolchain)" ]
+    }
+  }
+
+  deps += [ "../common:srcs" ]
+
+  data = [
+    "../common/shaders/frag.spv",
+    "../common/shaders/vert.spv",
+  ]
+}
+
+copy("spirv_copy") {
+  sources = [
+    "../common/shaders/frag.spv",
+    "../common/shaders/vert.spv",
+  ]
+
+  outputs = [ "$target_out_dir/{{source_file_part}}" ]
+}
+
+#
+# Linux / Mac Build
+#
+group("cmd-buf-benchmark-glfw") {
+  deps = [ ":bin($host_toolchain)" ]
+}
+
+fuchsia_test_component("cmd-buf-benchmark-test-component") {
+  component_name = "cmd-buf-benchmark-test"
+  test_type = "vulkan"
+  manifest = "meta/cmd-buf-benchmark.cml"
+}
+
+fuchsia_test_package("cmd-buf-benchmark-test") {
+  test_components = [ ":cmd-buf-benchmark-test-component" ]
+  subpackages = [ ":cmd-buf-benchmark-test-child" ]
+  test_specs = {
+    environments = vulkan_envs
+  }
+}

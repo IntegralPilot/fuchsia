@@ -1,0 +1,187 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#
+# These rules are only used by the Fuchsia platform build.
+#
+import("//build/components.gni")
+import("//build/testing/environments.gni")
+import("build_settings.gni")
+
+# A target providing access to Vulkan at compile time when added to deps.
+graphics_compute_vulkan_loader_target = "//src/lib/vulkan"
+
+# A target providing the GTest main() function.
+#
+# This version sets up logging appropriately for Fuchsia on startup.
+#
+graphics_compute_gtest_main_target = "//src/lib/fxl/test:gtest_main"
+
+# Generate a Fuchsia package that contains a single component.
+#
+# The binary executable target must be defined before calling this
+# rule.  This will generate the component manifest automatically.
+#
+# Accept all variables from the GN executable() rule, as well as:
+#
+#   needs_vulkan (optional)
+#     [boolean] Set to true if Vulkan is required to run the component.
+#
+#  test_package (optional)
+#     [boolean] Set to true to turn this into a test package that can
+#     run with 'fx test' or 'fx shell runtests'. Will force |testonly|
+#     to be true.
+#
+#  test_environments (optional)
+#     [list of strings] A list of test environments. Requires
+#     |test_package| to be true. Used to run the test in the right
+#     environment on the continuous integration bots.
+#
+template("graphics_compute_single_component_package") {
+  _component_name = target_name
+  _test_package = defined(invoker.test_package) && invoker.test_package
+  _testonly = (defined(invoker.testonly) && invoker.testonly) || _test_package
+  _needs_vulkan = defined(invoker.needs_vulkan) && invoker.needs_vulkan
+
+  if (defined(invoker.test_environments)) {
+    assert(_test_package,
+           "Using test_environments requires test_package=true!!")
+  }
+
+  _binary_target = "bin_${target_name}"
+
+  # Generate executable target.
+  executable(_binary_target) {
+    testonly = _testonly
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             # Avoid clobbering default configs
+                             "configs",
+                             "needs_vulkan",
+                             "target_name",
+                             "testonly",
+                             "test_environments",
+                             "test_package",
+                           ])
+    if (defined(invoker.configs)) {
+      configs += invoker.configs
+    }
+    if (_needs_vulkan) {
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += [
+        "//src/lib/vulkan/swapchain:image_pipe_swapchain_fb_layer",
+        "//src/lib/vulkan/validation_layers",
+        graphics_compute_vulkan_loader_target,
+      ]
+    }
+
+    # NOTE: The package() rule *requires* that for tests, the executable's
+    # name be the same as the component name. Otherwise, a very cryptic error
+    # will be displayed by GN.
+    output_name = _component_name
+  }
+
+  # Generate a component manifest automatically.
+  _component_manifest = "${target_gen_dir}/meta/${_component_name}.cml"
+  _component_manifest_target = "${_component_name}__manifest"
+
+  action(_component_manifest_target) {
+    script = "${graphics_compute_dir}/scripts/generate_component_manifest.py"
+    outputs = [ _component_manifest ]
+    args = [
+      "--name",
+      _component_name,
+      "--output",
+      rebase_path(_component_manifest, root_build_dir),
+    ]
+    if (_test_package) {
+      args += [
+        "--type",
+        "test",
+      ]
+    }
+    if (_needs_vulkan) {
+      args += [
+        # For now, all graphics compute tests and programs rely on framebuffer
+        # display. This will change in the future when imagepipe swapchain
+        # support will be added, and --needs-vulkan will be used instead.
+        "--needs-vulkan-framebuffer",
+      ]
+    }
+    testonly = _testonly
+  }
+
+  _component_target = "${target_name}_component"
+
+  if (_test_package) {
+    fuchsia_test_component(_component_target) {
+      component_name = _component_name
+      manifest = _component_manifest
+      deps = [ ":${_binary_target}" ]
+      manifest_deps = [ ":${_component_manifest_target}" ]
+      test_type = "system"
+    }
+    fuchsia_test_package(target_name) {
+      test_components = [ ":$_component_target" ]
+      if (defined(invoker.test_environments)) {
+        test_specs = {
+          environments = invoker.test_environments
+        }
+      }
+    }
+  } else {
+    fuchsia_component(_component_target) {
+      component_name = _component_name
+      manifest = _component_manifest
+      deps = [ ":${_binary_target}" ]
+      manifest_deps = [ ":${_component_manifest_target}" ]
+    }
+    group(target_name) {
+      deps = [ ":$_binary_target" ]
+    }
+  }
+}
+
+template("graphics_compute_executable_rule") {
+  graphics_compute_single_component_package(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "test_package",
+                             "test_environments",
+                           ])
+  }
+}
+
+template("graphics_compute_test_rule") {
+  graphics_compute_single_component_package(target_name) {
+    forward_variables_from(invoker, "*")
+    test_package = true
+    if (defined(invoker.needs_vulkan) && invoker.needs_vulkan) {
+      # Intel NUC not tested because of switch to lavapipe.
+      test_environments = [
+        astro_env,
+        nelson_env,
+        sherlock_env,
+        vim3_env,
+      ]
+    }
+  }
+}
+
+template("graphics_compute_unittests_rule") {
+  graphics_compute_test_rule(target_name) {
+    forward_variables_from(invoker, "*")
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [
+      # This version sets up logging appropriately for Fuchsia on startup.
+      "//src/lib/fxl/test:gtest_main",
+    ]
+  }
+}

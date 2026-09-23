@@ -1,0 +1,55 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include <lib/fidl/cpp/features.h>
+#include <lib/fidl/internal.h>
+#include <zircon/assert.h>
+
+#if __FIDL_SUPPORT_HANDLES
+#include <zircon/syscalls.h>
+#endif  // __FIDL_SUPPORT_HANDLES
+
+zx_status_t FidlHandleCloseMany(const zx_handle_t* handles, size_t num_handles) {
+  if (num_handles == 0) {
+    return ZX_OK;
+  }
+#if __FIDL_SUPPORT_HANDLES
+  return zx_handle_close_many(handles, num_handles);
+#else
+  ZX_PANIC("handle closing not implemented on host");
+#endif  // __FIDL_SUPPORT_HANDLES
+}
+
+zx_status_t FidlHandleDispositionCloseMany(const zx_handle_disposition_t* handle_dispositions,
+                                           size_t num_handles) {
+  if (num_handles == 0) {
+    return ZX_OK;
+  }
+#if __FIDL_SUPPORT_HANDLES
+  ZX_ASSERT_MSG(num_handles <= ZX_CHANNEL_MAX_MSG_HANDLES, " num_handles: %zu", num_handles);
+  zx_handle_t handles[ZX_CHANNEL_MAX_MSG_HANDLES];
+  for (size_t i = 0; i < num_handles; i++) {
+    handles[i] = handle_dispositions[i].handle;
+  }
+  return zx_handle_close_many(handles, num_handles);
+#else
+  ZX_PANIC("handle closing not implemented on host");
+#endif  // __FIDL_SUPPORT_HANDLES
+}
+
+zx_status_t FidlHandleInfoCloseMany(const zx_handle_info_t* handle_infos, size_t num_handles) {
+  if (num_handles == 0) {
+    return ZX_OK;
+  }
+#if __FIDL_SUPPORT_HANDLES
+  ZX_ASSERT_MSG(num_handles <= ZX_CHANNEL_MAX_MSG_HANDLES, " num_handles: %zu", num_handles);
+  zx_handle_t handles[ZX_CHANNEL_MAX_MSG_HANDLES];
+  for (size_t i = 0; i < num_handles; i++) {
+    handles[i] = handle_infos[i].handle;
+  }
+  return zx_handle_close_many(handles, num_handles);
+#else
+  ZX_PANIC("handle closing not implemented on host");
+#endif  // __FIDL_SUPPORT_HANDLES
+}

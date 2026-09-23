@@ -1,0 +1,144 @@
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Unit tests for //tools/devshell/lib/metrics.sh
+#
+# Usage: metrics-tests
+
+set -o errexit
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")"/../../tools/devshell/lib >/dev/null 2>&1 && pwd)"/vars.sh || exit $?
+
+set -o nounset
+# Read in the test framework and the library to test
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")"/lib >/dev/null 2>&1 && pwd)"/common.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")"/../../tools/devshell/lib >/dev/null 2>&1 && pwd)"/metrics.sh || exit $?
+
+function test::run_command_with_metrics_disabled {
+  _config_file="$(mktemp)"
+  _debug_file="$(mktemp)"
+  _enable_testing "${_debug_file}" 0 "${_config_file}"
+  metrics-write-config 0 "TEST"
+  metrics-read-config
+  track-command-execution "shell" "ls /"
+
+  # debug file is expected to be empty because debug is disabled
+  if [[ ! -s "$_debug_file" ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+function test::run_command_with_metrics_enabled {
+  _config_file="$(mktemp)"
+  _debug_file="$(mktemp)"
+  _enable_testing "${_debug_file}" 0 "${_config_file}"
+  metrics-write-config 1 "TEST"
+  metrics-read-config
+  track-command-execution "shell" "ls /"
+
+  # debug file is expected to be non-empty because debug is enabled
+  if [[ -s "$_debug_file" ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+function test::enable_metrics {
+  _config_file="$(mktemp)"
+  _debug_file="$(mktemp)"
+  _enable_testing "${_debug_file}" 0 "${_config_file}"
+  local enable=1
+  local test_uuid="__TEST__"
+  metrics-write-config $enable "$test_uuid"
+  metrics-read-config
+
+  track-command-execution "shell" "ls /"
+
+  # debug file is expected to contain the test UUID
+  if [[ -s "$_debug_file" && $(grep "$test_uuid" "$_debug_file") ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+function test::fx_set_with_packages {
+  _config_file="$(mktemp)"
+  _debug_file="$(mktemp)"
+  _enable_testing "${_debug_file}" 0 "${_config_file}"
+  local enable=1
+  local test_uuid="__TEST__"
+  metrics-write-config $enable "$test_uuid"
+  metrics-read-config
+
+  foo="foo"
+  bar="bar"
+  baz="baz"
+  # exercise --with and --with-base flags, as well as comma-separated package labels
+  track-command-execution "set" "core.x64" \
+    "--with-base" "$foo" "--with" "$bar,$baz"
+
+  # debug file should not be empty
+  if [[ ! -s "$_debug_file" ]]; then
+    return 1
+  fi
+
+  expected=(
+    # debug file should have a line for the set subcommand
+    "t=event ec=fx ea=set el=core.x64 --with-base $foo --with $bar,$baz" \
+    # debug file should have a separate line for each package label
+    "t=event ec=fx-with-base ea=$foo el=core.x64" \
+    "t=event ec=fx-with ea=$bar el=core.x64" \
+    "t=event ec=fx-with ea=$baz el=core.x64" \
+    )
+  for i in "${expected[@]}"; do
+    if [[ ! $(grep "$i" "$_debug_file") ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+function test::ok_exit_status {
+  _config_file="$(mktemp)"
+  _debug_file="$(mktemp)"
+  _enable_testing "${_debug_file}" 0 "${_config_file}"
+  local enable=1
+  local test_uuid="__TEST__"
+  metrics-write-config $enable "$test_uuid"
+  metrics-read-config
+
+  # exercise track-command-finished
+  track-command-finished "1234" "0" "set"
+  track-command-finished "1234" "128" "build"
+
+  # debug file should not be empty
+  if [[ ! -s "$_debug_file" ]]; then
+    return 1
+  fi
+
+  debug_result="202"
+  expected=(
+    # first command (set) ended succesfully, so it generated a timing event
+    "t=timing utc=fx utv=set utt=1234 utl= RESULT=${debug_result}" \
+    # the second command (build) failed with exit code 128
+    "t=event ec=fx_exception ea=build el= cd1=128 RESULT=${debug_result}" \
+    )
+  local c=0
+  for expected_line in "${expected[@]}"; do
+    c=$(( c+1 ))
+    local actual="$(sed "${c}q;d" "${_debug_file}")"
+    if [[ ! ${actual} = *${expected_line} ]]; then
+      echo "TEST FAILURE: '${actual}' does not end with '${expected_line}'"
+      return 1
+    fi
+  done
+  return 0
+}
+
+test_main "$@"
+

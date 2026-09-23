@@ -1,0 +1,188 @@
+#!/bin/bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+
+#### CATEGORY=Build
+### Manage build ResultStore configuration.  ResultStore is a service
+### for publishing and sharing build and test results (not artifacts).
+### Fuchsia's results can be found at go/fxbtx (ResultStore UI).
+
+## usage:
+##  fx resultstore status
+##       Show if ResultStore uploading during fx build is enabled or disabled
+##       across both global (checkout) and local (build directory) scopes.
+##
+##  fx resultstore enable [--local] [--ninja | --bazel]
+##       Enable ResultStore uploading during fx build.
+##       --local: Write to the current build directory instead of globally.
+##       --ninja: Enable only for Ninja uploads.
+##       --bazel: Enable only for Bazel uploads.
+##       If neither --ninja nor --bazel is specified, both will be enabled (all).
+##
+##  fx resultstore disable [--local]
+##       Disable ResultStore uploading during fx build.
+##       --local: Disable for the current build directory instead of globally.
+##
+## ResultStore data will contain information about the users's environment,
+## including $USER name, and working directory.
+## ResultStore data however, is only visible internally to Googlers.
+
+set -e
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+source "${FUCHSIA_DIR}/tools/devshell/lib/style.sh" || exit $?
+
+readonly RESULTSTORE_CONFIG="${FUCHSIA_DIR}/.fx/config/resultstore"
+readonly rsproxy_wrap="${FUCHSIA_DIR}/prebuilt/rsclient/${HOST_PLATFORM}/bin/rsproxy-wrap.sh"
+
+function usage {
+  fx-command-help
+}
+
+function styled-status {
+  local val="$1"
+  local color="red"
+  if [[ "$val" != "none" && "$val" != "disabled" ]]; then
+    color="green"
+  fi
+  style::echo --bold "--${color}" "${val}"
+}
+
+fx-standard-switches "$@"
+set -- "${FX_ARGV[@]}"
+
+if [[ $# -lt 1 ]]; then
+  fx-error "Invalid syntax"
+  fx-command-help
+  exit 1
+fi
+
+action="$1"
+shift
+action_args=("$@")
+
+# Parse subcommand options
+use_local=0
+value="all"
+for opt in "${action_args[@]}"; do
+  case "$opt" in
+    --local)
+      use_local=1
+      ;;
+    --ninja)
+      value="ninja"
+      ;;
+    --bazel)
+      value="bazel"
+      ;;
+    *)
+      fx-error "Invalid option: $opt"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$use_local" -eq 1 ]]; then
+  if [[ -z "${FUCHSIA_BUILD_DIR}" || ! -d "${FUCHSIA_BUILD_DIR}" ]]; then
+    fx-error "No Fuchsia build directory found. Please run 'fx set' or 'fx gen' first."
+    exit 1
+  fi
+  readonly CONFIG_PATH="${FUCHSIA_BUILD_DIR}/.resultstore"
+  readonly SCOPE="local build directory (${FUCHSIA_BUILD_DIR})"
+else
+  readonly CONFIG_PATH="${RESULTSTORE_CONFIG}"
+  readonly SCOPE="global checkout (${FUCHSIA_DIR})"
+fi
+
+function resultstore-read-config {
+  local path="$1"
+  RESULTSTORE_ENABLED=0
+  RESULTSTORE_VAL="none"
+  if [[ ! -f "${path}" ]]; then
+    return 1
+  fi
+  # Clean up "export " prefixes if they exist for safe sourcing
+  local temp_env
+  temp_env=$(mktemp)
+  trap 'rm -f "${temp_env}"' EXIT
+  sed 's/^export //' "${path}" > "${temp_env}"
+  # shellcheck disable=SC1090
+  source "${temp_env}"
+  RESULTSTORE_VAL="${resultstore:-none}"
+  if [[ "$RESULTSTORE_VAL" == "none" && "${RESULTSTORE_ENABLED:-0}" -eq 1 ]]; then
+    RESULTSTORE_VAL="all"
+  fi
+  return 0
+}
+
+case "$action" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+
+  status)
+    global_val="none"
+    if resultstore-read-config "${RESULTSTORE_CONFIG}"; then
+      global_val="${RESULTSTORE_VAL}"
+    fi
+    global_status=$(styled-status "${global_val}")
+
+    local_val="none"
+    local_status="disabled"
+    if [[ -n "${FUCHSIA_BUILD_DIR}" && -d "${FUCHSIA_BUILD_DIR}" ]]; then
+      if resultstore-read-config "${FUCHSIA_BUILD_DIR}/.resultstore"; then
+        local_val="${RESULTSTORE_VAL}"
+        local_status=$(styled-status "${local_val}")
+      else
+        local_status="$(style::echo --bold --red "disabled") (no local config)"
+      fi
+    else
+      local_status="$(style::echo --bold --red "disabled") (no build directory)"
+    fi
+
+    cat <<EOF
+ResultStore uploading is currently:
+  Global: ${global_status}
+  Local:  ${local_status}
+
+To change it, run: fx resultstore <enable|disable> [--local] [--ninja|--bazel]
+EOF
+    exit 0
+    ;;
+
+  enable)
+    if [[ ! -x "${rsproxy_wrap}" ]]; then
+      fx-warn "ResultStore cannot be enabled because the 'rsclient' prebuilt package is missing."
+      fx-warn "Please run 'jiri sync' to download the required prebuilts."
+      exit 1
+    fi
+
+    resultstore-read-config "${CONFIG_PATH}" || true
+    if [[ "$RESULTSTORE_VAL" == "$value" ]]; then
+      echo "ResultStore uploading is already enabled with value '$(styled-status "${value}")' in ${SCOPE}."
+      exit 0
+    fi
+    fx-resultstore-write-config "${CONFIG_PATH}" "${value}"
+    echo "ResultStore uploading is now $(styled-status "${value}") in ${SCOPE}."
+    ;;
+
+  disable)
+    resultstore-read-config "${CONFIG_PATH}" || true
+    if [[ "$RESULTSTORE_VAL" == "none" ]]; then
+      echo "ResultStore uploading is already disabled in ${SCOPE}."
+      exit 0
+    fi
+    fx-resultstore-write-config "${CONFIG_PATH}" "none"
+    echo "ResultStore uploading is now $(styled-status "none") in ${SCOPE}."
+    ;;
+
+  *)
+    fx-error "Invalid syntax"
+    fx-command-help
+    exit 1
+    ;;
+esac

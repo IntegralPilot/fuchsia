@@ -1,0 +1,837 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/developer_overrides.gni")
+import("//build/bazel/assembly/bazel_product_configuration.gni")
+import("//build/sdk/product_bundle_transfer_manifest.gni")
+import("//sdk/config.gni")
+import("//src/sys/pkg/bin/package-tool/package-tool.gni")
+
+# A GN wrapper for a Bazel product bundle target. From GN's perspective, the
+# output product bundle is opaque (only a manifest file containing paths to the
+# Bazel output base). This template only useful if you have a downstream target
+# in GN that is capable of consuming a product bundle built by Bazel in its
+# entirety.
+#
+# Parameters
+#
+#  bazel_product_bundle_target (required)
+#    The Bazel product bundle target to build.
+#    Type: label (from BUILD.bazel)
+#
+#  bazel_product_image_target (required)
+#    The Bazel product image target for this product bundle.
+#
+#    When set, two extra targets are provided to access outputs from Bazel
+#    product image build steps:
+#
+#      * ${target_name}_product_assembly: for image_assembly.json
+#      * ${target_name}_create_system: for assembled_system.json
+#
+#    NOTE: This template does NOT check this is the actual product image target
+#    used in `bazel_product_bundle_target`.
+#
+#    Type: label (from BUILD.bazel)
+#
+#  bazel_product_config_target (optional)
+#    The Bazel product config target for the product image.
+#
+#    When set, one extra target is provided to access product config from
+#    Bazel assembly build steps:
+#
+#      * ${target_name}_product_config: for product_assembly_config.json
+
+#    NOTE: This template does NOT check this is the actual product config target
+#    used in `bazel_product_bundle_target`.
+#
+#  bazel_recovery_image_target (optional)
+#    The Bazel recovery image target for this product bundle.
+#
+#    When set, one extra target is provided to access outputs from Bazel
+#    recovery image build steps:
+#
+#      * ${target_name}_create_recovery_system: for assembled_system.json
+#
+#    NOTE: This template does NOT check this is the actual recovery image target
+#    used in `bazel_product_bundle_target`.
+#
+#    Type: label (from BUILD.bazel)
+#
+#  bazel_size_report_aggregator_target (optional)
+#    The Bazel fuchsia_size_report_aggregator target that includes both a budget
+#    and a size report for gerrit.
+#
+#  bazel_product_size_check_target (optional)
+#    The Bazel fuchsia_product_size_check target that includes both a breakdown
+#    and a size visualization.
+#
+#  bazel_elf_sizes_target (optional)
+#    The Bazel fuchsia_elf_sizes target for this product bundle's product image.
+#
+#    When set, one extra target is provided to access elf_sizes.json
+#    produced by Bazel.
+#
+#      * ${target_name}_elf_sizes
+#
+#    NOTE: This template does NOT check the provided elf sizes target matches
+#    the product bundle.
+#
+#    [0] https://cs.opensource.google/fuchsia/fuchsia/+/main:tools/artifactory/cmd/up.go;l=65;drc=bf9ca43004a8073e322e9235c3b7a3e607aa7622
+#
+#  bazel_license_review_target (optional)
+#    The fuchsia_licenses_review target for this product bundle.
+#
+#    When set, one extra target is included in the final group to output
+#    license_review.zip from Bazel.
+#
+#        * ${target_name}_license_review
+#
+#    NOTE: This template does NOT check the provided license review target
+#    matches the product bundle.
+#
+#  bazel_inputs_from_gn (required)
+#    The Bazel input targets (defined by bazel_input_xxx GN templates) used to
+#    plumb outputs from GN/Ninja to Bazel. This list should include all GN
+#    targets producing outputs used in the Bazel product bundle. This is usually
+#    legacy images configurations, legacy AIBs, prebuilt packages from GN, etc.
+#
+#    For example:
+#
+#      * //build/images/fuchsia:fuchsia.legacy_aib_bazel_inputs
+#
+#    Type: list(label)
+#
+#  use_bringup_platform_bundles (optional; default=false)
+#    If true, use the 'bringup' platform bundles instead of the full set of
+#    bundles for products that don't need the 'core' realm, or are building
+#    for architectures where the full set of bundles won't compile.
+#
+#  generate_product_bundle_metadata (optional; default = true)
+#    Whether to generate the product bundle metadata for this product bundle.
+#
+#  product_bundle_name (required)
+#    The name of the product bundle produced in Bazel.
+#    This name will be used to populate the GN metadata.
+#
+#  generate_image_metadata (optional; default = true)
+#    Whether to generate image metadata for this product bundle.
+#
+#  image_has_fxfs_blob (optional; default = true)
+#    Whether the image contains an fxfs blob partition.
+#
+#  image_has_fvm (optional; default = opposite of image_has_fxfs_blob)
+#    Whether the image contains an fvm. This is exclusive to fxfs_blob, but both can be false.
+#
+#  image_supports_fastboot_fvm (optional; default = image_has_fvm)
+#    Whether the image supports a fastboot fvm.
+#
+#  image_has_recovery (optional; default = true)
+#    Whether the image should contain a recovery partition.
+#
+#  image_use_vbmeta (optional; default = true)
+#    Whether the image should contain a vbmeta.
+#
+#  deps
+#  testonly
+#  visibility
+#
+template("bazel_product_bundle") {
+  assert(defined(invoker.bazel_product_bundle_target),
+         "bazel_product_bundle_target is required")
+  assert(defined(invoker.bazel_product_image_target),
+         "bazel_product_image_target is required")
+  assert(defined(invoker.bazel_inputs_from_gn),
+         "bazel_inputs_from_gn is required")
+  assert(defined(invoker.product_bundle_name),
+         "product_bundle_name is required")
+  invoker.testonly = true
+
+  targets = {
+    bazel_product_bundle = "${target_name}_bazel_action"
+    package_manifest_list = "${target_name}_package_manifests_list"
+    transfer_manifest = "${target_name}_transfer_manifest"
+
+    if (defined(invoker.bazel_product_image_target)) {
+      bazel_product_assembly = "${target_name}_product_assembly"
+    }
+
+    if (defined(invoker.bazel_license_review_target)) {
+      license_review_bazel_action_target = "${target_name}_license_review"
+    }
+  }
+
+  files = {
+    out_dir = target_name
+
+    create_system_out_dir = "${out_dir}_create_system_out"
+    product_bundle_out_dir = "${out_dir}/product_bundle"
+    package_manifests_out_dir = "${out_dir}/manifests"
+
+    # NOTE: transfer.json MUST live in the parent directory of
+    # `product_bundle_out_dir` for `ffx product download` to work.
+    # See details in https://fxbug.dev/42079368.
+    transfer_json = "${out_dir}/transfer.json"
+
+    product_bundle_json = "${out_dir}/product_bundle/product_bundle.json"
+
+    size_report = "${out_dir}/size_report.json"
+
+    if (defined(invoker.bazel_product_image_target)) {
+      product_assembly_out_dir = targets.bazel_product_assembly
+    }
+  }
+
+  # The bazel inputs for all of the bazel actions described by this template.
+  _bazel_inputs = []
+
+  # See if there are any developer overrides enabled for this target, and
+  # if so, pass them to assembly.
+  _overrides_match_found = false
+  foreach(overrides_def, all_product_assembly_overrides) {
+    # This is done by seeing if the target_name matches each of the defined
+    # label patterns that are to have overrides.
+    if (label_matches(":$target_name", [ overrides_def.assembly ])) {
+      # Compute the bazel input target for the overrides used by this product
+      # bundle.
+      _bazel_inputs += [ "${overrides_def.overrides}.bazel_input" ]
+
+      assert(_overrides_match_found == false,
+             "Multiple matching overrides targets found for " +
+                 get_label_info(":$target_name", "label_no_toolchain") +
+                 " ${overrides_def.assembly} and ${_overrides_match_found}")
+      _overrides_match_found = overrides_def.assembly
+    }
+
+    # TODO: The GN<->Bazel input analysis is falsely beleiving that it needs the
+    # inputs to the other assembly overrides targets as well (probably due to
+    # how the FuchsiaAssemblyDeveloperOverridesListInfo provider has a reference
+    # to all the Bazel overrides targets).  So add all the overrides as inputs,
+    # until this is understood.
+    _bazel_inputs += [ "${overrides_def.overrides}.bazel_input" ]
+  }
+  not_needed([ "_overrides_match_found" ])
+
+  # The bringup AIBs are always included because all but a very few products
+  # will need them for their recovery image.  In a few CLs, this will change
+  # to being just the bazel_inputs targets, and at that point, the bringup
+  # set is a strict subset of the main set, and so this will have no additional
+  # cost.
+  _bazel_inputs += [ "//bundles/assembly/bazel_inputs:bringup_inputs" ]
+
+  _bringup_only = defined(invoker.use_bringup_platform_bundles) &&
+                  invoker.use_bringup_platform_bundles
+
+  if (!_bringup_only) {
+    _bazel_inputs += [ "//bundles/assembly/bazel_inputs:platform_inputs" ]
+  }
+  not_needed(invoker,
+             [
+               "allow_userdebug_platform_bundle_use",
+               "allow_eng_platform_bundle_use",
+             ])
+
+  _generate_image_metadata = true
+  if (defined(invoker.generate_image_metadata)) {
+    _generate_image_metadata = invoker.generate_image_metadata
+  }
+
+  _common_deps = _bazel_inputs + invoker.bazel_inputs_from_gn
+  if (defined(invoker.deps)) {
+    _common_deps += invoker.deps
+  }
+
+  _product_assembly_target = "${target_name}_product_assembly"
+  bazel_build_action(_product_assembly_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    bazel_target = invoker.bazel_product_image_target + "_product_assembly"
+    bazel_config = "fuchsia_sdk"
+
+    copy_outputs = [
+      {
+        bazel = "{{BAZEL_TARGET_OUT_DIR}}/{{BAZEL_TARGET_NAME}}_out/image_assembly.json"
+        ninja = "${_product_assembly_target}/image_assembly.json"
+      },
+      {
+        bazel = "{{BAZEL_TARGET_OUT_DIR}}/{{BAZEL_TARGET_NAME}}_out/assembly_builder_forensics.json"
+        ninja = "${_product_assembly_target}/assembly_builder_forensics.json"
+      },
+    ]
+    deps = _common_deps
+  }
+
+  # Declare a product config action that is not built by default.
+  # To build this build ${target_name}_product_config.
+  if (defined(invoker.bazel_product_config_target)) {
+    assert(
+        defined(invoker.bazel_product_config_name),
+        "bazel_product_config_name must be supplied if bazel_product_config_target is given")
+    _product_config_target = "${target_name}_product_config"
+    bazel_product_configuration(_product_config_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      bazel_product_configuration_target = invoker.bazel_product_config_target
+      name = invoker.bazel_product_config_name
+      deps = _common_deps
+    }
+  }
+
+  not_needed(invoker, [ "bazel_recovery_image_target" ])
+
+  _size_targets = []
+
+  if (defined(invoker.bazel_size_report_aggregator_target)) {
+    _size_report_target = "${target_name}_size_report"
+    _size_targets += [ ":${_size_report_target}" ]
+
+    bazel_build_action(_size_report_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      bazel_target = invoker.bazel_size_report_aggregator_target
+      bazel_config = "fuchsia_sdk"
+
+      _size_budgets_path = "${_size_report_target}/size_budgets.json"
+      _size_report_path = "${_size_report_target}/size_report.json"
+      copy_outputs = [
+        {
+          bazel = "{{BAZEL_TARGET_OUT_PATH}}_size_budgets.json"
+          ninja = _size_budgets_path
+        },
+        {
+          bazel = "{{BAZEL_TARGET_OUT_PATH}}_size_report.json"
+          ninja = _size_report_path
+        },
+        {
+          bazel = "{{BAZEL_TARGET_OUT_PATH}}_verbose_output.json"
+          ninja = "${_size_report_target}/verbose_output.json"
+        },
+      ]
+
+      deps = _common_deps
+
+      metadata = {
+        gerrit_size_reports =
+            [ rebase_path("${target_out_dir}/${_size_report_path}",
+                          root_build_dir) ]
+        detailed_size_checker_data = [
+          {
+            name = "size_budgets"
+            path = rebase_path("${target_out_dir}/${_size_budgets_path}",
+                               root_build_dir)
+          },
+        ]
+      }
+    }
+  } else {
+    _size_report_target = "${target_name}_size_report"
+    _size_targets += [ ":${_size_report_target}" ]
+
+    _size_report_path = files.size_report
+
+    group(_size_report_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      public_deps = [ ":${targets.bazel_product_bundle}" ]
+
+      metadata = {
+        gerrit_size_reports =
+            [ rebase_path("${target_out_dir}/${_size_report_path}",
+                          root_build_dir) ]
+      }
+    }
+  }
+
+  if (defined(invoker.bazel_product_size_check_target)) {
+    _product_size_checker_target = "${target_name}_product_size_checker"
+    _size_targets += [ ":${_product_size_checker_target}" ]
+    _visualization_path = "${_product_size_checker_target}/visualization"
+    _size_breakdown_path = "${_product_size_checker_target}/size_breakdown.txt"
+
+    bazel_build_action(_product_size_checker_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      bazel_target = invoker.bazel_product_size_check_target
+      bazel_config = "fuchsia_sdk"
+
+      directory_outputs = [
+        {
+          bazel_dir = "{{BAZEL_TARGET_OUT_PATH}}_visualization"
+          ninja_dir = _visualization_path
+          tracked_files = [ "index.html" ]
+        },
+      ]
+
+      copy_outputs = [
+        {
+          bazel = "{{BAZEL_TARGET_OUT_PATH}}_size_breakdown.txt"
+          ninja = _size_breakdown_path
+        },
+      ]
+
+      deps = _common_deps
+
+      metadata = {
+        product_size_checker_output = [
+          {
+            visualization =
+                rebase_path("${target_out_dir}/${_visualization_path}",
+                            root_build_dir)
+            size_breakdown =
+                rebase_path("${target_out_dir}/${_size_breakdown_path}",
+                            root_build_dir)
+          },
+        ]
+      }
+    }
+  }
+
+  group("${target_name}_size_targets") {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = _size_targets
+  }
+
+  _elf_sizes_bazel_action_target = "${target_name}_elf_sizes"
+  if (defined(invoker.bazel_elf_sizes_target)) {
+    _elf_sizes_ninja_out_path =
+        "${_elf_sizes_bazel_action_target}/elf_sizes.json"
+
+    bazel_build_action(_elf_sizes_bazel_action_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      bazel_target = invoker.bazel_elf_sizes_target
+      bazel_config = "fuchsia_sdk"
+
+      copy_outputs = [
+        {
+          bazel = "{{BAZEL_TARGET_OUT_PATH}}_elf_sizes.json"
+          ninja = _elf_sizes_ninja_out_path
+        },
+      ]
+
+      deps = _common_deps
+
+      metadata = {
+        images = [
+          {
+            name = "elf_sizes.json"
+            label = get_label_info(":${_elf_sizes_bazel_action_target}",
+                                   "label_with_toolchain")
+            type = "manifest"
+            path = rebase_path("${target_out_dir}/${_elf_sizes_ninja_out_path}",
+                               root_build_dir)
+          },
+        ]
+      }
+    }
+  } else {
+    group(_elf_sizes_bazel_action_target) {
+    }
+  }
+
+  if (defined(invoker.bazel_license_review_target)) {
+    _license_review_bazel_action_target = "${target_name}_license_review"
+    bazel_build_action(_license_review_bazel_action_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      bazel_target = invoker.bazel_license_review_target
+      bazel_config = "fuchsia_sdk"
+
+      copy_outputs = [
+        {
+          bazel = "{{BAZEL_TARGET_OUT_DIR}}/license_review.zip"
+          ninja = "license_review.zip"
+        },
+      ]
+
+      deps = _common_deps
+
+      # This metadata is added to infra's build output
+      metadata = {
+        licenses = [
+          {
+            license_review_archive =
+                rebase_path("${target_out_dir}/license_review.zip",
+                            root_build_dir)
+          },
+        ]
+      }
+    }
+  }
+
+  # NOTE: The "if (true)" below is only used to keep the indentation
+  # of the code in its block to ease code review.
+  if (true) {
+    _product_bundle_tracked_files = [
+      "product_bundle.json",
+      "system_a/fuchsia.zbi",
+    ]
+
+    _generate_product_bundle_metadata = true
+    if (defined(invoker.generate_product_bundle_metadata)) {
+      _generate_product_bundle_metadata =
+          invoker.generate_product_bundle_metadata
+    }
+
+    _metadata = {
+    }
+
+    if (_generate_product_bundle_metadata) {
+      # This value can be set (e.g. for testing) with `--args sdk_id=1234` on
+      # the `fx set` call.
+      # In the future, the product bundles should be versioned independently of
+      # the sdk version. So far they have been the same value.
+      product_version = sdk_id
+      assert(product_version != "")
+
+      _product_bundle_name = invoker.product_bundle_name
+      _metadata.product_bundles = [
+        {
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          path =
+              rebase_path("${target_out_dir}/${files.product_bundle_out_dir}",
+                          root_build_dir)
+          name = _product_bundle_name
+          json = rebase_path("${target_out_dir}/${files.product_bundle_json}",
+                             root_build_dir)
+          product_version = product_version
+          transfer_manifest_path =
+              rebase_path("${target_out_dir}/${files.transfer_json}",
+                          root_build_dir)
+          transfer_manifest_url = "file://" + transfer_manifest_path
+        },
+      ]
+    } else {
+      not_needed(invoker, [ "product_bundle_name" ])
+    }
+
+    # Populate metadata when Bazel image is not used will pollute GN assembly.
+    if (_generate_image_metadata) {
+      _full_label = get_label_info(":${target_name}", "label_with_toolchain")
+      _system_a_root = rebase_path(target_out_dir, root_out_dir) +
+                       "/${files.product_bundle_out_dir}/system_a"
+
+      _metadata.assembly_manifests = [
+        {
+          image_name = "fuchsia"
+          label = _full_label
+          assembly_manifest_path = rebase_path(
+                  "${target_out_dir}/${target_name}_create_system_out/assembled_system.json",
+                  root_build_dir)
+        },
+      ]
+
+      _image_has_fxfs_blob = true
+      if (defined(invoker.image_has_fxfs_blob)) {
+        _image_has_fxfs_blob = invoker.image_has_fxfs_blob
+      }
+
+      _image_has_fvm = !_image_has_fxfs_blob
+      if (defined(invoker.image_has_fvm)) {
+        _image_has_fvm = invoker.image_has_fvm
+      }
+
+      if (_image_has_fxfs_blob) {
+        _product_bundle_tracked_files += [ "system_a/fxfs.sparse.blk" ]
+        assert(!_image_has_fvm, "Cannot have both fxfs and fvm.")
+      } else if (_image_has_fvm) {
+        _product_bundle_tracked_files += [ "system_a/fvm.blk" ]
+      }
+
+      _image_use_vbmeta = true
+      if (defined(invoker.image_use_vbmeta)) {
+        _image_use_vbmeta = invoker.image_use_vbmeta
+      }
+
+      if (_image_use_vbmeta) {
+        _product_bundle_tracked_files += [ "system_a/fuchsia.vbmeta" ]
+      }
+
+      _image_has_recovery = true
+      if (defined(invoker.image_has_recovery)) {
+        _image_has_recovery = invoker.image_has_recovery
+      }
+
+      if (_image_has_recovery) {
+        _system_r_root = rebase_path(target_out_dir, root_out_dir) +
+                         "/${files.product_bundle_out_dir}/system_r"
+        _recovery_name = "zedboot"
+      }
+
+      # TODO(https://fxbug.dev/42078046): Add metadata for recovery image as well.
+      _metadata.images = [
+        {
+          name = "zircon-a"
+          type = "zbi"
+          cpu = current_cpu
+          label = _full_label
+          path = "${_system_a_root}/fuchsia.zbi"
+
+          archive = true
+          fastboot_flash = []
+          if (zircon_a_partition != "") {
+            fastboot_flash += [ zircon_a_partition ]
+          }
+          if (zircon_b_partition != "") {
+            fastboot_flash += [ zircon_b_partition ]
+          }
+        },
+      ]
+
+      if (_image_has_recovery) {
+        _metadata.images += [
+          {
+            name = "zircon-r"
+            cpu = current_cpu
+            type = "zbi"
+            label = _full_label
+            path = "${_system_r_root}/${_recovery_name}.zbi"
+
+            archive = true
+            fastboot_flash = []
+            if (zircon_r_partition != "") {
+              fastboot_flash = [ zircon_r_partition ]
+            }
+          },
+        ]
+      }
+
+      if (_image_has_fxfs_blob) {
+        _metadata.images += [
+          {
+            name = "fuchsia.fxfs_sparse"
+            type = "blk"
+            cpu = current_cpu
+            label = _full_label
+            path = "${_system_a_root}/fxfs.sparse.blk"
+            archive = true
+          },
+        ]
+      } else if (_image_has_fvm) {
+        _metadata.images += [
+          {
+            name = "blob"
+            type = "blk"
+            cpu = current_cpu
+            label = _full_label
+            path = "${_system_a_root}/blob.blk"
+          },
+          {
+            name = "storage-full"
+            type = "blk"
+            cpu = current_cpu
+            label = _full_label
+            path = "${_system_a_root}/fvm.blk"
+            archive = add_qemu_to_build_archives
+          },
+          {
+            name = "storage-sparse"
+            type = "blk"
+            cpu = current_cpu
+            label = _full_label
+            path = "${_system_a_root}/fvm.sparse.blk"
+            archive = true
+          },
+        ]
+
+        _image_supports_fastboot_fvm = _image_has_fvm
+        if (defined(invoker.image_supports_fastboot_fvm)) {
+          _image_supports_fastboot_fvm = invoker.image_supports_fastboot_fvm
+        }
+
+        if (_image_supports_fastboot_fvm) {
+          _metadata.images += [
+            {
+              name = "fvm.fastboot"
+              cpu = current_cpu
+              type = "blk"
+              label = _full_label
+              path = "${_system_a_root}/fvm.fastboot.blk"
+
+              archive = true
+              fastboot_flash = [ fvm_partition ]
+            },
+          ]
+        }
+      }
+
+      if (_image_use_vbmeta) {
+        _metadata.images += [
+          {
+            name = "zircon-a"
+            cpu = current_cpu
+            type = "vbmeta"
+            label = _full_label
+            path = "${_system_a_root}/fuchsia.vbmeta"
+            archive = true
+            fastboot_flash = []
+            if (vbmeta_a_partition != "") {
+              fastboot_flash += [ vbmeta_a_partition ]
+            }
+            if (vbmeta_b_partition != "") {
+              fastboot_flash += [ vbmeta_b_partition ]
+            }
+          },
+        ]
+
+        if (_image_has_recovery) {
+          _metadata.images += [
+            {
+              name = "zircon-r"
+              cpu = current_cpu
+              type = "vbmeta"
+              label = _full_label
+              path = "${_system_r_root}/${_recovery_name}.vbmeta"
+
+              archive = true
+              fastboot_flash = []
+              if (vbmeta_r_partition != "") {
+                fastboot_flash = [ vbmeta_r_partition ]
+              }
+            },
+          ]
+        }
+      }
+    } else {
+      not_needed(invoker,
+                 [
+                   "image_has_fvm",
+                   "image_has_fxfs_blob",
+                   "image_has_recovery",
+                   "image_supports_fastboot_fvm",
+                   "image_use_vbmeta",
+                 ])
+    }
+  }
+
+  bazel_build_action(targets.bazel_product_bundle) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    bazel_target = invoker.bazel_product_bundle_target
+    bazel_config = "fuchsia_sdk"
+
+    # Directory outputs are OK because `product_bundle.json` correctly
+    # represents the freshness of all outputs.
+    directory_outputs = [
+      {
+        bazel_dir = "{{BAZEL_TARGET_OUT_DIR}}/{{BAZEL_TARGET_NAME}}_out"
+        ninja_dir = files.product_bundle_out_dir
+        tracked_files = _product_bundle_tracked_files
+        copy_debug_symbols = true
+      },
+    ]
+    copy_outputs = [
+      {
+        bazel =
+            "{{BAZEL_TARGET_OUT_PATH}}_create_system_out/assembled_system.json"
+        ninja = "${files.create_system_out_dir}/assembled_system.json"
+      },
+    ]
+
+    # If a size report aggregator isn't provided, copy the size report out from
+    # the product bundle itself, instead.
+    if (!defined(invoker.bazel_size_report_aggregator_target)) {
+      copy_outputs += [
+        {
+          bazel = "{{BAZEL_TARGET_OUT_PATH}}_size_report.json"
+          ninja = files.size_report
+        },
+      ]
+    }
+    deps = _common_deps
+
+    metadata = _metadata
+  }
+
+  if (_generate_product_bundle_metadata) {
+    package_tool_package_manifest_list_create(targets.package_manifest_list) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      product_bundle = "${target_out_dir}/${files.product_bundle_out_dir}"
+      manifests_dir = "${target_out_dir}/${files.package_manifests_out_dir}"
+      deps = [ ":${targets.bazel_product_bundle}" ]
+    }
+
+    product_bundle_transfer_manifest(targets.transfer_manifest) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      product_bundle_target = ":${targets.bazel_product_bundle}"
+      product_bundle_dir = "${target_out_dir}/${files.product_bundle_out_dir}"
+      outputs = [ "${target_out_dir}/${files.out_dir}/transfer.json" ]
+    }
+  }
+
+  # A convenience group for easy `fx build` invocation.
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    # Some dependents want to claim outputs from these targets as inputs.
+    public_deps = [ ":${targets.bazel_product_bundle}" ]
+
+    deps = [
+      ":${_elf_sizes_bazel_action_target}",
+      ":${_product_assembly_target}",
+      ":${target_name}_size_targets",
+    ]
+
+    if (_generate_product_bundle_metadata) {
+      deps += [
+        ":${targets.package_manifest_list}",
+        ":${targets.transfer_manifest}",
+      ]
+    }
+
+    if (defined(invoker.bazel_license_review_target)) {
+      deps += [ ":${targets.license_review_bazel_action_target}" ]
+    }
+
+    metadata = {
+      # Assembly does not emit information about the packages that it includes
+      # via metadata, but via its own output files.
+      assembly_inputs_barrier = []
+      assembly_package_barrier = []
+      distribution_entries_barrier = []
+      package_barrier = []
+      test_component_manifest_barrier = []
+      test_component_manifest_program_barrier = []
+    }
+  }
+}

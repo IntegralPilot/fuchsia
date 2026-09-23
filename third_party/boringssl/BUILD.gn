@@ -1,0 +1,488 @@
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/dist/resource.gni")
+import("BUILD.generated.gni")
+import("BUILD.generated_tests.gni")
+
+################################################################################
+# Public targets
+
+group("boringssl") {
+  public_deps = [
+    ":crypto",
+    ":ssl",
+  ]
+}
+
+group("boringssl-shared") {
+  public_deps = [
+    ":crypto-shared",
+    ":ssl-shared",
+  ]
+}
+
+group("boringssl-static") {
+  public_deps = [
+    ":crypto-static",
+    ":ssl-static",
+  ]
+}
+
+crypto_sources += crypto_sources_asm
+
+# TODO(https://fxbug.dev/42122741): remove this added source.
+crypto_sources += [ "src/decrepit/xts/xts.cc" ]
+
+# TODO(https://fxbug.dev/42122741): Required for TPM2.0 TSS Library //third_party/tpm2-tss.
+crypto_sources += [ "src/decrepit/cfb/cfb.cc" ]
+
+################
+# libcrypto.so #
+################
+
+if (is_kernel) {
+  lib_types = []
+  lib_names = []
+} else {
+  lib_types = [
+    "static",
+    "shared",
+  ]
+  lib_names = [
+    "crypto",
+    "ssl",
+  ]
+}
+
+foreach(lib_type, lib_types) {
+  target("${lib_type}_library", "crypto-${lib_type}") {
+    if (default_library_type == "${lib_type}_library") {
+      output_name = "crypto"
+    }
+    sources = crypto_sources
+    public = crypto_headers
+    public_configs = [ ":boringssl_config" ]
+    configs += [
+      ":internal_config",
+      ":export_symbols",
+    ]
+    if (is_host && lib_type == "static") {
+      configs -= [ ":export_symbols" ]
+    }
+    if (is_fuchsia) {
+      # TODO(https://fxbug.dev/42138737): profile instrumentation significantly affects performance.
+      configs += [ "//build/config:no_profile" ]
+
+      # boringssl should always be optimized for speed because otherwise
+      # performance is significantly worse, impacting pave and boot times on
+      # debug builds. See
+      # https://fxbug.dev/42133086.
+      configs -= [ "//build/config:default_optimize" ]
+      configs += [ "//build/config:optimize_speed" ]
+
+      # sysrand() uses Zircon system call.
+      deps = [ "//src/zircon/lib/zircon" ]
+    }
+  }
+
+  target("${lib_type}_library", "ssl-${lib_type}") {
+    if (default_library_type == "${lib_type}_library") {
+      output_name = "ssl"
+    }
+    sources = ssl_sources
+    public = ssl_headers
+    public_configs = [ ":boringssl_config" ]
+    configs += [
+      ":internal_config",
+      ":export_symbols",
+    ]
+
+    # For this and the crypto lib, do not export symbols if building a binary
+    # for the host if building a static library. This prevents potential name
+    # conflicts if this is statically included in a .so and the .so is then used
+    # via dlopen.
+    if (is_linux && lib_type == "static") {
+      configs -= [ ":export_symbols" ]
+    }
+    deps = [ ":crypto-${lib_type}" ]
+    if (is_fuchsia) {
+      # boringssl should always be optimized for speed because otherwise
+      # performance is significantly
+      # worse, impacting pave and boot times on debug builds (https://fxbug.dev/42133086)
+      configs -= [ "//build/config:default_optimize" ]
+      configs += [ "//build/config:optimize_speed" ]
+    }
+  }
+}
+
+foreach(lib_name, lib_names) {
+  group("$lib_name") {
+    if (default_library_type == "shared_library") {
+      public_deps = [ ":${lib_name}-shared" ]
+    } else if (default_library_type == "static_library") {
+      public_deps = [ ":${lib_name}-static" ]
+    } else {
+      assert(false, "unsupported default_library_type: $default_library_type")
+    }
+  }
+}
+
+if (!is_kernel) {
+  import("//build/fuzz.gni")
+  import("//build/test.gni")
+
+  if (is_fuchsia) {
+    import("//build/components.gni")
+  }
+
+  source_set("crypto_unsafe") {
+    testonly = true
+    visibility = [ ":*" ]
+    sources = crypto_sources
+    public = crypto_headers
+    configs += [ ":fuzz_config" ]
+
+    if (is_fuchsia) {
+      # sysrand() uses Zircon system call.
+      deps = [ "//src/zircon/lib/zircon" ]
+    }
+  }
+
+  source_set("ssl_unsafe") {
+    testonly = true
+    visibility = [ ":*" ]
+    sources = ssl_sources
+    public = ssl_headers
+    configs += [ ":fuzz_config" ]
+    deps = [ ":crypto_unsafe" ]
+  }
+
+  ##########################
+  # bssl command line tool #
+  ##########################
+  if (is_fuchsia) {
+    fuchsia_package("boringssl_tool") {
+      deps = [ ":bssl" ]
+    }
+  } else {
+    group("boringssl_tool") {
+      deps = [ ":bssl" ]
+    }
+  }
+
+  # See //third_party/boringssl/tool/CMakeLists.txt
+  executable("bssl") {
+    visibility = [ ":*" ]
+    sources = tool_sources
+    configs += [
+      ":internal_config",
+      ":export_symbols",
+    ]
+    deps = [
+      ":crypto",
+      ":ssl",
+    ]
+
+    # TODO(https://fxbug.dev/42180987): workaround for the toolchain issue.
+    deps += [ "//build/config/fuchsia:uses-outline-atomics-fxbug98632" ]
+  }
+
+  ##############
+  # Unit tests #
+  ##############
+
+  crypto_tests = []
+
+  crypto_test_main = "src/crypto/test/gtest_main.cc"
+  source_set("crypto_test_main") {
+    visibility = [ ":*" ]
+    testonly = true
+    sources = [ crypto_test_main ]
+    deps = [
+      ":crypto",
+      "//third_party/googletest:gmock",
+      "//third_party/googletest:gtest",
+    ]
+  }
+
+  static_library("test_support") {
+    visibility = [ ":*" ]
+    testonly = true
+
+    # get_test_data.cc provides our own definition of GetTestData(), which is
+    # declared somewhere in test_support_sources. This is permitted by defining
+    # BORINGSSL_CUSTOM_GET_TEST_DATA.
+    sources = test_support_sources + [ "get_test_data.cc" ]
+    deps = [
+      "//sdk/lib/zircon-assert",
+      "//third_party/googletest:gtest",
+    ]
+    configs += [ ":test_config" ]
+    defines = [ "BORINGSSL_CUSTOM_GET_TEST_DATA" ]
+  }
+
+  foreach(crypto_test_source, crypto_test_sources - [ crypto_test_main ]) {
+    name = get_path_info(crypto_test_source, "name")
+    target_name = "${name}_crypto_test"
+    crypto_tests += [ target_name ]
+    test(target_name) {
+      visibility = [ ":*" ]
+      sources = [ crypto_test_source ]
+      configs += [ ":test_config" ]
+      deps = [
+        ":crypto",
+        ":crypto_test_main",
+        ":test_support",
+        "//third_party/googletest:gmock",
+        "//third_party/googletest:gtest",
+      ]
+    }
+  }
+
+  test("ssl_test") {
+    visibility = [ ":*" ]
+    sources = ssl_test_sources
+    configs += [ ":test_config" ]
+    deps = [
+      ":crypto",
+      ":ssl",
+      ":test_support",
+      "//third_party/googletest:gmock",
+      "//third_party/googletest:gtest",
+    ]
+  }
+
+  test_data_deps = []
+  foreach(test_data, crypto_test_data) {
+    target_name = "test_data.${test_data}"
+    resource(target_name) {
+      sources = [ test_data ]
+      outputs = [ "data/" + rebase_path(test_data, "src") ]
+    }
+    test_data_deps += [ ":${target_name}" ]
+  }
+
+  group("temp_storage") {
+    visibility = [ ":*" ]
+    testonly = true
+    metadata = {
+      test_component_manifest_cml = [
+        {
+          include = [ "//src/sys/test_runners/tmp_storage.shard.cml" ]
+        },
+      ]
+    }
+  }
+
+  if (is_fuchsia) {
+    crypto_test_components = []
+    needs_custom_component_manifest = [ "bio_test_crypto_test" ]
+    foreach(crypto_test, crypto_tests) {
+      _component_name = "${crypto_test}_component"
+      crypto_test_components += [ ":${_component_name}" ]
+      fuchsia_unittest_component(_component_name) {
+        if (needs_custom_component_manifest + [ crypto_test ] -
+            [ crypto_test ] != needs_custom_component_manifest) {
+          manifest = "meta/${crypto_test}.cml"
+        }
+        deps = [
+          ":${crypto_test}",
+          ":temp_storage",
+        ]
+        if (crypto_test == "bytestring_test_crypto_test" ||
+            crypto_test == "mem_test_crypto_test") {
+          deps += [ "//src/sys/test_runners/gtest:death_test" ]
+        }
+      }
+    }
+    fuchsia_unittest_component("ssl_test_component") {
+      deps = [
+        ":ssl_test",
+        ":temp_storage",
+        "//src/sys/test_runners/gtest:death_test",
+      ]
+    }
+    fuchsia_test_package("boringssl_tests") {
+      test_components = crypto_test_components + [ ":ssl_test_component" ]
+      deps = [
+        "//src/connectivity/network/netstack:component",
+        "//src/sys/stash:stash_secure_v2",
+      ]
+      deps += test_data_deps
+    }
+  }
+
+  group("tests") {
+    testonly = true
+    if (is_fuchsia) {
+      deps = [ ":boringssl_tests" ]
+    } else {
+      deps = [ ":ssl_test" ]
+      foreach(crypto_test, crypto_tests) {
+        deps += [ ":${crypto_test}" ]
+      }
+    }
+    deps += [ "rust:tests" ]
+  }
+
+  # ################################################################################
+  # Fuzzers
+
+  # Upstream BoringSSL defines a `fuzzers` global variable in the generated GNI
+  # files; we rename it to avoid colliding with the similarly-named parameter on
+  # the fuzzer_package.
+  #
+  # TODO(https://fxbug.dev/42056966): Remove once `fuzzers` parameter is removed.
+  fuzzer_names = fuzzers
+  fuzzers = []
+
+  # Explicitly remove the arm_cpuinfo fuzzer, which tests Linux-specific
+  # routines
+  if (is_fuchsia) {
+    fuzzer_names -= [ "arm_cpuinfo" ]
+  }
+
+  # Explicitly remove libpki fuzzers
+  # TODO(b/323926212): properly integrate libpki and fix these.
+  if (is_fuchsia) {
+    fuzzer_names -= [
+      "crl_getcrlstatusforcert_fuzzer",
+      "crl_parse_crl_certificatelist_fuzzer",
+      "crl_parse_crl_tbscertlist_fuzzer",
+      "crl_parse_issuing_distribution_point_fuzzer",
+      "ocsp_parse_ocsp_cert_id_fuzzer",
+      "ocsp_parse_ocsp_response_data_fuzzer",
+      "ocsp_parse_ocsp_response_fuzzer",
+      "ocsp_parse_ocsp_single_response_fuzzer",
+      "parse_authority_key_identifier_fuzzer",
+      "parse_certificate_fuzzer",
+      "parse_crldp_fuzzer",
+      "verify_name_match_fuzzer",
+      "verify_name_match_normalizename_fuzzer",
+      "verify_name_match_verifynameinsubtree_fuzzer",
+    ]
+  }
+
+  foreach(name, fuzzer_names) {
+    cpp_fuzzer("${name}_fuzzer") {
+      visibility = [ ":*" ]
+      sources = [ "src/fuzz/${name}.cc" ]
+      configs += [ ":fuzz_config" ]
+
+      # TODO(https://fxbug.dev/407045587): Remove after boringssl no longer uses is_pod.
+      configs += [ "//build/config:Wno-deprecated-declarations" ]
+
+      deps = [
+        ":crypto_unsafe",
+        ":ssl_unsafe",
+      ]
+    }
+  }
+
+  if (is_fuchsia) {
+    foreach(name, fuzzer_names) {
+      fuchsia_fuzzer_component("${name}_fuzzer_component") {
+        manifest = "meta/${name}_fuzzer.cml"
+        deps = [ ":${name}_fuzzer" ]
+      }
+    }
+
+    fuchsia_fuzzer_package("boringssl-fuzzers") {
+      cpp_fuzzer_components = []
+      foreach(name, fuzzer_names) {
+        cpp_fuzzer_components += [ ":${name}_fuzzer_component" ]
+      }
+    }
+
+    group("boringssl_fuzzers") {
+      testonly = true
+      deps = [ ":boringssl-fuzzers" ]
+    }
+  } else {
+    group("boringssl_fuzzers") {
+      testonly = true
+      deps = []
+      foreach(fuzzer, fuzzer_names) {
+        deps += [ ":${name}_fuzzer" ]
+      }
+    }
+  }
+}
+
+################################################################################
+# Configs
+
+# Note that //zircon/kernel/lib/crypto/boringssl/BUILD.gn uses this config but
+# it doesn't use the rest of this file's targets or configs for kernel cases.
+config("boringssl_config") {
+  include_dirs = [
+    "fuchsia/include",
+    "src/include",
+  ]
+
+  cflags = [
+    "-Wno-conversion",
+    "-Wno-unused-but-set-variable",
+    "-Wno-unused-function",
+  ]
+
+  cflags_cc = [ "-Wno-deprecated-copy" ]
+
+  if (is_gcc) {
+    cflags_cc += [ "-Wno-extra-semi" ]
+  } else {
+    cflags += [ "-Wno-extra-semi" ]
+  }
+}
+
+config("export_symbols") {
+  defines = [ "BORINGSSL_IMPLEMENTATION" ]
+}
+
+config("internal_config") {
+  visibility = [ ":*" ]
+  defines = [
+    "BORINGSSL_ALLOW_CXX_RUNTIME",
+    "BORINGSSL_NO_STATIC_INITIALIZER",
+    "BORINGSSL_SHARED_LIBRARY",
+    "OPENSSL_SMALL",
+  ]
+  if (is_linux) {
+    # pthread_rwlock_t on Linux requires a feature flag.
+    defines += [ "_XOPEN_SOURCE=700" ]
+  }
+  configs = [
+    ":boringssl_config",
+    "//build/config:shared_library_config",
+  ]
+  if (is_fuchsia) {
+    configs += [ "//build/config/fuchsia:static_cpp_standard_library" ]
+  }
+}
+
+config("test_config") {
+  visibility = [ ":*" ]
+  include_dirs = [
+    "src/crypto/test",
+    "src/ssl/test",
+  ]
+  cflags = [ "-fno-strict-aliasing" ]
+  configs = [
+    ":internal_config",
+    ":export_symbols",
+  ]
+}
+
+config("fuzz_config") {
+  visibility = [ ":*" ]
+
+  # BoringSSL explicitly decided against using the common LLVM fuzzing macro:
+  # https://boringssl-review.googlesource.com/c/boringssl/+/31244
+  defines = [ "BORINGSSL_UNSAFE_DETERMINISTIC_MODE" ]
+  configs = [
+    ":internal_config",
+    ":export_symbols",
+  ]
+}

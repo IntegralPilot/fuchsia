@@ -1,0 +1,303 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+#
+# Source platform.sh so that we can point to jq and include it as a runtime dependency. We need to
+# do it in a subfunction since platform.sh defines readonly variables, and it gets re-sourced to
+# avoid conflicts.
+function read_host_platform() {
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/../../lib/platform.sh" || exit $?
+  echo "$HOST_PLATFORM"
+}
+
+BT_FILE_DEPS=(
+  "prebuilt/third_party/jq/$(read_host_platform)/bin/jq"
+  "scripts/fx"
+  "tools/devshell/jq.fx"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/platform.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/ota"
+)
+
+BT_MOCKED_TOOLS=(
+  "tools/devshell/build"
+  "tools/devshell/contrib/build-main-pb"
+  "tools/devshell/wait"
+  "tools/devshell/shell"
+  "tools/devshell/lib/updates.sh"
+  "tools/devshell/serve"
+)
+
+declare fx build check_package_server trigger_update trigger_reboot commit_update
+
+BT_SET_UP() {
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+  cat > "${BT_TEMP_DIR}/out/default/args.json" <<EOF
+{
+  "bazel_product_bundle_prefix": "//products/core:product_bundle",
+  "bazel_product_bundle_board": "x64"
+}
+EOF
+  source "${BT_TEMP_DIR}/tools/devshell/lib/vars.sh"
+  fx-config-read
+  build="${BT_TEMP_DIR}/tools/devshell/build"
+  check_package_server="${BT_TEMP_DIR}/check_package_server"
+  trigger_update="${BT_TEMP_DIR}/trigger_update"
+  trigger_reboot="${BT_TEMP_DIR}/trigger_reboot"
+  commit_update="${BT_TEMP_DIR}/commit_update"
+  btf::make_mock "$check_package_server"
+  btf::make_mock "$trigger_update"
+  btf::make_mock "$trigger_reboot"
+  btf::make_mock "$commit_update"
+  local updateslib="${BT_TEMP_DIR}/tools/devshell/lib/updates.sh"
+  cat > "${updateslib}.mock_side_effects" <<EOF
+    function check-for-package-server { $check_package_server ; }
+EOF
+
+  cat > "${BT_TEMP_DIR}/tools/devshell/shell.mock_side_effects" <<EOF
+   if [[ "\$1 \$2" == "update check-now" ]]; then
+     $trigger_update "\$@"
+     return
+   elif [[ "\$1 \$2" == "update wait-for-commit" ]]; then
+     $commit_update "\$@"
+     return
+  fi
+EOF
+}
+
+setup_ffx() {
+  local ffx="$(btf::make_installed_hosttools_mock ffx)"
+  cat > "${ffx}.mock_side_effects" <<EOF
+   if [[ "\$@" == "target update force-install --reboot false --product-bundle --packageless" ]]; then
+     $trigger_update "\$@"
+     return
+   elif [[ "\$@" == "target reboot --reason system-update" ]]; then
+     $trigger_reboot "\$@"
+     return
+   else
+     echo "unknown command \$@" 1>&2
+     exit 1
+  fi
+EOF
+}
+
+setup_versions_after_update() {
+  local from_device="$1"
+  local from_build="$2"
+  cat >> "${BT_TEMP_DIR}/tools/devshell/shell.mock_side_effects" <<EOF
+   if [[ "\$1" == "read ver"* ]]; then
+     echo "$from_device"
+     return 0
+   fi
+EOF
+  local system_image_merkle="${FUCHSIA_BUILD_DIR}"/obj/build/images/fuchsia/fuchsia/base/base.merkle
+  mkdir -p "${BT_TEMP_DIR}/out/default/amber-files/repository"
+  cat >> "${BT_TEMP_DIR}/out/default/amber-files/repository/targets.json" <<EOF
+{
+  "signed": {
+    "targets": {
+      "system_image/0": {
+        "custom": {
+          "merkle": "${from_build}"
+        }
+      }
+    }
+  }
+}
+EOF
+}
+
+TEST_ota_incr_noargs() {
+  echo "0" > "${check_package_server}.mock_status" # package server is running
+  setup_versions_after_update "1" "1"
+  setup_ffx
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  BT_EXPECT ${fx} --enable=incremental ota > "$out" 2>&1
+  # build was called with the minimal targets required for incremental ota
+  btf::expect-mock-args "${build}" "//build/images/updates"
+  # update was triggered
+  BT_ASSERT_FILE_EXISTS "${trigger_update}.mock_state"
+  # reboot was called with reason
+  btf::expect-mock-args "${trigger_reboot}" "target" "reboot" "--reason" "system-update"
+  # update was committed
+  BT_ASSERT_FILE_EXISTS "${commit_update}.mock_state"
+}
+
+TEST_ota_noincr_noargs() {
+  echo "0" > "${check_package_server}.mock_status" # package server is running
+  setup_versions_after_update "1" "1"
+  setup_ffx
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  BT_EXPECT ${fx} --disable=incremental ota > "$out" 2>&1
+  # build was not called - this is the legacy behavior before incremental
+  BT_ASSERT_FILE_DOES_NOT_EXIST "${build}.mock_state"
+  # update was triggered
+  BT_ASSERT_FILE_EXISTS "${trigger_update}.mock_state"
+  # reboot was called with reason
+  btf::expect-mock-args "${trigger_reboot}" "target" "reboot" "--reason" "system-update"
+  # update was committed
+  BT_ASSERT_FILE_EXISTS "${commit_update}.mock_state"
+}
+
+TEST_ota_nobuild() {
+  echo "0" > "${check_package_server}.mock_status" # package server is running
+  setup_versions_after_update "1" "1"
+  setup_ffx
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  BT_EXPECT ${fx} ota --no-build > "$out" 2>&1
+  # build was not called
+  BT_ASSERT_FILE_DOES_NOT_EXIST "${build}.mock_state"
+  # update was triggered
+  BT_ASSERT_FILE_EXISTS "${trigger_update}.mock_state"
+  # reboot was called with reason
+  btf::expect-mock-args "${trigger_reboot}" "target" "reboot" "--reason" "system-update"
+  # update was committed
+  BT_ASSERT_FILE_EXISTS "${commit_update}.mock_state"
+}
+
+TEST_ota_packageless() {
+  echo "0" > "${check_package_server}.mock_status" # package server is running
+  setup_versions_after_update "1" "1"
+  setup_ffx
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  BT_EXPECT ${fx} ota --no-build --packageless > "$out" 2>&1
+  # update was triggered
+  BT_ASSERT_FILE_EXISTS "${trigger_update}.mock_state"
+  # reboot was called with reason
+  btf::expect-mock-args "${trigger_reboot}" "target" "reboot" "--reason" "system-update"
+  # update was committed
+  BT_ASSERT_FILE_EXISTS "${commit_update}.mock_state"
+  # check that ffx was called with --reboot false, --product-bundle and --packageless
+  btf::expect-mock-args "${trigger_update}" "target" "update" "force-install" "--reboot" "false" "--product-bundle" "--packageless"
+}
+
+TEST_ota_no_packageless() {
+  echo "0" > "${check_package_server}.mock_status" # package server is running
+  setup_versions_after_update "1" "1"
+
+  local ffx="$(btf::make_installed_hosttools_mock ffx)"
+  cat > "${ffx}.mock_side_effects" <<EOF
+   if [[ "\$@" == "target update force-install --reboot false" ]]; then
+     $trigger_update "\$@"
+     return
+   elif [[ "\$@" == "target reboot --reason system-update" ]]; then
+     $trigger_reboot "\$@"
+     return
+   else
+     echo "unknown command \$@" 1>&2
+     exit 1
+  fi
+EOF
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  BT_EXPECT ${fx} ota --no-build --no-packageless > "$out" 2>&1
+  # update was triggered
+  BT_ASSERT_FILE_EXISTS "${trigger_update}.mock_state"
+  # reboot was called with reason
+  btf::expect-mock-args "${trigger_reboot}" "target" "reboot" "--reason" "system-update"
+  # update was committed
+  BT_ASSERT_FILE_EXISTS "${commit_update}.mock_state"
+  # check that ffx was called with --reboot false and without --packageless
+  btf::expect-mock-args "${trigger_update}" "target" "update" "force-install" "--reboot" "false"
+}
+
+TEST_ota_update_failed() {
+  echo "0" > "${check_package_server}.mock_status" # package server is running
+  setup_versions_after_update "1" "2"
+  setup_ffx
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  BT_EXPECT_FAIL ${fx} ota --no-build > "$out" 2>&1
+  # update was not triggered
+  BT_ASSERT_FILE_EXISTS "${trigger_update}.mock_state"
+  # update was not committed
+  BT_ASSERT_FILE_EXISTS "${commit_update}.mock_state"
+}
+
+TEST_ota_nopackageserver() {
+  echo "1" > "${check_package_server}.mock_status" # package server is not running
+  setup_ffx
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  # ota fails because package server is not running
+  BT_EXPECT_FAIL ${fx} ota --no-packageless > "$out" 2>&1
+
+  # build was not called
+  BT_ASSERT_FILE_DOES_NOT_EXIST "${build}.mock_state"
+}
+
+TEST_ota_serve() {
+  echo "1" > "${check_package_server}.mock_status" # package server is not running
+  setup_versions_after_update "1" "1"
+
+  local ffx="$(btf::make_installed_hosttools_mock ffx)"
+  local stop_called="${BT_TEMP_DIR}/stop_called"
+  btf::make_mock "$stop_called"
+
+  cat > "${ffx}.mock_side_effects" <<EOF
+   if [[ "\$@" == "target update force-install --reboot false" ]]; then
+     $trigger_update "\$@"
+     return
+   elif [[ "\$@" == "target reboot --reason system-update" ]]; then
+     $trigger_reboot "\$@"
+     return
+   elif [[ "\$@" == "repository server stop fx-ota-serve-"* ]]; then
+     $stop_called "\$@"
+     return
+   fi
+EOF
+
+  local serve_mock="${BT_TEMP_DIR}/tools/devshell/serve"
+  cat >> "${serve_mock}.mock_side_effects" <<EOF
+    echo "0" > "${check_package_server}.mock_status"
+EOF
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  BT_EXPECT ${fx} ota --no-packageless --serve > "$out" 2>&1
+
+  # Assert serve was called
+  BT_ASSERT_FILE_EXISTS "${serve_mock}.mock_state"
+
+  # Assert update was triggered
+  BT_ASSERT_FILE_EXISTS "${trigger_update}.mock_state"
+
+  # Assert reboot was called with reason
+  btf::expect-mock-args "${trigger_reboot}" "target" "reboot" "--reason" "system-update"
+
+  # Assert stop was called
+  BT_ASSERT_FILE_EXISTS "${stop_called}.mock_state"
+}
+
+TEST_ota_serve_packageless() {
+  echo "0" > "${check_package_server}.mock_status"
+  setup_versions_after_update "1" "1"
+  setup_ffx
+
+  local serve_mock="${BT_TEMP_DIR}/tools/devshell/serve"
+
+  local out="${BT_TEMP_DIR}/_fx_ota_output"
+  BT_EXPECT ${fx} ota --no-build --serve > "$out" 2>&1
+
+  # Assert serve was not called
+  BT_ASSERT_FILE_DOES_NOT_EXIST "${serve_mock}.mock_state"
+
+  # Assert update was triggered
+  BT_ASSERT_FILE_EXISTS "${trigger_update}.mock_state"
+  # Assert reboot was called with reason
+  btf::expect-mock-args "${trigger_reboot}" "target" "reboot" "--reason" "system-update"
+  # Assert update was committed
+  BT_ASSERT_FILE_EXISTS "${commit_update}.mock_state"
+}
+
+BT_RUN_TESTS "$@"

@@ -1,0 +1,682 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+use crate::*;
+use fuchsia_async as fasync;
+use futures::channel::mpsc::channel;
+use futures::channel::oneshot::channel as oneshot;
+use futures::stream::StreamExt;
+
+/// Given two nodes that both exist in this process, connect them directly to oneanother. This
+/// function runs the connection and must be polled continuously.
+///
+/// This is written as a test function. In short: it panics at the slightest irregularity.
+async fn connect_nodes(
+    a: &Node,
+    b: &Node,
+) -> impl std::future::Future<Output = ()> + Send + Sync + use<> {
+    let (a_control_reader, write_a_control_reader) = stream::stream();
+    let (read_a_control_writer, a_control_writer) = stream::stream();
+    let (b_control_reader, write_b_control_reader) = stream::stream();
+    let (read_b_control_writer, b_control_writer) = stream::stream();
+    let (a_new_stream_sender, mut a_new_streams) = channel(1);
+    let (b_new_stream_sender, mut b_new_streams) = channel(1);
+    let (mut a_new_stream_requests, a_new_stream_receiver) = channel(1);
+    let (mut b_new_stream_requests, b_new_stream_receiver) = channel(1);
+    let a_runner = a.link_node(
+        Some((read_a_control_writer, write_a_control_reader)),
+        a_new_stream_sender,
+        a_new_stream_receiver,
+        Quality::IN_PROCESS,
+    );
+    let b_runner = b.link_node(
+        Some((read_b_control_writer, write_b_control_reader)),
+        b_new_stream_sender,
+        b_new_stream_receiver,
+        Quality::IN_PROCESS,
+    );
+
+    async move {
+        let a_to_b = async move {
+            loop {
+                let got = a_control_reader
+                    .read(1, |buf| {
+                        b_control_writer.write(buf.len(), |out_buf| {
+                            out_buf[..buf.len()].copy_from_slice(buf);
+                            Ok(buf.len())
+                        })?;
+                        Ok(((), buf.len()))
+                    })
+                    .await;
+
+                if let Err(Error::ConnectionClosed(_)) = got {
+                    break;
+                }
+                got.unwrap();
+            }
+        };
+
+        let b_to_a = async move {
+            loop {
+                let got = b_control_reader
+                    .read(1, |buf| {
+                        a_control_writer.write(buf.len(), |out_buf| {
+                            out_buf[..buf.len()].copy_from_slice(buf);
+                            Ok(buf.len())
+                        })?;
+                        Ok(((), buf.len()))
+                    })
+                    .await;
+
+                if let Err(Error::ConnectionClosed(_)) = got {
+                    break;
+                }
+                got.unwrap();
+            }
+        };
+
+        let a_to_b = pin!(a_to_b);
+        let b_to_a = pin!(b_to_a);
+
+        let control = futures::future::join(a_to_b, b_to_a);
+
+        let a_runner = async move {
+            let _ = a_runner.await;
+        };
+        let b_runner = async move {
+            let _ = b_runner.await;
+        };
+
+        let a_runner = pin!(a_runner);
+        let b_runner = pin!(b_runner);
+
+        let runners = futures::future::join(a_runner, b_runner);
+
+        let a_to_b = async move {
+            while let Some((reader, writer)) = a_new_streams.next().await {
+                let (err_sender, err) = oneshot();
+                b_new_stream_requests.send((reader, writer, err_sender)).await.unwrap();
+                err.await.unwrap().unwrap();
+            }
+        };
+
+        let b_to_a = async move {
+            while let Some((reader, writer)) = b_new_streams.next().await {
+                let (err_sender, err) = oneshot();
+                a_new_stream_requests.send((reader, writer, err_sender)).await.unwrap();
+                err.await.unwrap().unwrap();
+            }
+        };
+
+        let a_to_b = pin!(a_to_b);
+        let b_to_a = pin!(b_to_a);
+
+        let streams = futures::future::join(a_to_b, b_to_a);
+
+        futures::future::join3(control, runners, streams).await;
+    }
+}
+
+#[fuchsia::test]
+async fn connect_to_nonexistent_peer() {
+    let (new_peer_sender_a, _new_peers) = channel(100);
+    let (incoming_streams_sender_a, _streams_a) = channel(100);
+    let a = Node::new("a", "test", new_peer_sender_a, incoming_streams_sender_a).unwrap();
+
+    let (_reader, peer_writer) = stream::stream();
+    let (peer_reader, _writer) = stream::stream();
+    match a.connect_to_peer(peer_reader, peer_writer, "b").await {
+        Err(Error::NoSuchPeer(peer)) => assert_eq!("b", &peer),
+        other => panic!("Unexpected result {other:?}!"),
+    }
+}
+
+#[fuchsia::test]
+async fn connection_test() {
+    let (new_peer_sender_a, mut new_peers) = channel(1);
+    let (new_peer_sender_b, _new_peers_b) = channel(100);
+    let (incoming_streams_sender_a, _streams_a) = channel(100);
+    let (incoming_streams_sender_b, mut streams) = channel(1);
+    let a = Node::new("a", "test", new_peer_sender_a, incoming_streams_sender_a).unwrap();
+    let b = Node::new("b", "test", new_peer_sender_b, incoming_streams_sender_b).unwrap();
+
+    let _conn = fasync::Task::spawn(connect_nodes(&a, &b).await);
+
+    let new_peer = new_peers.next().await.unwrap();
+    assert_eq!("b", &new_peer);
+
+    let (_reader, peer_writer) = stream::stream();
+    let (peer_reader, writer) = stream::stream();
+    a.connect_to_peer(peer_reader, peer_writer, "b").await.unwrap();
+
+    writer
+        .write(8, |buf| {
+            buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            Ok(8)
+        })
+        .unwrap();
+
+    let (reader, _writer, from) = streams.next().await.unwrap();
+    assert_eq!("a", &from);
+
+    reader
+        .read(8, |buf| {
+            assert_eq!(&[1, 2, 3, 4, 5, 6, 7, 8], &buf);
+            Ok(((), 8))
+        })
+        .await
+        .unwrap();
+}
+
+#[fuchsia::test]
+async fn connection_test_duplex() {
+    let (new_peer_sender_a, new_peers_a) = channel(1);
+    let (new_peer_sender_b, new_peers_b) = channel(1);
+    let (incoming_streams_sender_a, streams_a) = channel(1);
+    let (incoming_streams_sender_b, streams_b) = channel(1);
+    let a = Node::new("a", "test", new_peer_sender_a, incoming_streams_sender_a).unwrap();
+    let b = Node::new("b", "test", new_peer_sender_b, incoming_streams_sender_b).unwrap();
+
+    let _conn = fasync::Task::spawn(connect_nodes(&a, &b).await);
+
+    let a_task = async move {
+        let mut new_peers = new_peers_a;
+        let new_peer = new_peers.next().await.unwrap();
+        assert_eq!("b", &new_peer);
+
+        let (_reader, peer_writer) = stream::stream();
+        let (peer_reader, writer) = stream::stream();
+        a.connect_to_peer(peer_reader, peer_writer, "b").await.unwrap();
+
+        writer
+            .write(8, |buf| {
+                buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+                Ok(8)
+            })
+            .unwrap();
+
+        let mut streams = streams_a;
+        let (reader, _writer, from) = streams.next().await.unwrap();
+        assert_eq!("b", &from);
+
+        reader
+            .read(8, |buf| {
+                assert_eq!(&[9, 10, 11, 12, 13, 14, 15, 16], &buf);
+                Ok(((), 8))
+            })
+            .await
+            .unwrap();
+    };
+
+    let b_task = async move {
+        let mut new_peers = new_peers_b;
+        let new_peer = new_peers.next().await.unwrap();
+        assert_eq!("a", &new_peer);
+
+        let (_reader, peer_writer) = stream::stream();
+        let (peer_reader, writer) = stream::stream();
+        b.connect_to_peer(peer_reader, peer_writer, "a").await.unwrap();
+
+        writer
+            .write(8, |buf| {
+                buf[..8].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+                Ok(8)
+            })
+            .unwrap();
+
+        let mut streams = streams_b;
+        let (reader, _writer, from) = streams.next().await.unwrap();
+        assert_eq!("a", &from);
+
+        reader
+            .read(8, |buf| {
+                assert_eq!(&[1, 2, 3, 4, 5, 6, 7, 8], &buf);
+                Ok(((), 8))
+            })
+            .await
+            .unwrap();
+    };
+
+    let a_task = pin!(a_task);
+    let b_task = pin!(b_task);
+
+    futures::future::join(a_task, b_task).await;
+}
+
+#[fuchsia::test]
+async fn connection_test_with_router() {
+    let (new_peer_sender_a, new_peers_a) = channel(1);
+    let (new_peer_sender_b, new_peers_b) = channel(1);
+    let (incoming_streams_sender_a, streams_a) = channel(1);
+    let (incoming_streams_sender_b, streams_b) = channel(1);
+    let a = Node::new("a", "test", new_peer_sender_a, incoming_streams_sender_a).unwrap();
+    let b = Node::new("b", "test", new_peer_sender_b, incoming_streams_sender_b).unwrap();
+    let (new_peer_sender_router, _new_peers_router) = channel(100);
+    let (incoming_streams_sender_router, _streams_router) = channel(100);
+    let (router, router_task) = Node::new_with_router(
+        "router",
+        "test",
+        std::time::Duration::from_millis(100),
+        new_peer_sender_router,
+        incoming_streams_sender_router,
+    )
+    .unwrap();
+
+    let _conn_a = fasync::Task::spawn(connect_nodes(&a, &router).await);
+    let _conn_b = fasync::Task::spawn(connect_nodes(&b, &router).await);
+    let _router_task = fasync::Task::spawn(router_task);
+
+    let a_task = async move {
+        let mut new_peers = new_peers_a;
+        let new_peers = [new_peers.next().await.unwrap(), new_peers.next().await.unwrap()];
+        assert!(new_peers.iter().any(|x| x == "b"));
+        assert!(new_peers.iter().any(|x| x == "router"));
+
+        let (_reader, peer_writer) = stream::stream();
+        let (peer_reader, writer) = stream::stream();
+        a.connect_to_peer(peer_reader, peer_writer, "b").await.unwrap();
+
+        writer
+            .write(8, |buf| {
+                buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+                Ok(8)
+            })
+            .unwrap();
+
+        let mut streams = streams_a;
+        let (reader, _writer, from) = streams.next().await.unwrap();
+        assert_eq!("b", &from);
+
+        reader
+            .read(8, |buf| {
+                assert_eq!(&[9, 10, 11, 12, 13, 14, 15, 16], &buf);
+                Ok(((), 8))
+            })
+            .await
+            .unwrap();
+    };
+
+    let b_task = async move {
+        let mut new_peers = new_peers_b;
+        let new_peers = [new_peers.next().await.unwrap(), new_peers.next().await.unwrap()];
+        assert!(new_peers.iter().any(|x| x == "a"));
+        assert!(new_peers.iter().any(|x| x == "router"));
+
+        let (_reader, peer_writer) = stream::stream();
+        let (peer_reader, writer) = stream::stream();
+        b.connect_to_peer(peer_reader, peer_writer, "a").await.unwrap();
+
+        writer
+            .write(8, |buf| {
+                buf[..8].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+                Ok(8)
+            })
+            .unwrap();
+
+        let mut streams = streams_b;
+        let (reader, _writer, from) = streams.next().await.unwrap();
+        assert_eq!("a", &from);
+
+        reader
+            .read(8, |buf| {
+                assert_eq!(&[1, 2, 3, 4, 5, 6, 7, 8], &buf);
+                Ok(((), 8))
+            })
+            .await
+            .unwrap();
+    };
+
+    let a_task = pin!(a_task);
+    let b_task = pin!(b_task);
+
+    futures::future::join(a_task, b_task).await;
+}
+
+#[fuchsia::test]
+async fn connection_test_with_injected_route() {
+    let (new_peer_sender_a, new_peers_a) = channel(1);
+    let (new_peer_sender_b, new_peers_b) = channel(1);
+    let (incoming_streams_sender_a, streams_a) = channel(1);
+    let (incoming_streams_sender_b, streams_b) = channel(1);
+    let a = Node::new("a", "test", new_peer_sender_a, incoming_streams_sender_a).unwrap();
+    let b = Node::new("b", "test", new_peer_sender_b, incoming_streams_sender_b).unwrap();
+    let (new_peer_sender_router, mut new_peers_router) = channel(1);
+    let (incoming_streams_sender_router, _streams_router) = channel(100);
+    let router =
+        Node::new("router", "test", new_peer_sender_router, incoming_streams_sender_router)
+            .unwrap();
+
+    let _conn_a = fasync::Task::spawn(connect_nodes(&a, &router).await);
+    let _conn_b = fasync::Task::spawn(connect_nodes(&b, &router).await);
+
+    let new_peer_1 = new_peers_router.next().await.unwrap();
+    let new_peer_2 = new_peers_router.next().await.unwrap();
+    assert!([new_peer_1.as_str(), new_peer_2.as_str()].contains(&"a"));
+    assert!([new_peer_1.as_str(), new_peer_2.as_str()].contains(&"b"));
+
+    let a_task = async move {
+        let mut new_peers = new_peers_a;
+        let new_peer = new_peers.next().await.unwrap();
+        assert_eq!("router", &new_peer);
+
+        a.route_via("b", "router");
+
+        let (_reader, peer_writer) = stream::stream();
+        let (peer_reader, writer) = stream::stream();
+        a.connect_to_peer(peer_reader, peer_writer, "b").await.unwrap();
+
+        writer
+            .write(8, |buf| {
+                buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+                Ok(8)
+            })
+            .unwrap();
+
+        let mut streams = streams_a;
+        let (reader, _writer, from) = streams.next().await.unwrap();
+        assert_eq!("b", &from);
+
+        reader
+            .read(8, |buf| {
+                assert_eq!(&[9, 10, 11, 12, 13, 14, 15, 16], &buf);
+                Ok(((), 8))
+            })
+            .await
+            .unwrap();
+    };
+
+    let b_task = async move {
+        let mut new_peers = new_peers_b;
+        let new_peer = new_peers.next().await.unwrap();
+        assert_eq!("router", &new_peer);
+
+        let mut streams = streams_b;
+        let (reader, _writer, from) = streams.next().await.unwrap();
+        assert_eq!("a", &from);
+
+        reader
+            .read(8, |buf| {
+                assert_eq!(&[1, 2, 3, 4, 5, 6, 7, 8], &buf);
+                Ok(((), 8))
+            })
+            .await
+            .unwrap();
+
+        let (_reader, peer_writer) = stream::stream();
+        let (peer_reader, writer) = stream::stream();
+        b.connect_to_peer(peer_reader, peer_writer, "a").await.unwrap();
+
+        writer
+            .write(8, |buf| {
+                buf[..8].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+                Ok(8)
+            })
+            .unwrap();
+    };
+
+    let a_task = pin!(a_task);
+    let b_task = pin!(b_task);
+
+    futures::future::join(a_task, b_task).await;
+}
+
+#[fuchsia::test]
+async fn connection_node_test() {
+    let (new_peer_sender_a, mut new_peers) = channel(1);
+    let (new_peer_sender_b, _new_peers_b) = channel(100);
+    let (a, a_incoming_conns) =
+        connection::ConnectionNode::new("a", "test", new_peer_sender_a).unwrap();
+    let (b, b_incoming_conns) =
+        connection::ConnectionNode::new("b", "test", new_peer_sender_b).unwrap();
+
+    let _conn = fasync::Task::spawn(connect_nodes(a.node(), b.node()).await);
+    let _a_runner = fasync::Task::spawn(async move {
+        let mut a_incoming_conns = pin!(a_incoming_conns);
+        if a_incoming_conns.next().await.is_some() {
+            unreachable!("Got connection from node 'a'")
+        }
+    });
+
+    let new_peer = new_peers.next().await.unwrap();
+    assert_eq!("b", &new_peer);
+
+    let (_reader, peer_writer) = stream::stream();
+    let (peer_reader, writer) = stream::stream();
+    let _conn = a.connect_to_peer("b", peer_reader, peer_writer).await.unwrap();
+
+    writer
+        .write(8, |buf| {
+            buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            Ok(8)
+        })
+        .unwrap();
+
+    let mut b_incoming_conns = pin!(b_incoming_conns);
+    let conn = b_incoming_conns.next().await.unwrap();
+    assert_eq!("a", conn.from());
+
+    let (reader, _writer) = conn.bind_stream(0).await.unwrap();
+
+    reader
+        .read(8, |buf| {
+            assert_eq!(&[1, 2, 3, 4, 5, 6, 7, 8], &buf);
+            Ok(((), 8))
+        })
+        .await
+        .unwrap();
+}
+
+#[fuchsia::test]
+async fn connection_node_test_duplex() {
+    let (new_peer_sender_a, mut new_peers) = channel(1);
+    let (new_peer_sender_b, _new_peers_b) = channel(100);
+    let (a, a_incoming_conns) =
+        connection::ConnectionNode::new("a", "test", new_peer_sender_a).unwrap();
+    let (b, b_incoming_conns) =
+        connection::ConnectionNode::new("b", "test", new_peer_sender_b).unwrap();
+
+    let _conn = fasync::Task::spawn(connect_nodes(a.node(), b.node()).await);
+    let _a_runner = fasync::Task::spawn(async move {
+        let mut a_incoming_conns = pin!(a_incoming_conns);
+        if a_incoming_conns.next().await.is_some() {
+            unreachable!("Got connection from node 'a'")
+        }
+    });
+
+    let new_peer = new_peers.next().await.unwrap();
+    assert_eq!("b", &new_peer);
+
+    let (_reader, peer_writer) = stream::stream();
+    let (peer_reader, writer) = stream::stream();
+    let conn_a = a.connect_to_peer("b", peer_reader, peer_writer).await.unwrap();
+
+    writer
+        .write(8, |buf| {
+            buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            Ok(8)
+        })
+        .unwrap();
+
+    let mut b_incoming_conns = pin!(b_incoming_conns);
+    let conn_b = b_incoming_conns.next().await.unwrap();
+    assert_eq!("a", conn_b.from());
+
+    let (reader, _writer) = conn_b.bind_stream(0).await.unwrap();
+
+    reader
+        .read(8, |buf| {
+            assert_eq!(&[1, 2, 3, 4, 5, 6, 7, 8], &buf);
+            Ok(((), 8))
+        })
+        .await
+        .unwrap();
+
+    let (_reader, peer_writer) = stream::stream();
+    let (peer_reader, writer) = stream::stream();
+    let b_to_a = conn_b.alloc_stream(peer_reader, peer_writer).await.unwrap();
+
+    writer
+        .write(8, |buf| {
+            buf[..8].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+            Ok(8)
+        })
+        .unwrap();
+
+    let (reader, _writer) = conn_a.bind_stream(b_to_a).await.unwrap();
+
+    reader
+        .read(8, |buf| {
+            assert_eq!(&[9, 10, 11, 12, 13, 14, 15, 16], &buf);
+            Ok(((), 8))
+        })
+        .await
+        .unwrap();
+}
+
+#[fuchsia::test]
+async fn connection_node_test_with_router() {
+    let (new_peer_sender_a, mut new_peers) = channel(1);
+    let (new_peer_sender_b, _new_peers_b) = channel(1);
+    let (new_peer_sender_router, _new_peers_router) = channel(1);
+    let (a, a_incoming_conns) =
+        connection::ConnectionNode::new("a", "test", new_peer_sender_a).unwrap();
+    let (b, b_incoming_conns) =
+        connection::ConnectionNode::new("b", "test", new_peer_sender_b).unwrap();
+    let (router, router_incoming_conns) = connection::ConnectionNode::new_with_router(
+        "router",
+        "test",
+        std::time::Duration::from_millis(500),
+        new_peer_sender_router,
+    )
+    .unwrap();
+
+    let _conn_a = fasync::Task::spawn(connect_nodes(a.node(), router.node()).await);
+    let _a_runner = fasync::Task::spawn(async move {
+        let mut a_incoming_conns = pin!(a_incoming_conns);
+        if a_incoming_conns.next().await.is_some() {
+            unreachable!("Got connection from node 'a'")
+        }
+    });
+
+    let _conn_b = fasync::Task::spawn(connect_nodes(b.node(), router.node()).await);
+    let _router_runner = fasync::Task::spawn(async move {
+        let mut router_incoming_conns = pin!(router_incoming_conns);
+        if router_incoming_conns.next().await.is_some() {
+            unreachable!("Got connection from router node")
+        }
+    });
+
+    let new_peer_1 = new_peers.next().await.unwrap();
+    let new_peer_2 = new_peers.next().await.unwrap();
+    assert!([new_peer_1.as_str(), new_peer_2.as_str()].contains(&"b"));
+    assert!([new_peer_1.as_str(), new_peer_2.as_str()].contains(&"router"));
+
+    let (_reader, peer_writer) = stream::stream();
+    let (peer_reader, writer) = stream::stream();
+    let _conn = a.connect_to_peer("b", peer_reader, peer_writer).await.unwrap();
+
+    writer
+        .write(8, |buf| {
+            buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            Ok(8)
+        })
+        .unwrap();
+
+    let mut b_incoming_conns = pin!(b_incoming_conns);
+    let conn = b_incoming_conns.next().await.unwrap();
+    assert_eq!("a", conn.from());
+
+    let (reader, _writer) = conn.bind_stream(0).await.unwrap();
+
+    reader
+        .read(8, |buf| {
+            assert_eq!(&[1, 2, 3, 4, 5, 6, 7, 8], &buf);
+            Ok(((), 8))
+        })
+        .await
+        .unwrap();
+}
+
+#[fuchsia::test]
+async fn connection_node_test_with_router_massively_parallel() {
+    let (new_peer_sender_a, mut new_peers) = channel(1);
+    let (new_peer_sender_b, _new_peers_b) = channel(1);
+    let (new_peer_sender_router, _new_peers_router) = channel(1);
+    let (a, a_incoming_conns) =
+        connection::ConnectionNode::new("a", "test", new_peer_sender_a).unwrap();
+    let (b, b_incoming_conns) =
+        connection::ConnectionNode::new("b", "test", new_peer_sender_b).unwrap();
+    let (router, router_incoming_conns) = connection::ConnectionNode::new_with_router(
+        "router",
+        "test",
+        std::time::Duration::from_millis(500),
+        new_peer_sender_router,
+    )
+    .unwrap();
+
+    let _conn_a = fasync::Task::spawn(connect_nodes(a.node(), router.node()).await);
+    let _a_runner = fasync::Task::spawn(async move {
+        let mut a_incoming_conns = pin!(a_incoming_conns);
+        if a_incoming_conns.next().await.is_some() {
+            unreachable!("Got connection from node 'a'")
+        }
+    });
+
+    let _conn_b = fasync::Task::spawn(connect_nodes(b.node(), router.node()).await);
+    let _router_runner = fasync::Task::spawn(async move {
+        let mut router_incoming_conns = pin!(router_incoming_conns);
+        if router_incoming_conns.next().await.is_some() {
+            unreachable!("Got connection from router node")
+        }
+    });
+
+    let new_peer_1 = new_peers.next().await.unwrap();
+    let new_peer_2 = new_peers.next().await.unwrap();
+    assert!([new_peer_1.as_str(), new_peer_2.as_str()].contains(&"b"));
+    assert!([new_peer_1.as_str(), new_peer_2.as_str()].contains(&"router"));
+
+    const NUM_CONNS: usize = 16;
+
+    let senders = futures::stream::iter(0..NUM_CONNS).for_each_concurrent(None, |_| async {
+        let (_reader, peer_writer) = stream::stream();
+        let (peer_reader, writer) = stream::stream();
+        let _conn = a.connect_to_peer("b", peer_reader, peer_writer).await.unwrap();
+
+        writer
+            .write(8, |buf| {
+                buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+                Ok(8)
+            })
+            .unwrap();
+    });
+
+    let receivers = b_incoming_conns.take(NUM_CONNS).for_each_concurrent(None, |conn| async move {
+        assert_eq!("a", conn.from());
+
+        let (reader, _writer) = conn.bind_stream(0).await.unwrap();
+
+        reader
+            .read(8, |buf| {
+                assert_eq!(&[1, 2, 3, 4, 5, 6, 7, 8], &buf);
+                Ok(((), 8))
+            })
+            .await
+            .unwrap();
+    });
+
+    futures::future::join(senders, receivers).await;
+}
+
+#[fuchsia::test]
+async fn connection_node_test_loopback() {
+    let (new_peer_sender_a, _new_peers) = channel(1);
+    let (a, _a_incoming_conns) =
+        connection::ConnectionNode::new("a", "test", new_peer_sender_a).unwrap();
+    let (_reader, peer_writer) = stream::stream();
+    let (peer_reader, _writer) = stream::stream();
+    assert!(matches!(
+        a.connect_to_peer("a", peer_reader, peer_writer).await,
+        Err(Error::LoopbackUnsupported)
+    ));
+}

@@ -1,0 +1,647 @@
+#!/bin/bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../../lib/platform.sh || exit $?
+
+BT_FILE_DEPS=(
+    "prebuilt/third_party/jq/${HOST_PLATFORM}/bin/jq"
+    "scripts/fx"
+    "scripts/fuchsia-vendored-python3.11"
+    "scripts/hermetic-env"
+    "build/scripts/main_build.py"
+    "build/scripts/signal_utils.py"
+    "build/force_clean/force_clean_if_needed.py"
+    "build/scripts/top_build_wrap.sh"
+    "build/profile/hardware_profiler.py"
+    "tools/devshell/lib/vars.sh"
+    "tools/devshell/lib/is_invoked_by_agent.sh"
+    "tools/devshell/lib/agents.txt"
+    "tools/devshell/build"
+    "tools/devshell/jq.fx"
+    "tools/devshell/lib/build_api_client.sh"
+    "tools/devshell/lib/fx-cmd-locator.sh"
+    "tools/devshell/lib/fx-optional-features.sh"
+    "tools/devshell/lib/platform.sh"
+    "tools/devshell/lib/generate-ssh-config.sh"
+    "tools/devshell/lib/bazel_utils.sh"
+    "tools/devshell/contrib/lib/count-ninja-actions.py"
+)
+
+declare fx
+
+BT_MKDIR_DEPS=(
+    "out/default"
+)
+
+MOCK_PYTHON3_DIR="prebuilt/third_party/python3/test"
+MOCK_PYTHON3="${MOCK_PYTHON3_DIR}/bin/python3"
+BT_MOCKED_TOOLS=(
+  "build/api/client"
+  "build/regenerator"
+  "scripts/fuchsia-vendored-python"
+  "tools/devshell/lib/bazel_utils.sh"
+  "tools/devshell/rbe"
+  "tools/devshell/lib/platform.sh"
+  "tools/integration/bootstrap.sh"
+  "build/rbe/fuchsia-reproxy-wrap.sh"
+  "build/profile/profile_wrap.sh"
+  "build/resultstore/fuchsia-rsproxy-wrap.sh"
+  "build/tui/build-tui-wrap.sh"
+  "${MOCK_PYTHON3}"
+)
+
+BT_SET_UP() {
+    source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+    fx="$(btf::setup_fx)"
+    TEST_BUILD_DIR="${BT_TEMP_DIR}/out/default"
+}
+
+# Helper to create a pass-through mock wrapper that shifts until '--'.
+# This is useful for testing orchestration of wrapper scripts without
+# exposing their internal requirements.
+btf::make_pass_through_mock() {
+  local mock_path="$1"
+  cat > "${BT_TEMP_DIR}/${mock_path}.mock_side_effects" <<EOF
+while [[ "\$#" -gt 0 && "\$1" != "--" ]]; do shift; done
+if [[ "\$1" == "--" ]]; then shift; fi
+exec "\$@"
+EOF
+}
+
+# This function must be called by any test that checks the
+# behavior of the validate_build_args() function.
+setup_parsing_validation_test() {
+    export FX_BUILD_DEBUG_VALIDATION=1
+}
+
+# This function must be called by regular build tests.
+setup_build_test() {
+  # Set up mocked replacements for system utils.
+
+  # IMPORTANT: The test suite invokes the current script through "/usr/bin/env -i"
+  # which appends ":." at the end of PATH, which will result in an error when
+  # calling fx-run-build-command, so remove this here explicitly.
+  export PATH="${BT_TEMP_DIR}/bin:${PATH%:.}"
+  export _FUCHSIA_WORKSPACE_CLI="${BT_TEMP_DIR}/nonexistent/fuchsia-workspace"
+
+  # Misc mock binaries invoked by tools/devshell/build
+  ninja="$(btf::make_mock_binary bin/ninja)"
+  gn_bin="$(btf::make_mock_binary bin/gn)"
+  build_api_client="${BT_TEMP_DIR}/build/api/client"
+
+  bazel="$(btf::make_mock_binary bin/bazel)"
+  cat > "${BT_TEMP_DIR}/tools/devshell/lib/bazel_utils.sh.mock_side_effects" <<EOF
+function fx-get-bazel {
+  echo "${bazel}"
+}
+
+function fx-update-bazel-workspace { return 0; }
+EOF
+  cat > "${BT_TEMP_DIR}/tools/devshell/lib/platform.sh.mock_side_effects" <<EOF
+    export PREBUILT_ALL_PATHS="${BT_TEMP_DIR}"
+    export PREBUILT_JQ="${BT_TEMP_DIR}/prebuilt/third_party/jq/linux-x64/bin/jq"
+    export PREBUILT_PYTHON3="$(command -v python3)"
+    export PREBUILT_PYTHON3_DIR="$(dirname "${PREBUILT_PYTHON3}")"
+    export PREBUILT_NINJA="${ninja}"
+    export PREBUILT_GN="${gn_bin}"
+EOF
+
+  if [[ "$1" != "enable_landmines" ]]; then
+    # Ensure the landmine checks pass by updating the timestamp of various files
+    # in the test directory.
+
+    # LINT.IfChange(landmine_files)
+    touch "${TEST_BUILD_DIR}/args.gn"
+    touch "${BT_TEMP_DIR}/tools/devshell/build"
+    touch "${BT_TEMP_DIR}/tools/devshell/lib/bazel_utils.sh"
+    touch "${BT_TEMP_DIR}/tools/devshell/lib/vars.sh"
+    touch "${TEST_BUILD_DIR}/build.ninja"  # Must appear last
+    # LINT.ThenChange(//tools/devshell/build:landmine_files)
+  fi
+
+  # Use pass-through mocks for all build wrappers.
+  # This allows testing the orchestration layer (top_build_wrap.sh)
+  # without satisfying the wrappers' own complex pre-flight requirements.
+  btf::make_pass_through_mock "build/rbe/fuchsia-reproxy-wrap.sh"
+  btf::make_pass_through_mock "build/profile/profile_wrap.sh"
+  btf::make_pass_through_mock "build/resultstore/fuchsia-rsproxy-wrap.sh"
+  btf::make_pass_through_mock "build/tui/build-tui-wrap.sh"
+
+  # Ensure RBE appears enabled to test that orchestration works.
+  echo '{"local_only": false}' > "${TEST_BUILD_DIR}/rbe_settings.json"
+  export FX_REMOTE_BUILD_METRICS=0
+
+  # fuchsia-vendored-python is used to run helper scripts like count-ninja-actions.py.
+  # Make it a pass-through to the real host python in the test environment.
+  cat > "${BT_TEMP_DIR}/scripts/fuchsia-vendored-python.mock_side_effects" <<EOF
+exec "$(command -v python3)" "\$@"
+EOF
+
+  # args.json is parsed to look for enable_jobserver in Ninja build mode.
+  # Ensure this is disabled by default.
+  touch "${TEST_BUILD_DIR}/args.json"
+
+  # Force concurrency, see fx-cpu-count.
+  mock_getconf=$(btf::make_mock_binary getconf)
+  echo "8" > "${mock_getconf}.mock_stdout"
+  btf::add_binary_to_path "${mock_getconf}"
+}
+
+# In Ninja build mode, build/api/client is called twice. The first time to
+# convert GN labels and Ninja output paths to GN labels (if possible, since
+# some GN convenience aliases have no GN labels), the second time to convert
+# the labels (and remaining aliases) to Ninja paths.
+#
+# These two steps are used to print different set of messages in case of
+# errors, and could be grouped into a single build/api/client command, but
+# for now, both need to be supported.
+# $1: The output of the first build/api/client (should be a list of labels)
+# $2: The output of the second build/api/client (should be a list of Ninja paths)
+setup_build_api_results() {
+  echo "$1" > "${build_api_client}.mock_stdout.1"
+  echo "$2" > "${build_api_client}.mock_stdout.2"
+}
+
+setup_fint_build() {
+  fint_build_mock="${BT_TEMP_DIR}/tools/integration/fint/fint_build.py"
+  mkdir -p "$(dirname "${fint_build_mock}")"
+  cat > "${fint_build_mock}" <<EOF
+#!/usr/bin/env python3
+import sys
+import pathlib
+
+state_file = pathlib.Path("${BT_TEMP_DIR}/tools/integration/fint/fint_build_test_state")
+# Format as a Bash-compatible array declaration
+args_str = " ".join(f'"{arg}"' for arg in sys.argv)
+state_file.write_text(f'BT_MOCK_ARGS=({args_str})\\n')
+EOF
+  chmod +x "${fint_build_mock}"
+}
+
+# --- Validation Tests ---
+
+TEST_fx-build-validate-gn-labels() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build //src:foo ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE gn"
+}
+
+TEST_fx-build-validate-gn-toolchain() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build --toolchain=//toolchain:bar //src:foo ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE gn"
+}
+
+TEST_fx-build-validate-gn-alias-default() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build --default //src:foo ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE gn"
+}
+
+TEST_fx-build-validate-gn-alias-fuchsia() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build --fuchsia //src:foo ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE gn"
+}
+
+TEST_fx-build-validate-gn-alias-fidl() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build --fidl //src:foo ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE gn"
+}
+
+TEST_fx-build-validate-gn-alias-host() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build --host //src:foo ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE gn"
+}
+
+TEST_fx-build-reject-gn-toolchain-as-last-argument() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build //src:foo --host "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: Toolchain option --host must be followed by at least one GN label"
+}
+
+TEST_fx-build-validate-bazel-single-label() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build @//src:foo ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE bazel"
+}
+
+TEST_fx-build-reject-bazel-and-gn-toolchain() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build @//src:foo --toolchain=//toolchain:bar "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: GN option --toolchain=//toolchain:bar cannot be used with Bazel targets: @//src:foo"
+}
+
+TEST_fx-build-reject-bazel-and-gn-alias-default() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build @//src:foo --default "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: GN option --default cannot be used with Bazel targets: @//src:foo"
+}
+
+TEST_fx-build-reject-bazel-and-gn-alias-fuchsia() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build @//src:foo --fuchsia "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: GN option --fuchsia cannot be used with Bazel targets: @//src:foo"
+}
+
+TEST_fx-build-reject-bazel-and-gn-alias-fidl() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build @//src:foo --fidl "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: GN option --fidl cannot be used with Bazel targets: @//src:foo"
+}
+
+TEST_fx-build-validate-bazel-with-host-alias() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build @//src:foo --host ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE bazel"
+}
+
+TEST_fx-build-reject-bazel-and-gn-labels() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build @//src:foo //src:bar "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: GN label //src:bar cannot be used with Bazel targets: @//src:foo"
+}
+
+TEST_fx-build-reject-fint-params-and-bazel-label() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build --fint-params-path foo @//src:foo "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: It's invalid to specify Bazel or GN arguments along with --fint-params-path."
+}
+
+TEST_fx-build-reject-fint-params-and-gn-label() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build --fint-params-path foo //src:foo "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: It's invalid to specify Bazel or GN arguments along with --fint-params-path."
+}
+
+TEST_fx-build-reject-fint-params-and-extra-args() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build --fint-params-path FILE -- -j20 "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: It's invalid to specify extra Ninja flags along with --fint-params-path."
+}
+
+TEST_fx-build-reject-fint-params-missing-arg() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build --fint-params-path "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: Missing --fint-params-path argument, see --help."
+}
+
+TEST_fx-build-validate-fint-params() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build --fint-params-path FOO ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE fint"
+}
+
+TEST_fx-build-validate-fint-params-with-single-arg() {
+    setup_parsing_validation_test
+    BT_EXPECT "${fx}" build --fint-params-path=FOO ">" stdout.txt
+    BT_EXPECT_FILE_CONTAINS stdout.txt "FX_BUILD_MODE fint"
+}
+
+TEST_fx-build-reject-log-missing-arg() {
+    setup_parsing_validation_test
+    BT_EXPECT_FAIL "${fx}" build --log "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: Missing --log argument, see --help."
+}
+
+# --- Integration Tests ---
+
+TEST_fx-build-with-fint() {
+    setup_build_test
+    setup_fint_build
+    BT_EXPECT "${fx}" build --fint-params-path=path/to/build_config.proto
+    local mock_state_file="${BT_TEMP_DIR}/tools/integration/fint/fint_build_test_state"
+    BT_EXPECT_FILE_EXISTS "${mock_state_file}"
+    source "${mock_state_file}"
+    # Verify that fint_build.py was executed with the correct static parameters path
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[1]}" "--static"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[2]}" "path/to/build_config.proto"
+}
+
+TEST_fx-build-with-gn-label() {
+    setup_build_test
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    # Use dry run to verify the entire stack without actually running Ninja.
+    # This flows through the real top_build_wrap.sh but uses pass-through mocks
+    # for intermediate wrappers (reproxy, profile, rsproxy).
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build //src:foo ">" stdout.txt
+    # Verify that the converted Ninja target reached the end of the stack.
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+}
+
+TEST_fx-build-with-gn-label-and-j32() {
+    setup_build_test
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build -j32 //src:foo ">" stdout.txt
+    # Verify both the flag and the target reached the end of the stack.
+    # Note: main_build.py normalizes -j32 to -j 32
+    BT_EXPECT "grep -q -e '-j 32' stdout.txt"
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+}
+
+TEST_fx-build-with-no-status() {
+    setup_build_test
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build --no-status //src:foo ">" stdout.txt
+    # Verify that NINJA_STATUS is set to [%f/%t] in the environment.
+    BT_EXPECT "grep -q -F \"NINJA_STATUS='[%f/%t] '\" stdout.txt"
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+}
+
+TEST_fx-build-auto-no-status-non-tty() {
+    setup_build_test
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build //src:foo ">" stdout.txt
+    # Verify that NINJA_STATUS is set to [%f/%t] due to auto-detection (non-TTY).
+    BT_EXPECT "grep -q -F \"NINJA_STATUS='[%f/%t] '\" stdout.txt"
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+}
+
+TEST_fx-build-auto-no-status-term-dumb() {
+    setup_build_test
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    export TERM=dumb
+    BT_EXPECT "${fx}" build //src:foo ">" stdout.txt
+    # Verify that NINJA_STATUS is set to [%f/%t] due to TERM=dumb.
+    BT_EXPECT "grep -q -F \"NINJA_STATUS='[%f/%t] '\" stdout.txt"
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+}
+
+TEST_fx-build-with-gn-label-and-enable_jobserver() {
+    setup_build_test
+    # Verify that enable_jobserver=true in args.gn sets the Ninja --jobserver flag.
+    echo "{ \"enable_jobserver\": true }" > "${TEST_BUILD_DIR}/args.json"
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build //src:foo ">" stdout.txt
+    BT_EXPECT grep -q -e "--jobserver" stdout.txt
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+}
+
+TEST_fx-build-with-gn-label-and-j-32() {
+    setup_build_test
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build -j 32 //src:foo ">" stdout.txt
+    # Verify both the flag and the target reached the end of the stack.
+    BT_EXPECT "grep -q -e '-j 32' stdout.txt"
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+}
+
+TEST_fx-build-with-ninja-path() {
+    setup_build_test
+    # When a raw Ninja path is used, build/api/client is called to convert it to GN labels (if any).
+    # If it's already a Ninja path, it might return it as-is.
+    setup_build_api_results "obj/src/foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build obj/src/foo ">" stdout.txt
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+}
+
+TEST_fx-build-with-bazel-no-config-label() {
+    setup_build_test
+    BT_EXPECT_FAIL "${fx}" build @//src/foo "2>" stderr.txt
+    BT_EXPECT_FILE_CONTAINS stderr.txt "ERROR: Only host or fuchsia_platform Bazel target labels are supported for now, please use --host or --fuchsia_platform flag."
+}
+
+TEST_fx-build-with-bazel-host-label() {
+    setup_build_test
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build --host @//src/foo ">" stdout.txt
+    # Verify that the command reached the end of the stack with correct flags.
+    BT_EXPECT grep -q "bazel" stdout.txt
+    BT_EXPECT grep -q "build" stdout.txt
+    BT_EXPECT grep -q -e "--config=host" stdout.txt
+    BT_EXPECT grep -q -e "@//src/foo" stdout.txt
+}
+
+TEST_fx-build-with-bazel-host-label-and-j32() {
+    setup_build_test
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build --host -j32 @//src/foo ">" stdout.txt
+    BT_EXPECT grep -q "bazel" stdout.txt
+    BT_EXPECT grep -q "build" stdout.txt
+    BT_EXPECT grep -q -e "--config=host" stdout.txt
+    BT_EXPECT grep -q -e "-j32" stdout.txt
+    BT_EXPECT grep -q -e "@//src/foo" stdout.txt
+}
+
+TEST_fx-build-with-bazel-label-with-trailing-host() {
+    setup_build_test
+    export FX_BUILD_DRY_RUN=1
+    # Unlike with GN build mode, --host can appear after the Bazel label
+    BT_EXPECT "${fx}" build @//src/foo --host ">" stdout.txt
+    BT_EXPECT grep -q "bazel" stdout.txt
+    BT_EXPECT grep -q "build" stdout.txt
+    BT_EXPECT grep -q -e "--config=host" stdout.txt
+    BT_EXPECT grep -q -e "@//src/foo" stdout.txt
+}
+
+TEST_fx-build-with-bazel-label-with-config-host() {
+    setup_build_test
+    export FX_BUILD_DRY_RUN=1
+    # Unlike GN --toolchain options, --config can appear after the Bazel label.
+    BT_EXPECT "${fx}" build @//src/foo --config=host ">" stdout.txt
+    BT_EXPECT grep -q "bazel" stdout.txt
+    BT_EXPECT grep -q "build" stdout.txt
+    BT_EXPECT grep -q -e "--config=host" stdout.txt
+    BT_EXPECT grep -q -e "@//src/foo" stdout.txt
+}
+
+TEST_fx-build-with-bazel-label-after-fuchsia-platform() {
+    setup_build_test
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build --fuchsia_platform @//src/foo ">" stdout.txt
+    # Verify that the command reached the end of the stack with correct flags.
+    BT_EXPECT grep -q "bazel" stdout.txt
+    BT_EXPECT grep -q "build" stdout.txt
+    BT_EXPECT grep -q -e "--config=fuchsia_platform" stdout.txt
+    BT_EXPECT grep -q -e "@//src/foo" stdout.txt
+}
+
+TEST_fx-build-with-bazel-label-before-fuchsia-platform() {
+    setup_build_test
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build @//src/foo --fuchsia_platform ">" stdout.txt
+    # Verify that the command reached the end of the stack with correct flags.
+    BT_EXPECT grep -q "bazel" stdout.txt
+    BT_EXPECT grep -q "build" stdout.txt
+    BT_EXPECT grep -q -e "--config=fuchsia_platform" stdout.txt
+    BT_EXPECT grep -q -e "@//src/foo" stdout.txt
+}
+
+TEST_fx-build-with-bazel-label-before-config-fuchsia-platform() {
+    setup_build_test
+    export FX_BUILD_DRY_RUN=1
+    # Unlike GN --toolchain options, --config can appear after the Bazel label.
+    BT_EXPECT "${fx}" build @//src/foo --config=fuchsia_platform ">" stdout.txt
+    BT_EXPECT grep -q "bazel" stdout.txt
+    BT_EXPECT grep -q "build" stdout.txt
+    BT_EXPECT grep -q -e "--config=fuchsia_platform" stdout.txt
+    BT_EXPECT grep -q -e "@//src/foo" stdout.txt
+}
+
+TEST_fx-build-produces-build-tracking-events() {
+    setup_build_test
+
+    track_build_event=$(btf::make_mock_binary track-build-event)
+
+    cat > "${BT_TEMP_DIR}/tools/devshell/lib/metrics.sh.mock_side_effects" <<EOF
+  function metrics-init {
+    echo ""
+  }
+  function track-command-execution {
+    echo ""
+  }
+  function track-feature-status {
+    echo ""
+  }
+  function track-command-finished {
+    echo ""
+  }
+  function track-build-event {
+    "${track_build_event}" "\$@"
+  }
+EOF
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build "-j4" //src:foo ">" stdout.txt
+    # Verify that the target reached the end of the stack.
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+
+    source "${track_build_event}.mock_state"
+    BT_EXPECT_EQ "${#BT_MOCK_ARGS[@]}" "10"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[0]}" "${track_build_event}"
+    # [1] is start time (time-dependent)
+    # [2] is end time (time-dependent)
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[3]}" "0"   # status
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[4]}" "-j4"    # extra switches
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[5]}" "obj/src/foo"  # ninja targets
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[6]}" "${TEST_BUILD_DIR}"  # fuchsia build dir
+    # [7] is_no_op (timestamp-dependent)
+    # [8] is_clean_build (timestamp-dependent)
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[9]}" ""  # quiet
+}
+
+TEST_fx-build-antigravity-quiet-by-default() {
+    setup_build_test
+
+    track_build_event=$(btf::make_mock_binary track-build-event)
+
+    cat > "${BT_TEMP_DIR}/tools/devshell/lib/metrics.sh.mock_side_effects" <<EOF
+  function metrics-init {
+    echo ""
+  }
+  function track-command-execution {
+    echo ""
+  }
+  function track-feature-status {
+    echo ""
+  }
+  function track-command-finished {
+    echo ""
+  }
+  function track-build-event {
+    "${track_build_event}" "\$@"
+  }
+EOF
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT ANTIGRAVITY_AGENT=1 "${fx}" build "-j4" //src:foo ">" stdout.txt
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+
+    source "${track_build_event}.mock_state"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[9]}" "true"  # quiet should be true by default in antigravity
+}
+
+TEST_fx-build-antigravity-verbose-overrides-quiet() {
+    setup_build_test
+
+    track_build_event=$(btf::make_mock_binary track-build-event)
+
+    cat > "${BT_TEMP_DIR}/tools/devshell/lib/metrics.sh.mock_side_effects" <<EOF
+  function metrics-init {
+    echo ""
+  }
+  function track-command-execution {
+    echo ""
+  }
+  function track-feature-status {
+    echo ""
+  }
+  function track-command-finished {
+    echo ""
+  }
+  function track-build-event {
+    "${track_build_event}" "\$@"
+  }
+EOF
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT ANTIGRAVITY_AGENT=1 "${fx}" build "-j4" --verbose //src:foo ">" stdout.txt
+    BT_EXPECT grep -q "obj/src/foo" stdout.txt
+
+    source "${track_build_event}.mock_state"
+    BT_EXPECT_EQ "${BT_MOCK_ARGS[9]}" ""  # quiet should be empty when --verbose is passed
+}
+
+TEST_fx-build-invokes-fuchsia-workspace-yield() {
+    setup_build_test
+
+    local fuchsia_workspace
+    fuchsia_workspace=$(btf::make_mock_binary fuchsia-workspace)
+    export _FUCHSIA_WORKSPACE_CLI="${fuchsia_workspace}"
+
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build //src:foo ">" stdout.txt
+
+    for _ in {1..100}; do
+      if [[ -f "${fuchsia_workspace}.mock_state" ]]; then
+        break
+      fi
+      sleep 0.05
+    done
+
+    BT_EXPECT btf::expect-mock-args "${fuchsia_workspace}" daemon yield _ANY_
+}
+
+TEST_fx-build-does-not-invoke-fuchsia-workspace-when-no-checks() {
+    setup_build_test
+
+    local fuchsia_workspace
+    fuchsia_workspace=$(btf::make_mock_binary fuchsia-workspace)
+    export _FUCHSIA_WORKSPACE_CLI="${fuchsia_workspace}"
+
+    setup_build_api_results "//src:foo" "obj/src/foo"
+    export FX_BUILD_DRY_RUN=1
+    BT_EXPECT "${fx}" build --no-checks //src:foo ">" stdout.txt
+
+    sleep 0.5
+    BT_EXPECT [ ! -f "${fuchsia_workspace}.mock_state" ]
+}
+
+TEST_fx-build-rbe-preflight-failure() {
+    setup_build_test
+    cat > "${BT_TEMP_DIR}/tools/devshell/rbe.mock_side_effects" <<EOF
+if [[ "\$1" == "preflight" ]]; then
+  # Use exit status 5 as an arbitrary non-zero value to verify that
+  # the preflight check exit code is propagated correctly.
+  exit 5
+fi
+EOF
+    local status=0
+    "${fx}" build //src:foo || status=$?
+    BT_EXPECT_EQ "${status}" "5"
+}
+
+BT_RUN_TESTS "$@"

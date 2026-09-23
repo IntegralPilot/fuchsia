@@ -1,0 +1,131 @@
+#!/bin/bash
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test "get-flash-source" script.
+
+# Source platform.sh so that we can point to jq and include it as a runtime dependency.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/../../lib/platform.sh" || exit $?
+
+BT_FILE_DEPS=(
+  "scripts/fx"
+  "prebuilt/third_party/jq/${HOST_PLATFORM}/bin/jq"
+  "tools/devshell/get-flash-source"
+  "tools/devshell/jq.fx"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/platform.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+)
+
+BT_MKDIR_DEPS=(
+  "out/default"
+)
+
+# A contrived "cpu" identifier that won't match $HOST_CPU.
+export readonly CROSS_COMPILED_CPU="CROSS_COMPILED_CPU"
+
+declare build_mock
+
+BT_SET_UP() {
+  # Set up the testing framework.
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+
+  # Set up mock build API modules.
+  cat > "${BT_TEMP_DIR}/out/default/args.json" <<EOF
+{
+  "build_info_product": "core",
+  "build_info_board": "x64"
+}
+EOF
+
+  cat > "${BT_TEMP_DIR}/out/default/product_bundles.json" <<EOF
+[
+  {
+    "label": "//build/images/fuchsia:product_bundle(//build/toolchain/fuchsia:x64)",
+    "name": "core.x64",
+    "path": "obj/build/images/fuchsia/product_bundle",
+    "product_version": "12.99991231.0.1",
+    "transfer_manifest_path": "obj/build/images/fuchsia/transfer.json",
+    "transfer_manifest_url": "file://obj/build/images/fuchsia/transfer.json"
+  },
+  {
+    "json": "kernel.phys32/obj/zircon/kernel/phys/test/qemu-hello-world-test.linuxboot.product_bundle/product_bundle.json",
+    "label": "//zircon/kernel/phys/test:qemu-hello-world-test.linuxboot.product_bundle(//zircon/kernel/arch/x86/phys:kernel.phys32)",
+    "name": "qemu-hello-world-test.linuxboot",
+    "path": "kernel.phys32/obj/zircon/kernel/phys/test/qemu-hello-world-test.linuxboot.product_bundle",
+    "product_version": "16.99991231.0.1",
+    "transfer_manifest_path": "kernel.phys32/obj/zircon/kernel/phys/test/qemu-hello-world-test.linuxboot.transfer.json",
+    "transfer_manifest_url": "file://kernel.phys32/obj/zircon/kernel/phys/test/qemu-hello-world-test.linuxboot.transfer.json"
+  }
+]
+EOF
+
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/build"
+}
+
+TEST_fx-get-flash-source-product-bundle() {
+  cat > "${BT_TEMP_DIR}/out/default/args.json" <<EOF
+{
+  "build_info_product": "core",
+  "build_info_board": "x64"
+}
+EOF
+
+  BT_EXPECT_EQ "$(${fx} get-flash-source)" "product-bundle:obj/build/images/fuchsia/product_bundle"
+}
+
+TEST_fx-get-flash-source-product-bundle-with-build() {
+  local build_args="${BT_TEMP_DIR}/build_args"
+  cat >"${BT_TEMP_DIR}/tools/devshell/build.mock_side_effects"<<INPUT
+printf %s "\$@" > "${build_args}"
+echo "Fake build output for testing - should be ignored"
+INPUT
+  cat > "${BT_TEMP_DIR}/out/default/args.json" <<EOF
+{
+  "build_info_product": "core",
+  "build_info_board": "x64"
+}
+EOF
+  BT_EXPECT_EQ "$(${fx} get-flash-source --build)" "product-bundle:obj/build/images/fuchsia/product_bundle"
+  BT_EXPECT_FILE_CONTAINS "${build_args}" "//build/images/fuchsia:product_bundle(//build/toolchain/fuchsia:x64)"
+}
+
+TEST_fx-get-flash-source-missing-product-bundle() {
+  cat > "${BT_TEMP_DIR}/out/default/product_bundles.json" <<EOF
+[
+]
+EOF
+  BT_EXPECT_FAIL "${fx}" get-flash-source 1>/dev/null 2>stderr
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING stderr "Failed to find a product bundle"
+}
+
+TEST_fx-get-flash-source-with-main-pb-label() {
+  cat > "${BT_TEMP_DIR}/out/default/args.json" <<EOF
+{
+  "main_pb_label": "//build/images/fuchsia:product_bundle_eng"
+}
+EOF
+  cat > "${BT_TEMP_DIR}/out/default/product_bundles.json" <<EOF
+[
+  {
+    "label": "//build/images/fuchsia:product_bundle_eng(//build/toolchain/fuchsia:x64)",
+    "name": "core.x64",
+    "path": "obj/build/images/fuchsia/product_bundle_eng",
+    "product_version": "12.99991231.0.1",
+    "transfer_manifest_path": "obj/build/images/fuchsia/transfer.json",
+    "transfer_manifest_url": "file://obj/build/images/fuchsia/transfer.json"
+  }
+]
+EOF
+
+  BT_EXPECT_EQ "$(${fx} get-flash-source)" "product-bundle:obj/build/images/fuchsia/product_bundle_eng"
+}
+
+
+BT_RUN_TESTS "$@"

@@ -1,0 +1,108 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang_prefix.gni")
+import("//build/ninja_implicit_inputs/config.gni")
+import("//build/ninja_implicit_inputs/ninja_implicit_inputs.gni")
+
+# Generate a manifest that provides information about Ninja implicit
+# inputs for a set of root GN labels.
+#
+# For now, these are limited to C++ headers that GN *knows* about but
+# nevertheless does *not* write as inputs into the Ninja build plan.
+#
+# As a consequence these inputs will not appear in the result of running
+# Ninja tools such as '-t inputs', '-t multi-inputs' or '-t affected'.
+#
+# This information is important for Ninja sub-builds launched from Bazel
+# though. Since Bazel doesn't support depfiles, it needs to know about all
+# possible inputs of a Ninja artifact to guarantee incremental correctness.
+# See https://fxbug.dev/377233505 for context.
+#
+# Without this information, modifying a header file that is only used by
+# a GN target in a Ninja sub-build would be invisible to Bazel.
+#
+# The manifest itself is a JSON array of objects, with the following schema:
+#
+# LINT.IfChange(manifest_schema)
+#
+#    gn_label: GN label, including toolchain suffix, of a root target definition.
+#
+#    manifest_path: Path, relative to the Ninja build directory, to a sub-manifest
+#       describing the implicit inputs collected from the root target and its
+#       transitive dependencies.
+#
+# Each sub-manifest itself is a JSON array of objects, using the following
+# schema:
+#
+#    gn_label: A GN label, including a toolchain suffix.
+#
+#    files: [Optional] A list of paths, relative to the Ninja build
+#        directory, to implicit input files for the corresponding target.
+#        One example are C++ headers from both the 'public' and 'sources'
+#        arguments of source_set(), static_library() et al.
+#
+#    directories: [Optional] A list of paths, relative to the Ninja build
+#        directory, to directories whose whole content should be treated
+#        as implicit inputs.
+#
+#        IMPORTANT: Because neither Bazel nor Ninja actions can track
+#        directories, changing any leaf files within them will always trigger
+#        the repository rule, which itself will re-run `gn gen` in the sub-build
+#        directory. This is not a problem for prebuilt toolchains or sysroots
+#        which are the primary use case for this type of entry.
+#
+# LINT.ThenChange(//build/ninja_implicit_inputs/ninja_implicit_inputs.py:manifest_schema)
+#
+# Other types of implicit inputs may be added in the future, using separate
+# key names.
+#
+
+if (current_toolchain == default_toolchain) {
+  # Generate the top-level manifest and its sub-manifests.
+  generate_ninja_implicit_inputs_manifest("manifest") {
+    root_labels = ninja_implicit_inputs_root_labels + [
+                    # TODO(digit): Ensure only compile and link targets for host
+                    # Linux binaries depend on this.
+                    ":linux_sysroot",
+
+                    # TODO(digit): Ensure only compile and link targets for C++
+                    # binaries depend on this.
+                    ":clang_toolchain",
+
+                    # TODO(digit): Ensure only compile and link targets for Go
+                    # host binaries depend on this.
+                    ":go_toolchain",
+                  ]
+  }
+
+  # The Linux sysroot files are implicit inputs for any action that
+  # needs to compile or link Linux host binaries.
+  ninja_implicit_directory_inputs("linux_sysroot") {
+    directories = [ "//prebuilt/third_party/sysroot/linux" ]
+  }
+
+  # The clang toolchain files are implicit inputs for any action that
+  # needs to compile or link C++ binaries, or use any of the tools
+  # provided by the toolchain.
+  ninja_implicit_directory_inputs("clang_toolchain") {
+    directories = [ get_path_info(clang_prefix, "dir") ]
+  }
+
+  # The llvm libc sources are heavily used by the Fuchsia C library.
+  ninja_implicit_directory_inputs("llvm_libc_sources") {
+    directories = [ "//third_party/llvm-libc/src" ]
+  }
+
+  # The go toolchain files that are implicit inputs to actions that
+  # compile and link go binaries.
+  ninja_implicit_file_inputs("go_toolchain") {
+    _go_base_dir = "//prebuilt/third_party/go/${host_os}-${host_cpu}"
+    files = [
+      "${_go_base_dir}/bin/go",
+      "${_go_base_dir}/makefuchsia/makefuchsia.go",
+      "${_go_base_dir}/makeroot/makeroot.go",
+    ]
+  }
+}

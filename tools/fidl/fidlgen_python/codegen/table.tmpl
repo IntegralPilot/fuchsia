@@ -1,0 +1,107 @@
+{{/*
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{ define "TableDeclaration" -}}
+@dataclass
+class {{ .PythonName }}:
+    {{- if .DocComments }}
+    """
+    {{- range .DocComments }}
+{{ . | escapeQuotes | trimSpace | indentNonEmpty4 }}
+    {{- end }}
+    """
+    {{- end }}
+    {{- range .PythonMembers }}
+    {{- if .DocComments }}
+    """
+    {{- range .DocComments }}
+{{ . | escapeQuotes | trimSpace | indentNonEmpty4 }}
+    {{- end }}
+    """
+    {{- end }}
+    {{ .PythonName }}: {{ .PythonType.PythonName }} | None
+    {{- end }}
+
+    {{ if .PythonMembers -}}
+    def __init__(
+        self,
+        {{- range .PythonMembers }}
+        {{ .PythonName }}: {{ .PythonType.PythonName }} | None = None,
+        {{- end }}
+    ) -> None:
+        {{- range .PythonMembers }}
+        self.{{ .PythonName }} = {{ .PythonName }}
+        {{- end -}}
+    {{- end }}
+
+    __fidl_kind__ = "table"
+    __fidl_type__ = "{{ .PythonName }}"
+    __fidl_raw_type__ = "{{ .Name }}"
+
+    # TODO(https://fxbug.dev/394421154): We should probably remove this method when we
+    # start making breaking changes.
+    def __getitem__(self, item: str): # type: ignore
+        if not isinstance(item, str):
+            raise TypeError("Subscripted item must be a string")
+        return getattr(self, item)
+
+    def encode(self) -> tuple[bytes, list[typing.Any]]:
+        return fidl.encode_struct(self, type(self)._encode, 16)
+
+    @classmethod
+    def decode(cls, data: bytes, handles: list[typing.Any]) -> typing.Self:
+        return fidl.decode_struct(data, handles, cls._decode, 16)
+
+    def _encode(self, encoder: fidl.Encoder, offset: int) -> None:
+        max_ord = 0
+        {{- range .PythonMembers }}
+        if self.{{ .PythonName }} is not None:
+            max_ord = max(max_ord, {{ .Ordinal }})
+        {{- end }}
+
+        if max_ord == 0:
+            encoder.write_inline(offset, b'\x00' * 8 + b'\xff' * 8)
+            return
+
+        encoder.write_uint64(max_ord, offset)
+        encoder.write_uint64(0xffffffffffffffff, offset + 8)
+
+        def encode_envelopes(val: typing.Any, enc: fidl.Encoder, start_offset: int) -> None:
+            {{- if .PythonMembers }}
+{{ .EncoderBody | indentNonEmpty12 }}
+            {{- else }}
+            pass
+            {{- end }}
+
+        encoder.ool_tasks.append(lambda: encoder.write_ool_struct(self, encode_envelopes, max_ord * 8))
+
+    @classmethod
+    def _decode(cls, decoder: fidl.Decoder, _offset: int) -> typing.Self:
+        _max_ord = decoder.read_uint64(_offset)
+        _presence = decoder.read_uint64(_offset + 8)
+        if _presence == 0:
+            return cls()
+
+        _pad_mod = decoder.ool_offset % 8
+        if _pad_mod != 0:
+            decoder.ool_offset += (8 - _pad_mod)
+        _env_array_start = decoder.ool_offset
+        decoder.ool_offset += _max_ord * 8
+
+{{ .DecoderBody | indentNonEmpty8 }}
+
+        return cls(
+            {{- range .PythonMembers }}
+            {{ .PythonName }}={{ .PythonName }},
+            {{- end }}
+        )
+
+    @classmethod
+    def make_default(cls) -> typing.Self:
+        return cls()
+
+
+{{ end }}

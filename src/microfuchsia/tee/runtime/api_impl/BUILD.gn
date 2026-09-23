@@ -1,0 +1,93 @@
+# Copyright 2024 The Fuchsia Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components/fuchsia_unittest_package.gni")
+import("//build/config/sanitizers/sanitizer_default_options.gni")
+import("//build/rust/rustc_library.gni")
+
+# Allocations made through the TEE Internal Core API's TEE_Malloc() and
+# TEE_Realloc() routines should be initialized to all zero. We implement these
+# on top of Fuchsia's C calloc() and realloc() routines. calloc() always zeros
+# the allocation, but we need to configure realloc() to also do so. To do so we
+# pass options to the allocator asking it to zero out all allocations. We use
+# two
+# different allocators in Fuchsia so we need to provide options for both.
+
+# When using scudo, we export the symbol __scudo_default_options() which returns
+# the string "zero_contents=true" that tells scudo to zero out newly allocated
+# memory (unless it knows that it's already zeroed out by the OS).
+config("export_scudo_dynamic_options") {
+  rustflags = [ "-Clink-arg=--export-dynamic-symbol=__scudo_default_options" ]
+}
+
+# When using ASan's allocator we have to provide the ASan option
+# malloc_fill_byte instead with a fill "pattern" of 0.
+sanitizer_extra_options("malloc_fill_byte_zero_asan") {
+  args = [ "malloc_fill_byte=0:max_malloc_fill_size=2147483647" ]
+  tags = [ "asan" ]
+  sanitizer = "asan"
+}
+
+# HWAsan also replaces the allocator and needs the same options.
+sanitizer_extra_options("malloc_fill_byte_zero_hwasan") {
+  args = [ "malloc_fill_byte=0:max_malloc_fill_size=2147483647" ]
+  tags = [ "hwasan" ]
+  sanitizer = "hwasan"
+}
+
+rustc_library("api_impl") {
+  edition = "2024"
+  sources = [
+    "src/binding_stubs.rs",
+    "src/context.rs",
+    "src/crypto.rs",
+    "src/lib.rs",
+    "src/mem.rs",
+    "src/props.rs",
+    "src/storage.rs",
+    "src/time.rs",
+  ]
+  deps = [
+    ":malloc_fill_byte_zero_asan",
+    ":malloc_fill_byte_zero_hwasan",
+    "//sdk/rust/zx",
+    "//src/lib/diagnostics/inspect/contrib/stubs:inspect_stubs",
+    "//src/lib/fuchsia-runtime",
+    "//src/microfuchsia/tee/lib/tee_properties",
+    "//src/microfuchsia/tee/tee_internal_api:tee_internal",
+    "//third_party/rust_crates:aes",
+    "//third_party/rust_crates:cbc",
+    "//third_party/rust_crates:cmac",
+    "//third_party/rust_crates:ecb",
+    "//third_party/rust_crates:hmac-0.12",
+    "//third_party/rust_crates:libc",
+    "//third_party/rust_crates:num-traits",
+    "//third_party/rust_crates:p256",
+    "//third_party/rust_crates:rsa",
+    "//third_party/rust_crates:sha1-0.10",
+    "//third_party/rust_crates:sha2-0.10",
+    "//third_party/rust_crates:thiserror",
+  ]
+  public_configs = [ ":export_scudo_dynamic_options" ]
+  configs += [ "//build/config/rust/lints:deny_unused_results" ]
+  with_unit_tests = true
+  test_deps = [ "//src/lib/fuchsia" ]
+}
+
+fuchsia_unittest_package("api-impl-tests") {
+  package_name = "tee-runtime-api-impl-tests"
+
+  # TODO(https://fxbug.dev/376124532): Update panic behavior tests to not require this.
+  test_specs = {
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+  deps = [ ":api_impl_test" ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [ ":api-impl-tests" ]
+}

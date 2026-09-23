@@ -1,0 +1,256 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "src/developer/debug/zxdb/format/format_name.h"
+
+#include <gtest/gtest.h>
+
+#include "src/developer/debug/zxdb/expr/expr_parser.h"
+#include "src/developer/debug/zxdb/format/output_buffer.h"
+#include "src/developer/debug/zxdb/symbols/base_type.h"
+#include "src/developer/debug/zxdb/symbols/collection.h"
+#include "src/developer/debug/zxdb/symbols/function.h"
+#include "src/developer/debug/zxdb/symbols/namespace.h"
+#include "src/developer/debug/zxdb/symbols/symbol_test_parent_setter.h"
+#include "src/developer/debug/zxdb/symbols/type_test_support.h"
+#include "src/developer/debug/zxdb/symbols/variable_test_support.h"
+
+namespace zxdb {
+
+TEST(FormatName, Regular) {
+  auto function = fxl::MakeRefCounted<Function>(DwarfTag::kSubprogram);
+  function->set_assigned_name("Function");
+
+  FormatFunctionNameOptions no_param_opts;
+  no_param_opts.name.show_global_qual = false;
+  no_param_opts.params = FormatFunctionNameOptions::kNoParams;
+
+  FormatFunctionNameOptions elide_param_opts;
+  elide_param_opts.name.show_global_qual = false;
+  elide_param_opts.params = FormatFunctionNameOptions::kElideParams;
+
+  FormatFunctionNameOptions type_param_opts;
+  type_param_opts.name.show_global_qual = false;
+  type_param_opts.params = FormatFunctionNameOptions::kParamTypes;
+
+  // Function with no parameters.
+  EXPECT_EQ("Function", FormatFunctionName(function.get(), no_param_opts).AsString());
+  EXPECT_EQ("Function()", FormatFunctionName(function.get(), elide_param_opts).AsString());
+  EXPECT_EQ("Function()", FormatFunctionName(function.get(), type_param_opts).AsString());
+
+  // Add two parameters.
+  auto int32_type = MakeInt32Type();
+  auto param_value = MakeVariableForTest("value", int32_type, 0x100, 0x200, DwarfExpr());
+  auto param_other = MakeVariableForTest("other_param", int32_type, 0x100, 0x200, DwarfExpr());
+  function->set_parameters({LazySymbol(param_value), LazySymbol(param_other)});
+
+  EXPECT_EQ("Function", FormatFunctionName(function.get(), no_param_opts).AsString());
+  EXPECT_EQ("Function(…)", FormatFunctionName(function.get(), elide_param_opts).AsString());
+  EXPECT_EQ("Function(int32_t, int32_t)",
+            FormatFunctionName(function.get(), type_param_opts).AsString());
+
+  // Put in a namespace and add some templates. This needs a new function because the name will be
+  // cached above.
+  function = fxl::MakeRefCounted<Function>(DwarfTag::kSubprogram);
+  function->set_assigned_name("Function<int>");
+  function->set_parameters({LazySymbol(param_value), LazySymbol(param_other)});
+
+  auto ns = fxl::MakeRefCounted<Namespace>();
+  ns->set_assigned_name("ns");
+  SymbolTestParentSetter function_parent(function, ns);
+
+  elide_param_opts.name.bold_last = true;
+  EXPECT_EQ(
+      "kNormal \"ns\", "
+      "kOperatorNormal \"::\", "
+      "kHeading \"Function\", "
+      "kComment \"<int>(…)\"",
+      FormatFunctionName(function.get(), elide_param_opts).GetDebugString());
+}
+
+TEST(FormatName, ClangLambda) {
+  // Clang lambdas are anonymous classes with an "operator()" function.
+  auto closure = fxl::MakeRefCounted<Collection>(DwarfTag::kClassType);
+  auto function = fxl::MakeRefCounted<Function>(DwarfTag::kSubprogram);
+  function->set_assigned_name("operator()");
+  SymbolTestParentSetter function_parent(function, closure);
+
+  EXPECT_EQ("λ()", FormatFunctionName(function.get(), FormatFunctionNameOptions()).AsString());
+}
+
+TEST(FormatName, GCCLambda) {
+  // GCC lambdas are specially-named structs with an "operator()" function.
+  auto closure = fxl::MakeRefCounted<Collection>(DwarfTag::kStructureType);
+  closure->set_assigned_name("<lambda()>");
+  auto function = fxl::MakeRefCounted<Function>(DwarfTag::kSubprogram);
+  function->set_assigned_name("operator()");
+  SymbolTestParentSetter function_parent(function, closure);
+
+  FormatFunctionNameOptions opts;
+  opts.name.enable_pretty = true;
+  EXPECT_EQ("λ()", FormatFunctionName(function.get(), opts).AsString());
+
+  opts.name.enable_pretty = false;
+  EXPECT_EQ("$(<lambda()>)::operator()()", FormatFunctionName(function.get(), opts).AsString());
+}
+
+TEST(FormatName, RustClosure) {
+  // Rust closures are named like:
+  // fuchsia_async::runtime::fuchsia::executor::local::{impl#1}::run_singlethreaded::{closure#0}<core::future::from_generator::GenFuture<regulatory_region::main::func::{async_fn_env#0}>>
+
+  // Make a function for the closure to be inside of.
+  auto enclosing = fxl::MakeRefCounted<Function>(DwarfTag::kSubprogram);
+  enclosing->set_assigned_name("EnclosingFunction");
+
+  auto closure = fxl::MakeRefCounted<Function>(DwarfTag::kSubprogram);
+  closure->set_assigned_name(
+      "{closure#0}<core::future::from_generator::GenFuture<regulatory_region::main::func::{async_"
+      "fn_env#0}>>");
+  SymbolTestParentSetter closure_parent(closure, enclosing);
+
+  FormatFunctionNameOptions opts;
+  opts.name.enable_pretty = true;
+  EXPECT_EQ("EnclosingFunction::λ()", FormatFunctionName(closure.get(), opts).AsString());
+
+  opts.name.enable_pretty = false;
+  EXPECT_EQ(
+      "EnclosingFunction::$({closure#0}<core::future::from_generator::GenFuture<regulatory_region::"
+      "main::func::{async_fn_env#0}>>)()",
+      FormatFunctionName(closure.get(), opts).AsString());
+}
+
+TEST(FormatName, FormatIdentifier) {
+  FormatIdentifierOptions global_opts;
+  global_opts.show_global_qual = true;
+  FormatIdentifierOptions no_global_opts;
+  no_global_opts.show_global_qual = false;
+
+  // Regular name with no global qualification.
+  OutputBuffer output = FormatIdentifier(Identifier("ThisIsAName"), global_opts);
+  EXPECT_EQ("kNormal \"ThisIsAName\"", output.GetDebugString());
+  output = FormatIdentifier(Identifier("ThisIsAName"), no_global_opts);
+  EXPECT_EQ("kNormal \"ThisIsAName\"", output.GetDebugString());
+
+  // Regular name with bolding.
+  FormatIdentifierOptions bold_global_opts;
+  bold_global_opts.show_global_qual = true;
+  bold_global_opts.bold_last = true;
+  output = FormatIdentifier(Identifier("ThisIsAName"), bold_global_opts);
+  EXPECT_EQ("kHeading \"ThisIsAName\"", output.GetDebugString());
+
+  // Hierarchical name.
+  ParsedIdentifier ident;
+  Err err = ExprParser::ParseIdentifier("::Foo<int, char*>::Bar<>", &ident);
+  ASSERT_FALSE(err.has_error());
+  EXPECT_EQ(
+      "kOperatorNormal \"::\", "
+      "kNormal \"Foo\", "
+      "kComment \"<int, char*>\", "
+      "kOperatorNormal \"::\", "
+      "kHeading \"Bar\", "
+      "kComment \"<>\"",
+      FormatIdentifier(ident, bold_global_opts).GetDebugString());
+
+  // Hide global qualification.
+  FormatIdentifierOptions bold_no_global_opts;
+  bold_no_global_opts.show_global_qual = true;
+  bold_no_global_opts.bold_last = true;
+  EXPECT_EQ("::Foo<int, char*>::Bar<>", FormatIdentifier(ident, bold_no_global_opts).AsString());
+
+  // With template eliding.
+  FormatIdentifierOptions elide_opts = bold_no_global_opts;
+  elide_opts.elide_templates = true;
+  EXPECT_EQ("::Foo<…>::Bar<>", FormatIdentifier(ident, elide_opts).AsString());
+
+  // With an anonymous namespace.
+  ParsedIdentifier anon(ParsedIdentifierComponent(""));
+  anon.AppendComponent(ParsedIdentifierComponent("Function"));
+  EXPECT_EQ(
+      "kComment \"$anon\", "
+      "kOperatorNormal \"::\", "
+      "kHeading \"Function\"",
+      FormatIdentifier(anon, bold_no_global_opts).GetDebugString());
+}
+
+TEST(FormatName, Operators) {
+  FormatIdentifierOptions opts;
+
+  // C++ operator functions shouldn't be escaped.
+  ParsedIdentifier op_ident;
+  op_ident.AppendComponent(ParsedIdentifierComponent("MyClass"));
+  op_ident.AppendComponent(ParsedIdentifierComponent("operator++"));
+  EXPECT_EQ("MyClass::operator++", FormatIdentifier(op_ident, opts).AsString());
+}
+
+TEST(FormatName, FormatSpecialIdentifier) {
+  FormatIdentifierOptions global_opts;
+  global_opts.show_global_qual = true;
+
+  // Hierarchical name.
+  ParsedIdentifier ident;
+  ident.AppendComponent(ParsedIdentifierComponent(SpecialIdentifier::kAnon));
+  ident.AppendComponent(ParsedIdentifierComponent(SpecialIdentifier::kPlt, "zx_channel_write"));
+  ident.AppendComponent(ParsedIdentifierComponent(SpecialIdentifier::kMain));
+  EXPECT_EQ(
+      "kComment \"$anon\", "  // $anon always dim.
+      "kOperatorNormal \"::\", "
+      "kComment \"$plt(\", "            // PLT annotation dim
+      "kNormal \"zx_channel_write\", "  // PLT function name regular.
+      "kComment \")\", "
+      "kOperatorNormal \"::\", "
+      "kNormal \"$main\"",
+      FormatIdentifier(ident, global_opts).GetDebugString());
+}
+
+// Tests printing components with respect to escaping.
+TEST(FormatName, EscapeComponent) {
+  FormatIdentifierOptions global_opts;
+
+  // Begins with a digit.
+  ParsedIdentifier ident;
+  ident.AppendComponent(ParsedIdentifierComponent("1two"));
+  EXPECT_EQ(
+      "kComment \"$(\", "
+      "kNormal \"1two\", "
+      "kComment \")\"",
+      FormatIdentifier(ident, global_opts).GetDebugString());
+
+  // Destructors don't need escaping: ~ is a valid character.
+  ident.components()[0] = ParsedIdentifierComponent("~MyClass");
+  EXPECT_EQ("kNormal \"~MyClass\"", FormatIdentifier(ident, global_opts).GetDebugString());
+
+  // Random bad characters.
+  ident.components()[0] = ParsedIdentifierComponent("h$ello \\world");
+  EXPECT_EQ(
+      "kComment \"$(\", "
+      "kNormal \"h\\$ello \\\\world\", "
+      "kComment \")\"",
+      FormatIdentifier(ident, global_opts).GetDebugString());
+
+  // Balanced parens - don't need backslash escaping for them.
+  ident.components()[0] = ParsedIdentifierComponent("a(b)c");
+  EXPECT_EQ(
+      "kComment \"$(\", "
+      "kNormal \"a(b)c\", "
+      "kComment \")\"",
+      FormatIdentifier(ident, global_opts).GetDebugString());
+
+  // Disordered parens require backslash escaping.
+  ident.components()[0] = ParsedIdentifierComponent("a)b(c");
+  EXPECT_EQ(
+      "kComment \"$(\", "
+      "kNormal \"a\\)b\\(c\", "
+      "kComment \")\"",
+      FormatIdentifier(ident, global_opts).GetDebugString());
+
+  // Imbalanced parens require backslash escaping.
+  ident.components()[0] = ParsedIdentifierComponent("a(b)c)");
+  EXPECT_EQ(
+      "kComment \"$(\", "
+      "kNormal \"a\\(b\\)c\\)\", "
+      "kComment \")\"",
+      FormatIdentifier(ident, global_opts).GetDebugString());
+}
+
+}  // namespace zxdb

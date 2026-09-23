@@ -1,0 +1,172 @@
+#compdef fx
+
+__fx_nodename() {
+  # TODO: allow configuration of node names with zstyle
+  local -a nodenames=( $(${fuchsia_dir}/${fuchsia_build_dir}.zircon/tools/netls | awk '/device/ { print $2; }') )
+  _describe 'nodename' nodenames
+}
+
+__fx_amber_package() {
+  # packages are directories in the build dir under amber-files/repository/targets
+  _values $(cd ${fuchsia_dir}/${fuchsia_build_dir}/amber-files/repository/targets >/dev/null 2>&1 && echo *(/))
+}
+
+__fx_build_dir() {
+  # build dirs are directories under out/ with an args.gn
+  compadd $(cd ${fuchsia_dir} >/dev/null 2>&1; echo out/^*.zircon/args.gn(N:h))
+}
+
+__fx_product_bundle() {
+  # product bundles are found in product_bundles.json
+  local -r absolute_build_dir="${fuchsia_dir}/${fuchsia_build_dir}"
+  local -r product_bundles_file="${absolute_build_dir}/product_bundles.json"
+  local -a -r product_bundles=( $(cd ${fuchsia_dir} >/dev/null 2>&1; jq -r ".[].name" $product_bundles_file) )
+  compadd -a product_bundles
+}
+
+__fx_gn_target() {
+  # use a cache of "gn ls" that's updated when build.ninja changes.
+  local -r absolute_build_dir="${fuchsia_dir}/${fuchsia_build_dir}"
+  local -r targets_file="${absolute_build_dir}/.gn_ls"
+  local -r ninja_file="${absolute_build_dir}/build.ninja"
+  if [ ! -e "${targets_file}" -o ${ninja_file} -nt ${targets_file} ]; then
+    local -r tmp_targets_file="$(mktemp -p "${absolute_build_dir}")"
+    "${fuchsia_dir}/prebuilt/third_party/gn/${prebuilt_os}/gn" ls "${absolute_build_dir}" > "${tmp_targets_file}"
+    mv "${tmp_targets_file}" "${targets_file}"
+  fi
+  _values $(cat ${absolute_build_dir}/.gn_ls)
+}
+
+_fx() {
+  typeset -A opt_args
+
+  # LINT.IfChange
+  local fuchsia_dir script_dir
+
+  function find_tree_root {
+    local parent="$1"
+    if [[ ! -d "$parent" ]]; then
+      return 1
+    fi
+    while [[ ! -f "${parent}/.fx-root" ]]; do
+      if [[ "$parent" == "/" ]]; then
+        return 1
+      fi
+      parent="$(dirname "${parent}")"
+    done
+    echo "$parent"
+  }
+
+  # We walk the parent directories looking for //.fx-root rather than using
+  # BASH_SOURCE so that we find the fuchsia_dir enclosing the current working
+  # directory instead of the one containing this file in case the user has
+  # multiple source trees and is picking up this file from another one.
+  #
+  # NOTE: The FUCHSIA_DIR environment variable is ignored here because it
+  # could point to a different Fuchsia checkout in some developer setups.
+  if ! fuchsia_dir="$(find_tree_root "$(pwd)")"; then
+    echo >&2 "ERROR: Cannot find the Platform Source Tree in a parent of the current directory: $(pwd)"
+    return 1
+  fi
+
+  script_dir="$(dirname "$(realpath "${(%):-%x}")")"
+
+  # NOTE: This check MUST be executed immediately after `fuchsia_dir` is set.
+  # Do NOT add any metric gathering or other setup before this block, as this
+  # `_fx` instance may be run in a foreign fuchsia checkout.
+  if [[ "${script_dir}/" != "${fuchsia_dir}/"* && "${script_dir}/" != "$(realpath "${fuchsia_dir}")/"* ]]; then
+    # When running within a foreign fuchsia checkout that is owned by the
+    # current user, use completion from the foreign checkout instead.
+    if [[ -O "${fuchsia_dir}" && -f "${fuchsia_dir}/scripts/zsh-completion/_fx" ]]; then
+      source "${fuchsia_dir}/scripts/zsh-completion/_fx"
+      return
+    fi
+
+    echo >&2 "ERROR: You are executing fx from outside of the current source tree"
+    echo >&2 "ERROR: This is not supported as fx does not have a stable internal API"
+    echo >&2
+    echo >&2 "    'fx' was executed from: ${(%):-%x}"
+    echo >&2 "    'fuchsia directory' resolved to: ${fuchsia_dir}"
+    echo >&2 "    'script_dir' resolved to: ${script_dir}"
+    echo >&2
+    echo >&2 "To run a command in the current Fuchsia directory, run fx from:"
+    echo >&2 "  ${fuchsia_dir}/scripts/fx"
+    echo >&2 "Or, if you use fx-env.sh, source fx-env from the current fuchsia dir:"
+    echo >&2 "  source ${fuchsia_dir}/scripts/fx-env.sh"
+    echo >&2 "To change your current environment, update your 'PATH':"
+    echo >&2 "  source ${fuchsia_dir}/scripts/fx-env.sh && fx-update-path"
+    return 1
+  fi
+  # LINT.ThenChange(
+  #   //scripts/fx,
+  #   //scripts/hermetic-env,
+  #   //src/developer/ffx/scripts/ffx,
+  # )
+
+  # list of commands based on //tools/devshell/
+  # each file is read to find the description line (starts with "### ").
+  local -aU commands
+  local -a lines
+  local -a command_dirs=(
+    "${fuchsia_dir}/tools/devshell"
+    "${fuchsia_dir}/tools/devshell/contrib"
+    ${fuchsia_dir}/vendor/*/scripts/devshell(/N)
+  )
+  local desc command dir cmd_name
+  for dir in ${command_dirs[*]}; do
+    for command in ${dir}/*(N.*) ${dir}/*.fx(N.); do
+      lines=("${(f)$(<${command})}")
+      desc=${${lines[${lines[(i)\#\#\# *]}]}#????}
+      cmd_name="${command#*${dir}/}"
+      commands+=("${cmd_name%.fx}:${desc}")
+    done
+  done
+  commands+=("gn:invoke the gn command")
+  commands+=("ninja:invoke the ninja command")
+
+  _arguments \
+    "--dir[build directory]:directory:__fx_build_dir" \
+    "-t[target device]:device:__fx_nodename" \
+    "-i[iterative mode]" \
+    "-x[print commands]" \
+    "1: :{_describe 'command' commands}" \
+    "*:: :->args"
+
+  if [[ $state != "args" ]]; then
+    return
+  fi
+
+  # get the config file location from --dir or ${fuchsia_dir}/.fx-build-dir
+  typeset -l fuchsia_build_dir="${opt_args[--dir]}"
+  if [[ -z "$fuchsia_build_dir" && -f "${fuchsia_dir}/.fx-build-dir" ]]; then
+    fuchsia_build_dir="$(<"${fuchsia_dir}/.fx-build-dir")"
+  fi
+
+  # the host os id for prebuilts
+  case "$(uname -s)" in
+    Linux)
+      local prebuilt_os=linux-x64
+      ;;
+    Darwin)
+      local prebuilt_os=mac-x64
+      ;;
+    *)
+      # Unknown OS, don't complete
+      return
+      ;;
+  esac
+
+  # look for a completion function
+  local f
+  f=_fx_$words[1]
+  if [[ -e ${fuchsia_dir}/scripts/zsh-completion/$f ]]; then
+    if [[ -z "${fpath[(r)${fuchsia_dir}/scripts/zsh-completion]}" ]]; then
+      fpath=( "${fuchsia_dir}/scripts/zsh-completion" $fpath )
+    fi
+    autoload -Uz $f; $f
+  else
+    _normal
+  fi
+}
+
+_fx

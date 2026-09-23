@@ -1,0 +1,261 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/fuchsia/target_api_level_range.gni")
+import("//build/testing/host_test_data.gni")
+import("config.gni")
+
+group("disable_strict_sources_check_allowlist") {
+  #  ________  _________  ________  ________
+  # |\   ____\|\___   ___\\   __  \|\   __  \
+  # \ \  \___|\|___ \  \_\ \  \|\  \ \  \|\  \
+  #  \ \_____  \   \ \  \ \ \  \\\  \ \   ____\
+  #   \|____|\  \   \ \  \ \ \  \\\  \ \  \___|
+  #     ____\_\  \   \ \__\ \ \_______\ \__\
+  #    |\_________\   \|__|  \|_______|\|__|
+  #    \|_________|
+  # This is an allowlist of packages that do not enforce that the source files
+  # are listed in `source`. This is only intended to be used as a temporary
+  # allowlist during soft migrations.
+  #
+  # All file dependencies of the targets in this list should be covered by the
+  # paths in the skipAnalysisAllowlist in
+  # //tools/integration/fint/should_build.go.
+  visibility = []
+
+  # ...Actually, there is one class of exceptions not intended to be temporary.
+  # There are rust crates that are versioned with and live alongside
+  # third-party, non-Rust code. Trading off between maximal, declarative build
+  # hygiene and the ease of rolling such third party repos without breaking
+  # changes, we lean toward the latter.
+  visibility += [ "//third_party/boringssl/rust:*" ]
+
+  # Third-party crates don't list sources explicitly.
+  visibility += [ "//third_party/rust_crates:*" ]
+}
+
+group("edition_legacy_allowlist") {
+  #  ________  _________  ________  ________
+  # |\   ____\|\___   ___\\   __  \|\   __  \
+  # \ \  \___|\|___ \  \_\ \  \|\  \ \  \|\  \
+  #  \ \_____  \   \ \  \ \ \  \\\  \ \   ____\
+  #   \|____|\  \   \ \  \ \ \  \\\  \ \  \___|
+  #     ____\_\  \   \ \__\ \ \_______\ \__\
+  #    |\_________\   \|__|  \|_______|\|__|
+  #    \|_________|
+  # This is an allowlist of packages that do not enforce that the edition is
+  # set to 2024.
+  visibility = [
+    "//sdk/fidl/*",
+    "//src/lib/android/binder/rust:*",
+    "//src/lib/mundane:*",
+    "//src/sys/pkg/lib/tuf:*",
+    "//third_party/*",
+    "//vendor/*",
+    "//zircon/tools/zither:*",
+    "//zircon/vdso:*",
+  ]
+}
+
+# NOTE: This target is used by "fx set --cargo-toml-gen ..." which
+# will do the following:
+#
+#  1) Ensure that "fx gen" (and "fx build") will pass `--ide-json`
+#     to `gn gen`, which generates an up-to-date
+#     `$root_build_dir/project.json` file, used here as input.
+#
+#  2) Add this target to the host_labels list to ensure its action script is
+#     run by "fx build".
+#
+# For more details, see docs/development/language/rust/README.md
+#
+# Notes on transitioning this target from `base_package_labels` to `host_tools`:
+#
+#  1) Existing `args.gn` files created by `fx set --cargo-toml-gen` will have
+#     added the target to the `base_package_labels` list.  This list assumes the
+#     default toolchain.
+#  2) `base_package_labels` currently feeds into
+#       - `//:developer_base_package_labels`
+#  3) New `args.gn` files created by `fx set --cargo-toml-gen` will instead use
+#     the `host_labels` arg (which assumes the host toolchain).  That list is
+#     currently being used with the `//:host` group
+#   4) Developers _may_ have added `//build/rust:cargo_toml_gen` to either of
+#      following:
+#        - `cache_package_labels` (`//:developer_cache_packages`)
+#        - `discoverable_package_labels` (`//:developer_discoverable_packages`)
+#      and those are being split as well, and so the following groups will need
+#      to be added to visibility:
+#        - `//:developer_cache_packages`
+#        - `//:developer_discoverable_packages`
+#
+if (current_toolchain != default_toolchain) {
+  # This is a redirect from the host toolchain to the default toolchain, as it
+  # is added to the host_labels group, not the product definition inputs.
+  group("cargo_toml_gen") {
+    testonly = true
+    public_deps = [ ":cargo_toml_gen($default_toolchain)" ]
+    visibility = [
+      # This is the supported group for developers to add tools to, going
+      # forward, and the group used by `fx set --cargo-toml-gen`.
+      ":tests",
+      "//:developer_host_tools",
+      "//:host",
+    ]
+  }
+} else {
+  project_json = "$root_build_dir/project.json"
+  api_level_cfg_flags = "$root_build_dir/rust_api_level_cfg_flags.txt"
+
+  action("cargo_toml_gen") {
+    testonly = true
+
+    # Nothing in-tree should depend on Cargo files.
+    visibility = [
+      # The only expected use of this target, going forward (the above group)
+      ":cargo_toml_gen",
+      ":tests",
+
+      # `fx set ... --cargo-toml-gen` previously used the `base_package_labels`
+      # GN arg, which feeds into `//:developer_base_packages`.  This is here for
+      # providing a transition for developers' existing `args.gn` files.
+      "//:developer_base_packages",
+
+      # Developers may have used these as well (also deprecated for this
+      # target).
+      "//:developer_cache_packages",
+      "//:developer_discoverable_packages",
+
+      # via --with-host or `host_labels`, and specifying the fuchsia toolchain:
+      "//:host",
+    ]
+    script = "generate_cargo.py"
+    sources = []
+    inputs = [
+      project_json,
+      "//third_party/rust_crates/Cargo.toml",
+      api_level_cfg_flags,
+    ]
+    hermetic_deps = false
+
+    outputs = [ "$root_build_dir/cargo/generate_cargo.stamp" ]
+    args = [
+      rebase_path(project_json, root_build_dir),
+      "--root_build_dir",
+      ".",
+      "--fuchsia_dir",
+      rebase_path("//", root_build_dir),
+      "--api_level_cfg_flags",
+      rebase_path(api_level_cfg_flags, root_build_dir),
+    ]
+    deps = [
+      "//build/rust:api_level_cfg_flags",
+      "//tools/gn_desc:gn_project_json",
+    ]
+    metadata = {
+      # Hint to ninja that this action takes about 30 seconds, so that it's
+      # appropriately weighted in the calculation of the critical path for
+      # a build.
+      ninja_edge_weights =
+          [ rebase_path(outputs[0], root_build_dir) + ",30000" ]
+    }
+  }
+}
+
+# Generated file containing flags to pass to each invocation of `rustc` (or
+# similar tools). Pass it to rustc by specifying `@rust_api_level_cfg_flags.txt`
+# in the command line.
+generated_file("api_level_cfg_flags") {
+  outputs = [ "$root_out_dir/rust_api_level_cfg_flags.txt" ]
+  output_conversion = "list lines"
+  contents = []
+
+  foreach(level, lesser_or_equal_fuchsia_api_levels) {
+    contents += [ "--cfg=fuchsia_api_level_at_least=\"${level}\"" ]
+  }
+  foreach(level, greater_fuchsia_api_levels) {
+    contents += [ "--cfg=fuchsia_api_level_less_than=\"${level}\"" ]
+  }
+}
+
+# Multiple integration tests rely on having a Rust toolchain available on the
+# host test runner, and host_test_data does not appear to support multiple
+# definitions of the same output path in the same build, so we provide a central
+# target here to be used by integration tests that need cargo or rustc.
+if (is_host) {
+  action("make_toolchain_host_binaries") {
+    script = "//build/copy_tree.py"
+
+    _stamp = "$target_gen_dir/$target_name.stamp"
+    _depfile = "$target_out_dir/$target_name.d"
+    args = [
+      rebased_rustc_prefix,
+      out_rustc_prefix,
+      rebase_path(_stamp, root_build_dir),
+      "--depfile",
+      rebase_path(_depfile, root_build_dir),
+    ]
+    outputs = [ _stamp ]
+    depfile = _depfile
+  }
+
+  group("tool_paths") {
+    visibility = [ "//:tool_paths" ]
+    deps = [
+      ":tool_paths.llvm-profdata-rust",
+      ":tool_paths.rustdoc-link",
+    ]
+  }
+
+  # This target adds a "rustdoc-link" tool to be consumed by the infra doc
+  # builder.
+  group("tool_paths.rustdoc-link") {
+    metadata = {
+      tool_paths = [
+        {
+          cpu = host_cpu
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          name = "rustdoc-link"
+          os = host_os
+          path =
+              rebase_path("//tools/devshell/contrib/lib/rust/rustdoc-link.py",
+                          root_build_dir)
+        },
+      ]
+    }
+  }
+
+  # This target adds llvm-profdata for the rust toolchain to tool_paths.json.
+  # Since this tool has the same name as the clang counterpart, we need to
+  # append -rust to the name to differentiate them. It also needs to be built
+  # in the host_toolchain in order for the tool path to be correct.
+  group("tool_paths.llvm-profdata-rust") {
+    deps = [ ":make_toolchain_host_binaries" ]
+    metadata = {
+      tool_paths = [
+        {
+          cpu = host_cpu
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          name = "llvm-profdata-rust"
+          os = host_os
+          path = rebase_path("$rustc_prefix/bin/llvm-profdata", root_build_dir)
+        },
+      ]
+    }
+  }
+
+  host_test_data("prebuilt_toolchain_host_test_data") {
+    deps = [ ":make_toolchain_host_binaries" ]
+    sources = [ "$root_build_dir/$out_rustc_prefix" ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":cargo_toml_gen",
+    "docs/rustdoc-index",
+    "docs/rustdoc-index:rustdoc-index(//build/toolchain:host_x64)",
+    "tests",
+  ]
+}

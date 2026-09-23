@@ -1,0 +1,184 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Defines a set of Go code that can be used by other Go targets
+#
+# Parameters
+#
+#   importpath (optional)
+#     The source import path of this library. Other libraries can import this
+#     library using this path.
+#     Defaults to "go.fuchsia.dev/fuchsia/${source_dir}".
+#
+#   name (optional)
+#     Alias to importpath for historical reasons.
+#
+#   name_file (optional)
+#     Path to a file containing the importpath of the Go package.
+#     This should be used when the package's name requires some computation in
+#     its own build target.
+#
+#     NOTE: Exactly one of `importpath` or `name_file` may be set, but not both.
+#           If neither is set, then the target name is used.
+#
+#   source_dir (optional)
+#     Path to the root of the sources for the package.
+#     Defaults to the current directory.
+#
+#   sources (required)
+#     List of source files, relative to source_dir.
+#
+#   embedsrcs (optional)
+#     For sources used by go:embed.
+#
+#   deps (optional)
+#     List of labels for Go libraries this target depends on.
+#
+#   non_go_deps (optional)
+#     List of labels for non-Go targets this library depends on.
+#
+#   public_non_go_deps (optional)
+#     List of labels for non-Go targets this library publicly depends on.
+#
+#   metadata (optional)
+#     Scope giving the metadata of this library.
+#
+template("go_library") {
+  assert(!(defined(invoker.name) && defined(invoker.name_file)),
+         "Defining both name and name_file is not allowed")
+
+  source_dir = "."
+  if (defined(invoker.source_dir)) {
+    source_dir = invoker.source_dir
+  }
+
+  if (defined(invoker.name_file)) {
+    # Make name_file a system-absolute path and add it to args.
+    name_args = [
+      "--name-file",
+      rebase_path(invoker.name_file, root_build_dir),
+    ]
+  } else {
+    target_name_dir = get_label_info(":$target_name", "dir")
+    source_dir = rebase_path(source_dir, target_name_dir)
+    default_importpath =
+        "go.fuchsia.dev/fuchsia/" + rebase_path(source_dir, "//")
+
+    if (defined(invoker.importpath) || defined(invoker.name)) {
+      assert(
+          !(defined(invoker.importpath) && defined(invoker.name)),
+          "importpath and name for go_library can't be defined at the same time (name is alias to importpath)")
+
+      importpath = ""
+      if (defined(invoker.importpath)) {
+        importpath = invoker.importpath
+      }
+      if (defined(invoker.name)) {
+        importpath = invoker.name
+      }
+
+      allow_importpath_override =
+          filter_exclude([ rebase_path(source_dir, "//") ],
+                         [
+                           # Third-party repositories must set `name` to the
+                           # canonical go package name.
+                           "third_party/*",
+
+                           # There's no standard naming scheme for libraries
+                           # that are generated at build time, so `name` must
+                           # be set.
+                           rebase_path(root_build_dir, "//") + "/*",
+
+                           # Required to support setting the `syzkaller_dir` GN
+                           # arg to point to a syzkaller checkout outside the
+                           # platform source tree.
+                           "../*",
+                         ]) == []
+      assert(
+          allow_importpath_override || importpath == default_importpath,
+          "Go importpath override is not allowed for this target, either omit importpath/name for this target or set it to ${default_importpath}")
+      not_needed([ "default_importpath" ])
+
+      name_args = [
+        "--name",
+        importpath,
+      ]
+    } else {
+      name_args = [
+        "--name",
+        default_importpath,
+      ]
+    }
+  }
+
+  action(target_name) {
+    script = "//build/go/gen_library_metadata.py"
+
+    library_file = "$target_gen_dir/$target_name.go_deps"
+
+    outputs = [ library_file ]
+
+    deps = []
+    dependent_libraries = []
+
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+      foreach(dep, invoker.deps) {
+        gen_dir = get_label_info(dep, "target_gen_dir")
+        name = get_label_info(dep, "name")
+        dependent_libraries += [ "$gen_dir/$name.go_deps" ]
+      }
+    }
+
+    forward_variables_from(invoker, [ "data_deps" ])
+
+    if (defined(invoker.non_go_deps)) {
+      deps += invoker.non_go_deps
+    }
+
+    public_deps = []
+    if (defined(invoker.public_deps)) {
+      public_deps += invoker.public_deps
+    }
+    if (defined(invoker.public_non_go_deps)) {
+      public_deps += invoker.public_non_go_deps
+    }
+
+    inputs = dependent_libraries
+    if (defined(invoker.name_file)) {
+      inputs += [ invoker.name_file ]
+    }
+
+    args = name_args + [
+             "--root-build-dir",
+             rebase_path(root_build_dir, root_build_dir),
+             "--fuchsia-source-dir",
+             rebase_path("//", root_build_dir),
+             "--source-dir",
+             rebase_path(source_dir, root_build_dir),
+             "--output",
+             rebase_path(library_file, root_build_dir),
+             "--deps",
+           ] + rebase_path(dependent_libraries, root_build_dir)
+
+    assert(defined(invoker.sources) && invoker.sources != [],
+           "sources must be listed")
+    srcs = invoker.sources
+    if (defined(invoker.embedsrcs)) {
+      srcs += invoker.embedsrcs
+    }
+    args += [ "--sources" ] + srcs
+    inputs += rebase_path(srcs, ".", source_dir)
+
+    if (defined(invoker.metadata)) {
+      metadata = invoker.metadata
+    }
+
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+  }
+}

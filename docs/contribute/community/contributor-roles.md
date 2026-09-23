@@ -1,0 +1,427 @@
+# Fuchsia contributor roles
+
+## Overview {#overview}
+
+This document defines the roles associated with contributing to
+the Fuchsia project.
+
+## Principles {#principles}
+
+Roles within the Fuchsia project seek to embody the following principles:
+
+*   _Transparency._ We are transparent and open about roles and requirements.
+*   _Inclusivity_. Fuchsia lets anyone contribute to the project, regardless of
+    their employer.We believe contributions from a diverse, open-source
+    community are critical to improving Fuchsia.
+*   _Responsibility_. Roles and privileges can be revoked if a person no
+    longer meets the requirements.
+
+## Roles {#roles}
+
+The following are the contributor roles associated with the Fuchsia project:
+
+*   [Member](#member)
+*   [Committer](#committer)
+*   [Owner](#owner)
+*   [Global Approver](#global-approver)
+
+### Member {#member}
+
+Anyone who contributes to the project by providing patches to code or
+documentation, and agrees to the Google Developers' [Contributor License Agreement](https://cla.developers.google.com/){:.external}.
+
+#### Responsibilities {#responsibilities}
+
+Members are responsible for acting in accordance with
+the [Fuchsia Code of Conduct](/CODE_OF_CONDUCT.md).
+
+#### Become a Member {#become-a-member}
+
+To become a Member you must do the following:
+
+*   Sign the Google Developers' [Contributor License Agreements](https://cla.developers.google.com/){:.external}.
+*   Acknowledge the [Fuchsia Code of Conduct](/CODE_OF_CONDUCT.md).
+
+### Committer {#committer}
+
+A Committer is a person who has write access to the
+[Fuchsia repository](https://fuchsia.googlesource.com/){:.external}. A Committer can submit
+their own Gerrit changes or Gerrit changes from any other member.
+
+A Committer is not just someone who can make changes, but also someone who
+demonstrated the ability to collaborate effectively with other Members of the
+Fuchsia community. Example collaboration activities include but are not limited
+to:
+
+*   Seeking out the most knowledgeable people to review their code changes.
+*   Contributing high-quality, well-tested code.
+*   Fixing bugs in code or tests.
+
+Members can become Committers with different kinds of contributions. For
+instance, those working on documentation or toolchain can meet the requirements
+to become Committers by contributing high-quality documentation or configuration
+changes, which would not meet the “traditional” bar for well-tested code.
+
+In order to submit Gerrit changes, Committers need to either be [Owners](#owner)
+of the affected files or receive approval from an Owner of the affected files.
+
+#### Responsibilities {#responsibilities}
+
+Committers are responsible for the following:
+
+*   Ensuring that the code submitted to Fuchsia by Committers is tested
+according to the [Testability Rubrics](/docs/development/testing/testability_rubric.md).
+*   Ensuring that the code submitted to Fuchsia by Committers follows testing
+best practices.
+
+#### Become a Committer {#become-a-committer}
+
+To become a Committer you must do the following:
+
+*   Contribute 10 non-trivial patches to the project, demonstrating the ability
+to write high-quality, well-tested code.
+*   Be nominated by a current Committer who has reviewed your code.
+*   Be supported by two other Committers who have reviewed your code.
+*   Ensure that your nomination is not blocked by any Committer.
+
+A current Committer nominates you by sending email to committers@fuchsia.dev containing the
+following information. Please do not CC the nominee on the nomination email.
+
+*   Your first and last name.
+*   Your email address.
+*   An explanation of why you should be a Committer.
+*   Embedded list of links to revisions (about top 10) containing your patches.
+
+Two other Committers need to second your nomination. If no one objects in 5 working days (U.S.),
+you're a Committer.  If anyone objects or wants more information, the Committers discuss and usually
+come to a consensus (within the 5 working days). If issues can't be resolved, there's a vote among
+current Committers.
+
+That's it! There is no further action you need to take on your part. The Committers will get back to
+you once they make a decision.
+
+In the worst case, this can drag out for two weeks. Keep writing patches! Even in the rare cases
+where a nomination fails, the objection is usually something easy to address like "more patches" or
+"not enough people are familiar with this person's work."
+
+Once you get approval from the existing Committers, a Fuchsia Community Manager will add you to
+committers@fuchsia.dev and reach out with some additional information on submitting contributions
+as an external contributor.
+
+### Try job access
+
+If you are contributing patches but not (yet) a Committer, you may wish to be able to run jobs on
+the try servers directly rather than asking a Committer or reviewer to do so for you.
+
+The process to obtain try job access is the following:
+
+*   Ask a Committer you're working with (a frequent reviewer, for example) to send email to
+    committers@fuchsia.dev nominating you for try job access.
+*   You must provide an email address and at least a brief explanation of why you'd like access.
+*   It is helpful to provide a name and company affiliation (if any) as well.
+*   It is very helpful to have already had some patches landed, but is not absolutely necessary.
+*   If no one objects within two (U.S.) working days, you will be approved for access. It may take
+    an additional few days for the grant to propagate to all of the systems.
+
+### Owner {#owner}
+
+An Owner is responsible for files or directories within the Fuchsia project and
+has comprehensive knowledge of the code in that subtree. Owners are listed in
+`OWNERS` files. For directories or files that are outside of an Owner's
+responsibility, that Owner has the same privileges as a Committer.
+
+Committers are encouraged to keep `OWNERS` files up to date.
+
+#### Responsibilities {#responsibilities}
+
+In addition to the responsibilities of a Committer and Member, Owners
+are responsible for the following:
+
+*   Nominating other Owners.
+*   Approving or removing other Owners.
+*   Provide high-quality reviews and design feedback.
+*   Approve changes for code in their subtree.
+
+#### Become an Owner {#become-an-owner}
+
+To become an Owner you must do the following:
+
+*   Be a [Committer](#become-a-committer).
+*   Submit a substantial number of non-trivial changes to the affected subtree.
+*   Provide high-quality reviews and code design feedback.
+*   Provide code reviews in a timely manner.
+*   Self-nominate or be nominated by another Committer.
+    *   To self-nominate, [submit a Gerrit change](/docs/development/source_code/contribute_changes.md)
+    that adds yourself to the `OWNERS` file of your desired repository.
+    Current Owners will evaluate your change and either accept or reject your
+    request.
+
+### Global Approver {#global-approver}
+
+A Global Approver is a member of the owners-override@fuchsia.dev
+group.  A Global Approver can invoke the Owners-override bit in
+Gerrit, which waives `OWNERS` requirements for a change.
+
+While Global Approvers are empowered to provide an Owners-override +1
+to large-scale changes, Global Approvers are not expected to have
+comprehensive knowledge of the entire Fuchsia codebase. It is expected
+that global approval will be used primarily in cases where the changes
+systematic, largely mechanical, and impacts a large fraction of the
+codebase. Global approval may also be appropriate in cases where an
+urgent change is needed to stabilize the tree, such a CL to  disable a
+test or a complex revert that cannot be approved automatically.
+
+Currently, members of [Fuchsia Engineering Council][fec] are global
+approvers, as well as a small number of reviewers to cover timezones
+with no FEC member. Committers that encounter cases where existing
+code owners are can't provide review coverage are encouraged to first
+send a change to update the local `OWNERS` file, or to add a
+top-level, per-file rule to cover a certain type of file, like
+`**/BUILD.gn` or `**/*.md`. For cases where this proves insufficient,
+committers should send email to owners-override@fuchsia.dev to discuss
+the issue.
+
+#### Responsibilities {#responsibilities}
+
+In addition to the responsibilities of a Member, Committer, and Owner, Global
+Approvers are responsible for the following:
+
+*   Approving large scale changes within the Fuchsia codebase with an
+    Owners-override +1 in Gerrit.
+*   Providing timely reviews for large scale changes.
+
+## Code review actions {#code-review-actions}
+
+The types of code review actions you can provide depend on your role within
+the Fuchsia project.
+
+### Initiate a CQ Dry Run {#initiate-a-cq-dry-run}
+
+A CQ Dry Run runs your change against the available tests in the Commit Queue.
+Committers, Owners, and Global Approvers can initiate a CQ Dry Run.
+
+### Score code reviews  {#score-code-reviews}
+
+#### Code Review {#code-review}
+
+After you request a code review, reviewers can score your change.
+
+Reviewers can label your change with a score of **-2, -1, 0, +1,** **or +2**.
+For more information on review label definitions, see [Gerrit Code Review - Review Labels](https://gerrit-review.googlesource.com/Documentation/config-labels.html){:.external}.
+
+Committers, Owners, and Global Approvers can score code reviews but only a
+Global Approver or repository Owner can provide a **+2**.
+
+### Submit approved changes {#submit-approved-changes}
+
+You need a **Code Review Label +2** to submit your change. A
+**Code-Review Label +2** score can only be applied by a repository Owner or
+Global Approver.
+
+When a change is submitted, the change is moved to the Commit Queue (CQ).
+The Commit Queue verifies, commits, and merges changes to the master branch.
+
+## Role matrix {#role-matrix}
+
+This table summarizes the actions that each Fuchsia contributor role can
+perform.
+
+<table>
+  <tr>
+   <td><strong>Role</strong>
+   </td>
+   <td><strong>Create Change</strong>
+   </td>
+   <td><strong>Code-Review another Committer’s change</strong>
+   </td>
+   <td><strong>Provide Code-Review +2</strong>
+   </td>
+   <td><strong>Provide CQ+1 (dry run of CQ)</strong>
+   </td>
+   <td><strong>Submit Approved Change to CQ</strong>
+   </td>
+   <td><strong>Add or remove Owners</strong>
+   </td>
+  </tr>
+  <tr>
+   <td>Member
+   </td>
+   <td>Yes
+   </td>
+   <td><strong>No</strong>
+   </td>
+   <td><strong>No</strong>
+   </td>
+   <td><strong>No</strong>
+   </td>
+   <td><strong>No</strong>
+   </td>
+   <td><strong>No</strong>
+   </td>
+  </tr>
+  <tr>
+   <td>Committer
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td><strong>No</strong>
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td><strong>No</strong>
+   </td>
+  </tr>
+  <tr>
+   <td>Owner (outside owned subtree)
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td><strong>No</strong>
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td><strong>No</strong>
+   </td>
+  </tr>
+  <tr>
+   <td>Owner (in own subtree)
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+  </tr>
+  <tr>
+   <td>Global Approver
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+   <td>Yes
+   </td>
+  </tr>
+</table>
+
+## Life of a change {#life-of-a-change}
+
+The following diagram depicts the high-level stages of what happens to a change
+after its pushed to Gerrit.
+
+![Diagram depicting the high-level stages of the change approval process after pushing to Gerrit.](/docs/contribute/community/images/change-resolution.png "Change approval process")
+
+## Specialized roles {#specialized-roles}
+
+Areas within the Fuchsia repository may have their own unique requirements,
+defining their own sets of roles and responsibilities, in addition to the ones
+detailed above.
+
+### API Reviewer {#api-reviewer}
+
+An API Reviewer is accountable for the quality and long-term
+health of the [Fuchsia API surface](/docs/glossary/README.md#Fuchsia-API-Surface).
+API Reviewers collectively form the API
+Council.
+
+Any change that modifies the Fuchsia API Surface must receive an **API-Review+1**.
+from a member of API Council in addition to the usual **Code-Review+2**.
+
+For more details about the responsibilities of an API Reviewer and how the API
+Council operates, see the [API Council Charter](/docs/contribute/governance/api_council.md).
+
+#### API Reviewer membership {#api-reviewer-membership}
+
+To become an API Reviewer you must do the following:
+
+*   Be a [Committer](#committer).
+*   Demonstrate good judgement about the quality and long-term health of APIs.
+*   Be appointed by the functional area of the Fuchsia project, as per the [API Council Charter](/docs/contribute/governance/api_council.md#membership).
+
+### Eng Council member {#eng-council-member}
+
+The Fuchsia Eng Council is a small group of senior technical leaders responsible
+for providing a coherent technical vision for Fuchsia. The Eng Council largely
+operates by delegation and ratification, communicating engineering standards,
+values, and objectives throughout the community and then reviewing and ratifying
+concrete engineering proposals from project contributors.
+
+#### Eng Council membership {#eng-council-membership}
+
+There is no predetermined number of people on the Eng Council. However, in order
+to provide a coherent technical vision, the council has a small number of
+members. Eng Council members are appointed by the governing authority for the
+project. For more information, see [Membership](/docs/contribute/governance/eng_council.md#membership)
+in the Fuchsia Eng Council Charter.
+
+## Revoking Privileges {#revoking-privileges}
+
+When contributors no longer meet requirements, their role and
+corresponding privileges can be revoked.
+
+### Scenarios {#scenarios}
+
+Example scenarios for having privileges revoked include, but are not limited to,
+the following:
+
+*   Not acting in accordance with the [Fuchsia Code of Conduct](/CODE_OF_CONDUCT.md).
+*   Committers repeatedly ignoring testability best-practices in their code
+    reviews.
+*   Owners discouraging people from requesting code reviews.
+*   Owners being unresponsive to review requests.
+
+### Process {#process}
+
+The process for revoking an individual’s role within the Fuchsia project
+involves the following steps:
+
+*   An Owner makes a recommendation to `community-managers@fuchsia.dev` to
+    revoke someone’s role, specifying the rationale. Revoking an Owner role
+    needs to be approved by an Owner in the same subtree
+    or above.
+    * Ownership is often revoked when an Owner is no longer actively
+      contributing to their associated files or directories.
+
+Revoking a Committer role should be a rare action and requires approval by the
+governance authority. Community managers should be involved in the process of
+revoking the Committer role.
+
+## Frequently asked questions {#frequently-asked-questions}
+
+As a Fuchsia Member, you might have the following questions about requesting a
+code review:
+
+*   Who can provide a **Code Review +1**?
+    * All Committers, Owners, and Global Approvers. Code Review +1 means
+    “Looks Good To Me” but a +1 alone doesn’t allow for submission.
+    Someone else has to approve the change with a +2. For more information on
+    review label definitions see, [Gerrit Code Review - Review Labels](https://gerrit-review.googlesource.com/Documentation/config-labels.html){:.external}.
+*   Can specific portions of the Fuchsia source code have different requirements?
+    * Yes. For example, API changes have special requirements as described in
+     the [Fuchsia API Council Charter](/docs/contribute/governance/api_council.md#api_review).
+*   Do I need **API-Review +1**?
+    * Changes affecting the Fuchsia API surface require **API-Review +1**, and the
+    code review tool will only show the API-Review flag when it is needed.
+
+[fec]: /docs/contribute/governance/eng_council.md

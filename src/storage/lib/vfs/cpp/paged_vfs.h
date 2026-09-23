@@ -1,0 +1,146 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_STORAGE_LIB_VFS_CPP_PAGED_VFS_H_
+#define SRC_STORAGE_LIB_VFS_CPP_PAGED_VFS_H_
+
+#include <lib/async/dispatcher.h>
+#include <lib/zx/pager.h>
+#include <lib/zx/result.h>
+#include <lib/zx/thread.h>
+#include <lib/zx/vmo.h>
+#include <zircon/compiler.h>
+#include <zircon/types.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <vector>
+
+#include "src/storage/lib/vfs/cpp/managed_vfs.h"
+#include "src/storage/lib/vfs/cpp/pager_thread_pool.h"
+
+namespace fs {
+
+class PagedVnode;
+
+// A variant of Vfs that supports paging. A PagedVfs supports PagedVnode objects.
+class PagedVfs : public ManagedVfs {
+ public:
+  // The caller must call Init() which must succeed before using this class.
+  explicit PagedVfs(async_dispatcher_t* dispatcher, int num_pager_threads = 1);
+  ~PagedVfs() override;
+
+  // Creates the pager and worker threads. If any of these fail, this class should not be used.
+  // After calling Init, TearDown *must* be called before destroying.
+  zx::result<> Init() __TA_EXCLUDES(vfs_lock_);
+  bool is_initialized() const { return pager_.is_valid(); }
+
+  // TearDown should be called before PagedVfs is destroyed. It can be called from the derived
+  // classes's destructor, but it should be on the class that is marked as final.
+  void TearDown();
+
+  // Gets the list of pager threads. This is designed to allow callers to set up scheduling profiles
+  // on their pagers.
+  std::vector<zx::unowned_thread> GetPagerThreads() const;
+
+  // Called in response to a successful PagedVnode::VmoRead() request, this supplies paged data from
+  // aux_vmo to the PagedVnode's VMO to the kernel. See zx_pager_supply_pages() documentation for
+  // more.
+  zx::result<> SupplyPages(const zx::vmo& node_vmo, uint64_t offset, uint64_t length,
+                           const zx::vmo& aux_vmo, uint64_t aux_offset) __TA_EXCLUDES(vfs_lock_);
+
+  // Called in response to a successful PagedVnode::VmoDirty() request, this transits page state
+  // from clean to dirty. See zx_pager_op_range() documentation for more.
+  zx::result<> DirtyPages(const zx::vmo& node_vmo, uint64_t offset, uint64_t length)
+      __TA_EXCLUDES(vfs_lock_);
+
+  // Called in response to a failed PagedVnode::VmoRead() request, this reports that there was an
+  // error populating page data. See zx_pager_op_range() documentation for more, only certain
+  // values are permitted for err.
+  zx::result<> ReportPagerError(const zx::vmo& node_vmo, uint64_t offset, uint64_t length,
+                                zx_status_t err) __TA_EXCLUDES(vfs_lock_);
+
+  // Notifies the kernel that the filesystem has started cleaning the `range` of pages. See
+  // `ZX_PAGER_OP_WRITEBACK_BEGIN` for more information.
+  zx::result<> WritebackBegin(const zx::vmo& node_vmo, uint64_t offset, uint64_t length)
+      __TA_EXCLUDES(vfs_lock_);
+
+  // Notifies the kernel that the filesystem has finished cleaning the `range` of pages. See
+  // `ZX_PAGER_OP_WRITEBACK_END` for more information.
+  zx::result<> WritebackEnd(const zx::vmo& node_vmo, uint64_t offset, uint64_t length)
+      __TA_EXCLUDES(vfs_lock_);
+
+  // Checks if the VMO has been modified since the VMO was created or the last time this function
+  // was called with the option `ZX_PAGER_RESET_VMO_STATS`.
+  zx::result<zx_pager_vmo_stats_t> QueryVmoStats(const zx::vmo& node_vmo, uint32_t options)
+      __TA_EXCLUDES(vfs_lock_);
+
+  // Allocates a VMO of the given size associated with the given PagedVnode. VMOs for use with
+  // the pager must be allocated by this method so the page requests are routed to the correct
+  // PagedVnode.
+  //
+  // This will register the PagedVnode for pager requests. A non-owning reference will be taken to
+  // it. The PagedVnode is responsible for notifying this class when it is destroyed via
+  // FreePagedVmo() to free this reference.
+  //
+  // This function is for internal use by PagedVnode. Most callers should use
+  // PagedVnode::EnsureCreateVmo().
+  //
+  // |options| must be zero or a combination of ZX_VMO_RESIZABLE and ZX_VMO_TRAP_DIRTY.
+  struct VmoCreateInfo {
+    zx::vmo vmo;
+
+    // Unique identifier for the VMO that can be used in FreePagedVmo().
+    uint64_t id = 0;
+  };
+  zx::result<VmoCreateInfo> CreatePagedNodeVmo(PagedVnode* node, uint64_t size,
+                                               uint32_t options = 0) __TA_EXCLUDES(vfs_lock_);
+
+  // When there is a VMO clone is alive, the PagedVnode should be registered with the VFS to handle
+  // the paging requests for it.
+  //
+  // PagedVnodes should unregister themselves and properly detach from the pager when being freed or
+  // when their VMO handle is destroyed to prevent leaks or use-after-free errors. Detaching from
+  // the pager is important because otherwise pager requests from any code that has mappings will
+  // hang indefinitely.
+  //
+  // The unique IDs are the ones generated by CreatePagedNodeVmo(). The vmo information should be
+  // moved into this function, which will destroy the VMO handle after it's unregistered.
+  void FreePagedVmo(VmoCreateInfo info) __TA_EXCLUDES(vfs_lock_);
+
+  // Callback that the PagerThreadPool uses to notify us of pager events. These calls will get
+  // issued on arbitrary threads.
+  void PagerVmoRead(uint64_t node_id, uint64_t offset, uint64_t length) __TA_EXCLUDES(vfs_lock_)
+      __TA_EXCLUDES(live_nodes_lock_);
+  void PagerVmoDirty(uint64_t node_id, uint64_t offset, uint64_t length) __TA_EXCLUDES(vfs_lock_)
+      __TA_EXCLUDES(live_nodes_lock_);
+
+  // Returns the number of VMOs registered for notifications. Used for testing.
+  size_t GetRegisteredPagedVmoCount() const __TA_EXCLUDES(vfs_lock_)
+      __TA_EXCLUDES(live_nodes_lock_);
+
+ private:
+  std::unique_ptr<PagerThreadPool> pager_pool_;  // Threadsafe, does not need locking.
+  zx::pager pager_;                              // Does not need locking.
+
+  // Vnodes with active VMOs from the kernel paging system. These are non-owning references and
+  // the PagedVnode class is responsible for notifying us when the reference is no longer valid.
+  //
+  // It is important for Vnodes to be registered here for as long as the VMO could possibly be used
+  // to avoid accumulating bad state in the kernel. For example, if there are currently no mappings
+  // one might think it would be safe to be unregistered. But if new mappings could possibly be
+  // created in the future, it needs to stay continuously registered in case of race conditions.
+  // See PagedVno::OnNoPagedVmoClones() for more.
+  //
+  // Protected by the registered vnode lock so creating nodes in the main lock doesn't attempt to
+  // reenter the lock by registering.
+  uint64_t next_node_id_ __TA_GUARDED(live_nodes_lock_) = 1;
+  std::map<uint64_t, PagedVnode*> paged_nodes_ __TA_GUARDED(live_nodes_lock_);
+};
+
+}  // namespace fs
+
+#endif  // SRC_STORAGE_LIB_VFS_CPP_PAGED_VFS_H_

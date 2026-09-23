@@ -1,0 +1,134 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_host_tool.gni")
+import("//build/go/go_binary.gni")
+import("//build/go/go_library.gni")
+import("//build/go/toolchain.gni")
+import("//build/host.gni")
+import("//build/testing/golden_files.gni")
+import("//tools/fidl/fidlc/testdata/info.gni")
+
+if (is_host) {
+  golden_files("fidlgen_go_golden_tests") {
+    testonly = true
+
+    formatter = {
+      script = "//prebuilt/third_party/go/$host_platform/bin/gofmt"
+    }
+
+    deps = []
+    comparisons = []
+    foreach(info, fidl_testdata_info) {
+      if (info.denylist + [ "fidlgen_go" ] - [ "fidlgen_go" ] ==
+          info.denylist) {
+        deps += [ "${info.target}_go_generate($go_toolchain)" ]
+        comparisons += [
+          {
+            golden = "goldens/${info.name}.go.golden"
+            candidate = "${info.fidl_gen_dir}/${info.target_name}/go/${info.library}.fidl/impl.go"
+          },
+        ]
+      }
+    }
+  }
+}
+
+# Test that the generated Go library compiles.
+#
+# Go libraries can only be compiled inside the context of some binary.
+# The following is modeled from a similar template in
+# /zircon/tools/zither/BUILD.gn.
+# We create a simple main file that imports the generated package, which
+# will feed into our compilation check.
+template("fidlgen_go_golden_compilation_test") {
+  info = invoker.info
+  compilation_check_target = target_name
+  output_dir = "${target_gen_dir}/${target_name}"
+  create_main_target = "${compilation_check_target}.create_main"
+  main_file = "$output_dir/main.go"
+
+  # Something like "fidl/test/foobar"
+  go_package_under_test = "fidl/" + string_replace(info.library, ".", "/")
+  generated_file(create_main_target) {
+    visibility = [ ":*" ]
+    testonly = true
+
+    contents = [
+      "package main",
+      "",
+      "import (",
+
+      # It is necessary to import the generated bindings library.
+      # Otherwise, the tree-shaking build optimization from Go will
+      # avoid actually compiling the library.
+      # `_` to avoid usage complaints.
+      "  _ \"${go_package_under_test}\"",
+
+      # Without this import, there are undefined symbol errors at link time.
+      "  _ \"syscall/zx\"",
+      ")",
+      "",
+      "func main() {}",
+      "",
+    ]
+    outputs = [ main_file ]
+  }
+
+  # The generated main file now needs to be declared in a package/library.
+  main_library_target = "${compilation_check_target}.main_library"
+  main_pkg_name = rebase_path(output_dir, root_build_dir)
+  go_library(main_library_target) {
+    visibility = [ ":*" ]
+    testonly = true
+
+    name = main_pkg_name
+    source_dir = output_dir
+    sources = [ rebase_path(main_file, source_dir) ]
+    deps = [ info.target + "_go($go_toolchain)" ]
+    non_go_deps = [ ":$create_main_target" ]
+  }
+
+  go_binary(compilation_check_target) {
+    embed = [ ":$main_library_target" ]
+    visibility = [ ":*" ]
+    testonly = true
+  }
+}
+
+golden_compilation_test_deps = []
+
+if (is_fuchsia) {
+  foreach(testdata_info, fidl_testdata_info) {
+    if (testdata_info.build_denylist + [ "fidlgen_go" ] - [ "fidlgen_go" ] ==
+        testdata_info.build_denylist) {
+      compilation_check_target = "${testdata_info.name}_go_compilation_test"
+      fidlgen_go_golden_compilation_test(compilation_check_target) {
+        info = testdata_info
+      }
+      golden_compilation_test_deps += [ ":${compilation_check_target}" ]
+    }
+  }
+}
+
+group("goldens") {
+  testonly = true
+  deps = golden_compilation_test_deps
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":fidlgen_go_golden_tests($host_toolchain)",
+    ":goldens",
+  ]
+}
+
+if (is_host) {
+  bazel_host_tool("fidlgen_go") {
+    bazel_target = ":fidlgen_go"
+    bazel_output_path = "{{BAZEL_TARGET_OUT_DIR}}/fidlgen_go_/fidlgen_go"
+    install_host_tool = true
+  }
+}

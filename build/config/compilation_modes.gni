@@ -1,0 +1,163 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This file will be processed in every toolchain, so detect when it's being
+# processed in the default_toolchain.  As this file is imported by
+# BUILDCONFIG.gn, `default_toolchain` hasn't yet been set, and while
+# `current_toolchain` _is_ set, it's an empty string while in the context of
+# the default toolchain.
+_print_warnings = current_toolchain == ""
+
+declare_args() {
+  # The overall compilation mode to use.  The valid values are:
+  #  * `debug`: for debug-enabled builds.
+  #  * `balanced`: some optimizations, but prioritizing compilation speed over
+  #                 runtime performance.
+  #  * `release`: all the optimizations, used for product releases.
+  # LINT.IfChange
+  compilation_mode = "balanced"
+
+  # LINT.ThenChange(//build/bazel/BUILD.gn)
+
+  # Overridden settings for the compilation mode.  This is a set of override
+  # values for variables whose default values are set by the chosen compilation
+  # mode (above).
+  #   * optimize:  The optimization mode to use.  Valid values are:
+  #       * `none`: really unoptimized, usually only build-tested and not run
+  #       * `debug`: "optimized for debugging", light enough to avoid confusion
+  #       * `moderate`: moderate optimization level (clang's default -O2)
+  #       * `size`:  optimized for space rather than purely for speed
+  #       * `size_thinlto`:  optimize for space and use Thin LTO
+  #       * `size_lto`:  optimize for space and use LTO
+  #       * `speed`: optimized purely for speed
+  #       * `sanitizer`: optimized for sanitizers (ASan, etc.)
+  #       * `profile`: optimized for coverage/profile data collection
+  #       * `coverage`: optimized for coverage data collection
+  #
+  compilation_settings_overrides = {
+  }
+}
+
+_default_compilation_settings = {
+  debug = {
+    fuchsia_optimize = "none"
+    host_optimize = "none"
+    kernel_optimize = "moderate_thinlto"
+    user_optimize = "moderate"
+  }
+
+  balanced = {
+    fuchsia_optimize = "size_thinlto_clang"
+    host_optimize = "size"
+    kernel_optimize = "moderate_thinlto"
+    user_optimize = "moderate"
+  }
+
+  release = {
+    fuchsia_optimize = "size_lto"
+    host_optimize = "size"
+    kernel_optimize = "moderate_thinlto"
+    user_optimize = "moderate"
+  }
+}
+
+# Validate that the chosen compilation mode is one of the valid modes
+assert(
+    defined(_default_compilation_settings[compilation_mode]),
+    "The specified compilation mode (${compilation_mode}) is not a valid option. They are: 'debug', 'balanced', and 'release'")
+
+# Create booleans for each compilation mode, to allow binaries to fine-tune
+# configuration
+
+is_debug = compilation_mode == "debug"
+is_balanced = compilation_mode == "balanced"
+is_release = compilation_mode == "release"
+
+compilation_settings = {
+  # Set the compilation settings to use based on the chosen compilation mode
+  _settings_defaults = _default_compilation_settings[compilation_mode]
+  forward_variables_from(_settings_defaults, "*")
+
+  if (_print_warnings) {
+    # Warn if the overridden settings are not at their default value for this
+    # compilation mode.
+    foreach(_setting_name,
+            [
+              "fuchsia_optimize",
+              "host_optimize",
+              "kernel_optimize",
+              "user_optimize",
+            ]) {
+      if (defined(compilation_settings_overrides[_setting_name]) &&
+          compilation_settings_overrides[_setting_name] ==
+          _settings_defaults[_setting_name]) {
+        print(
+            "  WARNING:  You are setting '${_setting_name}' to the default value (${optimize}) for this compilation mode (${compilation_mode}), this is unncessary.")
+      }
+    }
+  }
+
+  # Apply overrides specified by the developer. This cannot be done using the
+  # forward_variables_from() function because that will refuse to clobber any
+  # existing values.  However, this also allows the inclusion of specific logic
+  # (such as warning about setting overrides to default values or using
+  # deprecated options).
+
+  # optimization settings
+  if (defined(compilation_settings_overrides.fuchsia_optimize)) {
+    fuchsia_optimize = compilation_settings_overrides.fuchsia_optimize
+  }
+  if (defined(compilation_settings_overrides.host_optimize)) {
+    host_optimize = compilation_settings_overrides.host_optimize
+  }
+  if (defined(compilation_settings_overrides.kernel_optimize)) {
+    kernel_optimize = compilation_settings_overrides.kernel_optimize
+  }
+  if (defined(compilation_settings_overrides.user_optimize)) {
+    user_optimize = compilation_settings_overrides.user_optimize
+  }
+}
+
+# Validate that the configured 'foo_optimize' values set above are one of the
+# valid optimization modes:
+_optimize_valid = [
+  "none",
+  "debug",
+  "minimal",
+  "sanitizer",
+  "profile",
+  "coverage",
+]
+foreach(primary,
+        [
+          "moderate",
+          "size",
+          "speed",
+        ]) {
+  foreach(suffix,
+          [
+            "",
+            "_lto",
+            "_thinlto",
+          ]) {
+    _optimize_valid += [ primary + suffix ]
+  }
+}
+
+# TODO(https://fxbug.dev/517626589): remove this when default is changed
+_optimize_valid += [ "size_thinlto_clang" ]
+
+foreach(_optimize_arg,
+        [
+          "fuchsia_optimize",
+          "host_optimize",
+          "kernel_optimize",
+          "user_optimize",
+        ]) {
+  _optimize_value = compilation_settings[_optimize_arg]
+  assert(
+      _optimize_valid + [ _optimize_value ] - [ _optimize_value ] !=
+          _optimize_valid,
+      "`${_optimize_arg}=\"...\"` must be one of $_optimize_valid (\"$_optimize_value\" was specified)")
+}

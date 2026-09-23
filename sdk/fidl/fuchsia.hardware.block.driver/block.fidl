@@ -1,0 +1,268 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.block.driver;
+
+using zx;
+
+alias Vmoid = uint16;
+
+/// The maximum value for a transfer size, identifying that there
+/// effectively exists no maximum for a single operation.
+const MAX_TRANSFER_UNBOUNDED uint32 = 0xFFFFFFFF;
+
+// Dummy vmoid value reserved for "invalid". Will never be allocated; can be
+// used as a local value for unallocated / freed ID.
+const BLOCK_VMOID_INVALID Vmoid = 0;
+
+const BLOCK_GUID_LEN uint32 = 16;
+
+/// Multiple block I/O operations may be sent at once before a response is
+/// actually sent back. Block I/O ops may be sent concurrently to different
+/// vmoids, and they also may be sent to different groups at any point in time.
+///
+/// `MAX_TXN_GROUP_COUNT` "groups" are pre-allocated lanes separated on the
+/// block server.  Using a group allows multiple message to be buffered at once
+/// on a single communication channel before receiving a response.
+///
+/// Usage of groups is identified by the `GROUP_ITEM` flag, and is optional.
+///
+/// These groups may be referred to with a "groupid", in the range [0,
+/// `MAX_TXN_GROUP_COUNT`).
+///
+/// The protocol to communicate with a single group is as follows:
+/// 1) SEND [N - 1] messages with an allocated groupid for any value of 1 <= N.
+///    The `GROUP_ITEM` flag is set for these messages.
+/// 2) SEND a final Nth message with the same groupid. The `GROUP_ITEM
+///    | GROUP_LAST` flags are set for this message.
+/// 3) RECEIVE a single response from the Block I/O server after all N requests
+///    have completed. This response is sent once all operations either complete
+///    or a single operation fails. At this point, step (1) may begin again for
+///    the same groupid.
+///
+/// For `READ` and `WRITE`, N may be greater than 1. Otherwise,
+/// N == 1 (skipping step (1) in the protocol above).
+///
+/// Notes:
+/// - groupids may operate on any number of vmoids at once.
+/// - If additional requests are sent on the same groupid before step (3) has
+///   completed, then the additional request will not be processed. If
+///   `GROUP_LAST` is set, an error will be returned. Otherwise, the
+///   request will be silently dropped.
+/// - Messages within a group are not guaranteed to be processed in any order
+///   relative to each other.
+/// - All requests receive responses, except for ones with `GROUP_ITEM`
+///   that do not have `GROUP_LAST` set.
+///
+/// For example, the following is a valid sequence of transactions:
+///
+///   -> (groupid = 1, vmoid = 1, OP = Write | GroupItem,             reqid = 1)
+///   -> (groupid = 1, vmoid = 2, OP = Write | GroupItem,             reqid = 2)
+///   -> (groupid = 2, vmoid = 3, OP = Write | GroupItem | GroupLast, reqid = 0)
+///   <- Response sent to groupid = 2, reqid = 0
+///   -> (groupid = 1, vmoid = 1, OP = Read | GroupItem | GroupLast,  reqid = 3)
+///   <- Response sent to groupid = 1, reqid = 3
+///   -> (groupid = 3, vmoid = 1, OP = Write | GroupItem,             reqid = 4)
+///   -> (groupid = don't care, vmoid = 1, OP = Read, reqid = 5)
+///   <- Response sent to reqid = 5
+///   -> (groupid = 3, vmoid = 1, OP = Read | GroupItem | GroupLast,  reqid = 6)
+///   <- Response sent to groupid = 3, reqid = 6
+///
+/// Each transaction reads or writes up to `length` blocks from the device,
+/// starting at `dev_offset` blocks, into the VMO associated with `vmoid`,
+/// starting at `vmo_offset` blocks.  If the transaction is out of range, for
+/// example if `length` is too large or if `dev_offset` is beyond the end of the
+/// device, `ZX_ERR_OUT_OF_RANGE` is returned.
+const MAX_TXN_GROUP_COUNT uint32 = 8;
+
+/// `READ`, `WRITE`
+//
+// Note: this data structure is used for the driver <--> driver interfaces,
+// while `BlockFifoRequest` is part of a client <--> server interface and
+// related to the block FIDL API.
+//
+// See src/storage/lib/block_client/cpp/block_fifo.h for FIFO protocol.
+//
+type BlockReadWrite = resource struct {
+    /// Opcode and flags.
+    command BlockCommand;
+
+    /// Available for temporary use.
+    extra uint32;
+
+    /// VMO of data to read or write.
+    vmo zx.Handle:VMO;
+
+    /// Transfer length in blocks (0 is invalid).
+    length uint32;
+
+    /// Device offset in blocks.
+    offset_dev uint64;
+
+    /// VMO offset in blocks.
+    offset_vmo uint64;
+
+    /// The keyslot used to encrypt/decrypt the request's data.
+    /// Only used if `INLINE_ENCRYPTION_ENABLED` is set in command flags.
+    slot uint8;
+
+    /// The data unit number (DUN) used as tweak for encrypting/decrypting the request.
+    /// Only used if `INLINE_ENCRYPTION_ENABLED` is set in command flags.
+    dun uint64;
+};
+
+/// `TRIM`
+type BlockTrim = struct {
+    /// Opcode and flags.
+    command BlockCommand;
+
+    /// Transfer length in blocks (0 is invalid).
+    length uint32;
+
+    /// Device offset in blocks.
+    offset_dev uint64;
+};
+
+type BlockOp = strict resource union {
+    /// All Commands
+    1: command BlockCommand;
+
+    /// Read and Write ops use rw for parameters.
+    2: rw BlockReadWrite;
+    3: trim BlockTrim;
+};
+
+type BlockCommand = struct {
+    opcode @generated_name("BlockOpcode") strict enum : uint8 {
+        /// Performs a regular data read or write from the device. The operation may
+        /// be cached internally.
+        READ = 1;
+        WRITE = 2;
+
+        /// Write any controller or device cached data to nonvolatile storage.
+        FLUSH = 3;
+
+        /// Instructs the device to invalidate a number of blocks, making them  usable
+        /// for storing something else. This is basically a "delete" optimization,
+        /// where the device is in charge of discarding the old content without
+        /// clients having to write a given pattern. The operation may be cached
+        /// internally.
+        TRIM = 4;
+
+        /// Detaches the VMO from the block device.
+        CLOSE_VMO = 5;
+    };
+
+    flags @generated_name("BlockIoFlag") strict bits : uint32 {
+        /// Associate the following request with `group`.
+        GROUP_ITEM = 0x00000001;
+
+        /// Only respond after this request (and all previous within group) have
+        /// completed. Only valid with `GROUP_ITEM`.
+        GROUP_LAST = 0x00000002;
+
+        /// Mark this operation as "Force Unit Access" (FUA), indicating that
+        /// it should not complete until the data is written to the non-volatile
+        /// medium (write), and that reads should bypass any on-device caches.
+        FORCE_ACCESS = 0x00000004;
+
+        /// Attaches a pre-barrier to a request.  This will ensure that no request which was
+        /// executed before this request will be re-ordered to execute after this request.
+        ///
+        /// NOTE: Barriers do NOT guarantee ordering of in-flight requests.  Any request which the
+        /// client has not yet received a response for is considered in-flight, and no guarantees
+        /// are made about relative ordering with this request.  This has important implications for
+        /// grouped requests:  A request in the middle of a group with PRE_BARRIER set will NOT have
+        /// ordering guarantees relative to the other requests in the same group.
+        PRE_BARRIER = 0x00000008;
+
+        /// If set, the request is to be decompressed.
+        DECOMPRESS_WITH_ZSTD = 0x00000010;
+
+        /// Use the `slot` and `dun` inline encryption (write) or decryption (read) parameters.
+        INLINE_ENCRYPTION_ENABLED = 0x00000020;
+    };
+};
+
+type DeviceFlag = strict bits : uint32 {
+    /// All writes to the block device will fail.
+    READONLY = 0x00000001;
+
+    /// The block device may be removed from the device during operation.
+    REMOVABLE = 0x00000002;
+
+    /// The device provides trim support.
+    TRIM_SUPPORT = 0x00000008;
+
+    /// The device provides Force Unit Access (FUA) support.
+    ///
+    /// If this bit is unset, and a request is sent with the FORCE_ACCESS option set, the device
+    /// will simulate a FUA by executing a device flush after the request completes (but before
+    /// responding to the client).  Clients are strongly encouraged to probe for FUA support and
+    /// avoid usage of FORCE_ACCESS without device support, since this is expensive.
+    FUA_SUPPORT = 0x00000010;
+
+    /// The device provides zstd decompression support.
+    ZSTD_DECOMPRESSION_SUPPORT = 0x00000020;
+
+    /// The device provides Barrier support.
+    ///
+    /// If this bit is unset, and a request is sent with the PRE_BARRIER option set, the device
+    /// will simulate a barrier by executing a device flush before the request is submitted.
+    /// Clients are strongly encouraged to probe for barrier support and avoid usage of
+    /// PRE_BARRIER without device support, since this is expensive.
+    BARRIER_SUPPORT = 0x00000040;
+};
+
+type BlockInfo = struct {
+    /// The number of blocks in this block device.
+    block_count uint64;
+
+    /// The size of a single block.
+    block_size uint32;
+
+    /// The maximum size, in bytes, of a transfer.
+    /// Set to MAX_TRANSFER_UNBOUNDED if no such maximum exists.
+    max_transfer_size uint32;
+
+    /// Identifiers about the device.
+    flags DeviceFlag;
+};
+
+closed protocol Common {
+    /// Obtains the parameters of the block device (`block_info_t`) and the
+    /// required size of `block_txn_t`. The `block_txn_t`s submitted via
+    /// `Queue()` must have `block_op_size_out - sizeof(block_op_t)` bytes
+    /// available at the end of the structure for the use of the driver.
+    strict Query() -> (struct {
+        info BlockInfo;
+        block_op_size uint64;
+    });
+
+    /// Submits an I/O request for processing. Ownership of `op` is transferred
+    /// to callee until `completion_cb` is invoked. Success or failure will be
+    /// reported via the `completion_cb`. This callback may be called before the
+    /// `Queue()` method returns.
+    @async
+    strict Queue(resource struct {
+        @in_out
+        txn BlockOp;
+    }) -> (resource struct {
+        status zx.Status;
+        @mutable
+        op BlockOp;
+    });
+};
+
+@transport("Banjo")
+@banjo_layout("ddk-protocol")
+closed protocol BlockImpl {
+    compose Common;
+};
+
+@transport("Banjo")
+@banjo_layout("ddk-protocol")
+closed protocol Block {
+    compose Common;
+};

@@ -1,0 +1,842 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.audio.mixer;
+
+using fuchsia.audio;
+using fuchsia.audio.effects;
+using fuchsia.media2;
+using zx;
+
+alias NodeId = uint64;
+alias ThreadId = uint64;
+alias GainControlId = uint64;
+
+/// By convention, the zero ID is never used.
+const INVALID_ID uint64 = 0;
+
+/// Maximum length of a `name` string.
+const MAX_NAME_LENGTH uint32 = 256;
+
+/// Maximum number of GainControls that can be attached to each graph edge.
+const MAX_GAIN_CONTROLS_PER_EDGE uint32 = 32;
+
+/// A factory for creating [`Graph`] protocols.
+@discoverable
+closed protocol GraphCreator {
+    /// Creates a new graph that lives until the channel is closed.
+    strict Create(resource table {
+        /// Required.
+        1: graph server_end:Graph;
+
+        /// Name of this graph, used for diagnostics only.
+        /// If specified, ideally this should be globally unique and have a
+        /// printable CamelCase format, but uniqueness is not required.
+        ///
+        /// Optional. Empty if not specified.
+        2: name string:MAX_NAME_LENGTH;
+
+        /// Deadline profile for the FIDL thread.
+        ///
+        /// This is to ensure time-sensitive requests are handled properly. For
+        /// example, packets sent on a [`fuchsia.audio.StreamSink`] channel must
+        /// be read immediately, otherwise the caller may miss their deadline.
+        ///
+        /// Optional. If not specified, the FIDL thread runs at a normal priority.
+        3: fidl_thread_deadline_profile zx.Handle:PROFILE;
+
+        /// If specified, the graph will use synthetic clocks that are created
+        /// and controlled over the given channel. This can be used to run the
+        /// graph faster than real time, which is useful in integration tests.
+        ///
+        /// If specified, then ALL clocks used by this graph MUST be created by
+        /// this realm OR by [`Graph.CreateGraphControlledReferenceClock`],
+        /// which will use this realm internally.
+        ///
+        /// Optional. If not specified, the graph uses real clocks.
+        4: synthetic_clock_realm server_end:SyntheticClockRealm;
+    }) -> (table {}) error CreateGraphError;
+};
+
+/// A mixer Graph.
+///
+/// ## Directed Acyclic Graphs (DAGs)
+///
+/// Each graph includes a set of nodes connected into one or more DAGs. Audio
+/// data flows from Producer nodes to Consumer nodes, and in between, may flow
+/// through processing nodes, including Mixers, Splitters, and Custom nodes.
+///
+/// Each node has zero or more incoming and outgoing edges. Each edge represents
+/// a single stream of audio data. Incoming edges are called "source streams"
+/// and outgoing edges are called "destination streams".
+///
+/// Audio is strongly typed: each node declares the audio format(s) it can
+/// ingest from source streams and the audio format(s) it can produce to
+/// destination streams. It is illegal to connect nodes with incompatible
+/// formats.
+///
+/// ## Execution Model
+///
+/// Execution is driven by Consumers. Each Consumer wakes every N ms (N is
+/// configurable per Consumer) and pulls N ms of audio from its sources, which
+/// pull audio from their sources, and so on, up to the connected Producers. As
+/// audio is pulled down the graph, it is processed and mixed into a single
+/// stream that is written into the Consumer.
+///
+/// Each Consumer is attached to a Thread, which gives the Consumer a place to
+/// do its work. Threads usually need deadline profiles to meet real-time
+/// constraints. The client is responsible for creating Thread objects,
+/// assigning Consumers to Threads, and attaching appropriate deadline profiles
+/// when needed.
+///
+/// When the DAG includes nodes with multiple outgoing edges, such as Splitters,
+/// we can end up in a situation where two Consumers A and B share the same
+/// dependencies (via the Splitter's source). If A and B run on different
+/// threads, it's unclear which Thread should process those shared dependencies,
+/// making it unclear how much deadline capacity is required by each thread. To
+/// avoid this problem, we partition the DAG so that each Consumer is the root
+/// of an inverted tree. At nodes with multiple outgoing edges, such as
+/// Splitters, we partition the node into a hidden Consumer node (which drives
+/// the sources) and hidden Producer nodes (which drive the destinations). When
+/// the client creates a Splitter, they must assign a Thread to the Splitter's
+/// hidden Consumer. This ensures that each node is processed on a unique
+/// thread, making it simpler to analyze the needed capacity for each Thread.
+///
+/// ## Method Semantics
+///
+/// Methods will be executed sequentially in the order they are called. Method
+/// calls can be pipelined, but if more than an implementation-defined number of
+/// requests are in flight at one time, the server reserves the right to assume
+/// a DoS attack and close the connection.
+///
+/// Most methods use a minimal set of arguments plus an "options" table to allow
+/// for extensibility.
+///
+/// ## IDs and names
+///
+/// Every object is identified by a numeric `id`. Within each object type
+/// (Nodes, Threads, and GainControls) IDs are guaranteed to be unique. Old IDs
+/// for deleted objects will never be reused for new objects.
+///
+/// Every object has an optional string `name`. If specified, ideally this name
+/// should be unique within the [`Graph`] and have a printable CamelCase format,
+/// but uniqueness is not required. Names are used for developer-visible
+/// diagnostics only -- they do not need to be unique. Duplicate names can at
+/// worst lead to potentially-confusing diagnostics. IDs, not names, should be
+/// used when unique identification is required.
+///
+/// ## Clocks
+///
+/// Each audio stream is associated with a *reference clock*. Different streams
+/// can use different clocks. Any two clocks can differ in both value (the
+/// current time) and the rate, where the rate may [change over
+/// time](https://fuchsia.dev/fuchsia-src/reference/syscalls/clock_update) as
+/// long as the clock remains [continuous and
+/// monotonic](https://fuchsia.dev/fuchsia-src/reference/kernel_objects/clock).
+/// This reflects many real situations. For example, a speaker may have an
+/// internal clock separate from the CPU's physical clock. Or, a stream may
+/// originate from some other computer on the network whose clock is not
+/// precisely synchronized to our local clock.
+///
+/// Every node must specify the reference clock used by the node's destination
+/// streams, except for Consumers, which must specify a clock for the Consumer's
+/// source stream. To connect two streams that use different clocks, we must
+/// translate one stream onto the other stream's clock. This is done at Mixer
+/// nodes, which use sample rate conversion (SRC) to translate source streams
+/// onto the Mixer's destination reference clock.
+///
+/// Reference clocks can change rate over time. These rate changes are typically
+/// controlled by the client. If the client doesn't need precise control over
+/// reference clocks, a cheaper option is to use Graph-controlled clocks (see
+/// [`Graph.CreateGraphControlledReferenceClock`]), which can avoid a
+/// potentially-expensive SRC in many cases. For example, if a Producer flows to
+/// a Consumer, where the Producer uses a Graph-controlled clock and the
+/// Consumer uses a client-controlled clock, the `Graph` will adjust the
+/// Producer clock's rate to synchronize the Producer and Consumer clocks,
+/// eliminating the need for SRC.
+closed protocol Graph {
+    /// Creates a Producer node with the given options.
+    ///
+    /// Producer nodes generate audio which can be consumed by other nodes. For
+    /// example, a Producer node might encapsulate audio coming from an
+    /// application or from a microphone. Producer nodes cannot have any
+    /// incoming edges and may have at most one outgoing edge.
+    strict CreateProducer(resource table {
+        /// Name of this node, used for diagnostics only. See "IDs and names" in the
+        /// comments for [`Graph`].
+        ///
+        /// Optional. Empty if not specified.
+        1: name string:MAX_NAME_LENGTH;
+
+        /// Direction of audio data produced by this node.
+        ///
+        /// Required.
+        2: direction PipelineDirection;
+
+        /// Data source for this producer.
+        ///
+        /// Required.
+        3: data_source ProducerDataSource;
+
+        /// If the `direction` is INPUT, this must be specified. This reports
+        /// the maximum delay between when a frame is captured at an input
+        /// microphone and when that frame is available at this producer.
+        ///
+        /// If `direction` is OUTPUT, this must be empty.
+        4: external_delay_watcher ExternalDelayWatcher;
+    }) -> (table {
+        /// ID of the newly-created node. Guaranteed to be unique.
+        1: id NodeId;
+    }) error CreateNodeError;
+
+    /// Creates a Consumer node with the given options.
+    ///
+    /// Consumer nodes write audio to a sink. For example, a Consumer node might
+    /// encapsulate audio being written to a speaker or to an application (which
+    /// may be capturing audio from a microphone). Consumer nodes can have at
+    /// most one incoming edge.
+    ///
+    /// Audio pipelines are driven by Consumers. Each Consumer is attached to a
+    /// Thread, which gives the Consumer a place to do work. A Consumer wakes
+    /// every `N` ms (`N` is configurable), pulls `N` ms of audio from its
+    /// incoming edge, then writes that audio to the Consumer's sink.
+    ///
+    /// For more details, see "Execution Model" under the description for
+    /// [`Graph`].
+    strict CreateConsumer(resource table {
+        /// Name of this node, used for diagnostics only. See "IDs and names" in the
+        /// comments for [`Graph`].
+        ///
+        /// Optional. Empty if not specified.
+        1: name string:MAX_NAME_LENGTH;
+
+        /// Direction of audio data consumed by this node.
+        ///
+        /// Required.
+        2: direction PipelineDirection;
+
+        /// Data sink for this consumer.
+        ///
+        /// Required.
+        3: data_sink ConsumerDataSink;
+
+        /// The consumer's source edge must have the given sample type. If not
+        /// specified, this defaults to the same sample type as `data_sink`.
+        ///
+        /// No matter what, the source edge source must have the same frame
+        /// rate and channelization as `data_sink`. Put differently, consumers
+        /// can perform sample type conversion, but they cannot perform rate
+        /// conversion or rechannelization.
+        4: source_sample_type fuchsia.audio.SampleType;
+
+        /// The Consumer's mix job should execute on this thread.
+        ///
+        /// Required.
+        5: thread ThreadId;
+
+        /// If `direction` is OUTPUT, this must be specified. This reports the
+        /// delay between when a frame is written by this consumer and when that
+        /// frame is rendered at its final destination (such as a speaker).
+        ///
+        /// If `direction` is INPUT, this must be empty.
+        6: external_delay_watcher ExternalDelayWatcher;
+    }) -> (table {
+        /// ID of the newly-created node. Guaranteed to be unique.
+        1: id NodeId;
+    }) error CreateNodeError;
+
+    /// Creates a Mixer node with the given options.
+    ///
+    /// Mixer nodes combine multiple PCM source streams into a single PCM
+    /// destination stream. Mixers apply format conversion and sample rate
+    /// conversion to the source streams to produce a destination stream with a
+    /// fixed format.
+    strict CreateMixer(resource table {
+        /// Name of this node, used for diagnostics only. See "IDs and names" in the
+        /// comments for [`Graph`].
+        ///
+        /// Optional. Empty if not specified.
+        1: name string:MAX_NAME_LENGTH;
+
+        /// Direction of audio data produced by this node.
+        ///
+        /// Required.
+        2: direction PipelineDirection;
+
+        /// Format of the Mixer's destination stream.
+        ///
+        /// Required.
+        3: dest_format fuchsia.audio.Format;
+
+        /// Clock for this node's destination stream.
+        ///
+        /// Required.
+        4: dest_reference_clock ReferenceClock;
+
+        /// Size of the internal mix buffer. This defines the maximum number of
+        /// frames that can be mixed at one time.
+        ///
+        /// Optional. If not specified, a default size is used.
+        5: dest_buffer_frame_count uint64;
+    }) -> (table {
+        /// ID of the newly-created node. Guaranteed to be unique.
+        1: id NodeId;
+    }) error CreateNodeError;
+
+    /// Creates a Splitter node with the given options.
+    ///
+    /// Splitter nodes copy a single source stream into multiple destination
+    /// streams. Each Splitter node has a hidden Consumer node which is
+    /// responsible for pulling data from the Splitter's source and writing that
+    /// data to an intermediate buffer. Destination streams read directly from
+    /// this buffer. For more details on this behavior, see "Execution Model"
+    /// under the description for [`Graph`].
+    ///
+    /// Each Splitter is assigned to a thread which drives the hidden Consumer's
+    /// work to fill the intermediate buffer. Destination streams can be
+    /// assigned to any thread. If a destination stream is assigned to the same
+    /// thread as the Splitter, that stream can copy the Splitter's source
+    /// stream without any additional latency. If a destination stream is
+    /// assigned to a different thread T, then extra buffering is required to
+    /// avoid data races -- that extra buffering adds additional latency of
+    /// `T.period`.
+    ///
+    /// Current limitation: The Splitter does not fill its intermediate buffer
+    /// unless it has at least one destination stream that is started and that
+    /// is assigned to the same thread as the Splitter. This limitation may be
+    /// lifted at a future time.
+    strict CreateSplitter(resource table {
+        /// Name of this node, used for diagnostics only. See "IDs and names" in the
+        /// comments for [`Graph`].
+        ///
+        /// Optional. Empty if not specified.
+        1: name string:MAX_NAME_LENGTH;
+
+        /// Direction of audio data produced by this node.
+        ///
+        /// Required.
+        2: direction PipelineDirection;
+
+        /// Format of the Splitter's source and destination streams.
+        ///
+        /// Required.
+        3: format fuchsia.audio.Format;
+
+        /// The thread which drives this Splitter's hidden consumer.
+        ///
+        /// Required.
+        4: thread ThreadId;
+
+        /// Clock for this node's source and destination streams.
+        ///
+        /// Required.
+        5: reference_clock ReferenceClock;
+    }) -> (table {
+        /// ID of the newly-created node. Guaranteed to be unique.
+        1: id NodeId;
+    }) error CreateNodeError;
+
+    /// Creates a Custom node with the given options.
+    ///
+    /// Custom nodes apply custom effects to one or more source streams,
+    /// producing one or more destination streams. The effects are implemented
+    /// out-of-process via a call to a FIDL interface.
+    ///
+    /// Custom nodes are composite nodes that encapsulate a fixed number of
+    /// sources and destinations. We assign an ID to each of these source and
+    /// destination slots -- see [`CustomNodeProperties`]. This allows creating
+    /// edges that target a specific slot. For example, a node that implements
+    /// AEC will have loopback and microphone source slots and the caller will
+    /// need to connect each source slot to an appropriate source. The caller
+    /// can do this by calling `CreateEdge` using a specific [`NodeId`] from
+    /// [`CustomNodeProperties.source_ids`]. These internal IDs cannot be
+    /// deleted, except by deleting the entire Custom node.
+    ///
+    /// The returned `id` describes the composite node. Passing `id` to
+    /// [`DeleteNode`] will delete the composite node as well as any internal
+    /// source and destination nodes. The returned `id` cannot be used in
+    /// [`CreateEdge`]. Edges must target a specific source or destination slot
+    /// as described above.
+    strict CreateCustom(resource table {
+        /// Name of this node, used for diagnostics only. See "IDs and names" in the
+        /// comments for [`Graph`].
+        ///
+        /// Optional. Empty if not specified.
+        1: name string:MAX_NAME_LENGTH;
+
+        /// Direction of audio data produced by this node.
+        ///
+        /// Required.
+        2: direction PipelineDirection;
+
+        /// Description of the out-of-process effects processor.
+        /// This includes a description of the node's source and destination
+        /// streams.
+        ///
+        /// Required.
+        3: config fuchsia.audio.effects.ProcessorConfiguration;
+
+        /// Clock for this node's source and destination streams.
+        ///
+        /// Required.
+        4: reference_clock ReferenceClock;
+    }) -> (resource table {
+        /// ID of the newly-created node. Guaranteed to be unique.
+        1: id NodeId;
+
+        /// Additional properties of the newly-created node.
+        2: node_properties CustomNodeProperties;
+    }) error CreateNodeError;
+
+    /// Deletes the given node.
+    ///
+    /// The node must exist. `DeleteNode(x)` will delete all incoming and
+    /// outgoing edges of node `x` before deleting the node itself. Once the node
+    /// has been deleted it cannot be mentioned by any future method calls.
+    strict DeleteNode(table {
+        /// ID of the node to delete.
+        1: id NodeId;
+    }) -> (table {}) error DeleteNodeError;
+
+    /// Creates an edge from the source node to the destination node.
+    ///
+    /// Both nodes must exist. The source's format must be supported by the
+    /// destination node. Mixer nodes support arbitrary source formats. Other
+    /// nodes support only specific (fixed) source formats.
+    ///
+    /// Both ends must use the same reference clock, unless the destination is a
+    /// Mixer, in which case the source can use any clock.
+    ///
+    /// If the source's direction is `INPUT`, the dest's direction cannot be
+    /// `OUTPUT`. See [`PipelineDirection`] for additional discussion.
+    strict CreateEdge(resource table {
+        /// ID of the destination node.
+        /// Required.
+        1: dest_id NodeId;
+
+        /// ID of the source node.
+        /// Required.
+        2: source_id NodeId;
+
+        /// This selects the sampler to use when performing sample rate conversion
+        /// on the source. Valid only when the dest node is a Mixer.
+        ///
+        /// Optional. If not specified, a default sampler is selected.
+        3: mixer_sampler Sampler;
+
+        /// Gains to apply to this edge. Since gain is applied by Mixer nodes,
+        /// either the source or dest node must be a Mixer.
+        ///
+        /// Optional. If empty, no gain is applied.
+        4: gain_controls vector<GainControlId>:MAX_GAIN_CONTROLS_PER_EDGE;
+    }) -> (table {}) error CreateEdgeError;
+
+    /// Deletes the edge connecting the source node to the destination node.
+    ///
+    /// The edge must exist.
+    strict DeleteEdge(table {
+        /// ID of the destination node.
+        1: dest_id NodeId;
+
+        /// ID of the source node.
+        2: source_id NodeId;
+    }) -> (table {}) error DeleteEdgeError;
+
+    /// Creates a thread.
+    ///
+    /// Each `CreateThread` call creates a new thread in the mixer service. This
+    /// new thread will be used to process audio for all Consumer nodes assigned
+    /// to this thread.
+    ///
+    /// For more details, see "Execution Model" under the description for
+    /// [`Graph`].
+    strict CreateThread(resource table {
+        /// Name of this thread, used for diagnostics only. See "IDs and names" in the
+        /// comments for [`Graph`].
+        ///
+        /// Optional. Empty if not specified.
+        1: name string:MAX_NAME_LENGTH;
+
+        /// Deadline profile to apply to this thread.
+        ///
+        /// Optional. If not specified, the thread runs at a normal priority.
+        2: deadline_profile zx.Handle:PROFILE;
+
+        /// This thread will process audio in batches of size `period`.
+        ///
+        /// Required.
+        3: period zx.Duration;
+
+        /// This thread is expected to use up to this much CPU time per
+        /// `period`. If `deadline_profile` is specified, then `cpu_per_period`
+        /// should match the profile's "capacity".
+        ///
+        /// Required.
+        4: cpu_per_period zx.Duration;
+    }) -> (table {
+        /// ID of the newly-created thread. Guaranteed to be unique.
+        1: id ThreadId;
+    }) error CreateThreadError;
+
+    /// Deletes the given thread.
+    ///
+    /// The thread must exist. A thread cannot be deleted until all Consumer
+    /// nodes assigned to that thread have been deleted.
+    strict DeleteThread(table {
+        /// ID of the thread to delete.
+        /// Required.
+        1: id ThreadId;
+    }) -> (table {}) error DeleteThreadError;
+
+    /// Creates a GainControl.
+    ///
+    /// A GainControl controls gain that should be applied to an audio stream.
+    /// GainControls can be attached to edges going into and out of a Mixer node.
+    /// Gain can be set to a specific value (e.g. in decibels) or it can be
+    /// muted.
+    ///
+    /// By default, a GainControl applies no gain and is not muted.
+    strict CreateGainControl(resource table {
+        /// Name of this GainControl, used for diagnostics only. See "IDs and names"
+        /// in the comments for [`Graph`].
+        ///
+        /// Optional. Empty if not specified.
+        1: name string:MAX_NAME_LENGTH;
+
+        /// Interface which controls this GainControl.
+        ///
+        /// Required.
+        2: control server_end:fuchsia.audio.GainControl;
+
+        /// Reference clock for this GainControl.
+        ///
+        /// Required.
+        3: reference_clock ReferenceClock;
+    }) -> (table {
+        /// ID of the newly-created GainControl. Guaranteed to be unique.
+        1: id GainControlId;
+    }) error CreateGainControlError;
+
+    /// Deletes the given GainControl.
+    ///
+    /// The GainControl must exist. A GainControl cannot be deleted until all
+    /// associated edges have been deleted.
+    strict DeleteGainControl(table {
+        /// ID of the GainControl to delete.
+        /// Required.
+        1: id GainControlId;
+    }) -> (table {}) error DeleteGainControlError;
+
+    /// Creates a graph-controlled reference clock.
+    ///
+    /// The returned clock has `ZX_RIGHT_READ` and `ZX_RIGHT_DUPLICATE` but not
+    /// `ZX_RIGHT_WRITE`. The clock may be duplicated and used wherever a
+    /// reference clock is needed. The graph will rate change this clock until
+    /// the `release_fence` is closed.
+    ///
+    /// For more details, see "Clocks" under the description for [`Graph`].
+    ///
+    /// * error Error from `zx_clock_create`
+    strict CreateGraphControlledReferenceClock() -> (resource table {
+        /// The new clock.
+        1: reference_clock zx.Handle:CLOCK;
+
+        /// The graph will control `reference_clock` until `release_fence` is
+        /// closed, at which point the clock can still be used but it will no
+        /// longer be rate-adjusted.
+        2: release_fence zx.Handle:EVENTPAIR;
+    }) error zx.Status;
+
+    /// Starts a consumer or a producer at a specified time.
+    ///
+    /// When a call to this method succeeds, the response is typically sent when
+    /// the operation actually occurs (that is, when it was scheduled to occur),
+    /// but may complete sooner. When a call to this method fails, the response
+    /// is sent when the failure is detected.
+    ///
+    /// If this method is called, and `when` specifies a time in the past, the
+    /// stream timeline is started as soon as possible.
+    ///
+    /// If a `Start` or `Stop` request is received when a previous `Start` or
+    /// `Stop` request is pending, the connection is closed. This request can be
+    /// canceled using the `CancelStartOrStop` method.
+    strict Start(table {
+        /// ID of the consumer or producer node.
+        ///
+        /// Required.
+        1: node_id NodeId;
+
+        /// When to apply the start command.
+        ///
+        /// Required.
+        2: when fuchsia.media2.RealTime;
+
+        /// Stream time of the start frame.
+        ///
+        /// Required.
+        3: stream_time fuchsia.media2.StreamTime;
+    }) -> (table {
+        /// The system time when the producer or consumer was actually started.
+        ///
+        /// Required.
+        1: system_time zx.Time;
+
+        /// The reference time when the producer or consumer was actually started.
+        ///
+        /// Required.
+        2: reference_time zx.Time;
+
+        /// The stream time at which the producer or consumer was actually started.
+        ///
+        /// Required.
+        3: stream_time zx.Duration;
+
+        /// The packet timestamp that corresponds to `stream_time`.
+        ///
+        /// Required.
+        4: packet_timestamp int64;
+    }) error StartError;
+
+    /// Stops a consumer or a producer at a specified time.
+    ///
+    /// When a call to this method succeeds, the response is typically sent when
+    /// the operation actually occurs (that is, when it was scheduled to occur),
+    /// but may complete sooner. When a call to this method fails, the response
+    /// is sent when the failure is detected.
+    ///
+    /// If this method is called when the stream timeline is stopped, the call
+    /// fails immediately with an `ALREADY_STOPPED` error.
+    ///
+    /// Otherwise, if this method is called, and `when` specifies a time in the
+    /// past, the stream timeline is stopped as soon as possible.
+    ///
+    /// If a `Start` or `Stop` request is received when a previous `Start` or
+    /// `Stop` request is pending, the connection is closed. This request can be
+    /// canceled using the `CancelStartOrStop` method.
+    strict Stop(table {
+        /// ID of the consumer or producer node.
+        ///
+        /// Required.
+        1: node_id NodeId;
+
+        /// When to apply the stop command.
+        ///
+        /// Required.
+        2: when fuchsia.media2.RealOrStreamTime;
+    }) -> (table {
+        /// The system time when the producer or consumer was actually stopped.
+        ///
+        /// Required.
+        1: system_time zx.Time;
+
+        /// The reference time when the producer or consumer was actually stopped.
+        ///
+        /// Required.
+        2: reference_time zx.Time;
+
+        /// The stream time at which the producer or consumer was actually stopped.
+        ///
+        /// Required.
+        3: stream_time zx.Duration;
+
+        /// The packet timestamp that corresponds to `stream_time`.
+        ///
+        /// Required.
+        4: packet_timestamp int64;
+    }) error StopError;
+
+    /// Cancels the previously-received `Start` or `Stop` request if it is still
+    /// pending. Cancel requests race with the pending operations they are
+    /// intended to cancel. The response to the request to be canceled indicates
+    /// the outcome of the race. In typical usage, a `CancelStartOrStop` request
+    /// should be followed in short order by a `Stop` or `Start` request so that
+    /// the state of the service is known.
+    strict CancelStartOrStop(table {
+        /// ID of the consumer or producer node.
+        ///
+        /// Required.
+        1: node_id NodeId;
+    }) -> () error CancelStartOrStopError;
+
+    /// Reports a producer's lead time. In output pipelines, a producer's lead
+    /// time defines how early an audio frame must be received in order for that
+    /// frame to be presented on time. If a client wishes to present an audio
+    /// frame at time T, that frame must be delivered to this producer by time
+    /// `T - LeadTime`.
+    strict BindProducerLeadTimeWatcher(resource table {
+        /// ID of a node that was created with CreateProducer. The producer must
+        /// have `direction == OUTPUT`.
+        1: id NodeId;
+
+        /// Channel to serve updates.
+        2: server_end server_end:fuchsia.audio.DelayWatcher;
+    }) -> () error BindProducerLeadTimeWatcherError;
+};
+
+/// Type of errors returned by [`CreateGraph`].
+type CreateGraphError = flexible enum {
+    /// The provided `server_end:Graph` was invalid.
+    INVALID_GRAPH_CHANNEL = 1;
+};
+
+/// Type of errors returned by CreateNode methods.
+type CreateNodeError = flexible enum {
+    /// A required field was not provided.
+    MISSING_REQUIRED_FIELD = 1;
+
+    /// A flexible field had an unsupported option. This can happen when a
+    /// client built with API version X+1 talks to a server built with API
+    /// version X.
+    UNSUPPORTED_OPTION = 2;
+
+    /// A parameter had an invalid value.
+    INVALID_PARAMETER = 3;
+};
+
+/// Type of errors returned by [`DeleteNode`].
+type DeleteNodeError = flexible enum {
+    /// The given `id` is invalid.
+    DOES_NOT_EXIST = 1;
+};
+
+/// Type of errors returned by [`CreateEdge`].
+type CreateEdgeError = flexible enum {
+    /// The given `dest_id` is invalid.
+    INVALID_DEST_ID = 1;
+
+    /// The destination does not support an additional source.
+    DEST_NODE_HAS_TOO_MANY_INCOMING_EDGES = 2;
+
+    /// The given `source_id` is invalid.
+    INVALID_SOURCE_ID = 3;
+
+    /// The source does not support an additional destination.
+    SOURCE_NODE_HAS_TOO_MANY_OUTGOING_EDGES = 4;
+
+    /// The source's format is not compatible with the dest.
+    INCOMPATIBLE_FORMATS = 5;
+
+    /// The source and dest are already connected.
+    ALREADY_CONNECTED = 6;
+
+    /// This edge would create a cycle.
+    CYCLE = 7;
+
+    /// The source node has PipelineDirection INPUT and the destination node has
+    /// PipelineDirection OUTPUT.
+    OUTPUT_PIPELINE_CANNOT_READ_FROM_INPUT_PIPELINE = 8;
+
+    /// A flexible field had an unsupported option. This can happen when a
+    /// client built with API version X+1 talks to a server built with API
+    /// version X.
+    UNSUPPORTED_OPTION = 9;
+
+    /// A gain control in the given `gain_controls` is invalid.
+    INVALID_GAIN_CONTROL = 10;
+};
+
+/// Type of errors returned by [`DeleteEdge`].
+type DeleteEdgeError = flexible enum {
+    /// The given `dest_id` is invalid.
+    INVALID_DEST_ID = 1;
+
+    /// The given `source_id` is invalid.
+    INVALID_SOURCE_ID = 2;
+
+    /// The edge does not exist.
+    EDGE_NOT_FOUND = 3;
+};
+
+/// Type of errors returned by [`CreateThread`].
+type CreateThreadError = flexible enum {
+    /// A required field was not provided.
+    MISSING_REQUIRED_FIELD = 1;
+
+    /// A parameter had an invalid value.
+    INVALID_PARAMETER = 2;
+};
+
+/// Type of errors returned by [`DeleteThread`].
+type DeleteThreadError = flexible enum {
+    /// The given `id` is invalid.
+    INVALID_ID = 1;
+
+    /// There are still Consumer nodes assigned to this thread. These Consumers
+    /// must be deleted before the Thread can be deleted.
+    STILL_IN_USE = 2;
+};
+
+/// Type of errors returned by [`CreateGainControl`].
+type CreateGainControlError = flexible enum {
+    /// A required field was not provided.
+    MISSING_REQUIRED_FIELD = 1;
+
+    /// A parameter had an invalid value.
+    INVALID_PARAMETER = 2;
+};
+
+/// Type of errors returned by [`DeleteGainControl`].
+type DeleteGainControlError = flexible enum {
+    /// The given `id` is invalid.
+    INVALID_ID = 1;
+
+    /// There are still edges using this GainControl. These edges must be deleted
+    /// before the GainControl can be deleted.
+    STILL_IN_USE = 2;
+};
+
+/// Type of errors returned by [`Start`].
+type StartError = flexible enum {
+    /// A required field was not provided.
+    MISSING_REQUIRED_FIELD = 1;
+
+    /// A parameter had an invalid value.
+    INVALID_PARAMETER = 2;
+
+    /// A flexible field had an unsupported option. This can happen when a
+    /// client built with API version X+1 talks to a server built with API
+    /// version X.
+    UNSUPPORTED_OPTION = 3;
+
+    /// Request is canceled.
+    CANCELED = 4;
+};
+
+/// Type of errors returned by [`Stop`].
+type StopError = flexible enum {
+    /// A required field was not provided.
+    MISSING_REQUIRED_FIELD = 1;
+
+    /// A parameter had an invalid value.
+    INVALID_PARAMETER = 2;
+
+    /// A flexible field had an unsupported option. This can happen when a
+    /// client built with API version X+1 talks to a server built with API
+    /// version X.
+    UNSUPPORTED_OPTION = 3;
+
+    /// Request is canceled.
+    CANCELED = 4;
+
+    /// The stream is already stopped.
+    ALREADY_STOPPED = 5;
+};
+
+/// Type of errors returned by [`CancelStartOrStop`]
+type CancelStartOrStopError = flexible enum {
+    /// A required field was not provided.
+    MISSING_REQUIRED_FIELD = 1;
+
+    /// The given `node_id` does not refer to a producer or a consumer.
+    INVALID_ID = 2;
+};
+
+/// Type of errors returned by [`BindProducerLeadTimeWatcher`].
+type BindProducerLeadTimeWatcherError = flexible enum {
+    /// A required field was not provided.
+    MISSING_REQUIRED_FIELD = 1;
+
+    /// The given `id` does not refer to a producer in an OUTPUT pipeline.
+    INVALID_ID = 2;
+};

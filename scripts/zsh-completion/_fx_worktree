@@ -1,0 +1,113 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Helper function to generate filtered lists of worktree names for completion.
+# Supported filters:
+#   - physical_free:   Only physical worktree slots that are not currently leased.
+#   - physical_leased: Only physical worktree slots that are currently leased.
+#   - physical_all:    All physical worktree slots.
+#   - leased:          Only leased task names (symlinks).
+#   - all:             Both physical worktree slots and leased task names (symlinks).
+
+__fx_worktree_names_filtered() {
+  local filter=$1
+  local fdir=$fuchsia_dir
+  if [[ -z "$fdir" ]]; then
+    # Fallback to resolve the Fuchsia source tree root if not defined.
+    local parent="$(pwd)"
+    while [[ ! -f "${parent}/.fx-root" ]]; do
+      if [[ "$parent" == "/" ]]; then
+        break
+      fi
+      parent="$(dirname "${parent}")"
+    done
+    if [[ -f "${parent}/.fx-root" ]]; then
+      fdir="$parent"
+    fi
+  fi
+
+  if [[ -n "$fdir" ]]; then
+    local -a matches
+    matches=( $( "${fdir}/scripts/fuchsia-vendored-python" "${fdir}/tools/devshell/worktree/main.py" _complete "$filter" 2>/dev/null ) )
+    if [[ ${#matches} -gt 0 ]]; then
+      compadd -- "${matches[@]}"
+    fi
+  fi
+
+}
+
+# Define the top-level subcommands for 'fx worktree'.
+local -a subcommands
+subcommands=(
+  'pool:Administrative commands for provisioning and maintaining physical checkouts'
+  'locate:Print the absolute path to a worktree directory'
+  'list:List all leased worktrees'
+  'add:Add a leased worktree checkout for development'
+  'remove:Remove a leased worktree and return it to the pool'
+)
+
+# Parse command-line arguments. State transitions allow nested completions.
+_arguments \
+  '1:subcommand:->subcommand' \
+  '*::args:->args'
+
+case $state in
+  subcommand)
+    _describe -t subcommands 'subcommand' subcommands
+    ;;
+  args)
+    # Complete arguments for the subcommand. Since Zsh shifts the $words array,
+    # $words[1] now refers to the subcommand.
+    local subcmd=$words[1]
+    case $subcmd in
+      pool)
+        local -a pool_subcommands
+        pool_subcommands=(
+          'list:List all physical worktrees in the pool'
+          'add:Add a new physical worktree checkout to the pool'
+          'remove:Remove a physical worktree from the pool'
+        )
+        _arguments \
+          '1:pool_subcommand:->pool_subcommand' \
+          '*::pool_args:->pool_args'
+
+        case $state in
+          pool_subcommand)
+            _describe -t pool_subcommands 'pool subcommand' pool_subcommands
+            ;;
+          pool_args)
+            local pool_subcmd=$words[1]
+            case $pool_subcmd in
+              add)
+                _arguments \
+                  '--set[Run fx set with these arguments]:args: ' \
+                  '1:name: '
+                ;;
+              remove)
+                _arguments \
+                  '--force[Force removal]' \
+                  '1:worktree: __fx_worktree_names_filtered physical_all'
+                ;;
+            esac
+            ;;
+        esac
+        ;;
+      locate)
+        # locate accepts either leased task names (symlinks) or physical slot names.
+        _arguments '1:worktree: __fx_worktree_names_filtered all'
+        ;;
+      add)
+        _arguments \
+          '--sync[Sync after adding]' \
+          '--pool-name[Specific pool slot to allocate]:pool_name: __fx_worktree_names_filtered physical_free' \
+          '--json[Output JSON]' \
+          '1:name: '
+        ;;
+      remove)
+        # remove accepts only leased task names (symlinks).
+        _arguments '1:worktree: __fx_worktree_names_filtered leased'
+        ;;
+    esac
+    ;;
+esac

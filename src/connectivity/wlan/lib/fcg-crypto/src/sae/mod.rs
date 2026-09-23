@@ -1,0 +1,882 @@
+// Copyright 2026 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+mod frame;
+mod state;
+
+use crate::boringssl::EcGroupId;
+use crate::ecc;
+use crate::fcg::FiniteCyclicGroup;
+use crate::hmac_utils::{HmacUtils, HmacUtilsImpl};
+
+use anyhow::{Error, bail};
+use fidl_fuchsia_wlan_ieee80211 as fidl_ieee80211;
+pub use frame::{AntiCloggingTokenMsg, CommitMsg, ConfirmMsg};
+use ieee80211::{MacAddr, Ssid};
+use log::warn;
+use mundane::hash::Sha256;
+use num::FromPrimitive;
+use wlan_common::ie::rsn::akm::{self, Akm};
+
+/// Maximum number of incorrect frames sent before SAE fails.
+const MAX_RETRIES_PER_EXCHANGE: u16 = 3;
+
+/// A shared key computed by an SAE handshake.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Key {
+    pub pmk: Vec<u8>,
+    pub pmkid: Vec<u8>,
+}
+
+/// IEEE Std 802.11-2020 9.4.2.241
+/// Method used to generate the PWE from a password.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum PweMethod {
+    /// IEEE Std 802.11-2020, 12.4.4.2.2/12.4.4.3.2
+    /// Generate the PWE using the looping hunt-and-peck method.
+    Loop = 0,
+
+    /// IEEE Std 802.11-2020, 12.4.4.2.3/12.4.4.3.3
+    /// Generate the PWE using the direct hashing method, hash-to-curve or hash-to-element.
+    Direct = 1,
+}
+
+/// Types of timeout that are used by SAE handshakes. Duration and scheduling of these timeouts
+/// is left to the user of this library.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Timeout {
+    /// Timeout before the most recent message(s) should be resent.
+    Retransmission,
+    /// Timeout before the PMK produced by a successful handshake is considered invalid.
+    KeyExpiration,
+}
+
+#[derive(Debug)]
+pub enum RejectReason {
+    /// We experienced a failure that was unrelated to data received from the peer. This likely
+    /// means we are not in a good state.
+    InternalError(Error),
+    /// Data received from the peer failed validation, and we cannot generate a PMK.
+    AuthFailed,
+    /// The peer has failed to respond or sent incorrect responses too many times.
+    TooManyRetries,
+    /// The SAE PMKSA has expired, reauthenticate.
+    KeyExpiration,
+}
+
+impl From<Error> for RejectReason {
+    fn from(e: Error) -> Self {
+        Self::InternalError(e)
+    }
+}
+
+#[derive(Debug)]
+pub struct AuthFrameRx<'a> {
+    pub seq: u16,
+    pub status_code: fidl_ieee80211::StatusCode,
+    pub body: &'a [u8],
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuthFrameTx {
+    pub seq: u16,
+    pub status_code: fidl_ieee80211::StatusCode,
+    pub body: Vec<u8>,
+}
+
+/// An update generated to progress an SAE handshake. These updates should generally be converted
+/// into a frame and sent to the SAE peer.
+#[derive(Debug)]
+pub enum SaeUpdate {
+    /// Send an auth frame to the peer.
+    SendFrame(AuthFrameTx),
+    /// Indicates the handshake is complete. The handshake should *not* be deleted at this point.
+    Success(Key),
+    /// Indicates that the handshake has failed and must be aborted or restarted.
+    Reject(RejectReason),
+    /// Request the user of the library to set or reset a timeout. If this timeout expires, it
+    /// should be passed to SaeHandshake::handle_timeout.
+    ResetTimeout(Timeout),
+    /// Request the user of the library to cancel a timeout that was previously set.
+    CancelTimeout(Timeout),
+}
+
+pub type SaeUpdateSink = Vec<SaeUpdate>;
+
+/// IEEE 802.11-2016 12.4: Simultaneous Authentication of Equals (SAE)
+///
+/// An SAE handshake with a peer is a symmetric handshake that may be used in place of open
+/// authentication as the AKM. A full handshake consists of both peers sending a Commit and Confirm
+/// frame, at which point they have both derived a shared key that is unique to those peers and that
+/// session.
+///
+/// Structs implementing this trait are responsible for handling both a successful SAE handshake,
+/// various failure modes, and edge cases such as retries and timeouts.
+///
+/// None of the functions in this trait return errors. Instead, non-fatal errors are logged, and
+/// fatal errors push an SaeUpdate::Reject to the update sink. Once an SaeUpdate::Reject is pushed,
+/// all further operations are no-ops.
+pub trait SaeHandshake: Send {
+    /// Initiate SAE by sending the first commit message. If the peer STA sends the first commit
+    /// message, handle_commit should be called first and initiate_sae should never be called.
+    fn initiate_sae(&mut self, sink: &mut SaeUpdateSink);
+
+    fn handle_commit(&mut self, sink: &mut SaeUpdateSink, commit_msg: &CommitMsg<'_>);
+    fn handle_confirm(&mut self, sink: &mut SaeUpdateSink, confirm_msg: &ConfirmMsg<'_>);
+    fn handle_anti_clogging_token(
+        &mut self,
+        sink: &mut SaeUpdateSink,
+        act_msg: &AntiCloggingTokenMsg<'_>,
+    );
+    fn handle_timeout(&mut self, sink: &mut SaeUpdateSink, timeout: Timeout);
+
+    fn handle_frame(&mut self, sink: &mut SaeUpdateSink, frame: &AuthFrameRx<'_>) {
+        match frame::parse(frame) {
+            Ok(parse) => match parse {
+                frame::ParseSuccess::Commit(commit) => self.handle_commit(sink, &commit),
+                frame::ParseSuccess::Confirm(confirm) => self.handle_confirm(sink, &confirm),
+                frame::ParseSuccess::AntiCloggingToken(act_msg) => {
+                    self.handle_anti_clogging_token(sink, &act_msg)
+                }
+            },
+            Err(e) => warn!("Failed to parse SAE auth frame: {}", e),
+        }
+    }
+}
+
+/// Creates a new SAE handshake for the given group ID and authentication parameters.
+pub fn new_sae_handshake(
+    group_id: u16,
+    akm: Akm,
+    pwe_method: PweMethod,
+    ssid: Ssid,
+    password: Vec<u8>,
+    password_id: Option<Vec<u8>>,
+    mac: MacAddr,
+    peer_mac: MacAddr,
+) -> Result<Box<dyn SaeHandshake>, Error> {
+    match akm.suite_type {
+        akm::SAE | akm::FT_SAE => (),
+        _ => bail!("Cannot construct SAE handshake with AKM {:?}", akm),
+    };
+    let (hmac, group_constructor) = match EcGroupId::from_u16(group_id) {
+        Some(EcGroupId::P256) => {
+            // IEEE 802.11-2020 12.4.2
+            // Group 19 has a 256-bit prime length, thus we use SHA256.
+            let hmac = Box::new(HmacUtilsImpl::<Sha256>::new());
+            let group_constructor = Box::new(|| {
+                ecc::Group::new(EcGroupId::P256).map(|group| {
+                    Box::new(group)
+                        as Box<
+                            dyn FiniteCyclicGroup<
+                                Element = <ecc::Group as FiniteCyclicGroup>::Element,
+                            >,
+                        >
+                })
+            });
+            (hmac, group_constructor)
+        }
+        _ => bail!("Unsupported SAE group id: {}", group_id),
+    };
+    Ok(Box::new(state::SaeHandshakeImpl::new(
+        group_constructor,
+        SaeParameters {
+            hmac,
+            pwe_method,
+            ssid,
+            password,
+            password_id,
+            sta_a_mac: mac,
+            sta_b_mac: peer_mac,
+        },
+    )?))
+}
+
+/// Creates a new SAE handshake in response to a first message from a peer, using the FCG indicated
+/// by the peer if possible. In a successful handshake, this will immediately push a Commit and
+/// Confirm to the given update sink.
+pub fn join_sae_handshake(
+    sink: &mut SaeUpdateSink,
+    first_frame: &AuthFrameRx<'_>,
+    akm: Akm,
+    ssid: Ssid,
+    password: Vec<u8>,
+    mac: MacAddr,
+    peer_mac: MacAddr,
+) -> Result<Box<dyn SaeHandshake>, Error> {
+    let parsed_frame = frame::parse(first_frame)?;
+    // IEEE 802.11-2020 12.4.4.2.3
+    // The first frame of the exchange indicates the use of hash to element via
+    // a special status code.
+    let pwe_method = match first_frame.status_code {
+        fidl_ieee80211::StatusCode::Success => PweMethod::Loop,
+        fidl_ieee80211::StatusCode::SaeHashToElement => PweMethod::Direct,
+        other => bail!("Unexpected status code {:?} in first frame", other),
+    };
+    match parsed_frame {
+        frame::ParseSuccess::Commit(commit) => {
+            let mut handshake = new_sae_handshake(
+                commit.group_id,
+                akm,
+                pwe_method,
+                ssid,
+                password,
+                None,
+                mac,
+                peer_mac,
+            )?;
+            handshake.handle_commit(sink, &commit);
+            Ok(handshake)
+        }
+        _ => bail!("Recieved incorrect first frame of SAE handshake"),
+    }
+}
+
+pub(crate) struct SaeParameters {
+    pub hmac: Box<dyn HmacUtils + Send>,
+    pub pwe_method: PweMethod,
+    // IEEE Std 802.11-2020 12.4.4.2.3/12.4.4.3.3: The SSID is needed to generate a password
+    // seed.
+    pub ssid: Ssid,
+    // IEEE Std 802.11-2020 12.4.3
+    pub password: Vec<u8>,
+    pub password_id: Option<Vec<u8>>,
+    // IEEE Std 802.11-2016 12.4.4.2.2: The MacAddrs are needed to generate a password seed.
+    pub sta_a_mac: MacAddr,
+    pub sta_b_mac: MacAddr,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(unused_variables)] // Allow unused variables in tests.
+    use super::*;
+    use assert_matches::assert_matches;
+    use std::convert::TryFrom;
+    use std::sync::LazyLock;
+    use test_case::test_case;
+    use wlan_common::ie::rsn::akm::{AKM_PSK, AKM_SAE};
+
+    // IEEE 802.11-2016 Annex J.10 SAE test vector
+    const TEST_SSID: &'static str = "SSID not in 802.11-2016";
+    const TEST_PWD: &'static str = "thisisreallysecret";
+
+    pub(crate) static TEST_STA_A: LazyLock<MacAddr> =
+        LazyLock::new(|| MacAddr::from([0x7b, 0x88, 0x56, 0x20, 0x2d, 0x8d]));
+    pub(crate) static TEST_STA_B: LazyLock<MacAddr> =
+        LazyLock::new(|| MacAddr::from([0xe2, 0x47, 0x1c, 0x0a, 0x5a, 0xcb]));
+
+    #[test]
+    fn bad_akm() {
+        let akm = AKM_PSK;
+        let res = new_sae_handshake(
+            19,
+            akm,
+            PweMethod::Loop,
+            Ssid::try_from(TEST_SSID).unwrap(),
+            Vec::from(TEST_PWD),
+            None, // Not required for PweMethod::Loop
+            *TEST_STA_A,
+            *TEST_STA_B,
+        );
+        assert!(res.is_err());
+        assert!(
+            format!("{}", res.err().unwrap())
+                .contains("Cannot construct SAE handshake with AKM 00-0F-AC:2")
+        );
+    }
+
+    #[test]
+    fn bad_fcg() {
+        let akm = AKM_SAE;
+        let res = new_sae_handshake(
+            200,
+            akm,
+            PweMethod::Loop,
+            Ssid::try_from(TEST_SSID).unwrap(),
+            Vec::from(TEST_PWD),
+            None, // Not required for PweMethod::Loop
+            *TEST_STA_A,
+            *TEST_STA_B,
+        );
+        assert!(res.is_err());
+        assert!(format!("{}", res.err().unwrap()).contains("Unsupported SAE group id: 200"));
+    }
+
+    struct TestHandshake {
+        sta1: Box<dyn SaeHandshake>,
+        sta2: Box<dyn SaeHandshake>,
+    }
+
+    // Helper structs for differentiating Commit/Confirm messages once they've been converted into
+    // generic auth frames.
+    #[derive(Clone, Eq, PartialEq, Debug)]
+    struct CommitTx(AuthFrameTx);
+    #[derive(Clone, Eq, PartialEq, Debug)]
+    struct ConfirmTx(AuthFrameTx);
+    struct CommitRx<'a>(AuthFrameRx<'a>);
+    struct ConfirmRx<'a>(AuthFrameRx<'a>);
+
+    fn to_rx(frame: &AuthFrameTx) -> AuthFrameRx<'_> {
+        AuthFrameRx { seq: frame.seq, status_code: frame.status_code, body: &frame.body[..] }
+    }
+
+    impl CommitTx {
+        fn to_rx(&self) -> CommitRx<'_> {
+            CommitRx(to_rx(&self.0))
+        }
+    }
+
+    impl ConfirmTx {
+        fn to_rx(&self) -> ConfirmRx<'_> {
+            ConfirmRx(to_rx(&self.0))
+        }
+    }
+
+    impl<'a> CommitRx<'a> {
+        fn msg(&'a self) -> CommitMsg<'a> {
+            assert_matches!(frame::parse(&self.0),
+                Ok(frame::ParseSuccess::Commit(commit)) => commit)
+        }
+    }
+
+    impl<'a> ConfirmRx<'a> {
+        fn msg(&'a self) -> ConfirmMsg<'a> {
+            assert_matches!(frame::parse(&self.0),
+                Ok(frame::ParseSuccess::Confirm(confirm)) => confirm)
+        }
+    }
+
+    fn expect_commit(sink: &mut Vec<SaeUpdate>) -> CommitTx {
+        let commit = assert_matches!(sink.remove(0), SaeUpdate::SendFrame(frame) => frame);
+        assert_matches!(frame::parse(&to_rx(&commit)), Ok(frame::ParseSuccess::Commit(msg)));
+        CommitTx(commit)
+    }
+
+    fn expect_confirm(sink: &mut Vec<SaeUpdate>) -> ConfirmTx {
+        let confirm = assert_matches!(sink.remove(0), SaeUpdate::SendFrame(frame) => frame);
+        assert_matches!(frame::parse(&to_rx(&confirm)), Ok(frame::ParseSuccess::Confirm(msg)));
+        ConfirmTx(confirm)
+    }
+
+    fn expect_reset_timeout(sink: &mut Vec<SaeUpdate>, timeout: Timeout) {
+        assert_matches!(sink.remove(0), SaeUpdate::ResetTimeout(timeout));
+    }
+
+    fn expect_cancel_timeout(sink: &mut Vec<SaeUpdate>, timeout: Timeout) {
+        assert_matches!(sink.remove(0), SaeUpdate::CancelTimeout(timeout));
+    }
+
+    struct TestHandshakeConfig {
+        pwe_method: PweMethod,
+    }
+
+    impl TestHandshakeConfig {
+        fn direct() -> Self {
+            Self { pwe_method: PweMethod::Direct }
+        }
+
+        fn looping() -> Self {
+            Self { pwe_method: PweMethod::Loop }
+        }
+    }
+
+    // Test helper to advance through successful steps of an SAE handshake.
+    impl TestHandshake {
+        fn new(cfg: TestHandshakeConfig) -> Self {
+            let akm = AKM_SAE;
+            let sta1 = new_sae_handshake(
+                19,
+                akm.clone(),
+                cfg.pwe_method,
+                Ssid::try_from(TEST_SSID).unwrap(),
+                Vec::from(TEST_PWD),
+                None, // Not required for PweMethod::Loop
+                *TEST_STA_A,
+                *TEST_STA_B,
+            )
+            .unwrap();
+            let sta2 = new_sae_handshake(
+                19,
+                akm,
+                cfg.pwe_method,
+                Ssid::try_from(TEST_SSID).unwrap(),
+                Vec::from(TEST_PWD),
+                None, // Not required for PweMethod::Loop
+                *TEST_STA_B,
+                *TEST_STA_A,
+            )
+            .unwrap();
+            Self { sta1, sta2 }
+        }
+
+        fn sta1_init(&mut self) -> CommitTx {
+            let mut sink = vec![];
+            self.sta1.initiate_sae(&mut sink);
+            assert_eq!(sink.len(), 2);
+            let commit = expect_commit(&mut sink);
+            expect_reset_timeout(&mut sink, Timeout::Retransmission);
+            commit
+        }
+
+        fn sta2_handle_commit(&mut self, commit1: CommitRx<'_>) -> (CommitTx, ConfirmTx) {
+            let mut sink = vec![];
+            self.sta2.handle_commit(&mut sink, &commit1.msg());
+            assert_eq!(sink.len(), 3);
+            let commit2 = expect_commit(&mut sink);
+            let confirm2 = expect_confirm(&mut sink);
+            expect_reset_timeout(&mut sink, Timeout::Retransmission);
+            (commit2, confirm2)
+        }
+
+        fn sta1_handle_commit(&mut self, commit2: CommitRx<'_>) -> ConfirmTx {
+            let mut sink = vec![];
+            self.sta1.handle_commit(&mut sink, &commit2.msg());
+            assert_eq!(sink.len(), 2);
+            let confirm1 = expect_confirm(&mut sink);
+            expect_reset_timeout(&mut sink, Timeout::Retransmission);
+            confirm1
+        }
+
+        fn sta1_handle_confirm(&mut self, confirm2: ConfirmRx<'_>) -> Key {
+            Self::__internal_handle_confirm(&mut self.sta1, confirm2.msg())
+        }
+
+        fn sta2_handle_confirm(&mut self, confirm1: ConfirmRx<'_>) -> Key {
+            Self::__internal_handle_confirm(&mut self.sta2, confirm1.msg())
+        }
+
+        fn __internal_handle_confirm(
+            sta: &mut Box<dyn SaeHandshake>,
+            confirm: ConfirmMsg<'_>,
+        ) -> Key {
+            let mut sink = vec![];
+            sta.handle_confirm(&mut sink, &confirm);
+            assert_eq!(sink.len(), 3);
+            expect_cancel_timeout(&mut sink, Timeout::Retransmission);
+            expect_reset_timeout(&mut sink, Timeout::KeyExpiration);
+            assert_matches!(sink.remove(0), SaeUpdate::Success(key) => key)
+        }
+    }
+
+    #[test_case(TestHandshakeConfig::looping(); "looping")]
+    #[test_case(TestHandshakeConfig::direct(); "direct")]
+    fn sae_handshake_success(cfg: TestHandshakeConfig) {
+        let mut handshake = TestHandshake::new(cfg);
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.to_rx());
+        let confirm1 = handshake.sta1_handle_commit(commit2.to_rx());
+        let key1 = handshake.sta1_handle_confirm(confirm2.to_rx());
+        let key2 = handshake.sta2_handle_confirm(confirm1.to_rx());
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn password_mismatch() {
+        let akm = AKM_SAE;
+        let sta1 = new_sae_handshake(
+            19,
+            akm.clone(),
+            PweMethod::Loop,
+            Ssid::try_from(TEST_SSID).unwrap(),
+            Vec::from(TEST_PWD),
+            None, // Not required for PweMethod::Loop
+            *TEST_STA_A,
+            *TEST_STA_B,
+        )
+        .unwrap();
+        let sta2 = new_sae_handshake(
+            19,
+            akm,
+            PweMethod::Loop,
+            Ssid::try_from(TEST_SSID).unwrap(),
+            Vec::from("other_pwd"),
+            None, // Not required for PweMethod::Loop
+            *TEST_STA_B,
+            *TEST_STA_A,
+        )
+        .unwrap();
+        let mut handshake = TestHandshake { sta1, sta2 };
+
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.to_rx());
+        let confirm1 = handshake.sta1_handle_commit(commit2.to_rx());
+
+        let mut sink1 = vec![];
+        handshake.sta1.handle_confirm(&mut sink1, &confirm2.to_rx().msg());
+        let mut sink2 = vec![];
+        handshake.sta2.handle_confirm(&mut sink2, &confirm1.to_rx().msg());
+        // The confirm is dropped both ways.
+        assert_eq!(sink1.len(), 0);
+        assert_eq!(sink2.len(), 0);
+    }
+
+    #[test]
+    fn retry_commit_on_unexpected_confirm() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.clone().to_rx());
+        let mut sink = vec![];
+        handshake.sta1.handle_confirm(&mut sink, &confirm2.to_rx().msg());
+        assert_eq!(sink.len(), 2);
+        let commit1_retry = expect_commit(&mut sink);
+        assert_matches!(sink.remove(0), SaeUpdate::ResetTimeout(Timeout::Retransmission));
+
+        // We retransmit the same commit in response to a faulty confirm.
+        assert_eq!(commit1, commit1_retry);
+    }
+
+    #[test]
+    fn retry_commit_on_anti_clogging_token() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+
+        let commit1 = handshake.sta1_init();
+
+        // Simulate an anti-clogging token sent to sta1.
+        let mut sink = vec![];
+        let anti_clogging_token = "anticloggingtokentext";
+        let act_msg = AntiCloggingTokenMsg {
+            group_id: 19,
+            anti_clogging_token: anti_clogging_token.as_bytes(),
+        };
+        handshake.sta1.handle_anti_clogging_token(&mut sink, &act_msg);
+        let commit1_retry = expect_commit(&mut sink);
+        assert_eq!(
+            commit1_retry.clone().to_rx().msg().anti_clogging_token,
+            Some(anti_clogging_token.as_bytes())
+        );
+
+        // Finish the handshake.
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1_retry.to_rx());
+        let confirm1 = handshake.sta1_handle_commit(commit2.to_rx());
+        let key1 = handshake.sta1_handle_confirm(confirm2.to_rx());
+        let key2 = handshake.sta2_handle_confirm(confirm1.to_rx());
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn ignore_wrong_confirm() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.to_rx());
+        let confirm1 = handshake.sta1_handle_commit(commit2.to_rx());
+
+        let mut sink = vec![];
+        let confirm2_wrong = ConfirmTx(frame::write_confirm(1, &[1; 32][..]));
+        handshake.sta1.handle_confirm(&mut sink, &confirm2_wrong.to_rx().msg());
+        assert_eq!(sink.len(), 0); // Ignored.
+
+        // STA1 should still be able to handle a subsequent correct confirm.
+        handshake.sta1_handle_confirm(confirm2.to_rx());
+    }
+
+    #[test]
+    fn handle_resent_commit() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.clone().to_rx());
+        let (commit2_retry, confirm2_retry) = handshake.sta2_handle_commit(commit1.to_rx());
+
+        // The resent commit message should be unchanged, but the resent confirm should increment
+        // sc and produce a different value.
+        assert_eq!(commit2, commit2_retry);
+        assert_eq!(confirm2.to_rx().msg().send_confirm, 1);
+        assert_eq!(confirm2_retry.to_rx().msg().send_confirm, 2);
+        assert!(confirm2.to_rx().msg().confirm != confirm2_retry.to_rx().msg().confirm);
+
+        // Now complete the handshake.
+        let confirm1 = handshake.sta1_handle_commit(commit2_retry.to_rx());
+        let key1 = handshake.sta1_handle_confirm(confirm2_retry.to_rx());
+        let key2 = handshake.sta2_handle_confirm(confirm1.to_rx());
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn completed_handshake_handles_resent_confirm() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.clone().to_rx());
+        let (commit2_retry, confirm2_retry) = handshake.sta2_handle_commit(commit1.to_rx());
+        // Send STA1 the second confirm message first.
+        let confirm1 = handshake.sta1_handle_commit(commit2.to_rx());
+        let key1 = handshake.sta1_handle_confirm(confirm2.clone().to_rx());
+
+        // STA1 should respond to the second confirm with its own confirm.
+        let mut sink = vec![];
+        handshake.sta1.handle_confirm(&mut sink, &confirm2_retry.to_rx().msg());
+        assert_eq!(sink.len(), 1);
+        let confirm1_retry = expect_confirm(&mut sink);
+        assert!(confirm1.to_rx().msg().confirm != confirm1_retry.to_rx().msg().confirm);
+        assert_eq!(confirm1_retry.to_rx().msg().send_confirm, u16::MAX);
+
+        // STA2 should complete the handshake with the resent confirm.
+        let key2 = handshake.sta2_handle_confirm(confirm1_retry.to_rx());
+        assert_eq!(key1, key2);
+
+        // STA1 should silently drop either of our confirm frames now.
+        handshake.sta1.handle_confirm(&mut sink, &confirm2_retry.to_rx().msg());
+        assert!(sink.is_empty());
+        handshake.sta1.handle_confirm(&mut sink, &confirm2.to_rx().msg());
+        assert!(sink.is_empty());
+
+        // STA1 should also silently drop an incorrect confirm, even if send_confirm is incremented.
+        let confirm2_wrong = ConfirmMsg { send_confirm: 10, confirm: &[0xab; 32][..] };
+        handshake.sta1.handle_confirm(&mut sink, &confirm2_wrong);
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn completed_handshake_ignores_commit() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.to_rx());
+        handshake.sta1_handle_commit(commit2.to_rx());
+        handshake.sta1_handle_confirm(confirm2.clone().to_rx());
+
+        // STA1 has completed it's side of the handshake.
+        let mut sink = vec![];
+        handshake.sta1.handle_confirm(&mut sink, &confirm2.to_rx().msg());
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn bad_first_commit_rejects_auth() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1_wrong = CommitMsg {
+            group_id: 19,
+            scalar: &[0xab; 32][..],
+            element: &[0xcd; 64][..],
+            anti_clogging_token: None,
+        };
+
+        let mut sink = vec![];
+        handshake.sta1.handle_commit(&mut sink, &commit1_wrong);
+        assert_eq!(sink.len(), 1);
+        assert_matches!(sink.remove(0), SaeUpdate::Reject(RejectReason::AuthFailed));
+    }
+
+    #[test]
+    fn bad_second_commit_ignored() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+        let (_commit1, _confirm2) = handshake.sta2_handle_commit(commit1.to_rx());
+        let commit2_wrong = CommitMsg {
+            group_id: 19,
+            scalar: &[0xab; 32][..],
+            element: &[0xcd; 64][..],
+            anti_clogging_token: None,
+        };
+        let mut sink = vec![];
+        handshake.sta1.handle_commit(&mut sink, &commit2_wrong);
+        assert_eq!(sink.len(), 0);
+    }
+
+    #[test]
+    fn reflected_commit_discarded() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+
+        let mut sink = vec![];
+        handshake.sta1.handle_commit(&mut sink, &commit1.to_rx().msg());
+        assert_eq!(sink.len(), 1);
+        assert_matches!(sink.remove(0), SaeUpdate::ResetTimeout(Timeout::Retransmission));
+    }
+
+    #[test]
+    fn maximum_commit_retries() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.clone().to_rx());
+
+        // STA2 should allow MAX_RETRIES_PER_EXCHANGE retry operations before giving up.
+        for i in 0..MAX_RETRIES_PER_EXCHANGE {
+            let (commit2_retry, confirm2_retry) =
+                handshake.sta2_handle_commit(commit1.clone().to_rx());
+            assert_eq!(commit2, commit2_retry);
+            assert_eq!(confirm2_retry.to_rx().msg().send_confirm, i + 2);
+        }
+
+        // The last straw!
+        let mut sink = vec![];
+        handshake.sta2.handle_commit(&mut sink, &commit1.to_rx().msg());
+        assert_eq!(sink.len(), 1);
+        assert_matches!(sink.remove(0), SaeUpdate::Reject(RejectReason::TooManyRetries));
+    }
+
+    #[test]
+    fn completed_exchange_fails_after_retries() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.clone().to_rx());
+
+        // STA2 should allow MAX_RETRIES_PER_EXCHANGE retry operations before giving up. We subtract 1
+        // here for the reason explained in the note below.
+        for i in 0..(MAX_RETRIES_PER_EXCHANGE - 1) {
+            let (commit2_retry, confirm2_retry) =
+                handshake.sta2_handle_commit(commit1.clone().to_rx());
+            assert_eq!(commit2, commit2_retry);
+            assert_eq!(confirm2_retry.to_rx().msg().send_confirm, i + 2);
+        }
+
+        let mut sink = vec![];
+
+        // Generate 3 different confirm messages for our testing...
+        let confirm1_sc1 = handshake.sta1_handle_commit(commit2.clone().to_rx());
+        handshake.sta1.handle_commit(&mut sink, &commit2.to_rx().msg());
+        assert_eq!(sink.len(), 3);
+        sink.remove(0);
+        let confirm1_sc2 = expect_confirm(&mut sink);
+        sink.clear();
+        let confirm1_invalid = ConfirmMsg { send_confirm: 3, confirm: &[0xab; 32][..] };
+
+        // STA2 completes the handshake. However, one more indication that STA1 is misbehaving will
+        // immediately kill the authentication.
+        handshake.sta2_handle_confirm(confirm1_sc1.clone().to_rx());
+
+        // NOTE: We run all of the operations here two times. This is because of a quirk in the SAE
+        // state machine: while only certain operations *increment* sync, all invalid operations
+        // will *check* sync. We can test whether sync is being incremented by running twice to see
+        // if this pushes us over the MAX_RETRIES_PER_EXCHANGE threshold.
+
+        // STA2 ignores commits.
+        handshake.sta2.handle_commit(&mut sink, &commit1.to_rx().msg());
+        handshake.sta2.handle_commit(&mut sink, &commit1.to_rx().msg());
+        assert_eq!(sink.len(), 0);
+
+        // STA2 ignores invalid confirm.
+        handshake.sta2.handle_confirm(&mut sink, &confirm1_invalid);
+        handshake.sta2.handle_confirm(&mut sink, &confirm1_invalid);
+        assert_eq!(sink.len(), 0);
+
+        // STA2 ignores old confirm.
+        handshake.sta2.handle_confirm(&mut sink, &confirm1_sc1.to_rx().msg());
+        handshake.sta2.handle_confirm(&mut sink, &confirm1_sc1.to_rx().msg());
+        assert_eq!(sink.len(), 0);
+
+        // But another valid confirm increments sync!
+        handshake.sta2.handle_confirm(&mut sink, &confirm1_sc2.to_rx().msg());
+        assert_eq!(sink.len(), 1);
+        expect_confirm(&mut sink);
+        handshake.sta2.handle_confirm(&mut sink, &confirm1_sc2.to_rx().msg());
+        assert_eq!(sink.len(), 1);
+        assert_matches!(sink.remove(0), SaeUpdate::Reject(RejectReason::TooManyRetries));
+    }
+
+    #[test]
+    fn resend_commit_after_retransmission_timeout() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+
+        let mut sink = vec![];
+        handshake.sta1.handle_timeout(&mut sink, Timeout::Retransmission);
+        let commit1_retry = expect_commit(&mut sink);
+        expect_reset_timeout(&mut sink, Timeout::Retransmission);
+        assert_eq!(commit1, commit1_retry);
+    }
+
+    #[test]
+    fn resend_confirm_after_retransmission_timeout() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.clone().to_rx());
+
+        let mut sink = vec![];
+        handshake.sta2.handle_timeout(&mut sink, Timeout::Retransmission);
+        // On timeout we should only send commit and confirm.
+        let confirm2_retry = expect_confirm(&mut sink);
+        expect_reset_timeout(&mut sink, Timeout::Retransmission);
+        assert_eq!(
+            confirm2.to_rx().msg().send_confirm + 1,
+            confirm2_retry.to_rx().msg().send_confirm
+        );
+    }
+
+    #[test]
+    fn abort_commit_after_too_many_timeouts() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+
+        let mut sink = vec![];
+        for i in 0..MAX_RETRIES_PER_EXCHANGE {
+            handshake.sta1.handle_timeout(&mut sink, Timeout::Retransmission);
+            let commit1_retry = expect_commit(&mut sink);
+            expect_reset_timeout(&mut sink, Timeout::Retransmission);
+            assert_eq!(commit1, commit1_retry);
+        }
+
+        // This camel can't hold another straw!
+        handshake.sta1.handle_timeout(&mut sink, Timeout::Retransmission);
+        assert_eq!(sink.len(), 1);
+        assert_matches!(sink.remove(0), SaeUpdate::Reject(RejectReason::TooManyRetries));
+    }
+
+    #[test]
+    fn abort_confirm_after_too_many_timeouts() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.clone().to_rx());
+
+        let mut sink = vec![];
+        for i in 0..MAX_RETRIES_PER_EXCHANGE {
+            handshake.sta2.handle_timeout(&mut sink, Timeout::Retransmission);
+            // On timeout we should only send commit and confirm.
+            let confirm2_retry = expect_confirm(&mut sink);
+            expect_reset_timeout(&mut sink, Timeout::Retransmission);
+            assert_eq!(
+                confirm2.to_rx().msg().send_confirm + i + 1,
+                confirm2_retry.to_rx().msg().send_confirm
+            );
+        }
+
+        handshake.sta2.handle_timeout(&mut sink, Timeout::Retransmission);
+        assert_eq!(sink.len(), 1);
+        assert_matches!(sink.remove(0), SaeUpdate::Reject(RejectReason::TooManyRetries));
+    }
+
+    #[test]
+    fn ignore_unexpected_retransmit_timeout() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        let mut sink = vec![];
+        // Timeout::Retransmission is ignored while in New state.
+        handshake.sta1.handle_timeout(&mut sink, Timeout::Retransmission);
+        assert!(sink.is_empty());
+
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.to_rx());
+        let confirm1 = handshake.sta1_handle_commit(commit2.to_rx());
+        let key1 = handshake.sta1_handle_confirm(confirm2.to_rx());
+
+        // Timeout::Retransmission is ignored while in Accepted state.
+        handshake.sta1.handle_timeout(&mut sink, Timeout::Retransmission);
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn fail_on_early_key_expiration() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        handshake.sta1_init();
+
+        // Early key expiration indicates that something has gone very wrong, so we abort.
+        let mut sink = vec![];
+        handshake.sta1.handle_timeout(&mut sink, Timeout::KeyExpiration);
+        assert_eq!(sink.len(), 1);
+        assert_matches!(sink.remove(0), SaeUpdate::Reject(RejectReason::InternalError(_)));
+    }
+
+    #[test]
+    fn key_expiration_timeout() {
+        let mut handshake = TestHandshake::new(TestHandshakeConfig::looping());
+        // Timeout::KeyExpiration is only expected once our handshake has completed.
+        let commit1 = handshake.sta1_init();
+        let (commit2, confirm2) = handshake.sta2_handle_commit(commit1.to_rx());
+        let confirm1 = handshake.sta1_handle_commit(commit2.to_rx());
+        let key1 = handshake.sta1_handle_confirm(confirm2.to_rx());
+
+        let mut sink = vec![];
+        handshake.sta1.handle_timeout(&mut sink, Timeout::KeyExpiration);
+        assert_eq!(sink.len(), 1);
+        assert_matches!(sink.remove(0), SaeUpdate::Reject(RejectReason::KeyExpiration));
+    }
+}

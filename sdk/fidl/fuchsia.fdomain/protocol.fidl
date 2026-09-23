@@ -1,0 +1,193 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=27)
+library fuchsia.fdomain;
+
+using zx;
+
+/// A handle ID. This is the same size as an actual Zircon handle, and refers to
+/// one conceptually, but internally it is not actually a Zircon handle number.
+type HandleId = struct {
+    id uint32;
+};
+
+/// A new handle ID. The ID should be a handle ID that has not been used before
+/// in this session. The call this is passed to will presumably make a handle at
+/// this ID, and it can be used as a `HandleId` in subsequent calls.
+type NewHandleId = struct {
+    id uint32;
+};
+
+/// A handle, and the rights that handle is known to possess. This is meant to be
+/// a direct analogue to `zx_handle_info_t` as described in
+/// https://fuchsia.dev/reference/syscalls/channel_read_etc
+type HandleInfo = struct {
+    handle HandleId;
+    type zx.ObjType;
+    rights zx.Rights;
+};
+
+/// A return value indicating asynchronous IO has stopped, optionally with an error.
+type AioStopped = struct {
+    error Error:optional;
+};
+
+type Error = flexible union {
+    /// An error produced by interacting with the handle itself.
+    1: target_error zx.Status;
+
+    /// An invalid handle ID was given.
+    2: bad_handle_id struct {
+        id uint32;
+    };
+
+    /// We passed a `NewHandleId` that contained an ID with a 1 in the most
+    /// significant bit.
+    3: new_handle_id_out_of_range struct {
+        id uint32;
+    };
+
+    /// We passed a `NewHandleId` that collides with an already-allocated handle.
+    4: new_handle_id_reused struct {
+        id uint32;
+
+        /// Indicates this `NewHandleId` did not collide before the method was called,
+        /// but we passed the same `NewHandleId` to the method twice.
+        same_call bool;
+    };
+
+    /// The handle used is not of the right type for the operation requested.
+    5: wrong_handle_type struct {
+        expected zx.ObjType;
+        got zx.ObjType;
+    };
+
+    /// Occurs when we try to start streaming reading twice on the same handle,
+    /// or try to directly read from a handle which we are already
+    /// streaming reading from.
+    6: streaming_read_in_progress struct {};
+
+    /// We tried to stop streaming reading on a handle we weren't streaming reads
+    /// from to begin with.
+    7: no_read_in_progress struct {};
+
+    /// We tried to write a channel into itself.
+    8: wrote_to_self struct {};
+
+    /// We received a request to close or transfer a handle while we were waiting
+    /// to read from it.
+    9: closed_during_read struct {};
+
+    /// The flexible features of this protocol allowed the client to send us
+    /// signals that we didn't actually understand, and we couldn't proceed
+    /// safely without knowing what they were. The signals field should contain
+    /// only the signals that weren't understood.
+    10: signals_unknown struct {
+        signals zx.Signals;
+    };
+
+    /// The flexible features of this protocol allowed the client to send us
+    /// rights that we didn't actually understand, and we couldn't proceed safely
+    /// without knowing what they were. The rights field should contain only the
+    /// rights that weren't understood.
+    11: rights_unknown struct {
+        rights zx.Rights;
+    };
+
+    /// The client used a socket disposition that the FDomain did not recognize.
+    12: socket_disposition_unknown struct {
+        disposition SocketDisposition;
+    };
+
+    /// The client used a socket type that the FDomain did not recognize.
+    13: socket_type_unknown struct {
+        type SocketType;
+    };
+};
+
+/// A handle, paired with an operation to perform on that handle (move or
+/// duplicate).
+@strict_audit(bug="https://fxbug.dev/467127620", state="PENDING_REVIEW")
+type HandleOp = strict union {
+    1: move HandleId;
+    2: duplicate HandleId;
+};
+
+/// A handle disposition. Contains a handle to be written to a channel, as well
+/// as an operation to perform before writing.
+type HandleDisposition = struct {
+    handle HandleOp;
+    rights zx.Rights;
+};
+
+/// The FDomain control protocol.
+///
+/// This protocol is designed to be used over a network or other non-channel
+/// transport.
+@no_resource
+open protocol FDomain {
+    compose Channel;
+    compose Event;
+    compose EventPair;
+    compose Socket;
+    @available(added=HEAD)
+    compose Vmo;
+
+    /// Adds a new channel handle to this namespace which points to a
+    /// fuchsia.io.Directory. Can be used to "bootstrap" the FDomain.
+    flexible GetNamespace(struct {
+        new_handle NewHandleId;
+    }) -> () error Error;
+
+    /// Close one or more handles.
+    flexible Close(struct {
+        handles vector<HandleId>;
+    }) -> () error Error;
+
+    /// Duplicate a handle.
+    flexible Duplicate(struct {
+        handle HandleId;
+        new_handle NewHandleId;
+        rights zx.Rights;
+    }) -> () error Error;
+
+    /// Close a handle and replace it with a new one with possibly different
+    /// rights.
+    flexible Replace(struct {
+        handle HandleId;
+        new_handle NewHandleId;
+        rights zx.Rights;
+    }) -> () error Error;
+
+    /// Set or clear signals on a handle.
+    flexible Signal(struct {
+        handle HandleId;
+        set zx.Signals;
+        clear zx.Signals;
+    }) -> () error Error;
+
+    /// Set or clear signals on a handle's peer.
+    flexible SignalPeer(struct {
+        handle HandleId;
+        set zx.Signals;
+        clear zx.Signals;
+    }) -> () error Error;
+
+    /// Wait for signals from the given handle. Reply will be returned when one
+    /// of the given signals is asserted.
+    flexible WaitForSignals(struct {
+        handle HandleId;
+        signals zx.Signals;
+    }) -> (struct {
+        signals zx.Signals;
+    }) error Error;
+
+    /// Return the kernel object ID (koid) of the handle.
+    @available(added=30)
+    flexible GetKoid(struct {
+        handle HandleId;
+    }) -> (struct {
+        koid zx.Koid;
+    }) error Error;
+};

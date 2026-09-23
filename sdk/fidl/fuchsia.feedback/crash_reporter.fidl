@@ -1,0 +1,239 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.feedback;
+
+using fuchsia.mem;
+using zx;
+
+/// Provides the ability to file crash reports.
+@discoverable
+closed protocol CrashReporter {
+    /// Files a crash `report` and gives the final result of the operation.
+    ///
+    /// This could mean generating a crash report in a local crash report
+    /// database or uploading the crash report to a remote crash server
+    /// depending on the FIDL server's configuration.
+    ///
+    /// Warning: this could potentially take up to several minutes. Calling
+    /// this function in a synchronous manner is not recommended.
+    @available(added=11)
+    strict FileReport(resource struct {
+        report CrashReport;
+    }) -> (struct {
+        results FileReportResults;
+    }) error FilingError;
+};
+
+const MAX_PROGRAM_NAME_LENGTH uint32 = 1024;
+const MAX_NUM_ANNOTATIONS_PER_CRASH_REPORT uint32 = 32;
+const MAX_NUM_ATTACHMENTS_PER_CRASH_REPORT uint32 = 16;
+const MAX_EVENT_ID_LENGTH uint32 = 128;
+const MAX_CRASH_SIGNATURE_LENGTH uint32 = 128;
+@available(added=11)
+const MAX_REPORT_ID_LENGTH uint32 = 64;
+
+/// Represents a crash report.
+type CrashReport = resource table {
+    /// The name of the program that crashed, e.g., the process or component's name.
+    ///
+    /// Internally, the program name is used to persist the report in case it can't be uploaded
+    /// immediately. As a result, it's sanitized when used as a filesystem path, e.g., stripped of
+    /// any fuchsia-pkg:// prefix. ZX_ERR_INVALID_ARGS will be returned if the sanitized program
+    /// name is any of the following:
+    ///  * ""
+    ///  * "."
+    ///  * ".."
+    1: program_name string:MAX_PROGRAM_NAME_LENGTH;
+
+    /// How long the program was running before it crashed.
+    6: program_uptime zx.Duration;
+
+    /// The specific report that depends on the type of crashes.
+    ///
+    /// This field should be set if additional information about the crashing program needs to be
+    /// sent, e.g., a minidump.
+    2: specific_report SpecificCrashReport;
+
+    /// A vector of key-value string pairs representing arbitrary data that should be attached to a
+    /// crash report.
+    ///
+    /// Keys should be unique as only the latest value for a given key in the vector will be
+    /// considered.
+    3: annotations vector<Annotation>:MAX_NUM_ANNOTATIONS_PER_CRASH_REPORT;
+
+    /// A vector of key-value string-to-VMO pairs representing arbitrary data that should be
+    /// attached to a crash report.
+    ///
+    /// Keys should be unique as only the latest value for a given key in the vector will be
+    /// considered.
+    ///
+    /// ZX_ERR_INVALID_ARGS will be returned if any of the following is true:
+    ///  * a key is ""
+    ///  * a key is "."
+    ///  * a key is ".."
+    ///  * a key contains a forward slash "/"
+    ///  * a key contains a space " "
+    ///  * a key contains characters other than printable ASCII
+    ///  * a key is reserved for use by Feedback:
+    ///    * annotations.json
+    ///    * minidump.dmp
+    ///    * snapshot_uuid.txt
+    ///    * snapshot.zip
+    ///    * uploadFileMinidump
+    4: attachments vector<Attachment>:MAX_NUM_ATTACHMENTS_PER_CRASH_REPORT;
+
+    /// A text ID that the crash server can use to group multiple crash reports related to the
+    /// same event.
+    ///
+    /// Unlike the crash signature, crash reports sharing the same ID correspond to different
+    /// crashes, but can be considered as belonging to the same event, e.g., a crash in a low-level
+    /// server causing a crash in a high-level UI widget.
+    5: event_id string:MAX_EVENT_ID_LENGTH;
+
+    /// A text signature that the crash server can use to track the same crash over time, e.g.,
+    /// "kernel-panic" or "oom". This signature will take precedence over any automated signature
+    /// derived from the rest of the data.
+    ///
+    /// Unlike the event ID, crash reports sharing the same signature correspond to the same crash,
+    /// but happening over multiple events, e.g., a null pointer exception in a server whenever
+    /// asked the same request.
+    ///
+    /// Must match [a-z][a-z\-]* i.e. only lowercase letters and hyphens or this will result in a
+    /// ZX_ERR_INVALID_ARGS epitaph.
+    7: crash_signature string:MAX_CRASH_SIGNATURE_LENGTH;
+
+    /// Indicates whether the crash report is for the atypical stop of a running process, component,
+    /// or the system itself.
+    ///
+    /// Examples of events that result in fatal crash reports are:
+    ///  * an ELF process crashing
+    ///  * the system rebooting because it ran out of memory.
+    ///  * the system rebooting because a critical component crashed.
+    ///  * the system rebooting because the device was too hot.
+    ///
+    /// Examples of events that result in non-fatal crash reports are:
+    ///  * an uncaught exception in a Dart program with many execution contexts. The runtime may
+    ///    chose to terminate that specific execution context and file a crash report for it instead
+    ///    of the whole program.
+    ///  * a component detecting a fatal event (like an OOM) may occur soon, but isn't guaranteed to
+    ///    occur.
+    ///
+    /// This field is primarily used for grouping crashes by fatal, not fatal, and unknown,
+    /// each corresponding to the field being set to true, set to false, or not set respectively.
+    8: is_fatal bool;
+
+    /// Optional. Used to indicate that this report represents more than just this instance of the
+    /// crash. For example, this field should be set to 10 if choosing to only file 1 out of every
+    /// 10 instances of this crash type.
+    ///
+    /// A weight of 1 is used if the field is not set. An explicitly set value of 0 is invalid and
+    /// will be rejected.
+    @available(added=28)
+    9: weight uint32;
+};
+
+/// Represents a specific crash report.
+///
+/// Add a new member when the server needs to special case how it handles certain annotations and
+/// attachments for a given type of crashes, e.g., a `RuntimeCrashReport` for Javascript.
+type SpecificCrashReport = flexible resource union {
+    /// Intended for a native exception.
+    2: native NativeCrashReport;
+
+    /// Intended for a Dart exception.
+    3: dart RuntimeCrashReport;
+
+    /// Intended for a text stack trace in Fuchsia's symbolization markup format.
+    @available(added=HEAD)
+    4: text_backtrace TextBacktraceCrashReport;
+};
+
+const MAX_PROCESS_NAME_LENGTH uint32 = 64;
+const MAX_THREAD_NAME_LENGTH uint32 = 64;
+
+/// Represents a crash report for a native exception out of which the client has built a minidump.
+type NativeCrashReport = resource table {
+    /// The core dump in the Minidump format.
+    1: minidump fuchsia.mem.Buffer;
+
+    /// The name of the crashed process.
+    2: process_name string:MAX_PROCESS_NAME_LENGTH;
+
+    /// The kernel object id of the crashed process.
+    3: process_koid zx.Koid;
+
+    /// The name of the crashed thread.
+    4: thread_name string:MAX_THREAD_NAME_LENGTH;
+
+    /// The kernel object id of the crashed thread.
+    5: thread_koid zx.Koid;
+};
+
+const MAX_EXCEPTION_TYPE_LENGTH uint32 = 128;
+@available(replaced=10)
+const MAX_EXCEPTION_MESSAGE_LENGTH uint32 = 2048;
+@available(added=10)
+const MAX_EXCEPTION_MESSAGE_LENGTH uint32 = 4096;
+
+/// Represents a crash report for a runtime exception, applicable to most languages.
+type RuntimeCrashReport = resource table {
+    /// The exception type, e.g., "FileSystemException".
+    1: exception_type string:MAX_EXCEPTION_TYPE_LENGTH;
+
+    /// The exception message, e.g., "cannot open file".
+    2: exception_message string:MAX_EXCEPTION_MESSAGE_LENGTH;
+
+    /// The text representation of the exception stack trace.
+    3: exception_stack_trace fuchsia.mem.Buffer;
+};
+
+/// Represents a crash report with a text stack trace.
+@available(added=HEAD)
+type TextBacktraceCrashReport = resource table {
+    /// The text representation of the backtrace in Fuchsia's symbolization markup format.
+    1: fuchsia_backtrace fuchsia.mem.Buffer;
+
+    /// The name of the crashed process.
+    2: process_name string:MAX_PROCESS_NAME_LENGTH;
+
+    /// The kernel object id of the crashed process.
+    3: process_koid zx.Koid;
+
+    /// The name of the crashed thread.
+    4: thread_name string:MAX_THREAD_NAME_LENGTH;
+
+    /// The kernel object id of the crashed thread.
+    5: thread_koid zx.Koid;
+};
+
+@available(added=11)
+type FileReportResults = table {
+    /// The success type.
+    1: result FilingSuccess;
+
+    /// A non-empty value if |result| is FilingSuccess::REPORT_UPLOADED.
+    2: report_id string:MAX_REPORT_ID_LENGTH;
+};
+
+/// "Memory" refers to a non-persistent location, e.g. a memory-backed
+/// filesystem.
+@available(added=11)
+type FilingSuccess = flexible enum {
+    @unknown
+    UNKNOWN = 0;
+    REPORT_UPLOADED = 1;
+    REPORT_ON_DISK = 2;
+    REPORT_IN_MEMORY = 3;
+    REPORT_NOT_FILED_USER_OPTED_OUT = 4;
+};
+
+@available(added=11)
+type FilingError = flexible enum {
+    @unknown
+    UNKNOWN = 0;
+    INVALID_ARGS_ERROR = 1;
+    SERVER_ERROR = 2;
+    PERSISTENCE_ERROR = 3;
+    QUOTA_REACHED_ERROR = 4;
+};

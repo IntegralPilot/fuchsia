@@ -1,0 +1,203 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_binary.gni")
+import("//build/testing/host_test.gni")
+import("//build/testing/host_test_data.gni")
+
+# Declares a host-side python test.
+#
+# Example
+#
+# ```
+# python_host_test("my_host_test") {
+#   main_source = "my_host_test.py"
+#   sources = [
+#     "test_helpers_foo.py",
+#     "test_helpers_bar.py",
+#   ]
+#   libraries = [
+#     "//path/to/foo:lib",
+#     "//path/to/bar:lib",
+#   ]
+#   main_callable = "my_module.main"
+#   extra_args = [ "--a_very_useful_flag" ]
+# }
+# ```
+#
+# Parameters
+#
+#  main_source (required)
+#    The .py file that will be interpreted.
+#    Type: path
+#
+#  sources (optional)
+#    Other files that are used in the test.
+#    Type: list(path)
+#    Default: empty list
+#
+#  libraries (optional)
+#    Paths to python_libraries this test imports.
+#    Type: list(string)
+#    Default: empty list
+#
+#  test_dir (optional)
+#    Path to where the test executes.
+#    Type: string
+#    Default: "${target_out_dir}/${target_name}"
+#
+#  extra_args (optional)
+#    Additional arguments to pass to the test.
+#    Type: list(string)
+#
+#  main_callable (optional)
+#    Main callable, which serves as the entry point of the output zip archive.
+#    In the example above, this is "my_module.main".
+#    Type: string
+#    Default: unittest.main
+#
+#  timeout_secs (optional)
+#    The infra timeout in seconds for the test.
+#    Type: int
+#    Default: 300
+#
+#  enable_mypy (optional)
+#    If true, enable MyPy type checking on the target and respective deps.
+#    Type: boolean
+#    Default: true
+#
+#  test_data_deps (optional)
+#    The dependencies used only at runtime for this test.
+#
+#  package_deps (optional)
+#    List of `fuchsia_package` labels that are needed at runtime. These are forwarded
+#    to the host_test() template which forwards it to the test_spec() template and may
+#    also need to be included in the build graph separately in universe to be included
+#    in the package repo because the package repo doesn't depend on tests that are
+#    included in host_labels.
+#    Type: list(string)
+#    Default: empty list
+#
+#  list_cases_argument (optional)
+#    Argument to pass to the host python unittest binary to list test cases.
+#    Type: string
+#    Default: "list_host_python_unittests"
+#
+#  data_sources (optional)
+#    See build/python/python_binary.gni
+#
+#  data_package_name (required if |data_sources| is provided, else optional)
+#    See build/python/python_binary.gni
+#
+#  deps
+#  environments
+#  visibility
+template("python_host_test") {
+  assert(defined(invoker.main_source), "main_source is required")
+  _python_binary_name = "${target_name}.pyz"
+  _python_binary_target = "${target_name}_python_binary"
+
+  _enable_mypy = true
+  if (defined(invoker.enable_mypy)) {
+    _enable_mypy = invoker.enable_mypy
+  }
+
+  python_binary(_python_binary_target) {
+    forward_variables_from(invoker,
+                           [
+                             "main_source",
+                             "sources",
+                             "deps",
+                             "data_sources",
+                             "data_package_name",
+                           ])
+
+    testonly = true
+    visibility = [ ":*" ]
+    enable_mypy = _enable_mypy
+    output_name = _python_binary_name
+    main_callable = "unittest.main"
+    if (defined(invoker.main_callable)) {
+      main_callable = invoker.main_callable
+    }
+
+    if (!defined(deps)) {
+      deps = []
+    }
+    if (defined(invoker.libraries)) {
+      deps += invoker.libraries
+    }
+  }
+
+  _test_dir = "${target_out_dir}/${target_name}"
+  if (defined(invoker.test_dir)) {
+    _test_dir = invoker.test_dir
+  }
+
+  _host_test_data_target = "${target_name}_test_data"
+  _test_lister_target_label =
+      "//scripts/fxtest/list_host_test:list_host_python_unittests_data"
+  _test_lister_target_out_dir =
+      get_label_info(_test_lister_target_label, "target_out_dir")
+  host_test_data(_host_test_data_target) {
+    testonly = true
+    visibility = [ ":*" ]
+
+    sources = [ get_label_info(":${_python_binary_target}", "target_out_dir") +
+                "/${_python_binary_name}" ]
+    outputs = [ "${_test_dir}/${_python_binary_name}" ]
+    deps = [
+      ":${_python_binary_target}",
+      _test_lister_target_label,
+    ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    if (!defined(data_deps)) {
+      data_deps = []
+    }
+    if (defined(invoker.test_data_deps)) {
+      data_deps += invoker.test_data_deps
+    }
+    if (defined(invoker.libraries)) {
+      data_deps += invoker.libraries
+    }
+  }
+
+  _list_cases_argument = "list_host_python_unittests"
+  if (defined(invoker.list_cases_argument)) {
+    _list_cases_argument = invoker.list_cases_argument
+  }
+
+  host_test(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "build_only",
+                             "environments",
+                             "metadata",
+                             "package_deps",
+                             "visibility",
+                             "timeout_secs",
+                             "isolated",
+                             "expects_ssh",
+                           ])
+
+    list_cases_argument = _list_cases_argument
+
+    binary_path = python_exe_src
+    args = [
+      "test_lister_path=" + rebase_path(
+              "${_test_lister_target_out_dir}/test_data/list_host_python_unittests.pyz",
+              root_build_dir),
+      rebase_path("${_test_dir}/${_python_binary_name}", root_build_dir),
+    ]
+    if (defined(invoker.extra_args)) {
+      args += invoker.extra_args
+    }
+    deps = [
+      ":${_host_test_data_target}",
+      "//build/python:interpreter",
+    ]
+  }
+}

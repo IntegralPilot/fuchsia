@@ -1,0 +1,226 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/developer_overrides.gni")
+import("//build/bazel/bazel_build_action.gni")
+
+# A GN wrapper for a Bazel product image target. From GN's perspective, this
+# target outputs a set of system images (ZBI, vbmeta, etc.) in its output
+# directory, making it a direct replacement for assembled_system() backed by
+# Bazel.
+#
+# Parameters
+#
+#  bazel_product_image_target (required)
+#    The Bazel fuchsia_product target to build.
+#    Type: label (from BUILD.bazel)
+#
+#  bazel_inputs_from_gn (required)
+#    The Bazel input targets (defined by bazel_input_xxx GN templates) used to
+#    plumb outputs from GN/Ninja to Bazel. This list should include all GN
+#    targets producing outputs used in the Bazel product image.
+#    Type: list(label)
+#
+#  image_has_fxfs_blob (optional; default = true)
+#    Whether the image contains an fxfs blob partition.
+#
+#  image_has_fvm (optional; default = opposite of image_has_fxfs_blob)
+#    Whether the image contains an fvm. This is exclusive to fxfs_blob.
+#
+#  image_use_vbmeta (optional; default = true)
+#    Whether the image should contain a vbmeta.
+#
+#  use_bringup_platform_bundles (optional; default=false)
+#    If true, use the 'bringup' platform bundles instead of the full set of
+#    bundles.
+#
+#  deps
+#  testonly
+#  visibility
+#
+template("bazel_product_image") {
+  assert(defined(invoker.bazel_product_image_target),
+         "bazel_product_image_target is required")
+  assert(defined(invoker.bazel_inputs_from_gn),
+         "bazel_inputs_from_gn is required")
+  invoker.testonly = true
+
+  targets = {
+    bazel_product_image = "${target_name}_bazel_action"
+    bazel_product_assembly = "${target_name}_product_assembly"
+    copy_outputs = "${target_name}_copy_outputs"
+  }
+
+  files = {
+    out_dir = target_name
+    product_image_out_dir = "${out_dir}/product_image"
+    bazel_raw_outputs_dir = "${out_dir}/bazel_raw_outputs"
+    product_assembly_out_dir = targets.bazel_product_assembly
+  }
+
+  # The bazel inputs for all of the bazel actions described by this template.
+  _bazel_inputs = []
+
+  # See if there are any developer overrides enabled for this target, and
+  # if so, pass them to assembly.
+  _overrides_match_found = false
+  foreach(overrides_def, all_product_assembly_overrides) {
+    if (label_matches(":$target_name", [ overrides_def.assembly ])) {
+      _bazel_inputs += [ "${overrides_def.overrides}.bazel_input" ]
+      assert(_overrides_match_found == false,
+             "Multiple matching overrides targets found for " +
+                 get_label_info(":$target_name", "label_no_toolchain") +
+                 " ${overrides_def.assembly} and ${_overrides_match_found}")
+      _overrides_match_found = overrides_def.assembly
+    }
+    _bazel_inputs += [ "${overrides_def.overrides}.bazel_input" ]
+  }
+  not_needed([ "_overrides_match_found" ])
+
+  _bazel_inputs += [ "//bundles/assembly/bazel_inputs:bringup_inputs" ]
+
+  _bringup_only = defined(invoker.use_bringup_platform_bundles) &&
+                  invoker.use_bringup_platform_bundles
+
+  if (!_bringup_only) {
+    _bazel_inputs += [ "//bundles/assembly/bazel_inputs:platform_inputs" ]
+  }
+
+  _common_deps = _bazel_inputs + invoker.bazel_inputs_from_gn
+  if (defined(invoker.deps)) {
+    _common_deps += invoker.deps
+  }
+
+  _product_assembly_target = targets.bazel_product_assembly
+  bazel_build_action(_product_assembly_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    bazel_target = invoker.bazel_product_image_target + "_product_assembly"
+    bazel_config = "fuchsia_sdk"
+
+    copy_outputs = [
+      {
+        bazel = "{{BAZEL_TARGET_OUT_DIR}}/{{BAZEL_TARGET_NAME}}_out/image_assembly.json"
+        ninja = "${_product_assembly_target}/image_assembly.json"
+      },
+      {
+        bazel = "{{BAZEL_TARGET_OUT_DIR}}/{{BAZEL_TARGET_NAME}}_out/assembly_builder_forensics.json"
+        ninja = "${_product_assembly_target}/assembly_builder_forensics.json"
+      },
+    ]
+    deps = _common_deps
+  }
+
+  bazel_build_action(targets.bazel_product_image) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    bazel_target = invoker.bazel_product_image_target
+    bazel_config = "fuchsia_sdk"
+    directory_outputs = [
+      {
+        bazel_dir = "{{BAZEL_TARGET_OUT_DIR}}/{{BAZEL_TARGET_NAME}}_out"
+        ninja_dir = files.bazel_raw_outputs_dir
+        tracked_files = [ "assembled_system.json" ]
+        copy_debug_symbols = true
+      },
+    ]
+    deps = _common_deps
+  }
+
+  _image_has_fxfs_blob = true
+  if (defined(invoker.image_has_fxfs_blob)) {
+    _image_has_fxfs_blob = invoker.image_has_fxfs_blob
+  }
+
+  _image_has_fvm = !_image_has_fxfs_blob
+  if (defined(invoker.image_has_fvm)) {
+    _image_has_fvm = invoker.image_has_fvm
+  }
+
+  _image_use_vbmeta = true
+  if (defined(invoker.image_use_vbmeta)) {
+    _image_use_vbmeta = invoker.image_use_vbmeta
+  }
+
+  # Post-processing action to parse assembled_system.json and copy
+  # the sequential image outputs into their stable flat layout.
+  action(targets.copy_outputs) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    script = "//build/bazel/scripts/copy_assembled_system_outputs.py"
+
+    _manifest =
+        "${target_out_dir}/${files.bazel_raw_outputs_dir}/assembled_system.json"
+    inputs = [ _manifest ]
+
+    _stable_out_dir = "${target_out_dir}/${files.product_image_out_dir}"
+    outputs = [
+      "${_stable_out_dir}/assembled_system.json",
+      "${_stable_out_dir}/fuchsia.zbi",
+    ]
+    args = [
+      "--manifest",
+      rebase_path(_manifest, root_build_dir),
+      "--bazel-dir",
+      rebase_path("${target_out_dir}/${files.bazel_raw_outputs_dir}",
+                  root_build_dir),
+      "--ninja-dir",
+      rebase_path(_stable_out_dir, root_build_dir),
+    ]
+
+    if (_image_has_fxfs_blob) {
+      outputs += [ "${_stable_out_dir}/fxfs.sparse.blk" ]
+      args += [
+        "--fxfs",
+        "fxfs.sparse.blk",
+      ]
+    }
+
+    if (_image_has_fvm) {
+      outputs += [ "${_stable_out_dir}/fvm.blk" ]
+      args += [
+        "--fvm",
+        "fvm.blk",
+      ]
+    }
+
+    if (_image_use_vbmeta) {
+      outputs += [ "${_stable_out_dir}/fuchsia.vbmeta" ]
+      args += [
+        "--vbmeta",
+        "fuchsia.vbmeta",
+      ]
+    }
+
+    deps = [ ":${targets.bazel_product_image}" ]
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = []
+    public_deps = [ ":${targets.copy_outputs}" ]
+
+    metadata = {
+      assembly_inputs_barrier = []
+      assembly_package_barrier = []
+      distribution_entries_barrier = []
+      package_barrier = []
+      test_component_manifest_barrier = []
+      test_component_manifest_program_barrier = []
+    }
+  }
+}

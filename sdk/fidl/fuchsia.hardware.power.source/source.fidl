@@ -1,0 +1,153 @@
+// Copyright 2026 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.power.source;
+
+using fuchsia.power.system;
+
+type Disconnected = table {};
+type SourceRole = table {};
+type SinkRole = table {
+    /// Name of the source it's drawing from.
+    1: name string:MAX;
+    /// What type of source it's drawing from.
+    2: type SourceType;
+};
+type Auto = table {};
+
+/// The role a power node plays in the system.
+type Role = flexible union {
+    /// The node is disconnected or isolated from the power system.
+    1: disconnected Disconnected;
+    /// The node provides energy to the common system bus.
+    2: source SourceRole;
+    /// The node consumes or stores energy from the common bus.
+    3: sink SinkRole;
+    /// The hardware automatically decides the role based on physical detection.
+    4: auto Auto;
+};
+
+/// The type of power source connected to the device.
+type SourceType = flexible enum {
+    /// Standard wall-plug or DC barrel-jack power. Typically uses the base
+    /// [`fuchsia.hardware.power.source/Source`] protocol.
+    AC = 1;
+    /// Internal or external chemical battery. See [`fuchsia.hardware.power.battery/Battery`].
+    BATTERY = 2;
+    /// Power supplied over a USB connection. See [`fuchsia.hardware.power.usb/UsbSource`].
+    USB = 3;
+};
+
+/// General errors returned by power source protocols.
+type Error = flexible enum {
+    /// An unexpected error occurred within the driver or service.
+    INTERNAL = 1;
+    /// The requested operation or field is not supported by this hardware.
+    NOT_SUPPORTED = 2;
+    /// One or more arguments provided to the method were invalid.
+    INVALID_ARGS = 3;
+    /// Source is already being watched.
+    ALREADY_BOUND = 4;
+};
+
+/// Static hardware characteristics of a power source.
+type Spec = table {
+    /// Unique name of the source (e.g., "USB-C", "Main Battery").
+    1: name string:MAX;
+    /// The roles this source is capable of performing.
+    2: supported_roles vector<Role>:MAX;
+    /// The name of the manufacturer of this hardware.
+    3: manufacturer string:MAX;
+    /// The model name or number assigned by the manufacturer.
+    4: model_name string:MAX;
+    /// The category of this power entity.
+    5: type SourceType;
+};
+
+/// Dynamic status of a power source.
+type Status = table {
+    /// Whether the power entity is currently physically present.
+    1: present bool;
+    /// The voltage at the node, in microvolts.
+    2: voltage_uv uint32;
+    /// The current flowing at the node, in microamps.
+    /// Positive means flowing out (if Source) or in (if Sink).
+    3: current_ua int32;
+    /// The role the node is currently performing.
+    4: current_role Role;
+};
+
+open protocol Source {
+    /// Returns static hardware characteristics that do not change during operation.
+    flexible GetSpec() -> (struct {
+        spec Spec;
+    }) error Error;
+
+    /// Returns dynamic status of the source immediately.
+    flexible GetStatus() -> (struct {
+        status Status;
+    }) error Error;
+
+    /// Set the role of this specific node.
+    ///
+    /// Errors:
+    /// + `INVALID_ARGS`: If the provided role is invalid.
+    /// + `NOT_SUPPORTED`: If the requested role is not supported by the hardware.
+    /// + `INTERNAL`: If an unexpected error occurred.
+    flexible SetRole(struct {
+        role Role;
+    }) -> () error Error;
+
+    /// Change notification for power source state using a "hanging-get" pattern.
+    ///
+    /// The first call to this method returns the current hardware state immediately.
+    /// Subsequent calls block until a change occurs that matches the provided masks.
+    ///
+    /// At most one `Watch` call may be outstanding at a time per connection.
+    /// Completing a call acknowledges that the client has received the previous update.
+    ///
+    /// ### Power Management and Suspend
+    /// To prevent lost wakeups, the server (driver) must ensure that the `Watch` call
+    /// remains active (and hardware interrupts armed) while the system is suspended.
+    ///
+    /// + **Interest Triggers**: If a change in the `interest` mask occurs while the
+    ///   system is suspended, the server MUST NOT complete the `Watch` call until
+    ///   the system wakes for another reason (e.g., a `wake_on` event or external trigger).
+    ///   This ensures the CPU remains asleep for non-critical updates.
+    /// + **Wake-On Triggers**: If a change in the `wake_on` mask occurs, the server
+    ///   MUST wake the system and complete the call immediately with a `wake_lease`.
+    ///
+    /// As a result of this queuing behavior, if multiple changes occur while the
+    /// system is suspended, they may be merged into a single returned `status` table,
+    /// and intermediate state transitions may be lost.
+    ///
+    /// + `interest`: The client wants to be notified if any of the fields present
+    ///   in this table change. If any field in `interest` changes, the method returns.
+    /// + `wake_on`: Similar to `interest`, but if a change occurs in these fields,
+    ///   the server will attempt to keep the system awake using the provided `lease`
+    ///   (or by returning a `wake_lease`) until the client acknowledges the update.
+    /// + `lease`: A power lease token used to coordinate handoff between the server
+    ///   and client, ensuring the system does not suspend before the client can
+    ///   process a critical power event.
+    ///
+    /// Returns:
+    /// + `status`: The updated status table containing the fields that changed.
+    /// + `wake_lease`: An optional lease token provided if the change triggered
+    ///   a `wake_on` condition and the server is maintaining system state.
+    ///
+    /// Errors:
+    /// + `ALREADY_BOUND`: If the source is already being watched.
+    flexible Watch(resource struct {
+        interest Status;
+        wake_on Status;
+        lease fuchsia.power.system.LeaseToken:optional;
+    }) -> (resource struct {
+        status Status;
+        wake_lease fuchsia.power.system.LeaseToken:optional;
+    }) error Error;
+};
+
+service Service {
+    source client_end:Source;
+};

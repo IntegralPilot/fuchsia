@@ -1,0 +1,193 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/board.gni")
+import("//build/json/validate_json.gni")
+import("//build/product.gni")
+
+# Generates a virtual device specification JSON from a product and board
+# definition.
+#
+# There is normally a single such target in the build graph that generates
+# metadata for the currently active board/product. The resulting metadata is
+# uploaded to the artifact repository.
+#
+# A release builder subsequently fetches all available device profiles metadata
+# and incorporates them into the single SDK release artifact.
+#
+# Parameters
+#
+#   name(required)
+#     The name or identifier of the device. This name will be referenced from
+#     the product bundle metadata.
+#
+#   output(optional)
+#     Location to write the output manifest
+#
+#   description(optional)
+#     The description of this virtual device. Defaults to the value in the
+#       GN variable `board_description`.
+#
+#   memory(optional) the memory object which matches the schema. The default is
+#       { quantity = 8192 units = "megabytes" }.
+#
+#   storage(optional) the storage object which matches the schema. The default is
+#       { quantity = 2 units = "gigabytes" }.
+#
+#   testonly (optional)
+#   visibility (optional)
+#     Standard GN meaning.
+#
+# GN args pulled from build environment
+#
+#   emu_window_size_width (optional)
+#     The emulator window size width. Defaults to 1280.
+#     Defined in //build/product.gni.
+#   emu_window_size_height (optional)
+#     The emulator window size height. Defaults to 800.
+#     Defined in //build/product.gni.
+#   board_description (optional)
+#     The human readable board description corresponding to the board name.
+#     Defaults to "". Defined in //build/board.gni.
+#   target_cpu
+#     Standard GN meaning.
+template("virtual_device_specification") {
+  assert(defined(invoker.name), "Device name is required.")
+
+  # This is the most recent schema.
+  schema_file = "virtual_device.json"
+  schema_target = "//build/sdk/meta/${schema_file}"
+
+  # Schema ID must match the schema file.
+  schema_id = "http://fuchsia.com/schemas/sdk/${schema_file}"
+
+  emu_window_size = {
+    height = 800
+    width = 1280
+    units = "pixels"
+  }
+
+  _description = board_description
+  if (defined(invoker.description)) {
+    _description = invoker.description
+  }
+
+  _memory = {
+  }
+  if (defined(invoker.memory)) {
+    _memory = invoker.memory
+  } else {
+    _memory = {
+      quantity = 4096
+      units = "megabytes"
+    }
+  }
+
+  _storage = {
+  }
+  if (defined(invoker.storage)) {
+    _storage = invoker.storage
+  } else {
+    _storage = {
+      quantity = 2
+      units = "gigabytes"
+    }
+  }
+
+  _cpu = {
+  }
+  if (defined(invoker.cpu)) {
+    _cpu = invoker.cpu
+  } else {
+    _cpu = {
+      count = 4
+      arch = target_cpu
+    }
+  }
+
+  file_contents = {
+    schema_id = schema_id
+    data = {
+      type = "virtual_device"
+      name = invoker.name
+      description = _description
+      hardware = {
+        cpu = _cpu
+        audio = {
+          model = "hda"
+        }
+        inputs = {
+          # Touch is the default to avoid issues with mouse capture
+          # especially with cloudtops.
+          pointing_device = "touch"
+        }
+        window_size = emu_window_size
+        vsock = {
+          enabled = false
+          cid = 0
+        }
+        memory = _memory
+        storage = _storage
+      }
+      ports = {
+        ssh = 22
+        mdns = 5353
+        debug = 2345
+      }
+    }
+  }
+
+  if (defined(invoker.output)) {
+    file = invoker.output
+  } else {
+    file = "${target_gen_dir}/${target_name}.json"
+  }
+  generator_target = "${target_name}_json_generator"
+
+  generated_file(generator_target) {
+    visibility = [ ":*" ]
+    forward_variables_from(invoker, [ "testonly" ])
+    contents = file_contents
+    output_conversion = "json"
+    outputs = [ file ]
+    metadata = {
+      images = [
+        {
+          label = get_label_info(":$target_name", "label_with_toolchain")
+          name = "virtual_device"
+          path = rebase_path(file, root_build_dir)
+          type = "manifest"
+        },
+      ]
+    }
+  }
+
+  validator_target = "${target_name}_json_validator"
+  validate_json(validator_target) {
+    visibility = [ ":*" ]
+    forward_variables_from(invoker, [ "testonly" ])
+    data = file
+    deps = [ ":${generator_target}" ]
+    schema = schema_target
+    sources = [
+      # Included schemata.
+      "//build/sdk/meta/common.json",
+      "//build/sdk/meta/hardware.json",
+      "//build/sdk/meta/virtual_device.json",
+    ]
+    allow_comments = true
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    public_deps = [
+      ":${generator_target}",
+      ":${validator_target}",
+    ]
+  }
+}

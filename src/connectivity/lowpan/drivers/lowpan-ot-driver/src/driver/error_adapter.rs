@@ -1,0 +1,150 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+use crate::prelude::ot::Error;
+use lowpan_driver_common::net::RouteAdminError;
+use openthread::ot;
+use std::fmt::Debug;
+use zx_status::Status as ZxStatus;
+
+#[allow(unused_imports)]
+use log::{debug, error, info, trace, warn};
+
+/// Used for wrapping around error types so that they can be
+/// converted to [`::zx_status::Status`] values
+/// that are returned by the methods of [`lowpan_driver_common::Driver`].
+#[derive(thiserror::Error, Debug)]
+pub(super) struct ErrorAdapter<T: Debug>(pub T);
+
+impl<T: Debug> std::fmt::Display for ErrorAdapter<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<ErrorAdapter<ot::Error>> for ZxStatus {
+    fn from(err: ErrorAdapter<ot::Error>) -> ZxStatus {
+        Self::from(ErrorAdapter(anyhow::Error::new(err.0)))
+    }
+}
+
+impl From<ErrorAdapter<anyhow::Error>> for ZxStatus {
+    fn from(err: ErrorAdapter<anyhow::Error>) -> ZxStatus {
+        if let Some(status) = err.0.downcast_ref::<ZxStatus>() {
+            *status
+        } else if let Some(err) = err.0.downcast_ref::<ot::Error>() {
+            ZxStatus::from(*err)
+        } else {
+            error!("Unhandled error when casting to ZxStatus: {:?}", err);
+            ZxStatus::INTERNAL
+        }
+    }
+}
+
+impl From<ErrorAdapter<ot::WrongSize>> for ZxStatus {
+    fn from(_: ErrorAdapter<ot::WrongSize>) -> ZxStatus {
+        ZxStatus::INVALID_ARGS
+    }
+}
+
+impl From<ErrorAdapter<futures::channel::oneshot::Canceled>> for ZxStatus {
+    fn from(_: ErrorAdapter<futures::channel::oneshot::Canceled>) -> ZxStatus {
+        ZxStatus::CANCELED
+    }
+}
+
+pub trait ErrorExt {
+    fn get_zx_status(&self) -> Option<ZxStatus>;
+    fn get_route_admin_error(&self) -> Option<RouteAdminError>;
+    fn get_ot_error(&self) -> Option<ot::Error>;
+}
+
+impl ErrorExt for anyhow::Error {
+    /// If this error is based on a `ZxStatus`, then return it.
+    fn get_zx_status(&self) -> Option<ZxStatus> {
+        #[allow(clippy::map_clone)]
+        self.downcast_ref::<ZxStatus>().map(|status| *status)
+    }
+
+    /// If this error is based on a RouteAdminError, then return it.
+    fn get_route_admin_error(&self) -> Option<RouteAdminError> {
+        self.downcast_ref::<RouteAdminError>().map(|err| *err)
+    }
+
+    fn get_ot_error(&self) -> Option<ot::Error> {
+        #[allow(clippy::map_clone)]
+        self.downcast_ref::<ot::Error>().map(|err| *err)
+    }
+}
+
+pub trait ErrorResultExt {
+    type Error;
+    fn ignore_already_exists(self) -> Result<(), Self::Error>;
+    fn ignore_not_found(self) -> Result<(), Self::Error>;
+    fn ignore_rejected(self) -> Result<(), Self::Error>;
+}
+
+impl ErrorResultExt for Result<(), anyhow::Error> {
+    type Error = anyhow::Error;
+    fn ignore_already_exists(self) -> Result<(), Self::Error> {
+        #[allow(clippy::if_same_then_else)] // TODO(https://fxbug.dev/42177056)
+        self.or_else(|err| {
+            if err.get_zx_status() == Some(ZxStatus::ALREADY_EXISTS) {
+                Ok(())
+            } else if err.get_route_admin_error() == Some(RouteAdminError::AlreadyExists) {
+                Ok(())
+            } else if err.get_ot_error() == Some(ot::Error::Already) {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        })
+    }
+
+    fn ignore_not_found(self) -> Result<(), Self::Error> {
+        #[allow(clippy::if_same_then_else)] // TODO(https://fxbug.dev/42177056)
+        self.or_else(|err| {
+            if err.get_zx_status() == Some(ZxStatus::NOT_FOUND) {
+                Ok(())
+            } else if err.get_route_admin_error() == Some(RouteAdminError::NotFound) {
+                Ok(())
+            } else if err.get_ot_error() == Some(ot::Error::NotFound) {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        })
+    }
+
+    fn ignore_rejected(self) -> Result<(), Self::Error> {
+        #[allow(clippy::if_same_then_else)] // TODO(https://fxbug.dev/42177056)
+        self.or_else(|err| {
+            if err.get_ot_error() == Some(ot::Error::Rejected) { Ok(()) } else { Err(err) }
+        })
+    }
+}
+
+impl ErrorResultExt for Result<(), ot::Error> {
+    type Error = ot::Error;
+    fn ignore_already_exists(self) -> Result<(), Self::Error> {
+        self.or_else(|err| match err {
+            Error::Already => Ok(()),
+            err => Err(err),
+        })
+    }
+
+    fn ignore_not_found(self) -> Result<(), Self::Error> {
+        self.or_else(|err| match err {
+            Error::NotFound => Ok(()),
+            err => Err(err),
+        })
+    }
+
+    fn ignore_rejected(self) -> Result<(), Self::Error> {
+        self.or_else(|err| match err {
+            Error::Rejected => Ok(()),
+            err => Err(err),
+        })
+    }
+}

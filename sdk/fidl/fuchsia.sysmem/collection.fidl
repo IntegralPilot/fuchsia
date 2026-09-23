@@ -1,0 +1,920 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.sysmem;
+
+using zx;
+
+@available(added=7, deprecated=23, note="use fuchsia.sysmem2")
+const MAX_COUNT_DUPLICATES uint32 = 64;
+
+/// Actually creating this many children isn't recommended in most typical
+/// scenarios, but isn't prevented, for testing reasons, and just in case an
+/// unusual scenario needs it.  Mitigation of potentially high time complexity
+/// in sysmem will limit the actual number of group child combinations
+/// considered in aggregation attempts to a separate maximum that is not
+/// settable via these protocols.  The maximum number of total nodes in a sysmem
+/// token tree is limited to a separate maximum that is not settable via these
+/// protocols.
+@available(added=9, deprecated=23, note="use fuchsia.sysmem2")
+const MAX_COUNT_CREATE_CHILDREN int32 = 64;
+
+// A protocol mixin for all nodes in the tree established by
+// BufferCollectionToken creation and BufferCollectionTokenGroup creation,
+// including BufferCollectionToken(s) which have since been converted to a
+// BufferCollection channel.
+@available(added=9, deprecated=23, note="use fuchsia.sysmem2")
+closed protocol Node {
+    // Sync()
+    //
+    /// Ensure that previous messages, including Duplicate() messages on a
+    /// token, collection, or group, have been received server side.
+    ///
+    /// Calling BufferCollectionToken.Sync() on a token that isn't/wasn't a
+    /// valid sysmem token risks the Sync() hanging forever.  See
+    /// ValidateBufferCollectionToken() for one way to mitigate the possibility
+    /// of a hostile/fake BufferCollectionToken at the cost of one round trip.
+    /// Another way is to pass the token to BindSharedCollection(), which also
+    /// validates the token as part of exchanging it for a BufferCollection
+    /// channel, and BufferCollection Sync() can then be used.
+    ///
+    /// After a Sync(), it's then safe to send the client end of token_request
+    /// to another participant knowing the server will recognize the token when
+    /// it's sent into BindSharedCollection() by the other participant.
+    ///
+    /// Other options include waiting for each token.Duplicate() to complete
+    /// individually (using separate call to token.Sync() after each), or
+    /// calling Sync() on BufferCollection after the token has been turned in
+    /// via BindSharedCollection().
+    ///
+    /// Another way to mitigate is to avoid calling Sync() on the token, and
+    /// instead later deal with potential failure of BufferCollection.Sync() if
+    /// the original token was invalid.  This option can be preferable from a
+    /// performance point of view, but requires client code to delay sending
+    /// tokens duplicated from this token until after client code has converted
+    /// the duplicating token to a BufferCollection and received successful
+    /// response from BufferCollection.Sync().
+    ///
+    /// Prefer using BufferCollection.Sync() instead, when feasible (see above).
+    /// When BufferCollection.Sync() isn't feasible, the caller must already
+    /// know that this token is/was valid, or BufferCollectionToken.Sync() may
+    /// hang forever.  See ValidateBufferCollectionToken() to check token
+    /// validity first if the token isn't already known to be (is/was) valid.
+    strict Sync() -> ();
+
+    // Close()
+    //
+    /// On a BufferCollectionToken channel:
+    ///
+    /// Normally a participant will convert a BufferCollectionToken into a
+    /// BufferCollection view, but a participant is also free to Close() the
+    /// token (and then close the channel immediately or shortly later in
+    /// response to server closing its end), which avoids causing logical buffer
+    /// collection failure.  Normally an unexpected token channel close will
+    /// cause logical buffer collection failure (the only exceptions being
+    /// certain cases involving AttachToken() or SetDispensable()).
+    ///
+    /// On a BufferCollection channel:
+    ///
+    /// By default the server handles unexpected failure of a BufferCollection
+    /// by failing the whole logical buffer collection.  Partly this is to
+    /// expedite closing VMO handles to reclaim memory when any participant
+    /// fails.  If a participant would like to cleanly close a BufferCollection
+    /// view without causing logical buffer collection failure, the participant
+    /// can send Close() before closing the client end of the BufferCollection
+    /// channel.  If this is the last BufferCollection view, the logical buffer
+    /// collection will still go away.  The Close() can occur before or after
+    /// SetConstraints().  If before SetConstraints(), the buffer collection
+    /// won't require constraints from this node in order to allocate.  If
+    /// after SetConstraints(), the constraints are retained and aggregated
+    /// along with any subsequent logical allocation(s), despite the lack of
+    /// channel connection.
+    ///
+    /// On a BufferCollectionTokenGroup channel:
+    ///
+    /// By default, unexpected failure of a BufferCollectionTokenGroup will
+    /// trigger failure of the logical BufferCollectionTokenGroup and will
+    /// propagate failure to its parent.  To close a BufferCollectionTokenGroup
+    /// channel without failing the logical group or propagating failure, send
+    /// Close() before closing the channel client endpoint.
+    ///
+    /// If Close() occurs before AllChildrenPresent(), the logical buffer
+    /// collection will still fail despite the Close() (because sysmem can't be
+    /// sure whether all relevant children were created, so it's ambiguous
+    /// whether all relevant constraints will be provided to sysmem).  If
+    /// Close() occurs after AllChildrenPresent(), the children and all their
+    /// constraints remain intact (just as they would if the
+    /// BufferCollectionTokenGroup channel had remained open), and the close
+    /// doesn't trigger or propagate failure.
+    strict Close();
+
+    /// Set a name for VMOs in this buffer collection. The name may be truncated
+    /// shorter. The name only affects VMOs allocated after it's set - this call
+    /// does not rename existing VMOs. If multiple clients set different names
+    /// then the larger priority value will win.
+    strict SetName(struct {
+        priority uint32;
+        name string:64;
+    });
+
+    /// Set information about the current client that can be used by sysmem to
+    /// help debug leaking memory and hangs waiting for constraints. |name| can
+    /// be an arbitrary string, but the current process name (see
+    /// fsl::GetCurrentProcessName()) is a good default. |id| can be an
+    /// arbitrary id, but the current process ID (see
+    /// fsl::GetCurrentProcessKoid()) is a good default.
+    ///
+    /// Also used when verbose logging is enabled (see SetVerboseLogging()) to
+    /// indicate which client is closing their channel first, leading to
+    /// sub-tree failure (which can be normal if the purpose of the sub-tree is
+    /// over, but if happening earlier than expected, the
+    /// client-channel-specific name can help diagnose where the failure is
+    /// first coming from, from sysmem's point of view).
+    ///
+    /// By default (unless overriden by this message or using
+    /// Allocator.SetDebugClientInfo()), a Node will copy info from its
+    /// parent Node at the time the child Node is created.  While this can be
+    /// better than nothing, it's often better for each participant to use
+    /// Node.SetDebugClientInfo() or Allocator.SetDebugClientInfo() to keep the
+    /// info directly relevant to the current client.  Also, SetVerboseLogging()
+    /// can be used to help disambiguate if a Node is suspected of having info
+    /// that was copied from its parent.
+    strict SetDebugClientInfo(struct {
+        name string:64;
+        id uint64;
+    });
+
+    /// Sysmem logs a warning if not all clients have set constraints 5 seconds
+    /// after creating a collection. Clients can call this method to change
+    /// when the log is printed. If multiple client set the deadline, it's
+    /// unspecified which deadline will take effect.
+    strict SetDebugTimeoutLogDeadline(struct {
+        deadline zx.Time;
+    });
+
+    // SetVerboseLogging()
+    //
+    /// Verbose logging includes constraints set via SetConstraints() from each
+    /// client along with info set via SetDebugClientInfo() and the structure of
+    /// the tree of Node(s).
+    ///
+    /// Normally sysmem prints only a single line complaint when aggregation
+    /// fails, with just the specific detailed reason that aggregation failed,
+    /// with minimal context.  While this is often enough to diagnose a problem
+    /// if only a small change was made and the system had been working before
+    /// the small change, it's often not particularly helpful for getting a new
+    /// buffer collection to work for the first time.  Especially with more
+    /// complex trees of nodes, involving things like AttachToken(),
+    /// SetDispensable(), BufferCollectionTokenGroup nodes, and associated
+    /// sub-trees of nodes, verbose logging may help in diagnosing what the tree
+    /// looks like and why it's failing a logical allocation, or why a tree or
+    /// sub-tree is failing sooner than expected.
+    ///
+    /// The intent of the extra logging is to be acceptable from a performance
+    /// point of view, if only enabled on a low number of buffer collections.
+    /// If we're not tracking down a bug, we shouldn't send this message.
+    ///
+    /// If too many participants leave verbose logging enabled, we may end up
+    /// needing to require that system-wide sysmem verbose logging be permitted
+    /// via some other setting, to avoid sysmem spamming the log too much due to
+    /// this message.
+    ///
+    /// This may be a NOP for some nodes due to intentional policy associated
+    /// with the node, if we don't trust a node enough to let it turn on verbose
+    /// logging.
+    strict SetVerboseLogging();
+
+    // GetNodeRef()
+    //
+    /// This gets an event handle that can be used as a parameter to
+    /// IsAlternateFor() called on any Node.  The client will not be granted the
+    /// right to signal this event, as this handle should only be used as proof
+    /// that the client obtained this handle from this Node.
+    ///
+    /// Because this is a get not a set, no Sync() is needed between the
+    /// GetNodeRef() and the call to IsAlternateFor(), despite the two calls
+    /// potentially being on different channels.
+    ///
+    /// See also IsAlternateFor().
+    strict GetNodeRef() -> (resource struct {
+        node_ref zx.Handle:EVENT;
+    });
+
+    // IsAlternateFor()
+    //
+    /// This checks whether the calling node is in a subtree rooted at a
+    /// different child token of a common parent BufferCollectionTokenGroup, in
+    /// relation to the passed-in node_ref.
+    ///
+    /// This call is for assisting with admission control de-duplication, and
+    /// with debugging.
+    ///
+    /// The node_ref must be obtained using GetNodeRef() of a
+    /// BufferCollectionToken, BufferCollection, or BufferCollectionTokenGroup.
+    ///
+    /// The node_ref can be a duplicated handle; it's not necessary to call
+    /// GetNodeRef() for every call to IsAlternateFor().
+    ///
+    /// If a calling token may not actually be a valid token at all due to
+    /// a potentially hostile/untrusted provider of the token, call
+    /// ValidateBufferCollectionToken() first instead of potentially getting
+    /// stuck indefinitely if IsAlternateFor() never responds due to a calling
+    /// token not being a real token (not really talking to sysmem).  Another
+    /// option is to call BindSharedCollection with this token first which also
+    /// validates the token along with converting it to a BufferCollection, then
+    /// call BufferCollection IsAlternateFor().
+    ///
+    /// error values:
+    ///
+    /// ZX_ERR_NOT_FOUND means the node_ref wasn't found within the same logical
+    /// buffer collection as the calling Node.  Before logical allocation and
+    /// within the same logical allocation sub-tree, this essentially means that
+    /// the node_ref was never part of this logical buffer collection, since
+    /// before logical allocation all node_refs that come into existence remain
+    /// in existence at least until logical allocation (including Node(s) that
+    /// have done a Close() and closed their channel), and for ZX_ERR_NOT_FOUND
+    /// to be returned, this Node's channel needs to still be connected server
+    /// side, which won't be the case if the whole logical allocation has
+    /// failed.  After logical allocation or in a different logical allocation
+    /// sub-tree there are additional potential reasons for this error.  For
+    /// example a different logical allocation (separated from this Node(s)
+    /// logical allocation by an AttachToken() or SetDispensable()) can fail its
+    /// sub-tree deleting those Node(s), or a BufferCollectionTokenGroup may
+    /// exist and may select a different child sub-tree than the sub-tree the
+    /// node_ref is in causing deletion of the node_ref Node.  The only time
+    /// sysmem keeps a Node around after that Node has no corresponding channel
+    /// is when Close() is used and the Node's sub-tree has not yet failed.
+    /// Another reason for this error is if the node_ref is an eventpair handle
+    /// with sufficient rights, but isn't actually a real node_ref obtained from
+    /// GetNodeRef().
+    ///
+    /// ZX_ERR_INVALID_ARGS means the caller passed a node_ref that isn't an
+    /// eventpair handle, or doesn't have the needed rights expected on a real
+    /// node_ref.
+    ///
+    /// No other failing status codes are returned by this call.  However,
+    /// sysmem may add additional codes in future, so the client should have
+    /// sensible default handling for any failing status code.
+    ///
+    /// On success, is_alternate has the following meaning:
+    ///   * true - The first parent node in common between the calling node and
+    ///     the node_ref Node is a BufferCollectionTokenGroup.  This means that
+    ///     the calling Node and the node_ref Node will _not_ have both their
+    ///     constraints apply - rather sysmem will choose one or the other of
+    ///     the constraints - never both.  This is because only one child of
+    ///     a BufferCollectionTokenGroup is selected during logical allocation,
+    ///     with only that one child's sub-tree contributing to constraints
+    ///     aggregation.
+    ///   * false - The first parent node in common between the calling Node and
+    ///     the node_ref Node is not a BufferCollectionTokenGroup.  Currently,
+    ///     this means the first parent node in common is a
+    ///     BufferCollectionToken or BufferCollection (regardless of not
+    ///     Close()ed or Close()ed).  This means that the calling Node and the
+    ///     node_ref Node _may_ have both their constraints apply during
+    ///     constraints aggregation of the logical allocation, if both Node(s)
+    ///     are selected by any parent BufferCollectionTokenGroup(s) involved.
+    ///     In this case, there is no BufferCollectionTokenGroup that will
+    ///     directly prevent the two Node(s) from both being selected and their
+    ///     constraints both aggregated, but even when false, one or both
+    ///     Node(s) may still be eliminated from consideration if one or both
+    ///     Node(s) has a direct or indirect parent BufferCollectionTokenGroup
+    ///     which selects a child sub-tree other than the sub-tree containing
+    ///     the calling Node or node_ref Node.
+    strict IsAlternateFor(resource struct {
+        node_ref zx.Handle:EVENT;
+    }) -> (struct {
+        is_alternate bool;
+    }) error zx.Status;
+};
+
+/// A BufferCollectionToken is not a BufferCollection, but rather a way to
+/// identify a potential shared BufferCollection prior to the BufferCollection
+/// being allocated.
+///
+/// We use a channel for the BufferCollectionToken instead of a single eventpair
+/// (pair) because this way we can detect error conditions like a participant
+/// dying mid-create.
+///
+/// The fuchsia.sysmem.BufferCollectionToken type is not yet deprecated due to
+/// its use in some other protocols (for now), but all the internals of
+/// fuchsia.sysmem.BufferCollectionToken are deprecated. Token channels serve
+/// both fuchsia.sysmem.BufferCollectionToken and
+/// fuchsia.sysmem2.BufferCollectionToken.
+///
+/// This protocol will be deprecated once other protocols have switched their
+/// token fields to fuchsia.sysmem2.BufferCollectionToken.
+//
+// LINT.IfChange
+@available(added=7)
+closed protocol BufferCollectionToken {
+    @available(added=9, deprecated=23, note="use fuchsia.sysmem2")
+    compose Node;
+
+    // See Node for non-deprecated equivalents.  Re-building existing code will
+    // use the Node equivalents instead.  These ordinals will eventually not be
+    // recognized by sysmem.
+    @available(removed=9, renamed="DeprecatedSync")
+    strict Sync() -> ();
+
+    @available(removed=9, renamed="DeprecatedClose")
+    strict Close();
+
+    @available(removed=9, renamed="DeprecatedSetName")
+    strict SetName(struct {
+        priority uint32;
+        name string:64;
+    });
+
+    @available(removed=9, renamed="DeprecatedSetDebugClientInfo")
+    strict SetDebugClientInfo(struct {
+        name string:64;
+        id uint64;
+    });
+
+    @available(removed=9, renamed="DeprecatedSetDebugTimeoutLogDeadline")
+    strict SetDebugTimeoutLogDeadline(struct {
+        deadline zx.Time;
+    });
+
+    /// This method can be used to add more participants prior to creating a
+    /// shared BufferCollection. A new token will be returned for each entry in
+    /// the `rights_attenuation_masks` array. The return value is the client
+    /// ends of each new participant token.
+    ///
+    /// If the calling token may not actually be a valid token at all due to
+    /// a potentially hostile/untrusted provider of the token, consider using
+    /// ValidateBufferCollectionToken() first instead of potentially getting
+    /// stuck indefinitely if DuplicateSync() never responds due to the calling
+    /// token not being a real token.
+    ///
+    /// In contrast to Duplicate(), no Sync() (see "protocol Node") is needed
+    /// after calling this method.
+    ///
+    /// All tokens must be turned in via BindSharedCollection() or Close() for a
+    /// BufferCollection to be successfully created.
+    ///
+    /// In each entry of `rights_attenuation_masks`, rights bits that are zero
+    /// will be absent in the buffer VMO rights obtainable via the corresponding
+    /// returned token. This allows an initiator or intermediary participant to
+    /// attenuate the rights available to a participant. This does not allow a
+    /// participant to gain rights that the participant doesn't already have.
+    /// The value ZX_RIGHT_SAME_RIGHTS can be used to specify that no
+    /// attenuation should be applied.
+    @available(added=7, deprecated=23, note="use fuchsia.sysmem2")
+    strict DuplicateSync(struct {
+        rights_attenuation_masks vector<zx.Rights>:MAX_COUNT_DUPLICATES;
+    }) -> (resource struct {
+        tokens vector<client_end:BufferCollectionToken>:MAX_COUNT_DUPLICATES;
+    });
+
+    /// This method can be used to add a participant prior to creating a shared
+    /// BufferCollection. It should only be used instead of DuplicateSync in
+    /// performance sensitive cases where it would be undesireable to wait for
+    /// sysmem to respond as part of each duplicate.
+    ///
+    /// After sending one or more Duplicate() messages, and before sending the
+    /// created tokens to other participants (or to other Allocator channels),
+    /// the client should send a Sync() and wait for its response.  The Sync()
+    /// call can be made on the token, or on the BufferCollection obtained by
+    /// passing this token to BindSharedCollection().  Either will ensure that
+    /// the server knows about the tokens created via Duplicate() before the
+    /// other participant sends the token to the server via separate Allocator
+    /// channel.
+    ///
+    /// All tokens must be turned in via BindSharedCollection() or Close() for a
+    /// BufferCollection to be successfully created.
+    ///
+    /// When a client calls BindSharedCollection() to turn in a
+    /// BufferCollectionToken, the server will process all Duplicate() messages
+    /// before closing down the BufferCollectionToken.  This allows the client
+    /// to Duplicate() and immediately turn in the BufferCollectionToken using
+    /// BindSharedCollection, then later transfer the client end of token_request
+    /// to another participant - the server will notice the existence of the
+    /// token_request before considering this BufferCollectionToken fully closed.
+    ///
+    /// `rights_attenuation_mask` rights bits that are zero in this mask will be
+    /// absent in the buffer VMO rights obtainable via the client end of
+    /// token_request. This allows an initiator or intermediary participant to
+    /// attenuate the rights available to a participant. This does not allow a
+    /// participant to gain rights that the participant doesn't already have.
+    /// The value ZX_RIGHT_SAME_RIGHTS can be used to specify that no
+    /// attenuation should be applied.
+    ///
+    /// These values for rights_attenuation_mask result in no attenuation:
+    ///   * ZX_RIGHT_SAME_RIGHTS (preferred)
+    ///   * 0xFFFFFFFF (this is reasonable when an attenuation mask is computed)
+    ///   * 0 (deprecated - do not use 0 - an ERROR will go to the log)
+    ///
+    /// `token_request` is the server end of a BufferCollectionToken channel.
+    /// The client end of this channel acts as another participant in creating the
+    /// shared BufferCollection.
+    @available(added=7, deprecated=23, note="use fuchsia.sysmem2")
+    strict Duplicate(resource struct {
+        rights_attenuation_mask uint32;
+        token_request server_end:BufferCollectionToken;
+    });
+
+    // SetDispensable()
+    //
+    /// A dispensable token can fail after buffers are logically allocated
+    /// without causing failure of its parent (if any).
+    ///
+    /// The dispensable token participates in constraints aggregation along with
+    /// its parent before logical buffer allocation.  If the dispensable token
+    /// fails before buffers are logically allocated, the failure propagates to
+    /// the dispensable token's parent.
+    ///
+    /// After buffers are logically allocated, failure of the dispensable token
+    /// (or any child of the dispensable token) does not propagate to the
+    /// dispensable token's parent.  Failure does propagate from a normal
+    /// child of a dispensable token to the dispensable token.  Failure
+    /// of a child is blocked from reaching its parent if the child is attached,
+    /// or if the child is dispensable and the failure occurred after logical
+    /// allocation.
+    ///
+    /// A dispensable token can be used in cases where a participant needs to
+    /// provide constraints, but after buffers are allocated, the participant
+    /// can fail without causing buffer collection failure from the parent's
+    /// point of view.
+    ///
+    /// In contrast, AttachToken() can be used to create a token which does not
+    /// participate in constraints aggregation with its parent, and whose
+    /// failure at any time does not propagate to its parent, and whose delay
+    /// providing constraints does not prevent the parent from completing its
+    /// buffer allocation.
+    ///
+    /// An initiator may in some scenarios choose to initially use a dispensable
+    /// token for a given instance of a participant, and then later if the first
+    /// instance of that participant fails, a new second instance of that
+    /// participant my be given a token created with AttachToken().
+    ///
+    /// If a client uses this message, the client should not rely on the
+    /// client's own BufferCollectionToken or BufferCollection channel to close
+    /// from the server end due to abrupt failure of any BufferCollectionToken
+    /// or BufferCollection that the client has SetDispensable() and given out
+    /// to another process.  For this reason, the client should take extra care
+    /// to notice failure of that other process via other means.
+    ///
+    /// While it is possible (and potentially useful) to SetDispensable() on a
+    /// direct child of a BufferCollectionTokenGroup, it isn't possible to later
+    /// replace a failed dispensable token that was a direct child of a group
+    /// with a new token using AttachToken() (since there's no AttachToken() on
+    /// a group).  Instead, to enable AttachToken() replacement in this case,
+    /// create an additional non-dispensable token (node) that's a direct child
+    /// of the group and make the existing dispensable token a child of the
+    /// additional token (node).  This way, the additional token (node) that is
+    /// a direct child of the group has BufferCollection.AttachToken() which can
+    /// be used to replace the failed dispensable token.
+    ///
+    /// SetDispensable() on an already-dispensable token is idempotent.
+    @available(added=7, deprecated=23, note="use fuchsia.sysmem2")
+    strict SetDispensable();
+
+    // CreateBufferCollectionTokenGroup()
+    //
+    /// Most sysmem clients and many participants don't need to care about this
+    /// message or about BufferCollectionTokenGroup(s) in general.
+    ///
+    /// A BufferCollectionTokenGroup is used to create a 1 of N OR among N child
+    /// tokens.  The child tokens which are not selected during aggregation will
+    /// fail (close), which a potential participant should notice when their
+    /// BufferCollection channel client endpoint sees PEER_CLOSED, allowing the
+    /// participant to clean up the speculative usage that didn't end up
+    /// happening (similarly to a normal BufferCollection server end closing
+    /// on failure of a logical buffer collection).
+    ///
+    /// See comments on protocol BufferCollectionTokenGroup.
+    ///
+    /// Any rights_attenuation_mask or AttachToken()/SetDispensable() to be
+    /// applied to the whole group can be achieved with a token for this purpose
+    /// as a direct parent of the group.
+    ///
+    /// group_request - the server end of a BufferCollectionTokenGroup channel
+    /// to be served by sysmem.
+    @available(added=9, deprecated=23, note="use fuchsia.sysmem2")
+    strict CreateBufferCollectionTokenGroup(resource struct {
+        group_request server_end:BufferCollectionTokenGroup;
+    });
+};
+// LINT.ThenChange(//src/sysmem/drivers/sysmem/combined_token.fidl)
+
+/// BufferCollection is a connection directly from a participant to sysmem re.
+/// a logical BufferCollection; typically the logical BufferCollection is shared
+/// with other participants.  In other words, an instance of the BufferCollection
+/// interface is a view of a "logical buffer collection".
+///
+/// This connection exists to facilitate async indication of when the logical
+/// BufferCollection has been populated with buffers.
+///
+/// Also, the channel's closure by the server is an indication to the client
+/// that the client should close all VMO handles that were obtained from the
+/// BufferCollection ASAP.
+///
+/// Also, this interface may in future allow specifying constraints in other
+/// ways, and may allow for back-and-forth negotiation of constraints to some
+/// degree.
+///
+/// This interface may in future allow for more than 64 VMO handles per
+/// BufferCollection, but currently the limit is 64.
+///
+/// This interface may in future allow for allocating/deallocating single
+/// buffers.
+///
+/// Some initiators may wait a short duration until all old logical
+/// BufferCollection VMO handles have closed (or until the short duration times
+/// out) before allocating a new BufferCollection, to help control physical
+/// memory fragmentation and avoid overlap of buffer allocation lifetimes for
+/// the old and new collections. Collections can be large enough that it's worth
+/// avoiding allocation overlap (in time).
+@available(added=7, deprecated=23, note="use fuchsia.sysmem2.BufferCollection")
+closed protocol BufferCollection {
+    @available(added=9)
+    compose Node;
+
+    // See Node for non-deprecated equivalents.  Re-building existing code will
+    // use the Node equivalents instead.  These ordinals will eventually not be
+    // recognized by sysmem.
+    @available(removed=9, renamed="DeprecatedSync")
+    strict Sync() -> ();
+
+    @available(removed=9, renamed="DeprecatedClose")
+    strict Close();
+
+    @available(removed=9, renamed="DeprecatedSetName")
+    strict SetName(struct {
+        priority uint32;
+        name string:64;
+    });
+
+    @available(removed=9, renamed="DeprecatedSetDebugClientInfo")
+    strict SetDebugClientInfo(struct {
+        name string:64;
+        id uint64;
+    });
+
+    /// Provide BufferCollectionConstraints to the logical BufferCollection.
+    ///
+    /// A participant may only call SetConstraints() once.
+    ///
+    /// Sometimes the initiator is a participant only in the sense of wanting to
+    /// keep an eye on success/failure to populate with buffers, and zx.Status
+    /// on failure.  In that case, `has_constraints` can be false, and
+    /// `constraints` will be ignored.
+    ///
+    /// VMO handles will not be provided to the client that sends null
+    /// constraints - that can be intentional for an initiator that doesn't need
+    /// VMO handles.  Not having VMO handles doesn't prevent the initator from
+    /// adjusting which portion of a buffer is considered valid and similar, but
+    /// the initiator can't hold a VMO handle open to prevent the logical
+    /// BufferCollection from cleaning up if the logical BufferCollection needs
+    /// to go away regardless of the initiator's degree of involvement for
+    /// whatever reason.
+    ///
+    /// For population of buffers to be attempted, all holders of a
+    /// BufferCollection client channel need to call SetConstraints() before
+    /// sysmem will attempt to allocate buffers.
+    ///
+    /// `has_constraints` if false, the constraints are effectively null, and
+    /// `constraints` are ignored.  The sender of null constraints won't get any
+    /// VMO handles in BufferCollectionInfo, but can still find out how many
+    /// buffers were allocated and can still refer to buffers by their
+    /// buffer_index.
+    ///
+    /// `constraints` are constraints on the buffer collection.
+    strict SetConstraints(struct {
+        has_constraints bool;
+        constraints BufferCollectionConstraints;
+    });
+
+    /// This request completes when buffers have been allocated, responds with
+    /// some failure detail if allocation has been attempted but failed.
+    ///
+    /// The following must occur before buffers will be allocated:
+    ///   * All BufferCollectionToken(s) of the logical BufferCollectionToken
+    ///     must be turned in via BindSharedCollection().
+    ///   * All BufferCollection(s) of the logical BufferCollection must have
+    ///     had SetConstraints() sent to them.
+    ///
+    /// Returns `ZX_OK` if successful.
+    /// Returns `ZX_ERR_NO_MEMORY` if the request is valid but cannot be
+    /// fulfilled due to resource exhaustion.
+    /// Returns `ZX_ERR_ACCESS_DENIED` if the caller is not permitted to
+    /// obtain the buffers it requested.
+    /// Returns `ZX_ERR_INVALID_ARGS` if the request is malformed.
+    /// Returns `ZX_ERR_NOT_SUPPORTED` if request is valid but cannot be
+    /// satisfied, perhaps due to hardware limitations.
+    ///
+    /// `buffer_collection_info` has the VMO handles and other related info.
+    strict WaitForBuffersAllocated() -> (resource struct {
+        status zx.Status;
+        buffer_collection_info BufferCollectionInfo_2;
+    });
+
+    /// This returns the same result code as WaitForBuffersAllocated if the
+    /// buffer collection has been allocated or failed, or `ZX_ERR_UNAVAILABLE`
+    /// if WaitForBuffersAllocated would block.
+    strict CheckBuffersAllocated() -> (struct {
+        status zx.Status;
+    });
+
+    @available(deprecated=8, removed=9)
+    strict AllocateSingleBuffer(struct {
+        buffer_index uint64;
+    });
+    @available(deprecated=8, removed=9)
+    strict CloseSingleBuffer(struct {
+        buffer_index uint64;
+    });
+    @available(deprecated=8, removed=9)
+    strict WaitForSingleBufferAllocated(struct {
+        buffer_index uint64;
+    }) -> (resource struct {
+        status zx.Status;
+        buffer_info SingleBufferInfo;
+    });
+    @available(deprecated=8, removed=9)
+    strict CheckSingleBufferAllocated(struct {
+        buffer_index uint64;
+    });
+    @available(deprecated=9, removed=23)
+    strict SetConstraintsAuxBuffers(struct {
+        constraints BufferCollectionConstraintsAuxBuffers;
+    });
+    @available(deprecated=9, removed=23)
+    strict GetAuxBuffers() -> (resource struct {
+        status zx.Status;
+        buffer_collection_info_aux_buffers BufferCollectionInfo_2;
+    });
+
+    /// Create a new token, for trying to add a new participant to an existing
+    /// collection, if the existing collection's buffer counts, constraints,
+    /// and participants allow.
+    ///
+    /// This can be useful in replacing a failed participant, and/or in
+    /// adding/re-adding a participant after buffers have already been
+    /// allocated.
+    ///
+    /// Failure of an attached token / collection does not propagate to the
+    /// parent of the attached token.  Failure does propagate from a normal
+    /// child of a dispensable token to the dispensable token.  Failure
+    /// of a child is blocked from reaching its parent if the child is attached,
+    /// or if the child is dispensable and the failure occurred after logical
+    /// allocation.
+    ///
+    /// An initiator may in some scenarios choose to initially use a dispensable
+    /// token for a given instance of a participant, and then later if the first
+    /// instance of that participant fails, a new second instance of that
+    /// participant my be given a token created with AttachToken().
+    ///
+    /// From the point of view of the client end of the BufferCollectionToken
+    /// channel, the token acts like any other token.  The client can
+    /// Duplicate() the token as needed, and can send the token to a different
+    /// process.  The token should be converted to a BufferCollection channel
+    /// as normal by calling BindSharedCollection().  SetConstraints() should
+    /// be called on that BufferCollection channel.
+    ///
+    /// A success result from WaitForBuffersAllocated() means the new
+    /// participant's constraints were satisfiable using the already-existing
+    /// buffer collection, the already-established BufferCollectionInfo
+    /// including image format constraints, and the already-existing other
+    /// participants and their buffer counts.  A failure result means the new
+    /// participant's constraints cannot be satisfied using the existing
+    /// buffer collection and its already-logically-allocated participants.
+    /// Creating a new collection instead may allow all participant's
+    /// constraints to be satisfied, assuming SetDispensable() is used in place
+    /// of AttachToken(), or a normal token is used.
+    ///
+    /// A token created with AttachToken() performs constraints aggregation with
+    /// all constraints currently in effect on the buffer collection, plus the
+    /// attached token under consideration plus child tokens under the attached
+    /// token which are not themselves an attached token or under such a token.
+    ///
+    /// Allocation of buffer_count to min_buffer_count_for_camping etc is
+    /// first-come first-served, but a child can't logically allocate before
+    /// all its parents have sent SetConstraints().
+    ///
+    /// See also SetDispensable(), which in contrast to AttachToken(), has the
+    /// created token + children participate in constraints aggregation along
+    /// with its parent.
+    ///
+    /// The newly created token needs to be Sync()ed to sysmem before the new
+    /// token can be passed to BindSharedCollection().  The Sync() of the new
+    /// token can be accomplished with BufferCollection.Sync() on this
+    /// BufferCollection.  Alternately BufferCollectionToken.Sync() on the new
+    /// token also works.  A BufferCollectionToken.Sync() can be started after
+    /// any BufferCollectionToken.Duplicate() messages have been sent via the
+    /// newly created token, to also sync those additional tokens to sysmem
+    /// using a single round-trip.
+    ///
+    /// These values for rights_attenuation_mask result in no attenuation (note
+    /// that 0 is not on this list; 0 will output an ERROR to the system log
+    /// to help diagnose the bug in client code):
+    ///   * ZX_RIGHT_SAME_RIGHTS (preferred)
+    ///   * 0xFFFFFFFF (this is reasonable when an attenuation mask is computed)
+    strict AttachToken(resource struct {
+        rights_attenuation_mask uint32;
+        token_request server_end:BufferCollectionToken;
+    });
+
+    /// AttachLifetimeTracking:
+    ///
+    /// AttachLifetimeTracking() is intended to allow a client to wait until an
+    /// old logical buffer collection is fully or mostly deallocated before
+    /// attempting allocation of a new logical buffer collection.
+    ///
+    /// Attach an eventpair endpoint to the logical buffer collection, so that
+    /// the server_end will be closed when the number of buffers allocated
+    /// drops to 'buffers_remaining'.  The server_end won't close until after
+    /// logical allocation has completed.
+    ///
+    /// If logical allocation fails, such as for an attached sub-tree (using
+    /// AttachToken()), the server_end will close during that failure regardless
+    /// of the number of buffers potenitally allocated in the overall logical
+    /// buffer collection.
+    ///
+    /// The lifetime signalled by this event includes asynchronous cleanup of
+    /// allocated buffers, and this asynchronous cleanup cannot occur until all
+    /// holders of VMO handles to the buffers have closed those VMO handles.
+    /// Therefore clients should take care not to become blocked forever waiting
+    /// for ZX_EVENTPAIR_PEER_CLOSED to be signalled, especially if any of the
+    /// participants using the logical buffer collection are less trusted or
+    /// less reliable.
+    ///
+    /// The buffers_remaining parameter allows waiting for all but
+    /// buffers_remaining buffers to be fully deallocated.  This can be useful
+    /// in situations where a known number of buffers are intentionally not
+    /// closed so that the data can continue to be used, such as for keeping the
+    /// last available video picture displayed in the UI even if the video
+    /// stream was using protected output buffers.  It's outside the scope of
+    /// the BufferCollection interface (at least for now) to determine how many
+    /// buffers may be held without closing, but it'll typically be in the range
+    /// 0-2.
+    ///
+    /// This mechanism is meant to be compatible with other protocols providing
+    /// a similar AttachLifetimeTracking() mechanism, in that duplicates of the
+    /// same event can be sent to more than one AttachLifetimeTracking(), and
+    /// the ZX_EVENTPAIR_PEER_CLOSED will be signalled when all the lifetime
+    /// over conditions are met (all holders of duplicates have closed their
+    /// handle(s)).
+    ///
+    /// There is no way to cancel an attach.  Closing the client end of the
+    /// eventpair doesn't subtract from the number of pending attach(es).
+    ///
+    /// Closing the client's end doesn't result in any action by the server.
+    /// If the server listens to events from the client end at all, it is for
+    /// debug logging only.
+    ///
+    /// The server intentionally doesn't "trust" any bits signalled by the
+    /// client.  This mechanism intentionally uses only ZX_EVENTPAIR_PEER_CLOSED
+    /// which can't be triggered early, and is only triggered when all handles
+    /// to server_end are closed.  No meaning is associated with any of the
+    /// other signal bits, and clients should functionally ignore any other
+    /// signal bits on either end of the eventpair or its peer.
+    ///
+    /// The server_end may lack ZX_RIGHT_SIGNAL or ZX_RIGHT_SIGNAL_PEER, but
+    /// must have ZX_RIGHT_DUPLICATE (and must have ZX_RIGHT_TRANSFER to
+    /// transfer without causing CodecFactory channel failure).
+    strict AttachLifetimeTracking(resource struct {
+        server_end zx.Handle:EVENTPAIR;
+        buffers_remaining uint32;
+    });
+};
+
+// BufferCollectionTokenGroup:
+//
+/// The sysmem implementation is guaranteed to be consistent with a logical /
+/// conceptual model as follows:
+///
+/// As usual, a logical allocation considers either the root and all nodes with
+/// connectivity to the root that don't transit an AttachToken(), or a sub-tree
+/// rooted at an AttachToken() token and all nodes with connectivity to that
+/// subtree that don't transit another AttachToken().  This is called the
+/// logical allocation pruned sub-tree, or pruned sub-tree for short.
+///
+/// During constraints aggregation, each BufferCollectionTokenGroup will select
+/// a single child token among its children.  The rest of the children will
+/// appear to fail the logical allocation, while the selected child may succeed.
+///
+/// When more than one BufferCollectionTokenGroup exists in the overall logical
+/// allocation pruned sub-tree, the relative priority between two groups is
+/// equivalent to their ordering in a DFS pre-order iteration of the tree, with
+/// parents higher priority than children, and left children higher priority
+/// than right children.
+///
+/// When a particular child of a group is selected (whether provisionally during
+/// a constraints aggregation attempt, or as a final selection), the
+/// non-selection of other children of the group can potentially "hide" other
+/// groups under those non-selected children.
+///
+/// Within a logical allocation, aggregation is attempted first by provisionally
+/// selecting the child 0 of the highest-priority group, and child 0 of the next
+/// highest-priority group that isn't hidden by the provisional selections so
+/// far, etc.
+///
+/// If that aggregation attempt fails, aggregation will be attempted with the
+/// ordinal 0 child of all the same groups except the lowest priority non-hidden
+/// group which will provisionally select its ordinal 1 child (and then child 2
+/// and so on).  If a new lowest-priority group is un-hidden as provisional
+/// selections are updated, that newly un-hidden lowest-priority group has all
+/// its children considered in order, before changing the provisional selection
+/// in the former lowest-priority group.  In terms of result, this is equivalent
+/// to systematic enumeration of all possible combinations of choices in a
+/// counting-like order updating the lowest-priority group the most often and
+/// the highest-priority group the least often.  Rather than actually attempting
+/// aggregation with all the combinations, we can skip over combinations which
+/// are redundant/equivalent due to hiding without any change to the result.
+///
+/// Attempted aggregations of enumerated non-equivalent combinations of choices
+/// continue in this manner until either (a) all aggregation attempts fail in
+/// which case the overall logical allocation fails, or (b) until an attempted
+/// aggregation succeeds, in which case buffer allocation (if needed) is
+/// attempted once.  If buffer allocation based on the first successful
+/// aggregation fails, the overall logical allocation fails (there is no buffer
+/// allocation retry / re-attempt).  If buffer allocation succeeds (or is not
+/// needed), the logical allocation succeeds.
+///
+/// If this prioritization scheme cannot reasonably work for your usage of
+/// sysmem, please contact sysmem folks to discuss potentially adding a way to
+/// achieve what you need.
+///
+/// Please avoid creating a large number of BufferCollectionTokenGroup(s) per
+/// logical allocation, especially with large number of children overall, and
+/// especially in cases where aggregation may reasonably be expected to often
+/// fail using ordinal 0 children and possibly with later children as well.  We
+/// anticipate mitigating potentially high time complexity of evaluating too
+/// many child combinations/selections across too many groups by simply failing
+/// logical allocation beyond a certain (fairly high, but not huge) max number
+/// of considered group child combinations/selections.  More advanced (and more
+/// complicated) mitigation is not anticipated to be practically necessary or
+/// worth the added complexity.  Please contact sysmem folks if the max limit
+/// is getting hit or if you anticipate it getting hit, to discuss potential
+/// options.
+///
+/// Prefer to use multiple ImageFormatConstraints in a single
+/// BufferCollectionConstraints when feasible (when a participant just needs to
+/// express the ability to work with more than a single PixelFormat, with
+/// sysmem choosing which PixelFormat to use among those supported by all
+/// participants).
+///
+/// Similar to BufferCollectionToken and BufferCollection, closure of the
+/// BufferCollectionTokenGroup channel without sending Close() first will cause
+/// logical buffer collection failure (or sub-tree failure if using
+/// SetDispensable() or AttachToken() and the BufferCollectionTokenGroup is part
+/// of a sub-tree under such a node that doesn't propagate failure to its
+/// parent).
+@available(added=9, deprecated=23, note="use fuchsia.sysmem2")
+closed protocol BufferCollectionTokenGroup {
+    compose Node;
+
+    /// Create a child token.  Before passing the client end of this token to
+    /// BindSharedCollection(), completion of Sync() after CreateChild() is
+    /// required.  Or the client can use CreateChildrenSync() which essentially
+    /// includes the Sync().
+    ///
+    /// token_request - the server end of the new token channel.
+    ///
+    /// rights_attenuation_mask - If ZX_RIGHT_SAME_RIGHTS, the created token
+    /// allows the holder to get the same rights to buffers as the parent token
+    /// (of the group) had.
+    strict CreateChild(resource table {
+        /// Must be set.
+        1: token_request server_end:BufferCollectionToken;
+
+        /// If not set, the default is ZX_RIGHT_SAME_RIGHTS.
+        2: rights_attenuation_mask uint32;
+    });
+
+    /// Create 1 or more child tokens at once, synchronously.  In contrast to
+    /// CreateChild(), no Sync() completion is required before passing the
+    /// client end of a returned token to BindSharedCollection().
+    ///
+    /// The size of the rights_attentuation_mask determines the number of
+    /// created child tokens.
+    ///
+    /// The lower-index child tokens are higher priority (attempted sooner) than
+    /// higher-index child tokens.
+    ///
+    /// As per all child tokens, successful aggregation will choose exactly one
+    /// child among all created children (across all children created across
+    /// potentially multiple calls to CreateChild() and CreateChildrenSync()).
+    ///
+    /// The maximum permissible total number of children per group, and total
+    /// number of nodes in an overall tree (from the root) are capped to limits
+    /// which are not configurable via these protocols.
+    strict CreateChildrenSync(struct {
+        rights_attenuation_masks vector<zx.Rights>:MAX_COUNT_CREATE_CHILDREN;
+    }) -> (resource struct {
+        tokens vector<client_end:BufferCollectionToken>:MAX_COUNT_CREATE_CHILDREN;
+    });
+
+    /// AllChildrenPresent()
+    ///
+    /// After creating all children, the client must call AllChildrenPresent()
+    /// to inform sysmem that no more children will be created, so that sysmem
+    /// can know when it's ok to start aggregating constraints.
+    ///
+    /// If Close() is to be sent, it should be sent _after_
+    /// AllChildrenPresent(), else failure of the group and propagation of the
+    /// failure to the group's parent will still be triggered.
+    strict AllChildrenPresent();
+};

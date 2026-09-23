@@ -1,0 +1,117 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/packages/prebuilt_test_package.gni")
+
+# Defines prebuilt package tests based on the contents in a prebuilt test
+# manifest.
+#
+# Vendors are required to upload one or more test manifest JSON files in the
+# same CIPD package as their prebuilt FAR tests. We use these manifests for
+# determining which test packages to enable and how each test package is run.
+#
+# The test manifest should contain a JSON list of objects. Each object's schema
+# is:
+#
+#   package (required)
+#     The name of the Fuchsia package
+#     Type: string
+#
+#   component_name (required)
+#     The name of the test component.
+#     Type: string
+#
+#   archive_name (optional)
+#     The name of the archive file containing the Fuchsia package, relative to
+#     $archive_dir, below.
+#     Type: string
+#     Default: $package
+#
+#   log_settings (optional)
+#     The properties of logs produced by the specific test. Overwrites the manifest's
+#     log_settings for a particular test.
+#     See //build/testing/test_spec.gni for more details.
+#     Type: JSON
+#
+# Parameters
+#
+#   archive_dir (required)
+#     [string] Path to directory containing prebuilt archives and test_manifest.json
+#
+#   environments (optional, default: [ { dimensions = { device_type = "QEMU" } } ])
+#     [list of scopes] Device environments in which the test should run.
+#
+#     Environment scope is defined in //build/testing/test_spec.gni
+#
+#   disabled_tests (optional)
+#     [list of scopes] List of scopes containing a "component_name" and either
+#     a "package" or "archive_name" to disable.
+#
+#   manifest_name (optional, default: test_manifest.json):
+#     [string] Name of the test manifest file.
+#
+#   log_settings (optional)
+#     The properties of logs produced by the tests defined in the manifest.
+#     See //build/testing/test_spec.gni for more details.
+#     Type: JSON
+#
+template("prebuilt_test_manifest") {
+  assert(defined(invoker.archive_dir), "archive_dir must be defined.")
+
+  manifest_name = "test_manifest.json"
+  if (defined(invoker.manifest_name)) {
+    manifest_name = invoker.manifest_name
+  }
+  manifest_path = "${invoker.archive_dir}/${manifest_name}"
+  manifest = read_file(manifest_path, "json")
+  test_targets = []
+  foreach(test, manifest) {
+    test_package = test.package
+    component_name = test.component_name
+    archive_name = test_package
+    if (defined(test.archive_name)) {
+      archive_name = test.archive_name
+    }
+    test_disabled = false
+    if (defined(invoker.disabled_tests)) {
+      foreach(disabled_test, invoker.disabled_tests) {
+        if (component_name == disabled_test.component_name) {
+          if (defined(disabled_test.archive_name) &&
+              archive_name == disabled_test.archive_name) {
+            test_disabled = true
+          } else if (test_package == disabled_test.package) {
+            test_disabled = true
+          }
+        }
+      }
+    }
+    if (!test_disabled) {
+      prebuilt_test_package_label = "${target_name}_${test_package}"
+      prebuilt_test_package(prebuilt_test_package_label) {
+        package = test_package
+        archive = "${invoker.archive_dir}/${archive_name}.far"
+        component_name = component_name
+        forward_variables_from(invoker,
+                               [
+                                 "deps",
+                                 "environments",
+                                 "package_deps",
+                               ])
+        if (defined(test.log_settings)) {
+          log_settings = test.log_settings
+          not_needed(invoker, [ "log_settings" ])
+        } else if (defined(invoker.log_settings)) {
+          log_settings = invoker.log_settings
+        }
+      }
+      test_targets += [ ":${prebuilt_test_package_label}" ]
+    }
+  }
+
+  group(target_name) {
+    testonly = true
+    forward_variables_from(invoker, [ "visibility" ])
+    public_deps = test_targets
+  }
+}

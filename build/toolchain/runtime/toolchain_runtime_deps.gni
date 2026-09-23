@@ -1,0 +1,360 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang.gni")
+import("//build/config/clang/clang_toolchain_info.gni")
+import("//build/rust/config.gni")
+import("//build/toolchain/zircon/clang.gni")
+
+# ## runtime.json
+#
+# Each toolchain (i.e. Clang or rustc) provides a "runtime.json" file
+# in its top-level lib/ sub-directory.
+#
+# This file is provided by the toolchain to describe the runtime
+# dependencies implied by linking a binary based on --target and other
+# compiler switches.  The file contains a JSON array of objects that map to
+# the following GN schema.  Each entry matches a single compilation mode
+# and yields all the runtime dependencies implied by that mode.
+#
+# Type: list(scope)
+#
+# * target
+#   - Required: --target tuples a la `${current_target_tuple}`.
+#   - Type: list(string)
+#
+# * cflags
+#   - Optional: List of compilation flags that select this mode,
+#     e.g. `"-fsanitizer=..."` and the like.
+#     If not specified, cflags are ignored during selection.
+#   - Type: list(string)
+#
+# * ldflags
+#   - Optional: Link-time flags that select this mode.
+#     This is usually either `[ "-static-libstdc++" ]` or `[]`.
+#     If not specified, ldflags are ignored during selection.
+#   - Type: list(string)
+#
+# * runtime
+#   - Required: List of runtime files needed by binaries in this mode.
+#   - Type: list(scope)
+#
+#     * name
+#       - Optional: A stable name for the library to use when publishing a
+#         zx_manifest. If omitted, soname is used.
+#       - Type: string
+#
+#     * soname
+#       - Required: `DT_SONAME` string in the ELF shared library.
+#       - Type: string
+#
+#     * dist
+#       - Required: File to load to satisfy $soname `DT_NEEDED` entries.
+#       - Type: path relative to `${toolchain_spec.lib_dir}`
+#
+#     * debug
+#       - Optional: Unstripped or separate debug file matching $dist.
+#       - Type: path relative to `${toolchain_spec.lib_dir}`
+#
+#     * breakpad
+#       - Required if `debug` is present and `toolchain.use_breakpad` is true:
+#         Path to breakpad .sym file.
+#       - Type: path relative to `${toolchain_spec.lib_dir}`
+#
+
+# Used internally by clang_runtime_deps and rust_runtime_deps.
+# Define a group() target with the metadata matching a specific
+# set of runtime libraries.
+#
+# Args:
+#   entry [scope | bool]
+#      Either a runtime.json input scope, or the boolean value "false"
+#      to indicate an empty group.
+#
+#   libraries: [optional string list]
+#      An optional list of library names to embed
+#      in Fuchsia packages. If not provided, all runtime libraries from entry
+#      will be used.
+#
+#   rebased_toolchain_lib_dir [string]
+#      The rebased path to the toolchain's "/lib" sub-directory.
+#
+#   binary_common [scope]
+#      A scope containing common arguments for each entry in the
+#      final metadata.binaries list for the generated group().
+#
+#   testonly, visibility
+#      Usual GN meaning.
+template("_define_runtime_group") {
+  _rebased_lib_dir = invoker.rebased_toolchain_lib_dir
+  _entry = invoker.entry
+
+  if (defined(invoker.libraries)) {
+    _libraries = invoker.libraries
+  } else {
+    _libraries = []
+  }
+
+  _label = get_label_info(":$target_name", "label_with_toolchain")
+
+  # scope containing shared values for all entries in _binaries.
+  _binary_base = {
+    forward_variables_from(invoker.binary_common, "*")
+
+    cpu = current_cpu
+    os = current_os
+    label = _label
+    type = "shared_library"
+  }
+
+  _binaries = []
+  _distribution_entries = []
+  _debug_symbol_files = []
+
+  if (_entry != false) {
+    # Add all runtime libraries for this entry to metadata.binaries even
+    # though they are not build outputs, as these are only used to upload the
+    # corresponding symbol files to cloud storage.
+    # See https://fxbug.dev/379848690
+    foreach(lib, _entry.runtime) {
+      _dist_file = "${_rebased_lib_dir}/${lib.dist}"
+
+      _binaries += [
+        {
+          forward_variables_from(_binary_base, "*")
+          dist = _dist_file
+          if (defined(lib.debug)) {
+            debug = "${_rebased_lib_dir}/${lib.debug}"
+            if (defined(lib.breakpad)) {
+              breakpad = "${_rebased_lib_dir}/${lib.breakpad}"
+            }
+          }
+        },
+      ]
+
+      if (defined(lib.debug)) {
+        # Compute build-id from lib.debug if possible. Look for
+        # ..../.build-id/xx/yyyyyy.debug
+        _build_id = ""
+        _lib_debug_nosuffix = string_replace(lib.debug, ".debug", "")
+        _has_debug_suffix = _lib_debug_nosuffix != lib.debug
+        if (_has_debug_suffix) {
+          _build_id_list = []
+          _build_id_list = string_split(_lib_debug_nosuffix, ".build-id/")
+          _is_under_build_id = _build_id_list != [ _lib_debug_nosuffix ]
+          if (_is_under_build_id) {
+            _build_id = _build_id_list[1]
+            _build_id = string_replace(_build_id, "/", "")
+          }
+        }
+        _debug_symbol_files += [
+          {
+            cpu = current_cpu
+            os = current_os
+            label = _label
+            debug = "${_rebased_lib_dir}/${lib.debug}"
+            if (_build_id != "") {
+              elf_build_id = _build_id
+            }
+            if (defined(lib.breakpad)) {
+              breakpad = "${_rebased_lib_dir}/${lib.breakpad}"
+            }
+          },
+        ]
+      }
+
+      # On the other hand, only add entries to metadata.distribution_entries
+      # for the libraries that really need to be packaged into dependent
+      # Fuchsia packages.
+      if (_libraries == [] ||
+          _libraries + [ lib.name ] - [ lib.name ] != _libraries) {
+        _distribution_entries += [
+          {
+            destination = "lib/${toolchain_variant.libprefix}${lib.soname}"
+            label = _label
+            source = _dist_file
+          },
+        ]
+      }
+    }
+  }
+
+  # In many cases, the loop above will be empty.
+  not_needed([
+               "_label",
+               "_libraries",
+               "_binary_base",
+               "_rebased_lib_dir",
+             ])
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    metadata = {
+      # Used by //:binaries build API module
+      binaries = _binaries
+
+      # Used by distribution_manifest() template.
+      distribution_entries = _distribution_entries
+
+      # Used by //:debug_symbols build API module.
+      debug_symbol_files = _debug_symbol_files
+    }
+  }
+}
+
+# Define a group() target carrying the metadata related to the libraries
+# needed at runtime when linking against a static or shared version of libc++
+# for the current build variant.
+#
+# Args:
+#    static_libcxx [bool]: Set to true for runtime dependencies of
+#       code linked with -static-libstdc++.
+#
+#    testonly, visibility: Usual GN meaning.
+#
+template("clang_runtime_deps") {
+  if (toolchain_variant.with_shared && current_toolchain != shlib_toolchain) {
+    group(target_name) {
+      public_deps = [ ":$target_name($shlib_toolchain)" ]
+    }
+    not_needed(invoker, [ "static_libcxx" ])
+  } else {
+    import("//build/config/clang/clang_prefix.gni")
+    import("//build/config/clang/clang_toolchain_info.gni")
+    import("//build/config/current_target_tuple.gni")
+    import("//build/toolchain/zircon/clang.gni")
+
+    _variant_cflags = []
+    _variant_tags = toolchain_variant.tags
+    if (_variant_tags + [ "asan" ] - [ "asan" ] != _variant_tags) {
+      _variant_cflags = [ "-fsanitize=address" ]
+    } else if (_variant_tags + [ "hwasan" ] - [ "hwasan" ] != _variant_tags) {
+      _variant_cflags = [ "-fsanitize=hwaddress" ]
+    } else if (_variant_tags + [ "ubsan" ] - [ "ubsan" ] != _variant_tags) {
+      _variant_cflags = [ "-fsanitize=undefined" ]
+    }
+
+    _variant_ldflags = []
+    if (invoker.static_libcxx) {
+      _variant_ldflags = [ "-static-libstdc++" ]
+    }
+
+    _target_tuple = current_target_tuple
+
+    # Find matching entry in runtime.json
+    _entry = false
+
+    _clang_runtimes = clang_toolchain_info.runtimes
+
+    foreach(entry, _clang_runtimes) {
+      if (entry.cflags == _variant_cflags &&
+          entry.ldflags == _variant_ldflags &&
+          entry.target + [ _target_tuple ] - [ _target_tuple ] !=
+          entry.target) {
+        assert(
+            _entry == false,
+            "Multiple matches for cflags=${_variant_cflags}, ldflags=${_variant_ldflags} and ${_target_tuple} in runtime.json. File is ill-formed!")
+        _entry = entry
+      }
+    }
+
+    _define_runtime_group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      entry = _entry
+      rebased_toolchain_lib_dir = "$rebased_clang_dir/lib"
+      binary_common = {
+        cflags = _variant_cflags
+        ldflags = _variant_ldflags
+        if (clang_version_string != "") {
+          toolchain_id = clang_version_string
+        }
+        if (clang_version_description != "") {
+          toolchain_version = clang_version_description
+        }
+      }
+    }
+  }
+}
+
+# Define a group() target carrying the metadata related to a Rust runtime
+# library.
+#
+# Args:
+#    name [string]: Library name prefix (e.g. "libstd" or "libtest").
+#    shared_runtime [bool]: Set to true to specify the shared version of
+#       the runtime.
+#
+#    testonly, visibility: Usual GN meaning.
+#
+template("rust_runtime_deps") {
+  if (toolchain_variant.with_shared && current_toolchain != shlib_toolchain) {
+    group(target_name) {
+      public_deps = [ ":$target_name($shlib_toolchain)" ]
+    }
+    not_needed(invoker,
+               [
+                 "name",
+                 "shared_runtime",
+               ])
+  } else {
+    import("//build/rust/config.gni")
+
+    if (invoker.shared_runtime) {
+      _rustflags = [ "-Cprefer-dynamic" ]
+    } else {
+      _rustflags = []
+    }
+
+    _target_tuple = current_target_tuple
+
+    not_needed(invoker, [ "name" ])
+
+    # Find matching entry in Rust runtime.json
+    # This must use the same rustflags, target tuple and must contain
+    #
+    _entry = false
+    foreach(entry, rustc_runtime) {
+      if (entry.rustflags == _rustflags && entry.target + [ _target_tuple ] -
+                                           [ _target_tuple ] != entry.target) {
+        # Need to find a library in entry.runtime that matches invoker.name
+        foreach(runtime, entry.runtime) {
+          if (runtime.name == invoker.name) {
+            assert(
+                _entry == false,
+                "Multiple matches for rustflags=${_rustflags} and ${_target_tuple} in rust runtime.json. File is ill-formed!")
+            _entry = entry
+          }
+        }
+      }
+    }
+
+    _define_runtime_group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      entry = _entry
+      rebased_toolchain_lib_dir = rebase_path(rustc_lib_dir, root_build_dir)
+      libraries = [ invoker.name ]
+      binary_common = {
+        rustflags = _rustflags
+        if (rustc_version_string != "") {
+          toolchain_id = rustc_version_string
+        }
+        if (rustc_version_description != "") {
+          toolchain_version = rustc_version_description
+        }
+      }
+    }
+  }
+}

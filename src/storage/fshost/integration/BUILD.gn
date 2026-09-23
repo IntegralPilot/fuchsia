@@ -1,0 +1,595 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/rust/rustc_test.gni")
+import("//src/storage/fshost/fshost.gni")
+import("//tools/cmc/build/cmc.gni")
+
+rustc_library("fshost_test_fixture") {
+  edition = "2024"
+  testonly = true
+  sources = [
+    "src/disk_builder.rs",
+    "src/lib.rs",
+    "src/mocks.rs",
+  ]
+  deps = [
+    "//sdk/fidl/fuchsia.boot:fuchsia.boot_rust",
+    "//sdk/fidl/fuchsia.component:fuchsia.component_rust",
+    "//sdk/fidl/fuchsia.component.decl:fuchsia.component.decl_rust",
+    "//sdk/fidl/fuchsia.component.test:fuchsia.component.test_rust",
+    "//sdk/fidl/fuchsia.driver.framework:fuchsia.driver.framework_rust",
+    "//sdk/fidl/fuchsia.driver.test:fuchsia.driver.test_rust",
+    "//sdk/fidl/fuchsia.driver.token:fuchsia.driver.token_rust",
+    "//sdk/fidl/fuchsia.feedback:fuchsia.feedback_rust",
+    "//sdk/fidl/fuchsia.hardware.block.volume:fuchsia.hardware.block.volume_rust",
+    "//sdk/fidl/fuchsia.hardware.inlineencryption:fuchsia.hardware.inlineencryption_rust",
+    "//sdk/fidl/fuchsia.hardware.ramdisk:fuchsia.hardware.ramdisk_rust",
+    "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+    "//sdk/fidl/fuchsia.logger:fuchsia.logger_rust",
+    "//sdk/fidl/fuchsia.security.keymint:fuchsia.security.keymint_rust",
+    "//sdk/fidl/fuchsia.storage.block:fuchsia.storage.block_rust",
+    "//sdk/fidl/fuchsia.storage.partitions:fuchsia.storage.partitions_rust",
+    "//sdk/lib/driver_test_realm/realm_builder/rust",
+    "//sdk/rust/zbi",
+    "//sdk/rust/zx",
+    "//src/devices/bind/fuchsia.platform:fuchsia.platform_rust",
+    "//src/devices/bus/drivers/platform",
+    "//src/lib/diagnostics/reader/rust",
+    "//src/lib/diagnostics/testing/diagnostics-assertions/rust:diagnostics-assertions",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia-async",
+    "//src/lib/fuchsia-component",
+    "//src/lib/fuchsia-component-test",
+    "//src/lib/fuchsia-fs",
+    "//src/security/lib/fake-keymint",
+    "//src/storage/blobfs/bin:blobfs-component",
+    "//src/storage/crypt/policy",
+    "//src/storage/crypt/zxcrypt",
+    "//src/storage/fidl/fuchsia.fs.startup:fuchsia.fs.startup_rust",
+    "//src/storage/fshost:fuchsia.fshost.fxfsprovisioner_rust",
+    "//src/storage/fshost/config",
+    "//src/storage/fshost/testing",
+    "//src/storage/fxfs/fidl/fuchsia.fxfs:fuchsia.fxfs_rust",
+    "//src/storage/gpt/component:lib",
+    "//src/storage/gpt/rust",
+    "//src/storage/lib/blob_writer:blob-writer",
+    "//src/storage/lib/block_client/rust",
+    "//src/storage/lib/block_matcher",
+    "//src/storage/lib/block_server/vmo_backed:test_vmo_backed_block_server",
+    "//src/storage/lib/delivery_blob",
+    "//src/storage/lib/fs_management/rust:fs_management",
+    "//src/storage/lib/key-bag",
+    "//src/storage/lib/ramdevice_client/rust",
+    "//src/storage/lib/vfs/rust:vfs",
+    "//src/storage/minfs/bin:minfs-component",
+    "//src/storage/testing:storage_drivers",
+    "//src/sys/pkg/lib/fuchsia-hash",
+    "//src/sys/pkg/lib/fuchsia-merkle",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:assert_matches",
+    "//third_party/rust_crates:futures",
+    "//third_party/rust_crates:log",
+    "//third_party/rust_crates:serde_json",
+    "//third_party/rust_crates:uuid",
+    "//third_party/rust_crates:zerocopy",
+    "//third_party/rust_crates:zstd",
+    "//third_party/zstd",
+  ]
+
+  data_deps = [ "//src/storage/crypt/fxfs" ]
+}
+
+# Generates an fshost integration test component based on one of the integration
+# test files. The binary also has config.rs included, and a couple of default
+# dependencies, but the rest should be specified as needed for the tests in the
+# file.
+#
+#   data_filesystem_variant (required)
+#     [string] A variant string passed to the integration test harness.
+#
+#   data_filesystem_format (required)
+#     [string] The format of the data partition fshost exports. One of "fxfs", "minfs", or "f2fs".
+#
+#   fshost_target (required)
+#     [string] The target for the fshost under test.
+#
+#   source_root (required)
+#     [string] The main file for the integration test. Likely one of the files under "tests".
+#
+#   deps (optional)
+#     [array] Dependencies for the rust test binary.
+#
+template("fshost_integration_test_component") {
+  _fshost_component_name = get_label_info(invoker.fshost_target, "name")
+  _test_bin = string_replace(target_name, "-", "_")
+  _test_bin = "${_test_bin}_bin"
+  rustc_test(_test_bin) {
+    edition = "2024"
+    source_root = invoker.source_root
+    sources = [
+      "tests/config.rs",
+      invoker.source_root,
+    ]
+    rustenv = [
+      "FSHOST_COMPONENT_NAME=${_fshost_component_name}",
+      "DATA_FILESYSTEM_FORMAT=${invoker.data_filesystem_format}",
+      "DATA_FILESYSTEM_VARIANT=${invoker.data_filesystem_variant}",
+    ]
+    features = [
+      invoker.data_filesystem_format,
+      invoker.data_filesystem_variant,
+    ]
+    deps = [
+      ":fshost_test_fixture",
+      "//src/lib/fuchsia",
+    ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+
+  _shard_target = "${target_name}-shard"
+  generated_file(_shard_target) {
+    testonly = true
+    contents = {
+      program = {
+        binary = "bin/${_test_bin}"
+      }
+    }
+    outputs = [ "${target_out_dir}/${_shard_target}.cml" ]
+    output_conversion = "json"
+    visibility = [ ":*" ]
+  }
+  _shard = get_target_outputs(":$_shard_target")
+  _shard = _shard[0]
+
+  _manifest_target = "${target_name}-manifest.cml"
+  cmc_merge("$_manifest_target") {
+    testonly = true
+    sources = [
+      "meta/fshost_integration_test.cml",
+      _shard,
+    ]
+    deps = [ ":$_shard_target" ]
+  }
+  _manifest = get_target_outputs(":$_manifest_target")
+  _manifest = _manifest[0]
+
+  fuchsia_test_component(target_name) {
+    manifest = _manifest
+    deps = [
+      ":$_manifest_target",
+      ":$_test_bin",
+    ]
+  }
+}
+
+# Generates an fshost integration test package. Includes the fshost component on
+# which the test is executed.
+#
+#   enable_corruption_tests (default: true)
+#     [bool] Include corruption tests in the integration test package.
+#
+#   enable_shred_keys_tests (default: false)
+#     [bool] Include key shredding tests in the integration test package.
+#
+#   enable_system_volume_manipulation_tests (default: true)
+#     [bool] Include tests for fuchsia.fshost/Recovery methods that manipulate volumes in the
+#            system container.
+#
+#   enable_bad_provision_fxfs_tests (default: false)
+#     [bool] Include test for bad provisioning of fxfs in the integration test package.
+#
+#   data_filesystem_variant (optional)
+#     [string] A variant string passed to the integration test harness. Defaults to the
+#              data_filesystem_format.
+#
+#   options.data_filesystem_format (required)
+#     [string] The format of the data partition fshost exports. One of "fxfs", "minfs", or "f2fs".
+#              The options scope can also contain additional fshost options if required.
+#
+#   extra_deps (optional)
+#     [array] A list of extra deps for the general integration test component. These deps are not
+#             added to any of the other components right now. NB: if other test components need
+#             extra deps then come up with a different solution here.
+#
+template("fshost_integration_test_package") {
+  assert(defined(invoker.options), "fshost options not specified")
+  fshost_options = invoker.options
+
+  if (!defined(invoker.data_filesystem_variant)) {
+    invoker.data_filesystem_variant = fshost_options.data_filesystem_format
+  }
+  if (!defined(invoker.enable_corruption_tests)) {
+    invoker.enable_corruption_tests = true
+  }
+  if (!defined(invoker.enable_shred_keys_tests)) {
+    invoker.enable_shred_keys_tests = false
+  }
+  if (!defined(invoker.enable_system_volume_manipulation_tests)) {
+    invoker.enable_system_volume_manipulation_tests = false
+  }
+  if (!defined(invoker.enable_volume_death_tests)) {
+    invoker.enable_volume_death_tests = false
+  }
+  if (!defined(fshost_options.data_filesystem_format)) {
+    # data_filesystem_format is implied from fxblob.
+    assert(!(defined(fshost_options.fxfs_blob) && !fshost_options.fxfs_blob))
+    fshost_options.data_filesystem_format = "fxfs"
+  }
+
+  _fshost_target = "test-fshost-${target_name}"
+  fshost_component_and_config(_fshost_target) {
+    testonly = true
+    options = invoker.options
+  }
+
+  _test_packages = []
+
+  #
+  # General Integration Tests
+  #
+  _integration_component_target = "${target_name}_general"
+  _test_components = [ ":$_integration_component_target" ]
+  fshost_integration_test_component(_integration_component_target) {
+    fshost_target = _fshost_target
+    data_filesystem_format = fshost_options.data_filesystem_format
+    data_filesystem_variant = invoker.data_filesystem_variant
+    source_root = "tests/fshost_integration_test.rs"
+    deps = [
+      "//sdk/fidl/fuchsia.fshost:fuchsia.fshost_rust",
+      "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+      "//sdk/fidl/fuchsia.storage.block:fuchsia.storage.block_rust",
+      "//sdk/fidl/fuchsia.storage.partitions:fuchsia.storage.partitions_rust",
+      "//sdk/rust/zx",
+      "//src/lib/fidl/rust/fidl",
+      "//src/lib/fuchsia-async",
+      "//src/lib/fuchsia-component",
+      "//src/lib/fuchsia-fs",
+      "//src/storage/crypt/policy",
+      "//src/storage/fidl/fuchsia.fs.startup:fuchsia.fs.startup_rust",
+      "//src/storage/fxfs/fidl/fuchsia.fxfs:fuchsia.fxfs_rust",
+      "//src/storage/lib/blob_writer:blob-writer",
+      "//src/storage/lib/delivery_blob",
+      "//src/sys/pkg/fidl/fuchsia.update.verify:fuchsia.update.verify_rust",
+      "//src/sys/pkg/lib/fuchsia-merkle",
+      "//third_party/rust_crates:assert_matches",
+      "//third_party/rust_crates:futures",
+      "//third_party/rust_crates:regex",
+    ]
+    if (defined(invoker.extra_deps)) {
+      deps += invoker.extra_deps
+    }
+    if (data_filesystem_variant == "fxblob") {
+      deps += [
+        "//sdk/fidl/fuchsia.fs:fuchsia.fs_rust",
+        "//sdk/fidl/fuchsia.security.keymint:fuchsia.security.keymint_rust",
+        "//src/lib/diagnostics/reader/rust",
+        "//src/lib/diagnostics/testing/diagnostics-assertions/rust:diagnostics-assertions",
+        "//src/security/lib/fake-keymint",
+        "//src/storage/crypt/policy",
+        "//src/storage/lib/fs_management/rust:fs_management",
+      ]
+    }
+  }
+
+  #
+  # Inline Encryption Routing Tests
+  #
+  if (fshost_options.data_filesystem_format == "fxfs") {
+    _inline_encryption_component_target = "${target_name}_inline_encryption"
+    _test_components += [ ":$_inline_encryption_component_target" ]
+    fshost_integration_test_component(_inline_encryption_component_target) {
+      fshost_target = _fshost_target
+      data_filesystem_format = fshost_options.data_filesystem_format
+      data_filesystem_variant = invoker.data_filesystem_variant
+      source_root = "tests/inline_encryption_routing.rs"
+      deps = [
+        "//sdk/fidl/fuchsia.hardware.inlineencryption:fuchsia.hardware.inlineencryption_rust",
+        "//sdk/rust/zx",
+        "//src/lib/fuchsia-async",
+        "//src/lib/fuchsia-component",
+        "//src/storage/lib/block_server/vmo_backed:test_vmo_backed_block_server",
+      ]
+    }
+  }
+
+  #
+  # System Volume Manipulation Tests
+  #
+  if (invoker.enable_system_volume_manipulation_tests) {
+    assert(invoker.data_filesystem_variant == "fxblob")
+    _system_volume_manipulation_component_target =
+        "${target_name}_system_volume_manipulation"
+    fshost_integration_test_component(
+        _system_volume_manipulation_component_target) {
+      fshost_target = _fshost_target
+      data_filesystem_format = fshost_options.data_filesystem_format
+      data_filesystem_variant = invoker.data_filesystem_variant
+      source_root = "tests/system_volume_manipulation.rs"
+      deps = [
+        "//sdk/fidl/fuchsia.fshost:fuchsia.fshost_rust",
+        "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+        "//sdk/fidl/fuchsia.storage.block:fuchsia.storage.block_rust",
+        "//sdk/fidl/fuchsia.storage.partitions:fuchsia.storage.partitions_rust",
+        "//sdk/lib/device-watcher/rust",
+        "//sdk/rust/zx",
+        "//src/lib/fidl/rust/fidl",
+        "//src/lib/fuchsia-async",
+        "//src/lib/fuchsia-component",
+        "//src/lib/fuchsia-fs",
+        "//src/storage/fxfs/fidl/fuchsia.fxfs:fuchsia.fxfs_rust",
+        "//src/storage/fxfs/make-blob-image",
+        "//src/storage/lib/block_client/rust",
+        "//src/storage/lib/block_server/vmo_backed:test_vmo_backed_block_server",
+        "//src/storage/lib/storage_device",
+        "//src/sys/pkg/lib/fuchsia-hash",
+        "//src/sys/pkg/lib/fuchsia-merkle",
+        "//third_party/rust_crates:futures",
+      ]
+    }
+
+    # These tests verify mounting a corrupt or unformatted fxfs partition, which
+    # results in some error logs. This requires we use a separate test package
+    # so we can control the test specs.
+    _system_volume_manipulation_test_package =
+        "${target_name}_system_volume_manipulation_package"
+    _test_packages += [ ":$_system_volume_manipulation_test_package" ]
+    fuchsia_test_package(_system_volume_manipulation_test_package) {
+      package_name = "$_system_volume_manipulation_component_target"
+      test_specs = {
+        log_settings = {
+          max_severity = "ERROR"
+        }
+        parallel = 1
+      }
+      test_components = [ ":$_system_volume_manipulation_component_target" ]
+      deps = [
+        ":$_fshost_target",
+        "//src/storage/fxfs:fxfs_component",
+      ]
+    }
+  }
+
+  #
+  # Write Data File Tests
+  #
+  _write_data_file_component_target = "${target_name}_write_data_file"
+  _test_components += [ ":$_write_data_file_component_target" ]
+  fshost_integration_test_component(_write_data_file_component_target) {
+    fshost_target = _fshost_target
+    data_filesystem_format = fshost_options.data_filesystem_format
+    data_filesystem_variant = invoker.data_filesystem_variant
+    source_root = "tests/write_data_file.rs"
+    deps = [
+      "//sdk/fidl/fuchsia.fshost:fuchsia.fshost_rust",
+      "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+      "//sdk/rust/zx",
+      "//src/lib/fuchsia-fs",
+    ]
+  }
+
+  #
+  # Corruption Tests
+  #
+  if (invoker.enable_corruption_tests) {
+    _corrupt_component_target = "${target_name}_corrupt"
+    fshost_integration_test_component(_corrupt_component_target) {
+      fshost_target = _fshost_target
+      data_filesystem_format = fshost_options.data_filesystem_format
+      data_filesystem_variant = invoker.data_filesystem_variant
+      source_root = "tests/corrupt.rs"
+    }
+
+    # Corruption tests get their own package so we can give them separate test
+    # specs
+    _corrupt_test_package = "${target_name}_corrupt_package"
+    _test_packages += [ ":$_corrupt_test_package" ]
+    fuchsia_test_package(_corrupt_test_package) {
+      package_name = "$_corrupt_component_target"
+      test_specs = {
+        log_settings = {
+          max_severity = "ERROR"
+        }
+        parallel = 1
+      }
+      test_components = [ ":$_corrupt_component_target" ]
+
+      deps = [ ":$_fshost_target" ]
+    }
+  }
+
+  #
+  # Key shredding Tests
+  #
+  if (invoker.enable_shred_keys_tests) {
+    _shred_keys_component_target = "${target_name}_shred_keys"
+    fshost_integration_test_component(_shred_keys_component_target) {
+      fshost_target = _fshost_target
+      data_filesystem_format = fshost_options.data_filesystem_format
+      data_filesystem_variant = invoker.data_filesystem_variant
+      source_root = "tests/shred_keys.rs"
+      deps = [
+        "//sdk/fidl/fuchsia.fshost:fuchsia.fshost_rust",
+        "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+        "//sdk/rust/zx",
+        "//src/lib/fuchsia-async",
+        "//src/lib/fuchsia-fs",
+        "//src/security/lib/fake-keymint",
+        "//src/storage/crypt/policy",
+        "//src/storage/fidl/fuchsia.fs.startup:fuchsia.fs.startup_rust",
+        "//src/storage/fxfs/fidl/fuchsia.fxfs:fuchsia.fxfs_rust",
+        "//src/storage/lib/block_server/vmo_backed:test_vmo_backed_block_server",
+        "//src/storage/lib/fs_management/rust:fs_management",
+        "//third_party/rust_crates:assert_matches",
+        "//third_party/rust_crates:futures",
+        "//third_party/rust_crates:log",
+      ]
+    }
+
+    # shred_keys tests get their own package so we can give them separate test
+    # specs
+    _shred_keys_test_package = "${target_name}_shred_keys_package"
+    _test_packages += [ ":$_shred_keys_test_package" ]
+    fuchsia_test_package(_shred_keys_test_package) {
+      package_name = "$_shred_keys_component_target"
+      test_specs = {
+        log_settings = {
+          max_severity = "ERROR"
+        }
+        parallel = 1
+      }
+      test_components = [ ":$_shred_keys_component_target" ]
+
+      deps = [ ":$_fshost_target" ]
+    }
+  }
+
+  #
+  # Bad Provision Fxfs Tests
+  #
+  if (defined(invoker.enable_bad_provision_fxfs_tests) &&
+      invoker.enable_bad_provision_fxfs_tests) {
+    _bad_provision_fxfs_component_target = "${target_name}_bad_provision_fxfs"
+    fshost_integration_test_component(_bad_provision_fxfs_component_target) {
+      fshost_target = _fshost_target
+      data_filesystem_format = fshost_options.data_filesystem_format
+      data_filesystem_variant = invoker.data_filesystem_variant
+      source_root = "tests/bad_provision_fxfs.rs"
+      deps = [
+        "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+        "//src/lib/fidl/rust/fidl",
+        "//third_party/rust_crates:assert_matches",
+      ]
+    }
+
+    # Bad Provision Fxfs tests get their own package so we can give them
+    # separate test specs. The tests will trigger fshost to crash and produce
+    # messages of ERROR severity.
+    _bad_provision_fxfs_test_package =
+        "${target_name}_bad_provision_fxfs_package"
+    _test_packages += [ ":$_bad_provision_fxfs_test_package" ]
+    fuchsia_test_package(_bad_provision_fxfs_test_package) {
+      package_name = "$_bad_provision_fxfs_component_target"
+      test_specs = {
+        log_settings = {
+          # Allow logs of up to ERROR severity.
+          max_severity = "ERROR"
+        }
+        parallel = 1
+      }
+      test_components = [ ":$_bad_provision_fxfs_component_target" ]
+
+      deps = [ ":$_fshost_target" ]
+    }
+  }
+
+  if (invoker.enable_volume_death_tests) {
+    _volume_death_component_target = "${target_name}_volume_death"
+    fshost_integration_test_component(_volume_death_component_target) {
+      fshost_target = _fshost_target
+      data_filesystem_format = fshost_options.data_filesystem_format
+      data_filesystem_variant = invoker.data_filesystem_variant
+      source_root = "tests/volume_death.rs"
+      deps = [
+        "//sdk/fidl/fuchsia.component:fuchsia.component_rust",
+        "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+        "//src/lib/fidl/rust/fidl",
+        "//src/lib/fuchsia-async",
+        "//src/lib/fuchsia-fs",
+        "//third_party/rust_crates:assert_matches",
+        "//third_party/rust_crates:futures",
+      ]
+    }
+
+    # The crash tests trigger fshost process termination and diagnostic error
+    # messages. They must reside in a separate test package configuring
+    # max_severity = "ERROR"
+    _volume_death_test_package = "${target_name}_volume_death_package"
+    _test_packages += [ ":$_volume_death_test_package" ]
+    fuchsia_test_package(_volume_death_test_package) {
+      package_name = "$_volume_death_component_target"
+      test_specs = {
+        log_settings = {
+          max_severity = "ERROR"
+        }
+        parallel = 1
+      }
+      test_components = [ ":$_volume_death_component_target" ]
+
+      deps = [ ":$_fshost_target" ]
+    }
+  }
+
+  _main_test_package = "${target_name}_test_package"
+  _main_test_package_name = "$target_name"
+  _test_packages += [ ":$_main_test_package" ]
+  fuchsia_test_package(_main_test_package) {
+    package_name = _main_test_package_name
+    test_specs = {
+      parallel = 1
+    }
+    test_components = _test_components
+
+    deps = [
+      ":$_fshost_target",
+
+      # We need to make sure we have all the filesystems available in the
+      # package for various tests of the migration paths.
+      "//src/storage/blobfs/bin:component",
+      "//src/storage/f2fs/bin:f2fs-component",
+      "//src/storage/fxfs:fxfs_component",
+      "//src/storage/gpt/component",
+      "//src/storage/minfs/bin:minfs-component",
+    ]
+  }
+
+  group(target_name) {
+    testonly = true
+    deps = _test_packages
+  }
+}
+
+fshost_integration_test_package("fshost_integration_tests_fxfs") {
+  data_filesystem_variant = "fxblob"
+  enable_bad_provision_fxfs_tests = true
+  enable_system_volume_manipulation_tests = true
+  enable_shred_keys_tests = true
+  options = {
+  }
+  extra_deps =
+      [ "//src/sys/pkg/fidl/fuchsia.update.verify:fuchsia.update.verify_rust" ]
+}
+
+fshost_integration_test_package("fshost_integration_tests_fvm_minfs") {
+  enable_volume_death_tests = true
+  options = {
+    data_filesystem_format = "minfs"
+    fxfs_blob = false
+  }
+  extra_deps = [ "//src/storage/fvm:fvm-component" ]
+}
+
+fshost_integration_test_package(
+    "fshost_integration_tests_fvm_minfs_no_zxcrypt") {
+  data_filesystem_variant = "minfs-no-zxcrypt"
+  options = {
+    data_filesystem_format = "minfs"
+    fxfs_blob = false
+    no_zxcrypt = true
+  }
+  extra_deps = [ "//src/storage/fvm:fvm-component" ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":fshost_integration_tests_fvm_minfs",
+    ":fshost_integration_tests_fvm_minfs_no_zxcrypt",
+    ":fshost_integration_tests_fxfs",
+  ]
+}

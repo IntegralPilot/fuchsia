@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: MIT
+
+use anyhow::Context;
+use netlink_packet_utils::DecodeError;
+use netlink_packet_utils::traits::{Parseable, ParseableParametrized};
+
+use crate::constants::*;
+use crate::{SockDiagRequest, SockDiagResponse, inet, unix};
+
+const BUF_MIN_LEN: usize = 2;
+
+pub struct SockDiagBuffer<T> {
+    buffer: T,
+}
+
+impl<T: AsRef<[u8]>> SockDiagBuffer<T> {
+    pub(crate) fn new_unchecked(buffer: T) -> SockDiagBuffer<T> {
+        SockDiagBuffer { buffer }
+    }
+
+    pub fn length(&self) -> usize {
+        self.buffer.as_ref().len()
+    }
+
+    pub fn new(buffer: T) -> Result<Self, DecodeError> {
+        let packet = Self::new_unchecked(buffer);
+        packet.check_len()?;
+        Ok(packet)
+    }
+
+    pub(crate) fn check_len(&self) -> Result<(), DecodeError> {
+        let len = self.buffer.as_ref().len();
+        if len < BUF_MIN_LEN {
+            return Err(format!(
+                "invalid buffer: length is {len} but packets are at least {BUF_MIN_LEN} bytes"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn family(&self) -> u8 {
+        self.buffer.as_ref()[0]
+    }
+}
+
+impl<'a, T: AsRef<[u8]> + ?Sized> SockDiagBuffer<&'a T> {
+    pub fn inner(&self) -> &'a [u8] {
+        self.buffer.as_ref()
+    }
+}
+
+impl<'a, T: AsRef<[u8]> + AsMut<[u8]> + ?Sized> SockDiagBuffer<&'a mut T> {
+    pub fn inner_mut(&mut self) -> &mut [u8] {
+        self.buffer.as_mut()
+    }
+}
+
+impl<'a, T: AsRef<[u8]>> ParseableParametrized<SockDiagBuffer<&'a T>, u16> for SockDiagRequest {
+    type Error = DecodeError;
+    fn parse_with_param(
+        buf: &SockDiagBuffer<&'a T>,
+        message_type: u16,
+    ) -> Result<Self, DecodeError> {
+        use crate::SockDiagRequest::*;
+        buf.check_len()?;
+        let message = match (message_type, buf.family()) {
+            (SOCK_DIAG_BY_FAMILY, AF_INET | AF_INET6) => {
+                let err = "invalid AF_INET/AF_INET6 request";
+                let buf = inet::InetRequestBuffer::new(buf.inner()).context(err)?;
+                InetRequest(inet::InetRequest::parse(&buf).context(err)?)
+            }
+            (SOCK_DIAG_BY_FAMILY, AF_UNIX) => {
+                let err = "invalid AF_UNIX request";
+                let buf = unix::UnixRequestBuffer::new(buf.inner()).context(err)?;
+                UnixRequest(unix::UnixRequest::parse(&buf).context(err)?)
+            }
+            (SOCK_DIAG_BY_FAMILY, af) => return Err(format!("unknown address family {af}").into()),
+            (SOCK_DESTROY, AF_INET | AF_INET6) => {
+                let err = "invalid AF_INET/AF_INET6 request";
+                let buf = inet::InetRequestBuffer::new(buf.inner()).context(err)?;
+                InetSockDestroy(inet::InetRequest::parse(&buf).context(err)?)
+            }
+            _ => return Err(format!("unknown message type {message_type}").into()),
+        };
+        Ok(message)
+    }
+}
+
+impl<'a, T: AsRef<[u8]>> ParseableParametrized<SockDiagBuffer<&'a T>, u16> for SockDiagResponse {
+    type Error = DecodeError;
+    fn parse_with_param(
+        buf: &SockDiagBuffer<&'a T>,
+        message_type: u16,
+    ) -> Result<Self, DecodeError> {
+        use crate::SockDiagResponse::*;
+        buf.check_len()?;
+        let message = match (message_type, buf.family()) {
+            (SOCK_DIAG_BY_FAMILY, AF_INET | AF_INET6) => {
+                let err = "invalid AF_INET/AF_INET6 response";
+                let buf = inet::InetResponseBuffer::new(buf.inner()).context(err)?;
+                InetResponse(Box::new(inet::InetResponse::parse(&buf).context(err)?))
+            }
+            (SOCK_DIAG_BY_FAMILY, AF_UNIX) => {
+                let err = "invalid AF_UNIX response";
+                let buf = unix::UnixResponseBuffer::new(buf.inner()).context(err)?;
+                UnixResponse(Box::new(unix::UnixResponse::parse(&buf).context(err)?))
+            }
+            (SOCK_DIAG_BY_FAMILY, af) => return Err(format!("unknown address family {af}").into()),
+            _ => return Err(format!("unknown message type {message_type}").into()),
+        };
+        Ok(message)
+    }
+}

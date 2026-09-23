@@ -1,0 +1,155 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.sysmem;
+
+using fuchsia.sysmem2;
+using zx;
+
+/// Allocates system memory buffers.
+///
+@available(added=7, deprecated=23, note="use fuchsia.sysmem2.Allocator")
+@discoverable(server="platform")
+closed protocol Allocator {
+    /// Allocates a BufferCollection on behalf of a single client (aka initiator)
+    /// who is also the only participant (from the point of view of sysmem).
+    ///
+    /// This call exists mainly for temp/testing purposes.  This call skips the
+    /// BufferCollectionToken stage, so there's no way to allow another
+    /// participant to specify its constraints.
+    ///
+    /// Real clients are encouraged to use AllocateSharedCollection() instead,
+    /// and to let relevant participants directly convey their own constraints to
+    /// sysmem.
+    ///
+    /// `collection_request` is the server end of the BufferCollection FIDL
+    /// channel.  The client can call SetConstraints() and then
+    /// WaitForBuffersAllocated() on the client end of this channel to specify
+    /// constraints and then determine success/failure and get the
+    /// BufferCollectionInfo_2 for the BufferCollection.  The client should also
+    /// keep the client end of this channel open while using the
+    /// BufferCollection, and should notice when this channel closes and stop
+    /// using the BufferCollection ASAP.
+    strict AllocateNonSharedCollection(resource struct {
+        collection_request server_end:BufferCollection;
+    });
+
+    /// Creates a logical BufferCollectionToken which can be shared among
+    /// participants (using BufferCollectionToken.Duplicate()), and then
+    /// converted into a BufferCollection using BindSharedCollection().
+    ///
+    /// Success/failure to populate the BufferCollection with buffers is
+    /// determined via the BufferCollection interface.
+    strict AllocateSharedCollection(resource struct {
+        token_request server_end:BufferCollectionToken;
+    });
+
+    /// Convert a BufferCollectionToken into a connection to the logical
+    /// BufferCollection.  The BufferCollection hasn't yet been populated with
+    /// buffers - the participant must first also send SetConstraints() via the
+    /// client end of buffer_collection.
+    ///
+    /// All BufferCollectionToken(s) duplicated from a logical
+    /// BufferCollectionToken created via AllocateSharedCollection() must be
+    /// turned in via BindSharedCollection() before the logical BufferCollection
+    /// will be populated with buffers.
+    ///
+    /// `token` the client endpoint of a channel whose server end was sent to
+    /// sysmem using AllocateSharedCollection or whose server end was sent to
+    /// sysmem using BufferCollectionToken.Duplicate().  The token is being
+    /// "exchanged" for a channel to the logical BufferCollection.
+    ///
+    /// `buffer_collection_request` the server end of a BufferCollection
+    /// channel.  The sender retains the client end as usual.  The
+    /// BufferCollection channel is a single participant's connection to the
+    /// logical BufferCollection.  There typically will be other participants
+    /// with their own BufferCollection channel to the logical BufferCollection.
+    strict BindSharedCollection(resource struct {
+        token client_end:BufferCollectionToken;
+        buffer_collection_request server_end:BufferCollection;
+    });
+
+    /// Validate that a BufferCollectionToken is known to the sysmem server.
+    ///
+    /// This can be used in cases where BindSharedCollection() won't be called
+    /// until after BufferCollectionToken.Duplicate() +
+    /// BufferCollectionToken.Sync(), when the client code wants to know earlier
+    /// whether an incoming token is valid (so far).
+    ///
+    /// Calling BufferCollectionToken.Sync() on a token that isn't known to
+    /// sysmem risks the Sync() hanging forever.
+    ///
+    /// Given that an incoming token can become invalid at any time if any
+    /// participant drops their BufferCollectionToken(s) or BufferCollection(s),
+    /// authors of client code are encouraged to consider not calling
+    /// ValidateBufferCollectionToken() and instead dealing with async failure
+    /// of the BufferCollection.Sync() after all the
+    /// BufferCollectionToken.Duplicate() and BindSharedCollection() (before
+    /// sending any duplicate tokens to other processes).
+    ///
+    /// Regardless of the result of this call, this call has no effect on the
+    /// token with the referenced koid.
+    ///
+    /// A true result from this call doesn't guarantee that the token remains
+    /// valid for any duration afterwards.
+    ///
+    /// Client code will zx_object_get_info() on the client's token handle,
+    /// passing ZX_INFO_HANDLE_BASIC and getting back the related_koid
+    /// which then gets passed to ValidateBufferCollectionToken().
+    ///
+    /// If ValidateBufferCollectionToken() returns true, the token was known at
+    /// the time the sysmem server processed the call, but may no longer be
+    /// valid/known by the time the client code receives the response.
+    ///
+    /// If ValidateBufferCollectionToken() returns false, the token wasn't known
+    /// at the time the sysmem server processed the call, but the token may
+    /// become known by the time the client code receives the response.  However
+    /// client code is not required to mitigate the possibility that the token
+    /// may become known late, since the source of the token should have synced
+    /// the token to sysmem before sending the token to the client code.
+    ///
+    /// If calling ValidateBufferCollectionToken() fails in some way, there will
+    /// be a zx_status_t from the FIDL layer.
+    ///
+    /// `token_server_koid` the koid of the server end of a channel that might
+    /// be a BufferCollectionToken channel.  This can be obtained from
+    /// zx_object_get_info() ZX_INFO_HANDLE_BASIC related_koid.
+    strict ValidateBufferCollectionToken(struct {
+        token_server_koid zx.Koid;
+    }) -> (struct {
+        is_known bool;
+    });
+
+    /// Set information about the current client that can be used by sysmem to
+    /// help debug leaking memory and hangs waiting for constraints. |name| can
+    /// be an arbitrary string, but the current process name (see
+    /// fsl::GetCurrentProcessName()) is a good default. |id| can be an
+    /// arbitrary id, but the current process ID (see
+    /// fsl::GetCurrentProcessKoid()) is a good default.
+    ///
+    /// This information is propagated to all BufferCollections created using
+    /// BindSharedCollection() or AllocateNonSharedCollection() from this
+    /// allocator. It does not affect BufferCollectionTokens, since they are
+    /// often passed cross-process and should have their names managed manually.
+    strict SetDebugClientInfo(struct {
+        name string:64;
+        id uint64;
+    });
+
+    /// This allows creating a sysmem2 `Allocator` given a sysmem(1)
+    /// `Allocator`.
+    ///
+    /// This is mainly useful in situations where library code is handed a
+    /// sysmem(1) allocator, but the library code has been updated to use
+    /// sysmem2. Typically the library will provide a way to pass in a sysmem2
+    /// `Allocator` instead, but client code isn't always in the same repo, so
+    /// this message allows the library to still accept the sysmem(1) Allocator
+    /// temporarily.
+    ///
+    /// The info set via `SetDebugClientInfo` (if any) is copied to the sysmem2
+    /// `Allocator`.
+    @available(added=20, deprecated=23, note="connect to fuchsia.sysmem2.Allocator directly")
+    strict ConnectToSysmem2Allocator(resource struct {
+        allocator_request server_end:fuchsia.sysmem2.Allocator;
+    });
+};

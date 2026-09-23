@@ -1,0 +1,129 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "zircon_platform_bus_mapper.h"
+
+#include <lib/magma/platform/platform_logger.h>
+#include <lib/magma/platform/platform_trace.h>
+#include <lib/zx/process.h>
+#include <zircon/status.h>
+
+namespace magma {
+
+namespace {
+zx::resource info_resource_s;
+}
+
+ZirconPlatformBusMapper::BusMapping::~BusMapping() {
+  for (auto& pmt : pmt_) {
+    zx_status_t status = pmt.unpin();
+    if (status != ZX_OK) {
+      DLOG("zx_pmt_unpin failed: %s\n", zx_status_get_string(status));
+    }
+  }
+}
+
+std::unique_ptr<PlatformBusMapper::BusMapping> ZirconPlatformBusMapper::MapPageRangeBus(
+    magma::PlatformBuffer* buffer, uint64_t start_page_index, uint64_t page_count) {
+  TRACE_DURATION("magma", "MapPageRangeBus");
+  static_assert(sizeof(zx_paddr_t) == sizeof(uint64_t), "unexpected sizeof(zx_paddr_t)");
+
+  if ((page_count == 0) || (start_page_index + page_count) * magma::page_size() > buffer->size())
+    return DRETP(nullptr, "Invalid range: %lu, %lu", start_page_index, page_count);
+
+  // Pin in 32MB chunks because Zircon can't pin a 512MB buffer (https://fxbug.dev/42121495)
+  const uint64_t kMaxPageCount = 32 * 1024 * 1024 / magma::page_size();
+  uint64_t pmt_count = magma::round_up(page_count, kMaxPageCount) / kMaxPageCount;
+
+  std::vector<uint64_t> page_addr(page_count);
+  std::vector<zx::pmt> pmt(pmt_count);
+
+  for (uint32_t i = 0; i < pmt_count; i++) {
+    uint64_t chunk_page_count = page_count - (i * kMaxPageCount);
+
+    if (chunk_page_count > kMaxPageCount) {
+      chunk_page_count = kMaxPageCount;
+    }
+
+    uint64_t size = chunk_page_count * magma::page_size();
+    uint64_t page_offset = i * kMaxPageCount;
+
+    zx_status_t status;
+    {
+      TRACE_DURATION("magma", "bti pin", "size", size);
+      status = zx_bti_pin(bus_transaction_initiator_->get(),
+                          ZX_BTI_PERM_READ | ZX_BTI_PERM_WRITE | ZX_BTI_PERM_EXECUTE,
+                          static_cast<ZirconPlatformBuffer*>(buffer)->handle(),
+                          (start_page_index + page_offset) * magma::page_size(), size,
+                          page_addr.data() + page_offset, chunk_page_count,
+                          pmt[i].reset_and_get_address());
+    }
+    if (status != ZX_OK) {
+      zx_info_kmem_stats_t kmem_stats{};
+      if (info_resource_s) {
+        info_resource_s.get_info(ZX_INFO_KMEM_STATS, &kmem_stats, sizeof(kmem_stats), nullptr,
+                                 nullptr);
+      }
+      zx_info_task_stats_t task_stats = {};
+      zx::process::self()->get_info(ZX_INFO_TASK_STATS, &task_stats, sizeof(task_stats), nullptr,
+                                    nullptr);
+      MAGMA_LOG(
+          WARNING,
+          "Failed to pin buffer \"%s\" koid %ld  %u 0x%lx pages (0x%lx bytes) with status %s. Out of Memory?\n"
+          "mem_mapped_bytes: 0x%lx mem_private_bytes: 0x%lx mem_shared_bytes: 0x%lx\n"
+          "total_bytes: 0x%lx free_bytes 0x%lx: wired_bytes: 0x%lx vmo_bytes: 0x%lx\n"
+          "mmu_overhead_bytes: 0x%lx other_bytes: 0x%lx\n",
+          buffer->GetName().c_str(), buffer->global_id(), i, chunk_page_count, size,
+          zx_status_get_string(status), task_stats.mem_mapped_bytes, task_stats.mem_private_bytes,
+          task_stats.mem_shared_bytes, kmem_stats.total_bytes, kmem_stats.free_bytes,
+          kmem_stats.wired_bytes, kmem_stats.vmo_bytes, kmem_stats.mmu_overhead_bytes,
+          kmem_stats.other_bytes);
+      return nullptr;
+    }
+  }
+
+  auto mapping =
+      std::make_unique<BusMapping>(start_page_index, std::move(page_addr), std::move(pmt));
+
+  return mapping;
+}
+
+std::unique_ptr<PlatformBuffer> ZirconPlatformBusMapper::CreateContiguousBuffer(
+    size_t size, uint32_t alignment_log2, const char* name) {
+  zx::vmo vmo;
+  zx_status_t status = zx_vmo_create_contiguous(bus_transaction_initiator_->get(), size,
+                                                alignment_log2, vmo.reset_and_get_address());
+  if (status != ZX_OK)
+    DRETP(nullptr, "Failed to create contiguous vmo: %d", status);
+  vmo.set_property(ZX_PROP_NAME, name, strlen(name));
+  return PlatformBuffer::Import(vmo.release());
+}
+
+// static
+void PlatformBusMapper::SetInfoResource(zx::resource info_resource) {
+  info_resource_s = std::move(info_resource);
+}
+
+// static
+void PlatformBusMapper::SetInfoResource(zx::unowned_resource info_resource) {
+  zx::resource resource_dup;
+  zx_status_t status = info_resource->duplicate(ZX_RIGHT_SAME_RIGHTS, &resource_dup);
+  if (status != ZX_OK) {
+    DMESSAGE("Failed to duplicate info resource: %s", zx_status_get_string(status));
+  }
+  info_resource_s = std::move(resource_dup);
+}
+
+std::unique_ptr<PlatformBusMapper> PlatformBusMapper::Create(
+    std::shared_ptr<PlatformHandle> bus_transaction_initiator) {
+  return std::make_unique<ZirconPlatformBusMapper>(
+      std::static_pointer_cast<ZirconPlatformHandle>(bus_transaction_initiator));
+}
+
+std::unique_ptr<PlatformBusMapper> PlatformBusMapper::Create(zx::bti bus_transaction_initiator) {
+  return std::make_unique<ZirconPlatformBusMapper>(
+      std::make_shared<ZirconPlatformHandle>(std::move(bus_transaction_initiator)));
+}
+
+}  // namespace magma

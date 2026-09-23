@@ -1,0 +1,438 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "src/lib/intl/intl_property_provider_impl/intl_property_provider_impl.h"
+
+#include <fuchsia/intl/cpp/fidl.h>
+#include <fuchsia/settings/cpp/fidl.h>
+#include <fuchsia/settings/cpp/fidl_test_base.h>
+#include <lib/fidl/cpp/binding.h>
+#include <lib/fidl/cpp/binding_set.h>
+#include <lib/inspect/cpp/inspect.h>
+#include <lib/inspect/testing/cpp/inspect.h>
+#include <lib/sys/cpp/testing/component_context_provider.h>
+#include <lib/syslog/cpp/log_settings.h>
+#include <lib/syslog/cpp/macros.h>
+
+#include <gtest/gtest.h>
+
+#include "lib/inspect/cpp/health.h"
+#include "src/lib/fidl_fuchsia_intl_ext/cpp/fidl_ext.h"
+#include "src/lib/fostr/fidl/fuchsia/intl/formatting.h"
+#include "src/lib/fostr/fidl/fuchsia/settings/formatting.h"
+#include "src/lib/fxl/test/test_settings.h"
+#include "src/lib/testing/loop_fixture/real_loop_fixture.h"
+#include "src/performance/trace/tests/component_context.h"
+
+namespace intl::testing {
+namespace {
+
+using fuchsia::intl::CalendarId;
+using fuchsia::intl::LocaleId;
+using fuchsia::intl::Profile;
+using fuchsia::intl::PropertyProvider;
+using fuchsia::intl::TemperatureUnit;
+using fuchsia::intl::TimeZoneId;
+using fuchsia::settings::HourCycle;
+using sys::testing::ComponentContextProvider;
+using namespace inspect::testing;
+
+template <typename T>
+T CloneStruct(const T& value) {
+  T new_value;
+  value.Clone(&new_value);
+  return new_value;
+}
+
+fuchsia::settings::IntlSettings NewSettings(const std::vector<std::string>& locale_ids,
+                                            HourCycle hour_cycle,
+                                            TemperatureUnit temperature_unit) {
+  EXPECT_FALSE(locale_ids.empty()) << "by settings protocol locale ids must be nonempty";
+  fuchsia::settings::IntlSettings settings;
+  std::vector<LocaleId> locales;
+  locales.reserve(locale_ids.size());
+  for (const auto& locale_id : locale_ids) {
+    locales.emplace_back(LocaleId{
+        .id = locale_id,
+    });
+  }
+  settings.set_locales(std::move(locales));
+  settings.set_temperature_unit(temperature_unit);
+  settings.set_hour_cycle(hour_cycle);
+  return settings;
+}
+
+// A fake implementation of fuchsia.settings.Intl service.  The Watch protocol specifically is not
+// implemented correctly for multiple watchers.
+class FakeSettingsService : public fuchsia::settings::testing::Intl_TestBase {
+ public:
+  FakeSettingsService()
+      : intl_settings_(NewSettings({"en-US-x-fxdef"}, HourCycle::H12, TemperatureUnit::FAHRENHEIT)),
+        state_changed_(true) {}
+
+  fidl::InterfaceRequestHandler<fuchsia::settings::Intl> GetHandler(
+      async_dispatcher_t* dispatcher = nullptr) {
+    return bindings_.GetHandler(static_cast<fuchsia::settings::Intl*>(this), dispatcher);
+  }
+
+  // Test method, used to modify the timezone identifier served by the fake setui service.
+  void SetTimeZone(const std::string& iana_tz_id) {
+    fuchsia::settings::IntlSettings new_settings = CloneStruct(intl_settings_);
+    new_settings.mutable_time_zone_id()->id = iana_tz_id;
+    SetIntl(new_settings);
+  }
+
+  // Test method, used to modify the fake intl data that this fake service implementation will
+  // serve.
+  void SetIntl(const fuchsia::settings::IntlSettings& intl_settings) {
+    if (fidl::Equals(intl_settings_, intl_settings)) {
+      return;
+    }
+    intl_settings_ = CloneStruct(intl_settings);
+    state_changed_ = true;
+    Notify();
+  }
+
+  // Implements `fuchsia.settings.Watch`, but only for a single watcher.
+  void Watch(WatchCallback callback) override {
+    watcher_ = std::move(callback);
+    if (state_changed_) {
+      Notify();
+    }
+  }
+
+  // Called on all other methods that this fake does not implement.
+  void NotImplemented_(const std::string& name) override {
+    FAIL() << "Method not implemented: " << name;
+  }
+
+ private:
+  void Notify() {
+    if (watcher_ == nullptr) {
+      FX_LOGS(INFO) << "No watcher, not notifying.";
+      return;
+    }
+    FX_LOGS(INFO) << "telling watcher it's " << intl_settings_;
+    watcher_(CloneStruct(intl_settings_));
+    state_changed_ = false;
+    watcher_ = nullptr;
+  }
+
+  // The server-side connection for Intl service
+  fidl::BindingSet<fuchsia::settings::Intl> bindings_;
+
+  // The fake implementation of the watch protocol works for one listener only.
+  WatchCallback watcher_;
+
+  // Settings reported on a Watch call.
+  fuchsia::settings::IntlSettings intl_settings_;
+
+  // If set, it means that any incoming watch should return immediately.
+  bool state_changed_{};
+};
+
+struct Inspect {
+  static constexpr char kNodeName[] = "inspect";
+  explicit Inspect(inspect::ComponentInspector inspector)
+      : comp_inspector(std::move(inspector)), node(comp_inspector.root().CreateChild(kNodeName)) {}
+
+  inspect::ComponentInspector comp_inspector;
+  inspect::Node node;
+};
+
+// Tests for `IntlPropertyProviderImpl`.
+class IntlPropertyProviderImplTest : public gtest::RealLoopFixture {
+ protected:
+  void SetUp() override {
+    inspect_ = std::make_unique<Inspect>(inspect::ComponentInspector(dispatcher(), {}));
+    SetUpInstanceWithIncomingServices();
+    PublishOutgoingService();
+  }
+
+  // Creates a server under test, connecting to the backend FIDL services that
+  // are exposed by the test fixture.
+  void SetUpInstanceWithIncomingServices() {
+    setui_service_ = std::make_unique<FakeSettingsService>();
+    ASSERT_EQ(ZX_OK, provider_.service_directory_provider()->AddService(
+                         setui_service_->GetHandler(dispatcher())));
+    fuchsia::settings::IntlPtr client =
+        provider_.context()->svc()->Connect<fuchsia::settings::Intl>();
+    auto health = inspect::NodeHealth(&inspect_->node);
+    instance_ = std::make_unique<IntlPropertyProviderImpl>(std::move(client), std::move(health));
+  }
+
+  // Makes the service of the unit under test available in the outgoing testing
+  // directory, so that the tests can connect to it.
+  void PublishOutgoingService() {
+    ASSERT_EQ(ZX_OK, provider_.context()->outgoing()->AddPublicService(
+                         instance_->GetHandler(dispatcher())));
+  }
+
+  // Creates a client of `fuchsia.intl.PropertyProvider`, which can be instantiated in a test case
+  // to connect to the service under test.
+  fuchsia::intl::PropertyProviderPtr GetClient() {
+    return provider_.ConnectToPublicService<fuchsia::intl::PropertyProvider>();
+  }
+
+  // The default component context provider.
+  ComponentContextProvider provider_;
+
+  // Component inspector is initialized on each SetUp.
+  std::unique_ptr<Inspect> inspect_;
+
+  // The fake setui service instance.
+  std::unique_ptr<FakeSettingsService> setui_service_;
+
+  // The instance of the server under test.
+  std::unique_ptr<IntlPropertyProviderImpl> instance_;
+};
+
+TEST_F(IntlPropertyProviderImplTest, GeneratesValidProfileFromDefaults) {
+  setui_service_->SetTimeZone("America/New_York");
+
+  Profile expected{};
+  expected.set_locales({LocaleId{.id = "en-US-u"
+                                       "-ca-gregory"
+                                       "-fw-sun"
+                                       "-hc-h12"
+                                       "-ms-ussystem"
+                                       "-nu-latn"
+                                       "-tz-usnyc"
+                                       "-x-fxdef"}});
+  expected.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected.set_time_zones({TimeZoneId{.id = "America/New_York"}});
+  expected.set_temperature_unit(TemperatureUnit::FAHRENHEIT);
+
+  auto client = GetClient();
+
+  Profile actual;
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+  EXPECT_EQ(expected, actual);
+
+  // Check that inspect is healthy after this.
+  // root:
+  //   inspect:
+  //     fuchsia.inspect.Health:
+  //       ...
+  //       status = OK
+  auto hierarchy_result = inspect::ReadFromVmo(inspect_->comp_inspector.inspector().DuplicateVmo());
+  auto health_matcher = NodeMatches(AllOf(NameMatches("fuchsia.inspect.Health"),
+                                          PropertyList(Contains(StringIs("status", "OK")))));
+  auto inspect_matcher = AllOf(ChildrenMatch(Contains(health_matcher)));
+  EXPECT_THAT(hierarchy_result.take_value(),
+              AllOf(NodeMatches(NameMatches("root")), ChildrenMatch(Contains(inspect_matcher))));
+}
+
+TEST_F(IntlPropertyProviderImplTest, NotifiesOnTimeZoneChange) {
+  setui_service_->SetTimeZone("America/New_York");
+
+  Profile expected_a{};
+  expected_a.set_locales({LocaleId{.id = "en-US-u"
+                                         "-ca-gregory"
+                                         "-fw-sun"
+                                         "-hc-h12"
+                                         "-ms-ussystem"
+                                         "-nu-latn"
+                                         "-tz-usnyc"
+                                         "-x-fxdef"}});
+  expected_a.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected_a.set_time_zones({TimeZoneId{.id = "America/New_York"}});
+  expected_a.set_temperature_unit(TemperatureUnit::FAHRENHEIT);
+
+  auto client = GetClient();
+
+  Profile actual;
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+  ASSERT_EQ(expected_a, actual);
+
+  bool changed = false;
+  client.events().OnChange = [&]() { changed = true; };
+  RunLoopUntilIdle();
+  ASSERT_FALSE(changed);
+
+  setui_service_->SetTimeZone("Asia/Shanghai");
+  RunLoopUntilIdle();
+  ASSERT_TRUE(changed);
+
+  Profile expected_b{};
+  expected_b.set_locales({LocaleId{.id = "en-US-u"
+                                         "-ca-gregory"
+                                         "-fw-sun"
+                                         "-hc-h12"
+                                         "-ms-ussystem"
+                                         "-nu-latn"
+                                         "-tz-cnsha"
+                                         "-x-fxdef"}});
+  expected_b.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected_b.set_time_zones({TimeZoneId{.id = "Asia/Shanghai"}});
+  expected_b.set_temperature_unit(TemperatureUnit::FAHRENHEIT);
+
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+  EXPECT_EQ(expected_b, actual);
+}
+
+TEST_F(IntlPropertyProviderImplTest, NotifiesOnLocaleChange) {
+  setui_service_->SetIntl(NewSettings({"nl-NL"}, HourCycle::H12, TemperatureUnit::CELSIUS));
+  setui_service_->SetTimeZone("UTC");
+  RunLoopUntilIdle();
+
+  Profile expected_a{};
+  expected_a.set_locales({LocaleId{.id = "nl-NL-u"
+                                         "-ca-gregory"
+                                         "-fw-mon"
+                                         "-hc-h12"
+                                         "-ms-metric"
+                                         "-nu-latn"
+                                         "-tz-utc"}});
+  expected_a.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected_a.set_time_zones({TimeZoneId{.id = "UTC"}});
+  expected_a.set_temperature_unit(TemperatureUnit::CELSIUS);
+
+  auto client = GetClient();
+
+  Profile actual;
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+  ASSERT_EQ(expected_a, actual);
+
+  bool changed = false;
+  client.events().OnChange = [&]() { changed = true; };
+  RunLoopUntilIdle();
+  ASSERT_FALSE(changed);
+
+  setui_service_->SetIntl(NewSettings({"ru-RU"}, HourCycle::H23, TemperatureUnit::CELSIUS));
+  RunLoopUntilIdle();
+  ASSERT_TRUE(changed);
+
+  Profile expected_b{};
+  expected_b.set_locales({LocaleId{.id = "ru-RU-u"
+                                         "-ca-gregory"
+                                         "-fw-mon"
+                                         "-hc-h23"
+                                         "-ms-metric"
+                                         "-nu-latn"
+                                         "-tz-utc"}});
+  expected_b.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected_b.set_time_zones({TimeZoneId{.id = "UTC"}});
+  expected_b.set_temperature_unit(TemperatureUnit::CELSIUS);
+
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+  EXPECT_EQ(expected_b, actual);
+}
+
+TEST_F(IntlPropertyProviderImplTest, SettingMix) {
+  setui_service_->SetIntl(NewSettings({"nl-NL"}, HourCycle::H12, TemperatureUnit::CELSIUS));
+  setui_service_->SetTimeZone("Europe/Amsterdam");
+  RunLoopUntilIdle();
+
+  auto client = GetClient();
+
+  Profile actual;
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+
+  Profile expected{};
+  expected.set_locales({LocaleId{.id = "nl-NL-u"
+                                       "-ca-gregory"
+                                       "-fw-mon"
+                                       "-hc-h12"
+                                       "-ms-metric"
+                                       "-nu-latn"
+                                       "-tz-nlams"}});
+  expected.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected.set_time_zones({TimeZoneId{.id = "Europe/Amsterdam"}});
+  expected.set_temperature_unit(TemperatureUnit::CELSIUS);
+
+  EXPECT_EQ(expected, actual);
+
+  setui_service_->SetIntl(NewSettings({"nl-NL"}, HourCycle::H23, TemperatureUnit::CELSIUS));
+  RunLoopUntilIdle();
+
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+
+  expected.set_locales({LocaleId{.id = "nl-NL-u"
+                                       "-ca-gregory"
+                                       "-fw-mon"
+                                       "-hc-h23"
+                                       "-ms-metric"
+                                       "-nu-latn"
+                                       "-tz-nlams"}});
+  expected.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected.set_time_zones({TimeZoneId{.id = "Europe/Amsterdam"}});
+  expected.set_temperature_unit(TemperatureUnit::CELSIUS);
+
+  EXPECT_EQ(expected, actual);
+}
+
+TEST_F(IntlPropertyProviderImplTest, Multilocale) {
+  setui_service_->SetIntl(
+      NewSettings({"nl-NL", "nl-BE", "nl", "fr-FR"}, HourCycle::H12, TemperatureUnit::CELSIUS));
+  setui_service_->SetTimeZone("Europe/Amsterdam");
+  RunLoopUntilIdle();
+
+  auto client = GetClient();
+
+  Profile actual;
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+
+  Profile expected{};
+  expected.set_locales({
+      LocaleId{.id = "nl-NL-u-ca-gregory-fw-mon-hc-h12-ms-metric-nu-latn-tz-nlams"},
+      LocaleId{.id = "nl-BE-u-ca-gregory-fw-mon-hc-h12-ms-metric-nu-latn-tz-nlams"},
+      LocaleId{.id = "nl-u-ca-gregory-fw-mon-hc-h12-ms-metric-nu-latn-tz-nlams"},
+      LocaleId{.id = "fr-FR-u-ca-gregory-fw-mon-hc-h12-ms-metric-nu-latn-tz-nlams"},
+  });
+  expected.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected.set_time_zones({TimeZoneId{.id = "Europe/Amsterdam"}});
+  expected.set_temperature_unit(TemperatureUnit::CELSIUS);
+
+  EXPECT_EQ(expected, actual);
+}
+
+TEST_F(IntlPropertyProviderImplTest, UnsetDefault) {
+  setui_service_->SetTimeZone("America/Los_Angeles");
+  RunLoopUntilIdle();
+
+  auto client = GetClient();
+
+  Profile actual;
+  client->GetProfile([&](Profile profile) { actual = std::move(profile); });
+  RunLoopUntilIdle();
+
+  Profile expected{};
+  // This locale is reported if we never received any explicit settings from
+  // the setui service.  The client will need to figure out what to do in the
+  // case the locale is undefined.  Will probably need to do some sort of an
+  // ultimate fallback.
+  expected.set_locales(
+      {LocaleId{.id = "en-US-u-ca-gregory-fw-sun-hc-h12-ms-ussystem-nu-latn-tz-uslax-x-fxdef"}});
+  expected.set_calendars({{CalendarId{.id = "und-u-ca-gregory"}}});
+  expected.set_time_zones({TimeZoneId{.id = "America/Los_Angeles"}});
+  expected.set_temperature_unit(TemperatureUnit::FAHRENHEIT);
+
+  EXPECT_EQ(expected, actual);
+}
+
+}  // namespace
+}  // namespace intl::testing
+
+// This test has its own main because we want the logger to be turned on.
+int main(int argc, char** argv) {
+  if (!fxl::SetTestSettings(argc, argv)) {
+    FX_LOGS(ERROR) << "Failed to parse log settings from command-line";
+    return EXIT_FAILURE;
+  }
+
+  testing::InitGoogleTest(&argc, argv);
+
+  tracing::test::InitComponentContext();
+
+  return RUN_ALL_TESTS();
+}

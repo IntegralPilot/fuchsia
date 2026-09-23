@@ -1,0 +1,448 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/assembled_system.gni")
+import("//build/assembly/board_configuration.gni")
+import("//build/assembly/generated_partitions_config.gni")
+import("//build/assembly/package_list.gni")
+import("//build/assembly/product_assembly_configuration.gni")
+import("//build/assembly/update_package.gni")
+import("//build/compiled_action.gni")
+import("//build/components/fuchsia_package.gni")
+import("//build/components/fuchsia_test_component.gni")
+
+import("//build/dist/resource.gni")
+import("//build/dist/zip_resource.gni")
+import("//build/info/info.gni")
+import("//build/packages/publish-archive.gni")
+import("//build/rust/rustc_binary.gni")
+
+# Construct a system assembly for use in product security tests.
+#
+# Parameters:
+#
+#
+#   Assembly parameters:
+#
+#   product_name (required):
+#     [string] product_name forwarded to the product config.
+#
+#   board_name (required):
+#     [string] board_name forwarded to assembled_system(target_name).
+#
+#   base_packages (optional):
+#     [list of labels] fuchsia_package() targets to add to the product config.
+#
+#   tuf_repo_configs (optional):
+#     [list of file paths] List of tuf repo configs to add to the product config.
+#
+#   system_version_file (required):
+#     [string] The file used to designate system version in the assembly's
+#     update package and build-info package.
+#
+#   fvm_truncate_to_length (optional)
+#     [int] The precise size to make the (non-sparse) FVM image. See
+#     documentation of the `--length` parameter of the `fvm` binary host tool
+#     for details.
+#
+#   use_fxfs_blob (optional; default: false)
+#     [bool] If set to true, prompts assembled_system to generate an fxfs image
+#     with fxblob and sets fshost's configuration to fxfs with fxfs_blob = true.
+#     If set to false, prompts assembled_system to generate an fvm and sets fshost's
+#     configuration to use minfs as the data format.
+#
+#   Test asset packaging parameters:
+#
+#   packaged_assembly_directory (required):
+#     [string] The subdirectory in data/assemblies where the
+#     packaged-in-a-fuchsia-package copy of assembled artifacts will be stored.
+#
+#   update_domain (required):
+#     Domain name (that is, hostname of package server) used for OTA updates.
+#     There must be a corresponding `pkg-resolver` configuration for this
+#     domain, and update packages must designate this domain in their
+#     `packages.json` file.
+#
+#   SSL/TLS asset packaging parameters:
+#
+#   root_ssl_cert (required):
+#     [string] The gn-style path to a root SSL certificate that is compatible
+#     with SSL/TLS connections needed in the test environment. This must be
+#     configured to be compatible with certchain/server key pairs used by
+#     network-connected test components such as pkg_server.
+#
+# Public targets:
+#
+#   ${target_name}:
+#     The assembled_system(target_name) { ... } used as a basis for other
+#     targets.
+#
+#   ${target_name}_update_package:
+#     The update package for the assembled system.
+#
+#   ${target_name}_system_resources:
+#     The resources required for serving the assembled system as installed on
+#     device. Resources reside in package's
+#     data/assemblies/${packaged_assembly_directory} directory.
+#
+#   ${target_name}_update_package_resource:
+#     The update package as a resource stored in package's
+#     data/assemblies/${packaged_assembly_directory}/update/update.far.
+#
+#   ${target_name}_tuf_repo_resources:
+#     The resources required for a static assets package server that can serve
+#     the assembled system (including the update package). Resources reside in
+#     package's data/assemblies/${packaged_assembly_directory}/repository
+#     directory.
+
+template("assemble_security_pkg_test_system") {
+  assert(defined(invoker.product_name),
+         "product_name must be defined for $target_name")
+  assert(defined(invoker.board_name),
+         "board_name must be defined for $target_name")
+  assert(defined(invoker.system_version_file),
+         "system_version_file must be defined for $target_name")
+  assert(defined(invoker.packaged_assembly_directory),
+         "packaged_assembly_directory must be defined for $target_name")
+  assert(defined(invoker.update_domain),
+         "update_domain must be defined for $target_name")
+  assert(defined(invoker.root_ssl_cert),
+         "root_ssl_cert must be defined for $target_name")
+
+  assembly_name = target_name
+  if (current_toolchain == target_toolchain) {
+    packaged_assembly_directory = invoker.packaged_assembly_directory
+  } else {
+    not_needed(invoker, [ "packaged_assembly_directory" ])
+  }
+
+  use_fxfs_blob = false
+  if (defined(invoker.use_fxfs_blob)) {
+    use_fxfs_blob = invoker.use_fxfs_blob
+  }
+
+  labels = {
+    assembly = assembly_name
+    assembly_image_assembler = "${assembly_name}.image_assembler"
+    assembly_partitions_config = "${assembly_name}_partitions_config"
+    product_config = "${assembly_name}_product_config"
+    board_config = "${assembly_name}_board_config"
+    repository_config = "${assembly_name}_repository_config"
+    packages_json = "${assembly_name}_packages_json"
+    update_package = "${assembly_name}_update_package"
+    root_ssl_certificates = "${assembly_name}_root_ssl_certificates"
+    root_ssl_certificates_resource_group =
+        "${assembly_name}_root_ssl_certificates_resource_group"
+    system_resources = "${assembly_name}_system_resources"
+    update_package_resource = "${assembly_name}_update_package_resource"
+    tuf_repo_resources = "${assembly_name}_tuf_repo_resources"
+    base_package_manifests_list = "${assembly_name}.base_packages.list"
+    update_packages_manifests_lists =
+        "${assembly_name}.update_packages_manifests.list"
+    all_package_manifests_list = "${assembly_name}_all_package_manifests_list"
+    publish_archive = "${assembly_name}_publish_archive"
+    packages_for_update = "${assembly_name}_packages_for_update"
+  }
+
+  directories = {
+    assembly_target_out =
+        get_label_info(":${labels.assembly}", "target_out_dir")
+    assembly_out = "${assembly_target_out}/${assembly_name}"
+    assembly_gen = "${assembly_target_out}/${assembly_name}_gen"
+    update_out = "${assembly_target_out}/${labels.update_package}"
+    all_package_manifests_list_out =
+        "${assembly_gen}/all_package_manifests_list"
+  }
+  if (current_toolchain == target_toolchain) {
+    directories.packaged_repository =
+        "data/assemblies/${packaged_assembly_directory}/repository"
+  }
+
+  files = {
+    packages_json =
+        "${directories.assembly_gen}/security_pkg_test_packages.json"
+    board_config = "${directories.assembly_gen}/board_config.json"
+    base_package_manifests_list =
+        "${target_out_dir}/${assembly_name}.base_packages.list"
+    update_packages_manifests_list =
+        "${target_out_dir}/${assembly_name}.update_packages.list"
+
+    # The combined set of base packages and the update package manifest(s) that
+    # lists them.
+    all_package_manifests_list = "${directories.all_package_manifests_list_out}/all_package_manifests.list"
+  }
+
+  # Resource files with both `local` and `packaged` paths.
+  if (current_toolchain == target_toolchain) {
+    # fxfs_blob is pulled in via assembled_system.gni which includes
+    # generated_fshost_config.gni. assembled_system will generate either a
+    # fxfs.blk or fvm.blk depending on the fxfs_blob flag.
+    if (use_fxfs_blob) {
+      fs_file_name = "fxfs"
+    } else {
+      fs_file_name = "fvm"
+    }
+
+    # Filesystem image can be fxfs or fvm, but the test should only need to know
+    # that it's a filesystem image. fshost will figure out which one it is when
+    # it's loaded into a VMO and added to the isolated dev tree via
+    # RamdiskClient.
+    fs_blk_resource = {
+      local = "${directories.assembly_gen}/${fs_file_name}.blk"
+      packaged = "data/assemblies/${packaged_assembly_directory}/fs.blk"
+    }
+    base_far_resource = {
+      local = "${directories.assembly_gen}/meta.far"
+      packaged = "data/assemblies/${packaged_assembly_directory}/base.far"
+    }
+    update_far_resource = {
+      local = "${directories.update_out}/update.far"
+      packaged =
+          "data/assemblies/${packaged_assembly_directory}/update/update.far"
+    }
+    root_ssl_certificates_resource = {
+      local = invoker.root_ssl_cert
+      packaged = "data/cert.pem"
+    }
+  } else {
+    # `invoker.root_ssl_cert` designates input only used for `target_toolchain`.
+    not_needed(invoker, [ "root_ssl_cert" ])
+  }
+
+  # Test-only root SSL certificates for domain names that may be used in tests.
+  fuchsia_package(labels.root_ssl_certificates) {
+    testonly = true
+    package_name = "root_ssl_certificates"
+    deps = [ ":${labels.root_ssl_certificates_resource_group}" ]
+  }
+
+  # Collect the build-info files using the default, but override the version.
+  _build_info = default_product_build_info
+  _build_info.name = invoker.product_name
+  _build_info.version = rebase_path(invoker.system_version_file, root_build_dir)
+
+  product_assembly_configuration(labels.product_config) {
+    testonly = true
+    platform = {
+      build_type = "eng"
+
+      if (defined(invoker.tuf_repo_configs)) {
+        software_delivery = {
+          tuf_config_paths =
+              rebase_path(invoker.tuf_repo_configs, root_build_dir)
+        }
+      }
+
+      # We use a utility assembly, because this needs a filesystem for the test,
+      # and bootstrap assemblies cannot produce a filesystem. A standard
+      # assembly would insert packages into the filesystem that collide with the
+      # packages provided by the test. Utility is the only option.
+      feature_set_level = "utility"
+
+      storage = {
+        filesystems = {
+          image_name = labels.assembly
+          if (!use_fxfs_blob) {
+            volume = {
+              fvm = {
+                data = {
+                  data_filesystem_format = "minfs"
+                }
+                blob = {
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    product = {
+      build_info = _build_info
+    }
+    base_packages = [
+      {
+        package_target = ":${labels.root_ssl_certificates}"
+      },
+    ]
+    if (defined(invoker.base_packages)) {
+      foreach(fuchsia_package_target, invoker.base_packages) {
+        base_packages += [
+          {
+            package_target = fuchsia_package_target
+          },
+        ]
+      }
+    }
+    deps = [ "//build/info:build_info_files" ]
+  }
+
+  board_configuration(labels.board_config) {
+    name = invoker.board_name
+    version = "fake_version"
+    partitions_config = ":${labels.assembly_partitions_config}"
+    filesystems = {
+      fvm = {
+        slice_size = 1048576
+        sparse_output = {
+        }
+      }
+      fxfs = {
+      }
+
+      if (defined(invoker.fvm_truncate_to_length)) {
+        fvm.truncate_to_length = invoker.fvm_truncate_to_length
+      }
+      if (defined(invoker.assembly_fxfs_image_size_bytes)) {
+        fxfs.size_bytes = invoker.assembly_fxfs_image_size_bytes
+      }
+    }
+  }
+
+  # Main system assembly.
+  assembled_system(labels.assembly) {
+    testonly = true
+    generate_fvm = !use_fxfs_blob
+    generate_fxfs = use_fxfs_blob
+    product_assembly_config_label = ":${labels.product_config}"
+    board_config_label = ":${labels.board_config}"
+  }
+
+  generated_partitions_config(labels.assembly_partitions_config) {
+    hw_revision = board_name
+  }
+
+  # Construct an update package for the system assembly.
+  update_package(labels.update_package) {
+    testonly = true
+    deps = [ ":${labels.assembly_image_assembler}" ]
+    partitions = ":${labels.assembly_partitions_config}"
+    system_a = directories.assembly_out
+    epoch = "1"
+
+    if (defined(invoker.update_domain)) {
+      deps += [ ":${labels.assembly}" ]
+      rewrite_default_repo = invoker.update_domain
+    } else {
+      deps += [ ":${labels.packages_json}" ]
+    }
+  }
+
+  # Get the base packages from the assembled_system()
+  package_list_from_assembly(labels.base_package_manifests_list) {
+    testonly = true
+    system_label = ":${labels.assembly}"
+    package_set = "base"
+    contents = "manifest"
+    outputs = [ files.base_package_manifests_list ]
+  }
+
+  # Get the set of update packages (and image packages) via metadata
+  generate_package_metadata(labels.update_packages_manifests_lists) {
+    testonly = true
+    outputs = [ files.update_packages_manifests_list ]
+    data_keys = [ "package_output_manifests" ]
+    rebase = root_build_dir
+    deps = [ ":${labels.update_package}" ]
+  }
+
+  # Merge the list of base package manifests with the path to the update
+  # package's manifest to create a single list of package manifests.
+  action(labels.all_package_manifests_list) {
+    testonly = true
+    script = "//build/images/updates/merge_package_manifests_list.py"
+    outputs = [ files.all_package_manifests_list ]
+    deps = [
+      ":${labels.base_package_manifests_list}",
+      ":${labels.update_packages_manifests_lists}",
+    ]
+    args = [
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+      "--paths",
+      rebase_path(files.base_package_manifests_list, root_build_dir),
+      "--paths",
+      rebase_path(files.update_packages_manifests_list, root_build_dir),
+    ]
+    inputs = [
+      files.base_package_manifests_list,
+      files.update_packages_manifests_list,
+    ]
+  }
+
+  # Publish TUF repository that corresponds to system update.
+  publish_archive(labels.publish_archive) {
+    testonly = true
+    deps = [ ":${labels.all_package_manifests_list}" ]
+    inputs = [ files.all_package_manifests_list ]
+  }
+
+  # `resource`/`resource_group` targets should be built on the
+  # `target_toolchain`. Other toolchains should depend on the `target_toolchain`
+  # outputs.
+  if (current_toolchain == target_toolchain) {
+    resource_group(labels.root_ssl_certificates_resource_group) {
+      testonly = true
+      files = [
+        {
+          source = root_ssl_certificates_resource.local
+          dest = root_ssl_certificates_resource.packaged
+        },
+      ]
+    }
+
+    # Resources needed to host a system image of this assembly.
+    resource_group(labels.system_resources) {
+      testonly = true
+      deps = [ ":${labels.assembly}" ]
+      files = [
+        {
+          source = fs_blk_resource.local
+          dest = fs_blk_resource.packaged
+        },
+        {
+          source = base_far_resource.local
+          dest = base_far_resource.packaged
+        },
+      ]
+    }
+
+    # Resource for update package far at a known path name.
+    resource_group(labels.update_package_resource) {
+      testonly = true
+      deps = [ ":${labels.update_package}" ]
+      files = [
+        {
+          source = update_far_resource.local
+          dest = update_far_resource.packaged
+        },
+      ]
+    }
+
+    # Resources needed for serving an OTA update of this assembly.
+    zip_resource(labels.tuf_repo_resources) {
+      testonly = true
+      deps = [ ":${labels.publish_archive}" ]
+      publish_archive_outputs = get_target_outputs(":${labels.publish_archive}")
+      file = publish_archive_outputs[0]
+      dest_prefix = directories.packaged_repository
+    }
+  } else {
+    group(labels.root_ssl_certificates_resource_group) {
+      testonly = true
+      public_deps = [ ":${labels.root_ssl_certificates}($target_toolchain)" ]
+    }
+    group(labels.system_resources) {
+      testonly = true
+      public_deps = [ ":${labels.system_resources}($target_toolchain)" ]
+    }
+    group(labels.tuf_repo_resources) {
+      testonly = true
+      public_deps = [ ":${labels.tuf_repo_resources}($target_toolchain)" ]
+    }
+    group(labels.update_package_resource) {
+      testonly = true
+      public_deps = [ "${labels.update_package_resource}($target_toolchain)" ]
+    }
+  }
+}

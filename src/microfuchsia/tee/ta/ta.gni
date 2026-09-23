@@ -1,0 +1,130 @@
+# Copyright 2024 The Fuchsia Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components/fuchsia_package.gni")
+import("//build/cpp/verify_public_symbols.gni")
+import("//build/dist/generated_resource.gni")
+import("//build/dist/renamed_binary.gni")
+import("//build/toolchain/ifs_extract.gni")
+
+# Defines a Fuchsia package containing a Trusted Application
+#
+# Example:
+# ```
+# fuchsia_ta_package("echo") {
+#   sources = [
+#     "ta_source_file.cc",
+#   ]
+#   deps = [
+#     "//path/to/library/used/by/ta",
+#   ]
+# }
+# ```
+#
+#  See loadable_module() for parameters.
+template("fuchsia_ta_package") {
+  main_target = target_name
+  module_target = "_fuchsia_ta_package.${target_name}.loadable_module"
+  ifs_target = "_fuchsia_ta_package.${target_name}.ifs"
+  verify_public_symbols_target =
+      "_fuchsia_ta_package.${target_name}.verify_public_symbols"
+  ta_name_resource_target = "_fuchsia_ta_package.${target_name}.name_resource"
+  ta_props_resource_target = "_fuchsia_ta_package.${target_name}.props_resource"
+
+  forward_variables_from(invoker, [ "props_file" ])
+  if (!defined(props_file)) {
+    props_file = "//src/microfuchsia/tee/ta/config/ta_properties_template.json5"
+  }
+
+  loadable_module(module_target) {
+    output_name = main_target
+    visibility = [ ":*" ]
+    deps = []
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "configs",
+                             "visibility",
+                           ])
+    deps += [ "//src/microfuchsia/tee/tee_internal_api" ]
+    if (defined(invoker.configs)) {
+      configs += invoker.configs
+    }
+  }
+
+  # An .ifs file describing the symbols defined and needed by the TA. This file
+  # is of use in build-time verification that a TA's expected public symbols
+  # are indeed defined (see next target), as well as of diagnostic value in
+  # seeing what subset of the TEE internal API is being used by a particular TA
+  # (especially during 'bring-up').
+  ifs_file = "$target_out_dir/$main_target.ifs"
+  ifs_extract(ifs_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+    outputs = [ ifs_file ]
+    deps = [ ":$module_target" ]
+  }
+
+  # This does a diff of the public symbols against those defined in
+  # //src/microfuchsia/tee/ta/abi.ifs.
+  verify_public_symbols(verify_public_symbols_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+    library_name = main_target
+    current = ifs_file
+    reference = "//src/microfuchsia/tee/ta/abi.ifs"
+
+    # TODO(https://fxbug.dev/375092974): Consider defensively filtering for only `TA_*` namespaced
+    # symbols once --include is a valid llvm-ifs flag.
+
+    # TODO(joshuaseaton): Remove once loadable_modules() are no longer linked
+    # with `-Wl,-soname=...`
+    ifs_args = [ "--soname=reference-ta" ]
+    deps = [ ":${ifs_target}" ]
+  }
+
+  # This adds a file to the package containing the name of the TA at a
+  # well-known location so that the runtime knows where in the package the TA is
+  # to load. There are a few other ways we could factor this if needed:
+  # *) We could require that the package name correspond to the TA name and use that
+  # *) We could place the TA name inside a manifest (perhaps even a component manifest)
+  #    and use that
+  # *) An external index could provide the TA name along with other data, such as its
+  #    UUID.
+  generated_resource(ta_name_resource_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+    contents = main_target
+    outputs = [ "data/ta_name" ]
+  }
+
+  # This file describes TA-specific properties, whose values may be queried by
+  # the Property set of internal core APIs.
+  # TODO(b/366486931): Build-time validation for this TA properties file.
+  resource(ta_props_resource_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+    sources = [ props_file ]
+    outputs = [ "data/ta_properties" ]
+  }
+
+  fuchsia_package(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = [
+      ":${module_target}",
+      ":${ta_name_resource_target}",
+      ":${ta_props_resource_target}",
+      "//src/microfuchsia/tee/runtime:runtime-component",
+    ]
+
+    # Not a really a dependency of the package itself, but we need somewhere to
+    # include this into the build graph and other package-related GN code
+    # unfortunately expects target_name to expand to a package target.
+    data_deps = [ ":${verify_public_symbols_target}" ]
+  }
+}

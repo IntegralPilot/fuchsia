@@ -1,0 +1,252 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/assembled_system.gni")
+import("//build/assembly/product_assembly_configuration.gni")
+import("//build/assembly/product_bundle.gni")
+import("//build/rust/rustc_library.gni")
+import("//src/sys/pkg/repositories/devhost/devhost.gni")
+
+# A template for end-to-end testing of ffx tools using `e2e_emu` library.
+#
+# Parameters
+#
+#   product_bundle (label, optional)
+#     Product bundle containing emulator image. Define your own easily with
+#     ffx_e2e_product_bundle().
+#     Default: "//src/developer/ffx/lib/e2e_emu:default_ffx_e2e_emu_product($default_toolchain)"
+#
+#   package_repository (label, optional)
+#     Package repository containing any packages that should be resolved at runtime. Defined with
+#     ffx_e2e_package_repository().
+#     Default: no package server is started
+#
+#   env (list, optional)
+#     A list of "KEY=VALUE" strings to pass to the host tests' environment.
+#
+#   any other arguments are forwarded to rustc_test.
+template("ffx_e2e_test") {
+  _host_test_data_label = "${invoker.target_name}_emulator_data"
+
+  # Exported SDK with ffx binary.
+  _sdk_label = "//sdk:exported_idk_for_ffx_tests($default_toolchain)"
+  _sdk_outdir = get_label_info(_sdk_label, "root_out_dir")
+  _sdk_path = _sdk_outdir + "/sdk/exported/core"
+
+  _package_repo_label = "//src/developer/ffx/lib/e2e_emu:empty_package_repository($target_toolchain)"
+  if (defined(invoker.package_repository)) {
+    _package_repo_label = invoker.package_repository
+  }
+  _package_repo_path = get_label_info(_package_repo_label, "target_out_dir") +
+                       "/" + get_label_info(_package_repo_label, "name")
+
+  _symbol_index_label = "//src/developer/ffx/lib/symbol-index:symbol_index_json($default_toolchain)"
+  _symbol_index_path = "$root_build_dir/.symbol-index.json"
+
+  # Default product bundle containing emulator image.
+  _pb_label = "//src/developer/ffx/lib/e2e_emu:default_ffx_e2e_emu_product($default_toolchain)"
+  if (defined(invoker.product_bundle)) {
+    _pb_label = invoker.product_bundle
+
+    # Ensure we only ever add dependency edges to assembly on the default
+    # toolchain.
+    if (get_label_info(_pb_label, "toolchain") != default_toolchain) {
+      _pb_label = get_label_info(_pb_label, "label_no_toolchain") +
+                  "($default_toolchain)"
+    }
+  }
+  _product_bundle = get_label_info(_pb_label, "target_out_dir") + "/" +
+                    get_label_info(_pb_label, "name")
+
+  rustc_test(target_name) {
+    deps = [ "//src/developer/ffx/lib/e2e_emu" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+
+    data_deps = [
+      ":$_host_test_data_label",
+      "//src/developer/ffx:suite_test_data",
+      _symbol_index_label,
+    ]
+    if (defined(invoker.data_deps)) {
+      data_deps += invoker.data_deps
+    }
+
+    args = [
+      "env PRODUCT_BUNDLE_PATH=" + rebase_path(_product_bundle, root_build_dir),
+      "env SYMBOL_INDEX_PATH=" +
+          rebase_path(_symbol_index_path, root_build_dir),
+      "env PACKAGE_REPOSITORY_PATH=" +
+          rebase_path(_package_repo_path, root_build_dir),
+    ]
+
+    if (defined(invoker.env)) {
+      foreach(env_var, invoker.env) {
+        args += [ "env ${env_var}" ]
+      }
+    }
+
+    if (defined(invoker.args)) {
+      args += invoker.args
+    }
+
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "product_bundle",
+                             "package_repository",
+                             "deps",
+                             "args",
+                             "data_deps",
+                             "configs",
+                           ])
+    if (defined(invoker.configs)) {
+      configs += invoker.configs
+    }
+  }
+  host_test_data(_host_test_data_label) {
+    sources = [
+      _package_repo_path,
+      _product_bundle,
+      _sdk_path,
+    ]
+    deps = [
+      _package_repo_label,
+      _pb_label,
+      _sdk_label,
+    ]
+  }
+}
+
+# Simplified wrapper around product assembly templates, designed just for
+# tweaking the things that are useful for an ffx_e2e_emu test. Uses an
+# appropriate emulator board for the current target architecture.
+#
+# Parameters
+#
+#   name (string, optional)
+#     String that will be the name for the product bundle. Useful to pick something descriptive to
+#     the test. Defaults to the target name.
+#
+#   product_configuration (scope, required)
+#     A scope whose contents will be forwarded to an invocation of product_assembly_configuration().
+template("ffx_e2e_product_bundle") {
+  # Don't let the assembly templates expand except on the default toolchain.
+  # Weirndess ensues if they're expanded on variant toolchains like for asan.
+  if (current_toolchain == default_toolchain) {
+    _pb_name = target_name
+    if (defined(invoker.name)) {
+      _pb_name = invoker.name
+    }
+    assert(defined(invoker.product_configuration))
+    _product_config = invoker.product_configuration
+
+    _image_name = "fuchsia"
+    _config_label = target_name + ".assembly_config"
+    _assembled_label = target_name + ".assembled"
+
+    # Always use the emulator boards, regardless of global board config.
+    if (target_cpu == "x64") {
+      _board_label = "//boards/x64"
+    } else if (target_cpu == "arm64") {
+      _board_label = "//boards/arm64"
+    } else if (target_cpu == "riscv64") {
+      _board_label = "//boards/riscv64"
+    } else {
+      assert(false, "unsupported target architecture $target_cpu")
+    }
+
+    product_assembly_configuration(_config_label) {
+      testonly = true
+      forward_variables_from(_product_config, "*")
+
+      # TODO(https://fxbug.dev/422572400) shouldn't need to manually add debug_agent
+      if (!defined(base_packages)) {
+        base_packages = []
+      }
+      base_packages += [
+        {
+          package_target = "//src/developer/debug/debug_agent"
+        },
+      ]
+    }
+
+    assembled_system(_assembled_label) {
+      testonly = true
+      image_name = _image_name
+      generate_fxfs = true
+      board_config_label = _board_label
+      product_assembly_config_label = ":${_config_label}"
+    }
+
+    product_bundle(target_name) {
+      testonly = true
+      name = _pb_name
+      system_a = target_out_dir + "/" + _image_name
+      deps = [ ":${_assembled_label}" ]
+    }
+  } else {
+    not_needed(invoker, "*")
+    not_needed([ "target_name" ])
+  }
+}
+
+# Simplified wrapper around package repository templates, designed just for
+# making some packages available from a repository server to an ffx_e2e_test().
+#
+# Parameters
+#
+#   packages (list of scopes, required)
+#     Each scope in this list can have the following fields:
+#        * label (label, required)
+#            Label of the fuchsia_package().
+#        * name (string, optional)
+#            Name of the package if it differs from the target name.
+template("ffx_e2e_package_repository") {
+  assert(defined(invoker.packages), "must provide a list of `packages`")
+
+  _manifest_list_label = "${target_name}.manifests"
+
+  _manifest_labels = []
+  _manifest_paths = []
+  foreach(_package, invoker.packages) {
+    assert(defined(_package.label), "each package must have a label")
+    _manifest_labels += [ _package.label ]
+    _package_outdir = get_label_info(_package.label, "target_out_dir")
+    _package_name = get_label_info(_package.label, "name")
+    if (defined(_package.name)) {
+      _package_name = _package.name
+    }
+    _manifest_path = "${_package_outdir}/${_package_name}/package_manifest.json"
+    _manifest_paths += [ rebase_path(_manifest_path, root_build_dir) ]
+  }
+
+  _manifests_list_path = "$target_out_dir/$target_name/package_manifests.list"
+  generated_file(_manifest_list_label) {
+    testonly = true
+    outputs = [ _manifests_list_path ]
+    output_conversion = "json"
+    contents = {
+      version = "1"
+      content = {
+        manifests = _manifest_paths
+      }
+    }
+
+    # Prevent packages in this list from making it into the overall universe set
+    # via our deps.
+    metadata = {
+      package_barrier = []
+    }
+    deps = _manifest_labels
+  }
+
+  devhost_repository_publish(target_name) {
+    testonly = true
+    output_repository_dir = "$target_out_dir/$target_name"
+    deps = [ ":${_manifest_list_label}" ]
+    package_list_manifests = [ _manifests_list_path ]
+  }
+}

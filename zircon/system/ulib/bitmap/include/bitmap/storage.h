@@ -1,0 +1,186 @@
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef BITMAP_STORAGE_H_
+#define BITMAP_STORAGE_H_
+
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <zircon/types.h>
+
+#include <fbl/algorithm.h>
+#include <fbl/alloc_checker.h>
+#include <fbl/array.h>
+#include <fbl/macros.h>
+
+#if !defined _KERNEL && defined __Fuchsia__
+#include <lib/zx/object.h>
+#include <lib/zx/vmar.h>
+#include <lib/zx/vmo.h>
+#include <zircon/syscalls.h>
+#include <zircon/syscalls/object.h>
+#endif
+
+namespace bitmap {
+
+class DefaultStorage {
+ public:
+  DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(DefaultStorage);
+  DefaultStorage() = default;
+
+  DefaultStorage(DefaultStorage&& rhs) = default;
+  DefaultStorage& operator=(DefaultStorage&& rhs) = default;
+
+  zx_status_t Allocate(size_t size) {
+    fbl::AllocChecker ac;
+    auto arr = new (&ac) uint8_t[size];
+    if (!ac.check()) {
+      return ZX_ERR_NO_MEMORY;
+    }
+    storage_.reset(arr, size);
+    return ZX_OK;
+  }
+  void* GetData() { return storage_.data(); }
+  const void* GetData() const { return storage_.data(); }
+
+ private:
+  fbl::Array<uint8_t> storage_;
+};
+
+template <size_t N>
+class FixedStorage {
+ public:
+  DISALLOW_COPY_ASSIGN_AND_MOVE(FixedStorage);
+  FixedStorage() = default;
+
+  zx_status_t Allocate(size_t size) {
+    ZX_ASSERT(size <= N);
+    return ZX_OK;
+  }
+  void* GetData() { return storage_; }
+  const void* GetData() const { return storage_; }
+
+ private:
+  size_t storage_[(N + sizeof(size_t) - 1) / sizeof(size_t)];
+};
+
+#if !defined _KERNEL && defined __Fuchsia__
+class VmoStorage {
+ public:
+  DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(VmoStorage);
+  VmoStorage() : vmo_(ZX_HANDLE_INVALID), mapped_addr_(0), size_(0) {}
+
+  VmoStorage(VmoStorage&& rhs)
+      : vmo_(std::move(rhs.vmo_)), mapped_addr_(rhs.mapped_addr_), size_(rhs.size_) {
+    rhs.mapped_addr_ = 0;
+  }
+
+  VmoStorage& operator=(VmoStorage&& rhs) {
+    Release();
+    vmo_ = std::move(rhs.vmo_);
+    mapped_addr_ = rhs.mapped_addr_;
+    size_ = rhs.size_;
+    rhs.mapped_addr_ = 0;
+    return *this;
+  }
+
+  ~VmoStorage() { Release(); }
+
+  zx_status_t Allocate(size_t size) {
+    Release();
+    size_ = fbl::round_up(size, static_cast<size_t>(zx_system_get_page_size()));
+    zx_status_t status = zx::vmo::create(size_, ZX_VMO_RESIZABLE, &vmo_);
+    if (status != ZX_OK) {
+      return status;
+    }
+
+    status = zx::vmar::root_self()->map(ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, 0, vmo_, 0, size_,
+                                        &mapped_addr_);
+    if (status != ZX_OK) {
+      vmo_.reset();
+      return status;
+    }
+
+    vmo_.set_property(ZX_PROP_NAME, "vmo-backed-bitmap", strlen("vmo-backed-bitmap"));
+    return ZX_OK;
+  }
+
+  zx_status_t Grow(size_t size) {
+    if (size <= size_) {
+      return ZX_OK;
+    }
+
+    size = fbl::round_up(size, static_cast<size_t>(zx_system_get_page_size()));
+    zx_status_t status;
+    if ((status = vmo_.set_size(size)) != ZX_OK) {
+      return status;
+    }
+
+    zx_info_vmar_t vmar_info;
+    status = zx::vmar::root_self()->get_info(ZX_INFO_VMAR, &vmar_info, sizeof(vmar_info), nullptr,
+                                             nullptr);
+    if (status != ZX_OK) {
+      return status;
+    }
+
+    // Try to extend the mapping.
+    uintptr_t addr;
+    status = zx::vmar::root_self()->map(ZX_VM_PERM_READ | ZX_VM_PERM_WRITE | ZX_VM_SPECIFIC,
+                                        mapped_addr_ + size_ - vmar_info.base, vmo_, size_,
+                                        size - size_, &addr);
+    if (status == ZX_OK) {
+      return ZX_OK;
+    }
+
+    // If extension fails, create an entirely new mapping and unmap the old one.
+    status =
+        zx::vmar::root_self()->map(ZX_VM_PERM_READ | ZX_VM_PERM_WRITE, 0, vmo_, 0, size, &addr);
+    if (status != ZX_OK) {
+      return status;
+    }
+
+    status = zx::vmar::root_self()->unmap(mapped_addr_, size_);
+    if (status != ZX_OK) {
+      zx::vmar::root_self()->unmap(addr, size);
+      return status;
+    }
+
+    mapped_addr_ = addr;
+    size_ = size;
+    return ZX_OK;
+  }
+
+  void* GetData() {
+    ZX_DEBUG_ASSERT(mapped_addr_ != 0);
+    return reinterpret_cast<void*>(mapped_addr_);
+  }
+
+  const void* GetData() const {
+    ZX_DEBUG_ASSERT(mapped_addr_ != 0);
+    return reinterpret_cast<const void*>(mapped_addr_);
+  }
+
+  const zx::vmo& GetVmo() const {
+    ZX_DEBUG_ASSERT(mapped_addr_ != 0);
+    return vmo_;
+  }
+
+ private:
+  void Release() {
+    if (mapped_addr_ != 0) {
+      zx::vmar::root_self()->unmap(mapped_addr_, size_);
+    }
+    mapped_addr_ = 0;
+  }
+
+  zx::vmo vmo_;
+  uintptr_t mapped_addr_;
+  size_t size_;
+};
+#endif
+
+}  // namespace bitmap
+
+#endif  // BITMAP_STORAGE_H_

@@ -1,0 +1,269 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/toolchain/toolchain_environment.gni")
+
+# Define a config() with conveniences for cross-language complexities.
+#
+# This is a thin wrapper around config() that handles passing related switches
+# to the compiler and/or linker for the C family (C, C++, Assembly) and Rust.
+# It includes special handling for the kernel environment's custom Rust target.
+#
+# This mostly just translates into `config(target_name)` with some parameters
+# expanded out to avoid boilerplate and conditionalization.  In the kernel
+# environment it also defines a "$target_name.rust-target-edits" group().  This
+# is used by //zircon/kernel/switch:rust-custom-target.
+#
+# Parameters
+#
+#   * configs
+#     - Optional: As for config().  But other compiler_config()s **must**
+#     be reached via $compiler_configs instead.
+#     - Type: list(label_no_toolchain)
+#     - Default: []
+#
+#   * compiler_configs
+#     - Optional: List of other compiler_config() labels that should be
+#     included just like $configs includes other configs() labels.  This is no
+#     different, but it adds the special sauce for the kernel environment.
+#     - Type: list(label_no_toolchain)
+#     - Default: []
+#
+#   * c_family_flags
+#     - Optional: Shorthand for adding to all of $asmflags, $cflags, $ldflags.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * llvm_flags
+#     - Optional: LLVM "backend" flags for both Clang and Rust compilers.
+#     These are added to $cflags, $ldflags, and $rustflags, with the
+#     appropriate syntax for each compiler driver.  This is implicitly ignored
+#     under `is_gcc`, so setting it doesn't need to be conditionalized.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * linker_flags
+#     - Optional: Flags for the underlying linker.  These are added to both
+#     $ldflags and $rustflags parameters to the config() with the appropriate
+#     syntax for the C++ and Rust compiler drivers, respectively.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * rust_linker_flags
+#     - Optional: Flags for the underlying linker, but only for Rust links.
+#     These are added only to $rustflags, but with the appropriate syntax for
+#     the Rust compiler driver.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * linker_llvm_flags
+#     - Optional: LLVM "backend" flags plumbed directly to the **linker** (for
+#     LTO code generation).  These are added to both $ldflags and $rustflags,
+#     with the appropriate syntax for each compiler driver.  This is implicitly
+#     ignored under `is_gcc`, so setting it doesn't need to be conditionalized.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * rust_linker_llvm_flags
+#     - Optional: LLVM "backend" flags plumbed directly to the **linker** (for
+#     LTO code generation), but only for Rust.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * rust_target_features
+#     - Optional: List of features, as used in `-Ctarget-feature=...` switches.
+#     Outside the kernel environment, these just go into $rustflags that way.
+#     In the kernel environment, they are edited into the "target-features"
+#     list from the base target, with "+feature" and "-feature" spellings
+#     replacing their earlier opposites.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * rust_target_edits
+#     - Optional: This must not be set outside the kernel environment.
+#     If there are alternative $rustflags spellings, conditionalize the
+#     parameters to use $rustflags in non-kernel toolchains.  Each element
+#     is a scope describing an edit to perform to the Rust target JSON file.
+#     - Type: list(scope)
+#       * key
+#         - Required: Key in the JSON dictionary.
+#         - Type: string
+#       * action
+#         - Required: The action to perform: "set", "unset" or "append".
+#         - Type: "set" or "unset" or "append"
+#     - Default: []
+#
+# Other parameters are as for config().
+#
+template("compiler_config") {
+  _custom_target = toolchain_environment == "kernel"
+
+  _compiler_configs = []
+  if (defined(invoker.compiler_configs)) {
+    _compiler_configs = invoker.compiler_configs
+  }
+
+  _c_family_flags = []
+  if (defined(invoker.c_family_flags)) {
+    _c_family_flags = invoker.c_family_flags
+  }
+
+  _linker_flags = []
+  if (defined(invoker.linker_flags)) {
+    _linker_flags = invoker.linker_flags
+  }
+
+  _rust_linker_flags = _linker_flags
+  if (defined(invoker.rust_linker_flags)) {
+    _rust_linker_flags += invoker.rust_linker_flags
+  }
+
+  _llvm_flags = []
+  _rust_llvm_flags = []
+  if (defined(invoker.llvm_flags)) {
+    if (!is_gcc) {
+      _llvm_flags += invoker.llvm_flags
+    }
+    _rust_llvm_flags += invoker.llvm_flags
+  }
+  if (defined(invoker.rust_llvm_flags)) {
+    _rust_llvm_flags += invoker.rust_llvm_flags
+  }
+
+  # The Rust _compiler_ is always LLVM-based and so takes LLVM backend flags
+  # even in is_gcc contexts.  However, the _linker_ it invokes in is_gcc
+  # contexts is the GNU linker that doesn't take any LLVM flags.
+  if (is_gcc) {
+    not_needed(invoker,
+               [
+                 "linker_llvm_flags",
+                 "rust_linker_llvm_flags",
+               ])
+  } else {
+    if (defined(invoker.linker_llvm_flags)) {
+      foreach(arg, invoker.linker_llvm_flags) {
+        _linker_flags += [ "--mllvm=$arg" ]
+        _rust_linker_flags += [ "--mllvm=$arg" ]
+      }
+    }
+    if (defined(invoker.rust_linker_llvm_flags)) {
+      foreach(arg, invoker.rust_linker_llvm_flags) {
+        _rust_linker_flags += [ "--mllvm=$arg" ]
+      }
+    }
+  }
+
+  _features = []
+  if (defined(invoker.rust_target_features)) {
+    _features = invoker.rust_target_features
+  }
+
+  _edits = []
+  if (defined(invoker.rust_target_edits)) {
+    _edits = invoker.rust_target_edits
+  }
+
+  config(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "testonly",
+                           ])
+    configs = []
+    asmflags = []
+    cflags = []
+    ldflags = []
+    rustflags = []
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "c_family_flags",
+                             "compiler_configs",
+                             "linker_flags",
+                             "linker_llvm_flags",
+                             "llvm_flags",
+                             "rust_linker_flags",
+                             "rust_linker_llvm_flags",
+                             "rust_target_edits",
+                             "rust_target_features",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    configs += _compiler_configs
+
+    asmflags += _c_family_flags
+    cflags += _c_family_flags
+    ldflags += _c_family_flags
+
+    foreach(arg, _llvm_flags) {
+      cflags += [
+        "-mllvm",
+        arg,
+      ]
+      ldflags += [
+        "-mllvm",
+        arg,
+      ]
+    }
+
+    foreach(arg, _rust_llvm_flags) {
+      rustflags += [ "-Cllvm-args=$arg" ]
+    }
+
+    if (_linker_flags != []) {
+      ldflags += [ "-Wl," + string_join(",", _linker_flags) ]
+    }
+
+    if (_rust_linker_flags != []) {
+      # For Fuchsia targets, rustc invokes ld.lld directly; -Clink-arg= doesn't
+      # split its argument like -Wl, does.  For other targets, rustc invokes
+      # the C compiler driver; -Clink-args=-Wl,... can join them all together.
+      if (is_fuchsia) {
+        foreach(arg, _rust_linker_flags) {
+          rustflags += [ "-Clink-arg=$arg" ]
+        }
+      } else {
+        rustflags +=
+            [ "-Clink-arg=-Wl," + string_join(",", _rust_linker_flags) ]
+      }
+    }
+
+    if (!_custom_target) {
+      assert(
+          _edits == [],
+          "compiler_config() cannot set rust_target_edits outside kernel environment")
+      foreach(feature, _features) {
+        rustflags += [ "-Ctarget-feature=$feature" ]
+      }
+    }
+  }
+
+  if (_custom_target) {
+    group("$target_name.rust-target-edits") {
+      forward_variables_from(invoker,
+                             [
+                               "visibility",
+                               "testonly",
+                             ])
+      deps = []
+      foreach(config, _compiler_configs) {
+        config = get_label_info(config, "label_no_toolchain")
+        deps += [ "$config.rust-target-edits" ]
+      }
+      metadata = {
+        kernel_rust_target_edits = _edits
+        if (_features != []) {
+          kernel_rust_target_edits += [
+            {
+              key = "features"
+              action = "append"
+              value = _features
+            },
+          ]
+        }
+      }
+    }
+  }
+}

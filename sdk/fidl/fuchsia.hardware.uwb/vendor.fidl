@@ -1,0 +1,150 @@
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.uwb;
+
+using zx;
+
+// FiRa UWB UCI Generic Specification Version 3.0.0 Section 4.4.2 and Section
+// 4.5.2: The size of the command and data packet header (message type, packet
+// boundary flag, gid, oid, payload length, etc).
+//
+// FiRa UWB UCI Generic Specification Version 3.0.0 Section 2.2: The maximum
+// payload size of UCI control packet is 255 octets.
+//
+// FiRa UWB UCI Generic Specification Version 3.0.0 Section 8.6: The maximum
+// payload size of UCI data packet is specified by the UWB Subsystem in the
+// Device Capability Parameters as a two byte value (65536).
+//
+// The MAX_PACKET_SIZE chosen here represents the maximum packet size of
+// a single UCI packet (control or data).
+//
+// HEADER_SIZE (4) + MAX_DATA_PAYLOAD_SIZE (65536) = 65540.
+//
+// NOTE: This value has been artificially reduced to 65500 to ensure that a
+// single FIDL message (including headers and table overhead) fits within the
+// maximum Zircon channel message size (65536 bytes).
+const MAX_PACKET_SIZE uint32 = 65500;
+
+type Packet = table {
+    1: data vector<byte>:MAX_PACKET_SIZE;
+};
+
+/// The full packet sent between the controller and the host, including
+/// packet headers.
+///
+/// Note: if the host or controller performed packet segmentation, the bytes
+/// represented here won't be reassembled and will be in segmented form. See
+/// FiRa UWB UCI Generic Specification Version 3.0.0 Section 4.4 for more
+/// information on segmentation and reassembly.
+type SnoopPacket = flexible union {
+    1: to_controller_data Packet;
+    2: from_controller_data Packet;
+    3: command Packet;
+    4: response Packet;
+    5: notification Packet;
+};
+
+/// The Snoop protocol is an output-only channel for monitoring UCI traffic. The
+/// snoop channel contains messages that are sent from the Host to the
+/// Controller (e.g. control packets, data packets). The snoop channel also
+/// contains responses sent from the Controller to the Host (e.g. response
+/// packets, notification packets, data packets).
+@discoverable
+open protocol Snoop {
+    /// A hanging-get method that returns when packets have been transmitted or
+    /// received. The server is allowed to drop packets if the client takes too
+    /// long to call WatchPacket().
+    WatchPacket() -> (table {
+        1: packets vector<SnoopPacket>:MAX;
+        /// The number of outbound packets dropped since the last response to
+        /// WatchPacket(). These packets are excluded from `packets`. This is
+        /// only non-zero when WatchPacket() is slow to poll.
+        2: dropped_sent uint32;
+        /// The number of inbound packets dropped since the last response to
+        /// WatchPacket(). These packets are excluded from `packets`. This is
+        /// only non-zero when WatchPacket() is slow to poll.
+        3: dropped_received uint32;
+    });
+};
+
+/// The UCI protocol is the way the UWB HAL interfaces with the vendor chip via
+/// the Driver.
+@discoverable
+open protocol Uci {
+    /// Sent by the server when the UWB Controller has been initialized. The
+    /// `status` indicates whether initialization was successful. If `status` is
+    /// `ZX_OK`, the controller is ready to receive UCI packets. The client
+    /// should wait for this event before sending data to ensure the controller
+    /// is in a known ready state, though the Driver may buffer a limited number
+    /// of packets sent before initialization is complete.
+    -> OnInitialized(table {
+        1: status zx.Status;
+    });
+
+    /// Send serialized UCI packets to the UWB Controller via the Driver. The
+    /// server isn't responsible for performing any packet segmentation or
+    /// reassembly. Bytes will be sent to the UWB Controller as is.
+    ///
+    /// NOTE: The UWB spec requires the host to wait for a response to a sent
+    /// command before sending another (FiRa UWB UCI Generic Specification
+    /// Version 3.0.0 Section 4.3.1). The client should wait for a response
+    /// before sending another command. One `Send()` may be queued by the Driver
+    /// if called before `OnInitialized()` is received, which will be answered
+    /// once initialization is complete.
+    ///
+    /// NOTE: This method and `SessionInit` are mutually exclusive. The client
+    /// must ensure that only one of these operations is active at a time.
+    flexible Send(table {
+        1: packets vector<Packet>:MAX;
+    }) -> ();
+
+    /// Perform vendor specific session initialization for a given session id.
+    ///
+    /// Session initialization is done via the Session Init UCI command
+    /// (FiRa UWB UCI Generic Specification Version 3.0.0 Section 7.2.1). This
+    /// command is normally sent by the upper layers of the stack via Send(...).
+    /// However, some Controllers may require vendor specific configuration
+    /// during session initialization. This command instructs the Driver to
+    /// perform that vendor specific initialization, inserting the necessary
+    /// bytes into the UCI data stream.
+    ///
+    /// NOTE: The client should wait for a response before sending another
+    /// command. One command may be queued by the Driver if `SessionInit()` is
+    /// called before `OnInitialized()` is received, which will be answered once
+    /// initialization is complete.
+    ///
+    /// NOTE: This method and `Send` are mutually exclusive. The client must
+    /// ensure that only one of these operations is active at a time.
+    flexible SessionInit(table {
+        1: session_id uint32;
+    }) -> ();
+
+    /// Watch for UCI packets from the UWB Controller. The server isn't
+    /// responsible for performing any packet segmentation or reassembly. Bytes
+    /// will be sent to the UWB Host as is.
+    flexible WatchReceive() -> (table {
+        1: packets vector<Packet>:MAX;
+    });
+
+    /// Request the UWB Controller to power off and close the UCI channel. The
+    /// server will close the channel after the device has been powered off.
+    flexible PowerOff();
+};
+
+@discoverable
+open protocol Device {
+    /// Opens a UCI channel to the UWB controller. This will power on the
+    /// device. The device will be powered off when the `uci` channel is closed
+    /// (either by the client or by calling `Uci.PowerOff()`).
+    flexible OpenUci(resource table {
+        1: uci server_end:Uci;
+    });
+};
+
+/// The Vendor service is served by the Driver of a particular vendor's
+/// Controller.
+service Vendor {
+    device client_end:Device;
+    snoop client_end:Snoop;
+};

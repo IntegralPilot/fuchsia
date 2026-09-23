@@ -1,0 +1,277 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library zx;
+
+/// The act of taking a sample takes on the order of single digit microseconds.
+/// A period close to or shorter than that doesn't make sense.
+const SAMPLER_MIN_PERIOD Duration = 10000;
+const SAMPLER_MAX_BUFFER_SIZE usize64 = 1073741824; // 1 GiB
+
+type SamplerConfig = struct {
+    period Duration;
+    buffer_size usize64;
+    discipline uint64;
+};
+
+@transport("Syscall")
+closed protocol Sampler {
+    /// ## Summary
+    ///
+    /// Create a sampler session, returning an IOBuffer containing a buffer allocated for each
+    /// active cpu.
+    ///
+    /// ## Declaration
+    ///
+    /// ```c
+    /// #include <zircon/syscalls.h>
+    ///
+    /// zx_status_t zx_sampler_create(zx_resource_t rsrc
+    ///                               uint64_t options,
+    ///                               zx_sampler_config_t* config,
+    ///                               size_t config_size;
+    ///                               zx_handle_t* iob_out);
+    /// ```
+    ///
+    /// ## Description
+    ///
+    /// `zx_sampler_create()` initializes a global singleton thread sampler which
+    /// writes samples to the returned IOBuffer. The returned iobuffer will have
+    /// a number of regions equal to the active number of cpus on the system
+    /// when called. Each buffer is of the size declared in *config*.
+    ///
+    ///
+    /// The parameter *options* must be 0.
+    ///
+    /// The parameter *config* must be a zx_sampler_config_t.
+    /// ### Config {#zx_sampler_config_t}
+    /// ```
+    /// typedef struct {
+    ///     // How long an individual cpu core will wait in nanoseconds between
+    ///     // taking each sample. The minimum period is ZX_SAMPLER_MIN_PERIOD (10000ns).
+    ///     zx_duration_mono_t period;
+    ///
+    ///     // The requested size of the region in bytes. The size will be
+    ///     // rounded up to the next system page size boundary, as reported by
+    ///     // zx_system_get_page_size(). Use `zx_object_get_info` with topic
+    ///     // `ZX_INFO_IOB_REGIONS` on the returned handle to determine the
+    ///     // actual size of each region.
+    ///     size_t buffer_size;
+    ///
+    ///     // The requested discipline of the returned iobuffer. See below for
+    ///     // valid disciplines.
+    ///     uint64_t iobuffer_discipline;
+    /// } zx_sampler_config_t;
+    /// ```
+    ///
+    /// The caller may request the samples be written to the returned IOBuffer
+    /// using an agreed upon iobuffer discipline. Currently, there is a single
+    /// supported discipline `ZX_IOB_DISCIPLINE_NONE (0)` which works as
+    /// follows:
+    ///
+    /// After threads are attached and sampling is started, each cpu will write
+    /// samples to the dedicated region. Samples will continue to be written to
+    /// the buffer until either sampling stops or the buffer becomes full.
+    ///
+    /// Samples are read by reading a thread's PC and attempting to walk the
+    /// thread's backtrace by following frame pointers.
+    ///
+    /// Samples are written as 8 bytes aligned [FXT Large Blob with Metadata]
+    /// records where the payload contains the PCs sampled from the thread's
+    /// stack. An FXT Header of `0` indicates that there is no additional data.
+    ///
+    /// To safely read the data from the buffer, a read should first call
+    /// zx_sampler_stop which will stop the session and return when no
+    /// additional samples will be written. A reader may then map each region of
+    /// the IOBuffer with `zx_vmar_map_iob` and access the samples.
+    ///
+    /// ## Controlling the Session
+    ///
+    /// The sampler is a global singleton and there is at most one session
+    /// active at a time. The session can be controlled by passing the returned
+    /// IOBuffer to the start/stop/attach calls. When the returned IOBuffer's
+    /// last handle is closed the session will stop and be destroyed.
+    ///
+    /// ## Rights
+    ///
+    /// *debug_resource* must have resource kind `ZX_RSRC_KIND_SYSTEM` with base
+    /// `ZX_RSRC_SYSTEM_DEBUG_BASE`.
+    ///
+    /// ## Errors
+    ///
+    /// `ZX_ERR_NOT_SUPPORTED`  `kernel.enable-debugging-syscalls` is not set to `true`
+    /// on the kernel command line.
+    ///
+    /// `ZX_ERR_PERMISION_DENIED` *rsrc* is not  resource kind
+    /// `ZX_RSRC_KIND_SYSTEM` with base `ZX_RSRC_SYSTEM_DEBUG_BASE`.
+    ///
+    /// `ZX_ERR_INVALID_ARGS`
+    ///
+    /// - *options* is not 0
+    /// - The provided *config* is invalid. See
+    /// [zx_sampler_config_t](sampler_create.md#zx_sampler_config_t) for the expected config.
+    ///
+    /// ## See also
+    ///
+    ///  - [`zx_sampler_start()`]
+    ///  - [`zx_sampler_stop()`]
+    ///  - [FXT Format]
+    ///  - [`zx_vmar_map_iob()`]
+    ///
+    /// [FXT Large Blob with Metadata]: /docs/reference/tracing/trace-format.md#large-blob-record
+    /// [`zx_sampler_start()`]: sampler_start.md
+    /// [`zx_sampler_stop()`]: sampler_stop.md
+    /// [FXT Format]: /docs/reference/tracing/trace-format.md
+    /// [`zx_vmar_map_iob()`]: vmar_map_iob.md
+    strict Create(resource struct {
+        rsrc Handle:RESOURCE;
+        options uint64;
+        config SamplerConfig;
+    }) -> (resource struct {
+        per_cpu_buffers Handle;
+    }) error Status;
+
+    /// ## Summary
+    ///
+    /// Begin sampling to the provided IOBuffer.
+    ///
+    /// ## Declaration
+    ///
+    /// ```c
+    /// #include <zircon/syscalls.h>
+    ///
+    /// zx_status_t zx_sampler_start(zx_handle_t iobuffer);
+    /// ```
+    ///
+    /// ## Description
+    ///
+    /// Begin sampling each attached thread and writing each sample to the
+    /// provided IOBuffer. The provided IOBuffer must be one previously returned
+    /// by zx_sampler_create.
+    ///
+    /// Attempting to start a session which has already been started will return
+    /// an error, but will not stop or otherwise modify the session.
+    ///
+    /// Restarting a previously started/stopped session will continue writing to
+    /// the buffers where the previous session left off.
+    ///
+    /// ## Errors
+    ///
+    /// `ZX_ERR_NOT_SUPPORTED`  `kernel.enable-debugging-syscalls` is not set to `true`
+    /// on the kernel command line.
+    ///
+    /// `ZX_ERR_PERMISION_DENIED` *iobuffer* is not an IOBuffer returned by zx_sampler_create.
+    ///
+    /// `ZX_ERR_BAD_STATE` the sampler has already been started.
+    ///
+    /// ## See also
+    ///
+    ///  - [`zx_sampler_create()`]
+    ///  - [`zx_sampler_stop()`]
+    ///
+    /// [`zx_sampler_create()`]: sampler_create.md
+    /// [`zx_sampler_stop()`]: sampler_stop.md
+    strict Start(resource struct {
+        iobuffer Handle;
+    }) -> () error Status;
+
+    /// ## Summary
+    ///
+    /// Stop writing samples to the provided IOBuffer.
+    ///
+    /// ## Declaration
+    ///
+    /// ```c
+    /// #include <zircon/syscalls.h>
+    ///
+    /// zx_status_t zx_sampler_stop(zx_handle_t iobuffer);
+    /// ```
+    ///
+    /// ## Description
+    ///
+    /// Stop sampling each attached thread and finish writing any in flight
+    /// samples to the iobuffer. This call will return after no additional
+    /// samples will be written. The provided IOBuffer must be one previously
+    /// returned by zx_sampler_create.
+    ///
+    /// Attempting to stop a session which has already been stopped will return
+    /// an error, but will not modify the session.
+    ///
+    /// ## Errors
+    ///
+    /// `ZX_ERR_NOT_SUPPORTED`  `kernel.enable-debugging-syscalls` is not set to `true`
+    /// on the kernel command line.
+    ///
+    /// `ZX_ERR_PERMISION_DENIED` *iobuffer* is not an IOBuffer returned by zx_sampler_create.
+    ///
+    /// `ZX_ERR_BAD_STATE` the sampler has not started or has already been
+    /// stopped
+    ///
+    /// ## See also
+    ///
+    ///  - [`zx_sampler_create()`]
+    ///  - [`zx_sampler_start()`]
+    ///
+    /// [`zx_sampler_create()`]: sampler_create.md
+    /// [`zx_sampler_start()`]: sampler_start.md
+    strict Stop(resource struct {
+        iobuffer Handle;
+    }) -> () error Status;
+
+    /// ## Summary
+    ///
+    /// Read out available samples.
+    ///
+    /// ## Declaration
+    ///
+    /// ```c
+    /// #include <zircon/syscalls.h>
+    ///
+    /// zx_status_t zx_sampler_read(zx_handle_t sampler,
+    ///                             void* data,
+    ///                             size_t data_size,
+    ///                             size_t* actual);
+    /// ```
+    ///
+    /// ## Description
+    ///
+    /// Read data written during the most recent sampling session. The provided
+    /// buffer must be large enough to read all available data. This size can be
+    /// queried by calling with `data` set to nullptr. The required minimum size
+    /// will be written to actual.
+    ///
+    /// On a successful read, returns ZX_OK and sets `actual` to the number of
+    /// bytes actually read.
+    ///
+    /// Additionally, on a ZX_ERR return code, a partial read may have still
+    /// occurred, and the number of bytes written to `data` will be returned in
+    /// `actual`.
+    ///
+    /// ## Errors
+    ///
+    /// `ZX_ERR_NOT_SUPPORTED`  `kernel.enable-debugging-syscalls` is not set to `true`
+    /// on the kernel command line.
+    ///
+    /// `ZX_ERR_PERMISION_DENIED` *sampler* is not a sampler returned by zx_sampler_create.
+    ///
+    /// `ZX_ERR_BAD_STATE` the sampler is currently active
+    ///
+    /// ## See also
+    ///
+    ///  - [`zx_sampler_create()`]
+    ///  - [`zx_sampler_start()`]
+    ///  - [`zx_sampler_stop()`]
+    ///
+    /// [`zx_sampler_create()`]: sampler_create.md
+    /// [`zx_sampler_start()`]: sampler_start.md
+    /// [`zx_sampler_stop()`]: sampler_stop.md
+    strict Read(resource struct {
+        iobuffer Handle;
+        @out
+        @voidptr
+        data experimental_pointer<byte>;
+        data_size usize64;
+    }) -> (struct {
+        actual usize64;
+    }) error Status;
+};

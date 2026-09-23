@@ -1,0 +1,143 @@
+# Copyright 2020 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/testing/boot_tests/boot_test.gni")
+import("//build/testing/environments.gni")
+import("//zircon/kernel/phys/shim_executable.gni")
+import("qemu.gni")
+
+# Defines a boot test that runs a QEMU kernel directly, for each supported
+# QEMU boot format.  In particular, the expanded `boot_test()` instances are
+# named "$target_name.$format" for each $format in $qemu_boot_formats.  The
+# The overall $target_name is a group of all those tests.
+#
+# Parameters
+#
+#   * disabled
+#     - Optional: See boot_test().  This overrides the $qemu_boot_formats value
+#     for all instances of this test.  By default, the $qemu_boot_formats entry
+#     for each format will determine whether its test is disabled.
+#     - Type: bool
+#     - Default: false
+#
+#   * environments
+#     - Optional: See boot_test().  This overrides the $qemu_boot_formats value
+#     for all instances of this test.  By default, the $qemu_boot_formats entry
+#     for each format will determine where its test is run.
+#     - Type: list(scope)
+#
+#   * initrd
+#     - Optional: A ramdisk (e.g., ZBI) with which to boot.
+#     - Type: label
+#
+# Apart from output_dir and output_extension, other parameters are propagated
+# to phys_executable(), which see.
+#
+template("qemu_kernel_test") {
+  group_target = target_name
+
+  group(group_target) {
+    forward_variables_from(invoker, [ "visibility" ])
+    testonly = true
+
+    deps = []
+    foreach(qemu, qemu_boot_formats) {
+      deps += [ ":$target_name.${qemu.name}" ]
+    }
+  }
+
+  foreach(qemu, qemu_boot_formats) {
+    test_target = "$group_target.${qemu.name}"
+
+    # Make this sub-target as public as the overall group target is.
+    # But make sure it also allows the group's deps to list it, and
+    # to itself for the environment redirect.
+    public_visibility = []
+    if (defined(invoker.visibility)) {
+      public_visibility = invoker.visibility + [
+                            ":$group_target",
+                            ":$test_target",
+                          ]
+    } else {
+      public_visibility = [ "*" ]
+    }
+
+    executable_target = "_qemu_phys_test.$test_target.executable"
+    if (toolchain_variant.base == qemu.environment ||
+        (defined(qemu.target_second_environment) &&
+         toolchain_variant.base == qemu.target_second_environment)) {
+      if (defined(qemu.import)) {
+        import(qemu.import)
+      }
+      if (defined(qemu.target_type)) {
+        shim_target_type = qemu.target_type
+      } else {
+        shim_target_type = "phys_executable"
+      }
+
+      shim_executable(executable_target) {
+        testonly = true
+        visibility = [ ":*" ]
+        deps = []
+
+        forward_variables_from(invoker,
+                               "*",
+                               [
+                                 "disabled",
+                                 "environments",
+                                 "initrd",
+                                 "output_dir",
+                                 "output_extension",
+                                 "output_name",
+                                 "tags",
+                                 "target_name",
+                                 "testonly",
+                                 "timeout",
+                                 "visibility",
+                               ])
+        forward_variables_from(qemu,
+                               [
+                                 "import",
+                                 "target_type",
+                               ])
+        deps += qemu.deps + [ "//zircon/kernel/phys/test:qemu-test-main" ]
+        if (!defined(target_type)) {
+          target_type = "phys_executable"
+        }
+      }
+    } else {
+      not_needed(invoker,
+                 "*",
+                 [
+                   "disabled",
+                   "environments",
+                   "initrd",
+                   "supported_environments",
+                 ])
+    }
+
+    boot_test(test_target) {
+      visibility = public_visibility
+
+      # The special kernel is all that really matters for this test.
+      qemu_kernel = ":$executable_target(${qemu.environment})"
+      if (defined(invoker.initrd)) {
+        zbi = invoker.initrd
+      }
+
+      if (defined(invoker.disabled)) {
+        disabled = invoker.disabled
+      } else {
+        forward_variables_from(qemu, [ "disabled" ])
+      }
+      if (defined(invoker.environments)) {
+        environments = invoker.environments
+      } else {
+        environments = qemu.supported_environments
+      }
+    }
+  }
+}

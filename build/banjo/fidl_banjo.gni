@@ -1,0 +1,419 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/fidl/toolchain.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/sdk/sdk_atom_alias.gni")
+
+template("_fidl_banjo_c") {
+  c_target_name = target_name
+  c_fidlgen_target_name = "${target_name}_generate"
+  c_config_target_name = "${target_name}_config"
+  forward_variables_from(invoker,
+                         [
+                           "library_name",
+                           "fidl_gen_dir",
+                         ])
+  c_header_path = string_replace(library_name, ".", "/")
+  c_header_path = string_replace(c_header_path, "_", "-")
+  c_header_include_base = "${fidl_gen_dir}/c"
+  c_header_file = "$c_header_include_base/$c_header_path/c/banjo.h"
+
+  if (is_fidl_toolchain) {
+    # Run fidlgen_banjo on the IR and generate C code.
+    compiled_action(c_fidlgen_target_name) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":*" ]
+
+      tool = "//src/devices/tools/fidlgen_banjo:bin"
+      tool_output_name = "fidlgen_banjo"
+      mnemonic = "FIDLGEN"
+
+      inputs = [ invoker.fidl_ir_json ]
+
+      outputs = [ c_header_file ]
+
+      deps = [ invoker.fidl_ir_target ]
+
+      args = [
+        "--ir",
+        rebase_path(invoker.fidl_ir_json, root_build_dir),
+        "--output",
+        rebase_path(c_header_file, root_build_dir),
+        "--backend",
+        "c",
+      ]
+    }
+  } else {
+    not_needed(invoker,
+               [
+                 "fidl_ir_json",
+                 "fidl_ir_target",
+               ])
+  }
+
+  # Build the C code that was generated in the FIDL toolchain.
+
+  # This config ensures dependents can find the generated header within the
+  # output directory.
+  config(c_config_target_name) {
+    include_dirs = [ c_header_include_base ]
+  }
+
+  # Exposes the bindings as C sources to the rest of the build.
+  # Eventually this target will be surfaced via the `fidl` template.
+  source_set(c_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    public = [ c_header_file ]
+
+    public_configs = [ ":$c_config_target_name" ]
+
+    deps = [ ":$c_fidlgen_target_name($fidl_toolchain)" ]
+
+    public_deps = [
+      # The generated headers #include <ddk/*.h>
+      # files from the libraries (that aren't generated).
+      "//src/lib/ddk",
+    ]
+    if (defined(invoker.public_deps)) {
+      foreach(dep, invoker.public_deps) {
+        _name = get_label_info(dep, "name")
+        _dir = get_label_info(dep, "dir")
+        public_deps += [ "$_dir:${_name}_banjo_c" ]
+      }
+    }
+  }
+}
+
+template("_fidl_banjo_cpp") {
+  cpp_target_name = target_name
+  cpp_config_target_name = "${target_name}_config"
+  cpp_mock_target_name = "${target_name}_mock"
+  cpp_public_fidlgen_target_name = "${target_name}_public_generate"
+  cpp_private_fidlgen_target_name = "${target_name}_private_generate"
+  cpp_mock_fidlgen_target_name = "${cpp_mock_target_name}_generate"
+
+  forward_variables_from(invoker,
+                         [
+                           "library_name",
+                           "fidl_gen_dir",
+                         ])
+  cpp_header_path = string_replace(library_name, ".", "/")
+  cpp_header_path = string_replace(cpp_header_path, "_", "-")
+  cpp_header_include_base = "${fidl_gen_dir}/cpp"
+  cpp_public_file = "$cpp_header_include_base/$cpp_header_path/cpp/banjo.h"
+  cpp_private_file =
+      "$cpp_header_include_base/$cpp_header_path/cpp/banjo-internal.h"
+  cpp_mock_file = "$cpp_header_include_base/$cpp_header_path/cpp/banjo-mock.h"
+
+  if (is_fidl_toolchain) {
+    # Run fidlgen_banjo on the IR and generate C++ code.
+    compiled_action(cpp_public_fidlgen_target_name) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":*" ]
+
+      tool = "//src/devices/tools/fidlgen_banjo:bin"
+      tool_output_name = "fidlgen_banjo"
+
+      inputs = [ invoker.fidl_ir_json ]
+
+      outputs = [ cpp_public_file ]
+
+      deps = [ invoker.fidl_ir_target ]
+
+      args = [
+        "--ir",
+        rebase_path(invoker.fidl_ir_json, root_build_dir),
+        "--output",
+        rebase_path(cpp_public_file, root_build_dir),
+        "--backend",
+        "cpp",
+      ]
+    }
+
+    compiled_action(cpp_private_fidlgen_target_name) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":*" ]
+
+      tool = "//src/devices/tools/fidlgen_banjo:bin"
+      tool_output_name = "fidlgen_banjo"
+
+      inputs = [ invoker.fidl_ir_json ]
+
+      outputs = [ cpp_private_file ]
+
+      deps = [ invoker.fidl_ir_target ]
+
+      args = [
+        "--ir",
+        rebase_path(invoker.fidl_ir_json, root_build_dir),
+        "--output",
+        rebase_path(cpp_private_file, root_build_dir),
+        "--backend",
+        "cpp_internal",
+      ]
+    }
+
+    compiled_action(cpp_mock_fidlgen_target_name) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":*" ]
+
+      tool = "//src/devices/tools/fidlgen_banjo:bin"
+      tool_output_name = "fidlgen_banjo"
+
+      inputs = [ invoker.fidl_ir_json ]
+
+      outputs = [ cpp_mock_file ]
+
+      deps = [ invoker.fidl_ir_target ]
+
+      args = [
+        "--ir",
+        rebase_path(invoker.fidl_ir_json, root_build_dir),
+        "--output",
+        rebase_path(cpp_mock_file, root_build_dir),
+        "--backend",
+        "cpp_mock",
+      ]
+    }
+  } else {
+    not_needed(invoker,
+               [
+                 "fidl_ir_json",
+                 "fidl_ir_target",
+               ])
+  }
+
+  # Build the C++ code that was generated in the FIDL toolchain.
+
+  config(cpp_config_target_name) {
+    include_dirs = [ cpp_header_include_base ]
+  }
+
+  source_set(cpp_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    public = [ cpp_public_file ]
+
+    sources = [ cpp_private_file ]
+
+    # Let dependencies use `#include "$file_stem.h"`.
+    public_configs = [
+      ":$cpp_config_target_name",
+      "//build/c:banjo_gen_config",
+    ]
+
+    deps = [
+      ":$cpp_private_fidlgen_target_name($fidl_toolchain)",
+      ":$cpp_public_fidlgen_target_name($fidl_toolchain)",
+      "//src/zircon/lib/zircon",
+    ]
+
+    public_deps = [
+      ":${invoker.c_target_name}",
+
+      # The generated headers #include <ddk/*.h> and #include <ddktl/*.h>
+      # files from the libraries (that aren't generated).
+      "//src/lib/ddk",
+      "//src/lib/ddktl",
+      "//zircon/system/ulib/zx",
+    ]
+
+    if (defined(invoker.public_deps)) {
+      foreach(dep, invoker.public_deps) {
+        _name = get_label_info(dep, "name")
+        _dir = get_label_info(dep, "dir")
+        public_deps += [ "$_dir:${_name}_banjo_cpp" ]
+      }
+    }
+  }
+
+  source_set(cpp_mock_target_name) {
+    forward_variables_from(invoker, [ "visibility" ])
+
+    testonly = true
+
+    public = [ cpp_mock_file ]
+
+    deps = [ ":$cpp_mock_fidlgen_target_name($fidl_toolchain)" ]
+
+    public_deps = [
+      ":$cpp_target_name",
+      "//zircon/system/ulib/fbl",
+      "//zircon/system/ulib/mock-function",
+      "//zircon/system/ulib/zxtest",
+    ]
+
+    if (defined(invoker.public_deps)) {
+      foreach(dep, invoker.public_deps) {
+        _name = get_label_info(dep, "name")
+        _dir = get_label_info(dep, "dir")
+        public_deps += [ "$_dir:${_name}_banjo_cpp_mock" ]
+      }
+    }
+  }
+
+  # Set up an SDK item for this library
+  if (defined(invoker.sdk_category)) {
+    # Instead of depending on the generated bindings, set up a dependency on
+    # the original library.
+    sdk_target_name = "${cpp_target_name}_sdk"
+    original_library_name = "${target_name}_sdk"
+    sdk_atom_alias(sdk_target_name) {
+      atom = ":$original_library_name($fidl_toolchain)"
+    }
+  }
+}
+
+template("_fidl_banjo_rust") {
+  rust_target_name = target_name
+  rust_fidlgen_target_name = "${target_name}_generate"
+
+  forward_variables_from(invoker,
+                         [
+                           "library_name",
+                           "fidl_gen_dir",
+                         ])
+  rust_library_name = "banjo_" + string_replace(library_name, ".", "_")
+  rust_file_name = "$rust_library_name.rs"
+  rust_source_file = "${fidl_gen_dir}/rust/$rust_file_name"
+
+  if (is_fidl_toolchain) {
+    # Run fidlgen_banjo on the IR and generate Rust code.
+    compiled_action(rust_fidlgen_target_name) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":*" ]
+
+      tool = "//src/devices/tools/fidlgen_banjo:bin"
+      tool_output_name = "fidlgen_banjo"
+
+      inputs = [ invoker.fidl_ir_json ]
+
+      outputs = [ rust_source_file ]
+
+      deps = [ invoker.fidl_ir_target ]
+
+      args = [
+        "--ir",
+        rebase_path(invoker.fidl_ir_json, root_build_dir),
+        "--output",
+        rebase_path(rust_source_file, root_build_dir),
+        "--backend",
+        "rust",
+      ]
+    }
+  } else {
+    not_needed(invoker,
+               [
+                 "fidl_ir_json",
+                 "fidl_ir_target",
+               ])
+  }
+
+  # Build the Rust code that was generated in the FIDL toolchain.
+  rustc_library(rust_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    name = rust_library_name
+    version = "0.1.0"
+    edition = "2024"
+    disable_clippy = true
+
+    source_root = rust_source_file
+    sources = [ rust_source_file ]
+
+    output_dir = "$target_out_dir/banjo/$rust_target_name"
+
+    non_rust_deps = [ ":$rust_fidlgen_target_name($fidl_toolchain)" ]
+
+    deps = []
+
+    configs += [ "//build/config/rust/lints:deny_unused_results" ]
+
+    if (defined(invoker.public_deps)) {
+      foreach(dep, invoker.public_deps) {
+        if (dep == "//zircon/vdso/zx") {
+          deps += [ "//sdk/rust/zx-types" ]
+        } else {
+          _name = get_label_info(dep, "name")
+          _dir = get_label_info(dep, "dir")
+          deps += [ "$_dir:${_name}_banjo_rust" ]
+        }
+      }
+    }
+  }
+}
+
+# Generates Banjo bindings for a FIDL library.
+#
+# Parameters
+#
+#  * library_name
+#    - Required: The name of the FIDL library.
+#    - Type: string
+#
+#  * fidl_gen_dir
+#    - Required: The directory under which bindings should be generated.
+#    - Type: path
+#
+#  * fidl_ir_json
+#    - Required: The path to the associated FIDL IR JSON file.
+#    - Type: path
+#
+#  * fidl_ir_target
+#    - Required: The label of the target that generates the FIDL IR JSON file.
+#    - Type: label
+#
+#  * sdk_cateogry
+#    - Optional: See //build/fidl/fidl.gni for a description.
+#    - Type: string
+#
+#  * testonly, visibility, public_deps
+#    - Optional: Usual GN meanings.
+#
+template("fidl_banjo") {
+  params = {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "public_deps",
+                             "library_name",
+                             "fidl_gen_dir",
+                             "fidl_ir_json",
+                             "fidl_ir_target",
+                           ])
+  }
+
+  c_target_name = "${target_name}_c"
+
+  _fidl_banjo_c(c_target_name) {
+    forward_variables_from(params, "*")
+  }
+
+  _fidl_banjo_cpp("${target_name}_cpp") {
+    forward_variables_from(params, "*")
+    if (!is_fidl_toolchain) {
+      forward_variables_from(invoker, [ "sdk_category" ])
+    }
+  }
+
+  _fidl_banjo_rust("${target_name}_rust") {
+    forward_variables_from(params, "*")
+  }
+}

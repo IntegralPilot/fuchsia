@@ -1,0 +1,150 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.starnix.runner;
+
+using zx;
+
+const PROXY_NAME_LEN uint32 = 1024;
+
+@discoverable
+open protocol Manager {
+    /// Suspends the container running in `job`.
+    ///
+    /// The call will return successfully when `wake_event` has been signaled. Returns
+    /// an error if `wake_locks` is signaled at the end of suspension, or an error is
+    /// encountered when suspending the container's processes.
+    flexible SuspendContainer(resource table {
+        /// The job of the container to suspend.
+        1: container_job zx.Handle:JOB;
+        /// The event that is used to signal whether or not there are any active wake locks
+        /// in the container.
+        2: wake_locks zx.Handle:EVENTPAIR;
+    }) -> (table {
+        /// The amount of time spent in the suspend state.
+        ///
+        /// It is used for tracking suspend stats in the Starnix kernel.
+        1: suspend_time zx.Duration;
+
+        /// The name of the event that woke the container.
+        2: resume_reason string:1024;
+    }) error SuspendError;
+
+    /// Creates a pass-through proxy that forwards messages between the `container_channel` and the
+    /// `remote_channel`.
+    ///
+    /// If any messages arrive on `remote_channel` while the container is suspended via
+    /// `SuspendContainer`, the container will be resumed and `counter` will be incremented.
+    ///
+    /// Once that message is handled by the container, and it's ok to suspend the container again
+    /// (relative to that message), the counter is expected to be decremented.
+    flexible ProxyWakeChannel(resource table {
+        /// The job of the container that holds the other end of `container_channel`.
+        1: container_job zx.Handle:JOB;
+
+        /// The channel endpoint that is connected to the container.
+        2: container_channel zx.Handle:CHANNEL;
+
+        /// The channel endpoint that is connected to a component outside the container.
+        3: remote_channel zx.Handle:CHANNEL;
+
+        /// The name of the proxy, used for debugging purposes.
+        4: name string:PROXY_NAME_LEN;
+
+        /// A counter that is used to count how many unhandled requests have been sent to the
+        /// container. If this counter is non-zero, the container will not be able to suspend.
+        ///
+        /// Each time the client handles a message on the proxied channel, it is expected to
+        /// decrement the counter by 1. This decrement should only happen once the client is
+        /// ready to allow suspension. Often this means that a new hanging get has been sent on
+        /// the proxied channel.
+        5: counter zx.Handle:COUNTER;
+    });
+
+    /// Adds `signals` on `handle` as a way to prevent the container from suspending, or wake it
+    /// if it is already suspended.
+    flexible AddWakeSource(resource table {
+        /// The job of the container that is meant to be woken by `signals` on `handle`.
+        1: container_job zx.Handle:JOB;
+
+        /// The name of the wake source, used for debugging purposes.
+        2: name string:PROXY_NAME_LEN;
+
+        /// A handle that is used to prevent the container from suspending when `signals` are
+        /// raised. If one of `signals` is raised while the container is suspended, the
+        /// container will be woken up.
+        3: handle zx.Handle;
+
+        /// The signals on `handle` that are meant to wake the container.
+        4: signals zx.Signals;
+    });
+
+    /// Removes a wake source handle from the `container_job`.
+    ///
+    /// If the container is currently suspended, the `handle` may still wake the container if
+    /// its signals are raised. To ensure that the wake source never wakes the container again
+    /// after this call, the client must make sure that the signals are cleared and not raised
+    /// again.
+    flexible RemoveWakeSource(resource table {
+        /// The job of the container that `handle` is associated with.
+        1: container_job zx.Handle:JOB;
+
+        /// The handle to the wake source that is to be removed.
+        2: handle zx.Handle;
+    });
+
+    /// Registers an eventpair that will be signaled when the container is suspended or resumed.
+    /// The signals are ASLEEP(USER_1) and AWAKE(USER_0).
+    ///
+    /// The kernel returns AWAKE upon initial registration of the eventpair.
+    flexible RegisterWakeWatcher(resource table {
+        /// The event that will be signaled when the container's wake status changes.
+        1: watcher zx.Handle:EVENTPAIR;
+    }) -> ();
+
+    /// Creates a `Pager` instance with the provided `backing_vmo` and `block_size`.
+    flexible CreatePager(resource table {
+        /// The backing vmo to use in the pager.
+        1: backing_vmo zx.Handle:VMO;
+
+        /// The block size for the pager to use.
+        2: block_size uint64;
+
+        /// The `Pager` instance that will serve the pager requests.
+        3: pager server_end:Pager;
+    });
+};
+
+open protocol Pager {
+    /// Registers a file with the pager.
+    flexible RegisterFile(table {
+        /// The name of the file vmo.
+        1: name string:MAX;
+
+        /// The inode name to use for the file.
+        2: inode_num uint32;
+
+        /// The size of the file.
+        3: size uint64;
+
+        /// The extents associated with the file, required to be sorted.
+        4: extents vector<PagerExtent>:1024;
+    }) -> (resource table {
+        /// A newly created child vmo.
+        1: vmo zx.Handle:VMO;
+    }) error zx.Status;
+};
+
+type PagerExtent = struct {
+    logical_start uint32;
+    logical_end uint32;
+    physical_block uint64;
+};
+
+type SuspendError = flexible enum {
+    // A wake lock was acquired during the suspend operation.
+    WAKE_LOCKS_EXIST = 1;
+    // Failed to suspend all the processes in the provided container's job.
+    SUSPEND_FAILURE = 2;
+};

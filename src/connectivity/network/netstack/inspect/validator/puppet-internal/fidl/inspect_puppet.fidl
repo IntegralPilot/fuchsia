@@ -1,0 +1,128 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// The Inspect VMO Validator program starts and controls a "puppet" program to
+/// exercise each Inspect library. This file defines the protocol to exercise
+/// the library (and report the result of commands). (After executing some
+/// commands, the Validator program will analyze the VMO contents for
+/// correctness and memory-packing efficiency.)
+///
+/// This is a fork of library `diagnostics.validate` that only supports features
+/// used by the VMO-backed flavor of the Go Inspect library.
+library diagnostics.validate.deprecated;
+
+using zx;
+
+/// InitializationParams tells how to initialize the Inspect library.
+type InitializationParams = table {
+    1: vmoSize uint64;
+};
+
+/// TestResult tells the result of executing an Initialize or Act command.
+type TestResult = strict enum {
+    /// The function call completed without error.
+    OK = 0;
+    /// The Inspect library doesn't implement a requested feature.
+    UNIMPLEMENTED = 1;
+    /// The Inspect library reported a failure executing the function.
+    FAILED = 2;
+    /// The driver and/or puppet-wrapper was in an illegal state.
+    ILLEGAL = 3;
+};
+
+/// Tells the puppet to create a Node with the given name, parentage, and ID
+/// (the id is specified so other nodes can later be created under it).
+type CreateNode = struct {
+    parent uint32;
+    id uint32;
+    name string;
+};
+
+/// Tells the puppet to delete the given node.
+type DeleteNode = struct {
+    id uint32;
+};
+
+type Value = flexible union {
+    1: int_t int64;
+    2: uint_t uint64;
+    3: double_t float64;
+    4: string_t string;
+};
+
+/// Tells the puppet to create a property with the given numeric value.
+type CreateNumericProperty = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    value Value;
+};
+
+/// Tells the puppet to create a property with the given byte array value.
+type CreateBytesProperty = struct {
+    parent uint32;
+    id uint32;
+    name string;
+    value vector<uint8>;
+};
+
+// Action sent to instruct a Puppet to create a lazy node.
+// TODO(https://fxbug.dev/42126047): This should be modified to allow for creating lazy nodes past 1-level deep.
+/// Tells the puppet to do something to modify the VMO.
+type Action = flexible union {
+    1: create_node CreateNode;
+    2: delete_node DeleteNode;
+    3: create_numeric_property CreateNumericProperty;
+    4: create_bytes_property CreateBytesProperty;
+};
+
+/// Indicate the preferred DiffType on failed tests.
+type DiffType = strict enum {
+    /// Get the full rendering of both trees.
+    FULL = 0;
+
+    /// Get the diff between the trees.
+    DIFF = 1;
+
+    /// Get both the full rendering of both trees, and their diff.
+    BOTH = 2;
+};
+
+@discoverable
+closed protocol InspectPuppet {
+    /// Initializes the Inspect library being tested by the puppet.
+    strict Initialize(struct {
+        params InitializationParams;
+    }) -> (resource struct {
+        vmo zx.Handle:optional;
+        result TestResult;
+    });
+
+    /// Provides configuration values for the validator.
+    strict GetConfig() -> (resource struct {
+        printable_name string:MAX;
+        options resource table {
+            /// Defaults to false
+            1: has_runner_node bool;
+
+            /// Defaults to FULL
+            2: diff_type DiffType;
+        };
+    });
+
+    /// Instruct the puppet to publish its current data over InspectSink.
+    ///
+    /// Note: It is an error for more than one Validate connection to
+    /// Publish at once. Unpublish must be called to cleanup.
+    strict Publish() -> (struct {
+        result TestResult;
+    });
+
+    /// Modifies the contents of the VMO.
+    strict Act(struct {
+        action Action;
+    }) -> (struct {
+        result TestResult;
+    });
+};

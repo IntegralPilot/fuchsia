@@ -1,0 +1,186 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.wlan.mlme;
+
+using fuchsia.wlan.common;
+using fuchsia.wlan.driver;
+using fuchsia.wlan.ieee80211 as ieee80211;
+using fuchsia.wlan.internal as internal;
+using fuchsia.wlan.stats;
+using fuchsia.wlan.minstrel;
+using zx;
+
+// Custom primitives for communicating between the wlan service and the MLME drivers.
+// The primitives defined here are not part of the official 802.11 MLME SAP interface specification,
+// but follow the same principle for the sake of consistency.
+
+// EAPOL.indication
+
+type EapolIndication = struct {
+    src_addr ieee80211.MacAddr;
+    dst_addr ieee80211.MacAddr;
+    data vector<uint8>:MAX;
+};
+
+// BandInfo groups capabilities defined per band.
+// This grouping is the industry's de factor standard.
+type BandCapability = struct {
+    /// The values of this struct apply to the band indicated in this field.
+    band ieee80211.WlanBand;
+
+    /// Basic rates supported in units of 500 kbit/s (as defined in
+    /// IEEE Std 802.11-2016, 9.4.2.3), e.g., 0x02 represents 1 Mbps.
+    /// The value returned by this type indicates all the non-HT rates
+    /// the device supports transmitting and receiving.
+    basic_rates vector<uint8>:ieee80211.MAX_SUPPORTED_BASIC_RATES;
+
+    ht_cap box<ieee80211.HtCapabilities>;
+    vht_cap box<ieee80211.VhtCapabilities>;
+
+    /// A list of primary channels considered valid by hardware, in the context of
+    /// regulatory information known to the device driver, at the time of its
+    /// construction during iface creation. In this context, a primary channel
+    /// means a channel which APs may transmit Beacon frames on in the current
+    /// regulatory domain.
+    ///
+    /// This list should be used to determine efficacy of subsequent requests to
+    /// scan a subset of channels using the iface, or to determine which primary
+    /// channel to use when starting an AP.
+    primary_channels vector<ieee80211.ChannelNumber>:ieee80211.MAX_UNIQUE_CHANNEL_NUMBERS;
+};
+
+type DeviceInfo = struct {
+    // Current station MAC address.
+    sta_addr ieee80211.MacAddr;
+    // MAC address as assigned in the factory.
+    factory_addr ieee80211.MacAddr;
+    role fuchsia.wlan.common.WlanMacRole;
+    bands vector<BandCapability>:fuchsia.wlan.common.MAX_BANDS;
+
+    // TODO(https://fxbug.dev/42169534): This field will be replaced in the new driver features
+    // framework.
+    softmac_hardware_capability fuchsia.wlan.driver.WlanSoftmacHardwareCapability;
+
+    // TODO(https://fxbug.dev/42120297): This field is stubbed out for future use.
+    qos_capable bool;
+};
+
+// SETKEYS.confirm
+// IEEE Std 802.11-2016 6.3.20.1 does not specify this primitive, but in practice
+// the SetKeys operation can sometimes fail. We return a list of results, since
+// multiple keys may be set at once and result in partial failure.
+
+type SetKeyResult = struct {
+    key_id uint16;
+    status zx.Status;
+};
+
+type SetKeysConfirm = struct {
+    results vector<SetKeyResult>;
+};
+
+// TODO(https://fxbug.dev/42164319): Move this to wlan_internal.fidl after https://fxbug.dev/42166364 is fixed
+type GetIfaceStatsResponse = strict union {
+    1: stats fuchsia.wlan.stats.IfaceStats;
+    2: error_status int32;
+};
+
+// TODO(https://fxbug.dev/42164319): Move this to wlan_internal.fidl after https://fxbug.dev/42166364 is fixed
+type GetIfaceHistogramStatsResponse = strict union {
+    1: stats fuchsia.wlan.stats.IfaceHistogramStats;
+    2: error_status int32;
+};
+
+type MinstrelListResponse = struct {
+    peers fuchsia.wlan.minstrel.Peers;
+};
+
+type MinstrelStatsRequest = struct {
+    peer_addr ieee80211.MacAddr;
+};
+
+type MinstrelStatsResponse = struct {
+    peer box<fuchsia.wlan.minstrel.Peer>;
+};
+
+// SET_CONTROLLED_PORT.request
+
+type SetControlledPortRequest = struct {
+    peer_sta_address ieee80211.MacAddr;
+    state ControlledPortState;
+};
+
+type ControlledPortState = strict enum {
+    CLOSED = 0;
+    OPEN = 1;
+};
+
+// START_CAPTURE_FRAMES.request
+
+/// Bits used to request management frame subtypes to be captured. Also used in
+/// StartCaptureFramesResponse to indicate what management frames are supported.
+///
+/// These values are set at `1 << MgmtFrameSubtypeValue`
+/// See IEEE Std 802.11-2016, 9.2.4.1.3, for value of each management frame subtype
+type MgmtFrameCaptureFlags = strict bits : uint32 {
+    ASSOC_REQ = 0x1;
+    ASSOC_RESP = 0x2;
+    REASSOC_REQ = 0x4;
+    REASSOC_RESP = 0x8;
+    PROBE_REQ = 0x10;
+    PROBE_RESP = 0x20;
+    TIMING_AD = 0x40;
+    BEACON = 0x100;
+    ATIM = 0x200;
+    DISASSOC = 0x400;
+    AUTH = 0x800;
+    DEAUTH = 0x1000;
+    ACTION = 0x2000;
+    ACTION_NO_ACK = 0x4000;
+};
+
+type StartCaptureFramesRequest = struct {
+    mgmt_frame_flags MgmtFrameCaptureFlags;
+};
+
+type StartCaptureFramesResponse = struct {
+    status int32;
+    supported_mgmt_frames MgmtFrameCaptureFlags;
+};
+
+type CapturedFrameResult = struct {
+    frame vector<uint8>:MAX;
+};
+
+/// Non-IEEE custom structure to inform a SoftMAC device about the association negotiation outcome.
+// TODO(https://fxbug.dev/42119326): Remove if we are able to intersect the capabilities with beacon before associating
+type NegotiatedCapabilities = struct {
+    primary ieee80211.ChannelNumber;
+    capability_info ieee80211.CapabilityInfo;
+    rates vector<uint8>:internal.MAX_ASSOC_BASIC_RATES;
+    wmm_param box<WmmParameter>;
+    ht_cap box<ieee80211.HtCapabilities>;
+    vht_cap box<ieee80211.VhtCapabilities>;
+};
+
+type PmkInfo = struct {
+    pmk vector<uint8>:MAX;
+    pmkid vector<uint8>:MAX;
+};
+
+type SaeHandshakeIndication = struct {
+    peer_sta_address ieee80211.MacAddr;
+};
+
+type SaeHandshakeResponse = struct {
+    peer_sta_address ieee80211.MacAddr;
+    status_code ieee80211.StatusCode;
+};
+
+type SaeFrame = struct {
+    peer_sta_address ieee80211.MacAddr;
+    status_code ieee80211.StatusCode;
+    seq_num uint16;
+    sae_fields vector<uint8>:MAX;
+};

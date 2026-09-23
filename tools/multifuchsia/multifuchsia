@@ -1,0 +1,791 @@
+#!/bin/bash
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+set -euE -o pipefail
+
+# If true, `./multifuchsia enter` will create a new namespace and mount the
+# checkout with the $MOUNTPOINT path. This has the advantage of making all
+# checkouts have the same path, but may prevent the ability to use tools like
+# RBE that will error out if run in a sub-namespace.
+ENTER_ISOLATED_NAMESPACE="false"
+
+function usage() {
+  echo "Usage: $0 subcommand [args]"
+  echo ""
+  echo "The following subcommands are supported:"
+  echo "* checkout <name>: Create a new checkout in checkouts/<name> from snapshots/update.success"
+  echo "* cleanup: Inspects the contents of checkouts, prints out a command line to remove old ones"
+  echo "* enter <name>: Create an isolated shell environment to work in"
+  echo "* mount <name>: Bind-mounts checkouts/<name> on MOUNTPOINT without isolation"
+  echo "* pack: Commits pending changes, and then stores the result in a git branch."
+  echo "* rebase <name>: Rebases a checkout on a new snapshot."
+  echo "* status: Summarises the latest state of nightly builds and the snapshots."
+  echo "* sync_and_build: Syncs the clean checkout to HEAD for all repositories and rebuild."
+  echo "* update: Updates the snapshot at snapshots/update.success and performs an fx ota".
+  exit 1
+}
+
+
+function swap() {
+  local -r file1=$1
+  local -r file2=$2
+  python3 -c 'import sys; import ctypes; syscall=ctypes.CDLL(None).syscall; syscall.restype=ctypes.c_int; syscall.argtypes=(ctypes.c_long, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint); sys.exit(syscall(316, -100, sys.argv[1].encode("utf-8"), -100, sys.argv[2].encode("utf-8"), 2))' "$file1" "$file2" || (
+    echo "failed to exchange snapshots: $?"
+    return 1
+  )
+}
+
+readonly WORKDIR="$(realpath "$(dirname "${BASH_SOURCE[0]}")")"
+
+function lookup_checkout() {
+  local -r name="$1"
+  if [[ "$name" == *"/"* ]]; then
+    echo "$name"
+  else
+    echo "$WORKDIR/checkouts/$name"
+  fi
+}
+
+# Strip leading "checkouts/" directory prefix and trailing separator from shell tabbing,
+# returning the actual checkout name
+function strip_checkout_name() {
+  echo "$1" | sed -e 's|^checkouts/||' | sed -e 's|/$||'
+}
+
+# Must be called while the current directory is $WORKDIR.
+function fixup_absolute_paths() {
+  local -r checkoutdir="$1"
+  local -r finaldir="$2"
+  if [ ${ENTER_ISOLATED_NAMESPACE} != "true" ]; then
+    sed -i "s,$(pwd)/clean,$(pwd)/${finaldir},g" "${checkoutdir}/rust-project.json"
+  fi
+}
+
+# Touches args.gn in the given checkout
+function touch_args_gn() {
+  local -r checkoutdir="$1"
+  (
+    cd $checkoutdir
+    local fuchsia_build_dir
+    fuchsia_build_dir="$(./scripts/fx get-build-dir)"
+    touch $fuchsia_build_dir/args.gn
+  )
+}
+
+function cmd_sync_and_build() {
+  local -r multifuchsia_workdir="$(realpath $(dirname "${BASH_SOURCE[0]}"))"
+  local -r multifuchsia_srcdir="$(dirname $(realpath "${BASH_SOURCE[0]}"))"
+  if [ "${multifuchsia_workdir}" == "${multifuchsia_srcdir}" ]; then
+    echo "error: multifuchsia should be run from a symlink located in the root of the multifuchsia workspace, not a copy or run directly." >&2
+    return 1
+  fi
+
+  local args=(
+    "${multifuchsia_srcdir}/update_and_build_inner.sh"
+    --workspace "${multifuchsia_workdir}"
+  )
+
+  if [ ${ENTER_ISOLATED_NAMESPACE} == "true" ]; then
+    unshare \
+      --user \
+      --mount \
+      --map-current-user \
+      --keep-caps \
+      "${args[@]}" \
+      --mount "${MOUNTPOINT}"
+  else
+    bash -- \
+      "${args[@]}"
+  fi
+}
+
+# For calling from systemd units/anywhere where it's easier to manipulate the
+# working directory than the executable path.
+function cmd_sync_and_build_here() {
+  local -r multifuchsia_current="$(realpath "${BASH_SOURCE[0]}")"
+  local -r multifuchsia_local="$(realpath ./multifuchsia)"
+  if [ "${multifuchsia_current}" != "${multifuchsia_local}" ]; then
+    echo "error: $(pwd) doesn't look like a multifuchsia workspace. \$(realpath ./multifuchsia) = \"${multifuchsia_local}\"" >&2
+    return 1
+  fi
+
+  ./multifuchsia sync_and_build "$@"
+}
+
+function cmd_checkout() {
+  if [ "$#" -lt 1 ]; then
+    usage
+  fi
+  local -r branch="$1"
+  local mode="$DEFAULT_CHECKOUT_MODE"
+  if [ $# -eq 2 ]; then
+    mode="$2"
+  elif [ $# -gt 2 ]; then
+    echo "error: too many arguments" >&2
+  fi
+
+  cd "$WORKDIR"
+
+  destdir="checkouts/$branch"
+  if [ -d "$destdir" ]; then
+    echo "error: $destdir already exists" >&2
+    return 1
+  else
+    case "$mode" in
+      worktree)
+        echo "Creating subvolume $destdir.new" >&2
+        btrfs subvolume snapshot snapshots/update.success "$destdir.new"
+        readonly git_commit="$(git -C "$destdir.new" rev-parse HEAD)"
+
+        echo "Creating worktree $destdir" >&2
+        git -C clean worktree add ../"$destdir" --detach --no-checkout "$git_commit"
+        git -C "$destdir" reset --quiet
+        readonly gitdir="$(git -C "$destdir" rev-parse --git-dir)"
+
+        echo "Joining subvolume $destdir.new with worktree $destdir" >&2
+        mv "$destdir.new"/.git/index "$gitdir"/index
+        mv "$destdir.new"/.git/modules "$gitdir"/
+        # fixup submodule .git links
+        sed -i 's|gitdir: \(../\)\+.git|'"$(cat "$destdir"/.git)"'|' $(find "$destdir.new" -path "$destdir.new/out" -prune -o -type f -name .git -print | grep -v "^$destdir.new/.git" | grep -v "^$destdir.new/out/")
+        rm -rf "$destdir.new"/.git
+        mv "$destdir"/.git "$destdir.new"/
+        rmdir "$destdir"
+        mv "$destdir.new" "$destdir"
+
+        # fixup core.worktree in submodule gitdirs
+        git -C "$destdir" submodule foreach --recursive --quiet 'sed -i "/^\tworktree/d" "$(cat .git|sed "s/^gitdir: //")"/config'
+        git -C "$destdir" submodule foreach --recursive --quiet 'git config core.worktree "$(pwd)"'
+
+        git -C "$destdir" status
+
+        echo "Restoring JIRI_HEAD to ${git_commit}" >&2
+        echo "create JIRI_HEAD ${git_commit}" | git -C "$destdir" update-ref --stdin -m 'copy JIRI_HEAD from snapshot'
+        ;;
+      snapshot)
+        echo "Creating subvolume $destdir" >&2
+        btrfs subvolume snapshot snapshots/update.success "$destdir"
+        ;;
+      *)
+        echo "unknown mode '$mode'" >&2
+        return 1
+        ;;
+    esac
+    fixup_absolute_paths "$destdir" "$destdir"
+    touch_args_gn "$destdir"
+  fi
+}
+
+function cmd_mount() {
+  if [ "$#" -lt 1 ]; then
+    usage
+  fi
+  local -r branch="$1"
+
+  unmount_repo
+
+  cd "$WORKDIR"
+
+  destdir="checkouts/$branch"
+  if [ -d "$destdir" ]; then
+    echo "Reusing existing $destdir" >&2
+    while [[ "$(git -C "$destdir" show -s --format='%s' HEAD)" == "wip!"* ]]; do git -C "$destdir" reset HEAD^; done
+  else
+    cmd_checkout "$branch"
+  fi
+
+  echo "Bind mounting $destdir as fuchsia" >&2
+  sudo mount --bind "$destdir" "$MOUNTPOINT"
+}
+
+function cmd_umount() {
+  unmount_repo
+}
+
+function unmount_repo() {
+  if findmnt --raw --noheadings --output 'SOURCE' --mountpoint "$MOUNTPOINT" >/dev/null; then
+    echo "Trying to unmount $MOUNTPOINT" >&2
+    if ! sudo umount "$MOUNTPOINT" ; then
+      (cd "$MOUNTPOINT" && ./scripts/fx ffx emu stop --all)
+      echo "Stopping bazel" >&2
+      (cd "$MOUNTPOINT" && ./scripts/fx bazel shutdown)
+      echo "Unmounting $MOUNTPOINT" >&2
+      sudo umount "$MOUNTPOINT"
+    fi
+  fi
+}
+
+## rebase
+
+function cmd_rebase() {
+  if [ "$#" -lt 1 ]; then
+    usage
+  fi
+  local -r checkout_name="$(strip_checkout_name "$1")"
+  local checkout
+  checkout="$(dirname "$(lookup_checkout "$checkout_name")"/fakefile)"
+
+  if [ ! -d "$checkout" ]; then
+    echo "$checkout/: not found" >&2
+    return 1
+  fi
+
+  if [ -d "$checkout.new" ]; then
+    btrfs subvolume delete -c "$checkout.new"
+  fi
+  btrfs subvolume snapshot "$WORKDIR"/snapshots/update.success "$checkout.new"
+  base_hash=$(git -C "$checkout.new" rev-parse HEAD)
+
+  local using_branchless
+  if [ -d "$checkout/.git/branchless" ]; then
+    echo "Detected git-branchless, will advance JIRI_HEAD and try to use "'`git branchless sync`' >&2
+    # Start by detaching so we don't move branch pointers around
+    git -C "$checkout" switch --detach
+    using_branchless="true"
+  else
+    using_branchless="false"
+  fi
+
+  local -r git_status="$(git -C "$checkout" status -s)"
+  local workdir_dirty
+  if [ -z "$git_status" ]; then
+    # clean
+    workdir_dirty="false"
+  else
+    workdir_dirty="true"
+    git -C "$checkout" add -A .
+    git -C "$checkout" commit -m "wip! changes from `date --iso`"
+  fi
+  git -C "$checkout" fetch --recurse-submodules=no "$(realpath $checkout.new)" "$base_hash"
+  echo "Updating JIRI_HEAD to ${base_hash}"
+  echo "update JIRI_HEAD ${base_hash}" | git -C "$checkout" update-ref --stdin -m 'copy JIRI_HEAD from snapshot'
+  if [ "$using_branchless" == "true" ]; then
+    # for branchless, we just leave all the commits where they are (including
+    # the wip! one), checkout the new JIRI_HEAD, and then use `git branchless
+    # sync`
+    git -C "$checkout" switch --detach "${base_hash}"
+    local -r branchless_main_branch="$(git -C "$checkout" config branchless.core.mainBranch)"
+    echo "Updating branchless main branch '${branchless_main_branch}' to ${base_hash}"
+    echo "update refs/heads/${branchless_main_branch} ${base_hash}" | git -C "$checkout" update-ref --stdin -m 'update git-branchless main branch with new JIRI_HEAD'
+    git -C "$checkout" branchless sync -m
+  else
+    git -C "$checkout" rebase "$base_hash"
+    new_hash=$(git -C "$checkout" rev-parse HEAD)
+    if [ "$workdir_dirty" == "true" ]; then
+      # undo the wip! commit we made earlier
+      git -C "$checkout" reset HEAD^
+    fi
+    git -C "$checkout.new" fetch --recurse-submodules=no "$(realpath $checkout)" "$new_hash"
+    git -C "$checkout.new" checkout "$new_hash"
+  fi
+  echo "restoring submodules (if any) to match snapshot" >&2
+  local gitmodules_dir
+  gitmodules_dir="$(git -C "$checkout" rev-parse --absolute-git-dir)/modules"
+  rm -rf "$gitmodules_dir"
+  mv "$checkout.new/.git/modules" "$gitmodules_dir" || echo "checkout has no submodules" >&2
+  rm -rf "$checkout.new/.git"
+  cp -a --reflink=auto "$checkout/.git" "$checkout.new/.git"
+  if ! cmp --quiet "$checkout/out/default/args.gn" "$checkout.new/out/default/args.gn"; then
+    cp "$checkout/out/default/args.gn" "$checkout.new/out/default/args.gn"
+  fi
+
+  if [[ -e $checkout/local ]]; then
+    (
+      cd $checkout/local
+      mkdir -p $checkout.new/local
+      for i in *; do
+        if ! cmp --quiet "$i" "$checkout.new/local/$i"; then
+          cp -pr "$i" "$checkout.new/local/$i";
+        fi
+      done
+    )
+  fi
+
+  if [[ -e $checkout/mise.local.toml ]]; then
+    (
+      if ! cmp --quiet "$checkout/mise.local.toml" "$checkout.new/mise.local.toml"; then
+        cp "$checkout/mise.local.toml" "$checkout.new/mise.local.toml"
+      fi
+    )
+  fi
+
+  (cd "$WORKDIR" && fixup_absolute_paths "checkouts/$checkout_name.new" "checkouts/$checkout_name")
+
+  # Update the checkout's remotes/origin/main.
+  echo "updating remotes/origin/main"
+  git -C "$checkout.new" fetch --force "$WORKDIR/snapshots/update.success" "remotes/origin/main:remotes/origin/main"
+
+  # Copy environment profile files over if they exist
+  for i in .env .envrc; do
+    if [ -f "$checkout/$i" ]; then
+      cp -p "$checkout/$i" "$checkout.new/$i"
+    fi
+  done
+
+  swap "$checkout" "$checkout.new"
+  btrfs subvolume delete -c "$checkout.new"
+
+  if [ -f "$checkout/.git" ]; then
+    echo "fixing gitmodule links for worktree" >&2
+    # fixup submodule .git links
+    sed -i 's|gitdir: \(../\)\+.git|'"$(cat "$checkout"/.git)"'|' $(find "$checkout" -path "$checkout/out" -prune -o -type f -name .git -print | grep -v "^$checkout/.git" | grep -v "^$checkout/out/")
+    # fixup core.worktree in submodule gitdirs
+    git -C "$checkout" submodule foreach --recursive --quiet 'sed -i "/^\tworktree/d" "$(cat .git|sed "s/^gitdir: //")"/config'
+    git -C "$checkout" submodule foreach --recursive --quiet 'git config core.worktree "$(pwd)"'
+  fi
+
+  touch_args_gn "$checkout"
+}
+
+function detect_non_fuchsia_git_changes() {
+  local checkout="$1"
+  local base_path="$(realpath "$checkout")"
+  readarray -d $'\0' -t git_dirs < <(find "$base_path" -path "$base_path/out" -prune -o -path "$base_path/.git" -prune -o -name '.git' -print0)
+  local result=0
+  for git_dir in ${git_dirs[@]}; do
+    local repo_path="${git_dir%/.git}"
+    if ! cleanup_repo "$checkout" "$repo_path"; then
+      result=1
+    fi
+  done
+  return $result
+}
+
+function cmd_pack() {
+  readonly gitdir="$(dirname "$1"/fakefile)"
+
+  echo "Checking for changes in other repos (which cannot currently be packed)" >&2
+  if ! detect_non_fuchsia_git_changes "$gitdir" ; then
+    echo "clean up or back up the changes in other repos, and then retry" >&2
+    return 1
+  fi
+
+  if ! git -C "$gitdir" symbolic-ref -q HEAD >/dev/null; then
+    echo "detected detached HEAD, creating branch" >&2
+    if ! git -C "$gitdir" switch -c "$(basename "$gitdir")"; then
+      return 1
+    fi
+  fi
+  local branchname
+  branchname="$(git -C "$gitdir" symbolic-ref HEAD)"
+
+  git -C "$gitdir" add -A .
+  git -C "$gitdir" add -f out/*/args.gn
+  git -C "$gitdir" commit -m "wip! changes from `date --iso`" --allow-empty
+
+  if [ ! -f "$gitdir"/.git ]; then
+    echo "pushing branch '$branchname' to clean" >&2
+    git -C "$gitdir" push "$(realpath "$WORKDIR/clean")" "$branchname":"$branchname"
+  fi
+
+  btrfs subvolume delete -c "$gitdir"
+}
+
+## update
+
+function cmd_update() {
+  local -r repository="$(realpath "$WORKDIR")/repository/fuchsia.com"
+  if [ -d "$WORKDIR/snapshots/update.new" ] ; then
+    btrfs property set "$WORKDIR/snapshots/update.new" ro false
+    btrfs subvolume delete -c "$WORKDIR/snapshots/update.new"
+  fi
+  btrfs subvolume snapshot -r "$WORKDIR/snapshots/build.success" "$WORKDIR/snapshots/update.new"
+  (
+    cd "$WORKDIR/snapshots/update.new"
+    (
+      cd out/default
+      if [ -d "$repository" ]; then
+        ../../scripts/fx host-tool --no-build package-tool repository publish --package-list all_package_manifests.list "$repository"
+      else
+        cp -a --reflink=always amber-files "$repository"
+      fi
+    )
+  )
+
+  "$WORKDIR"/multifuchsia enter "$WORKDIR/snapshots/update.new" "$(realpath "$WORKDIR")"/multifuchsia update_helper
+
+  if [ -d "$WORKDIR"/snapshots/update.success ] ; then
+    swap "$WORKDIR"/snapshots/update.new "$WORKDIR"/snapshots/update.success
+    btrfs property set -ts "$WORKDIR"/snapshots/update.new ro false
+    btrfs subvolume delete -c "$WORKDIR"/snapshots/update.new
+  else
+    mv "$WORKDIR"/snapshots/update.new "$WORKDIR"/snapshots/update.success
+  fi
+}
+
+function cmd_update_helper() {
+  local fuchsia_build_dir
+  fuchsia_build_dir="$(./scripts/fx get-build-dir)"
+  local expected_system_image_merkle
+  expected_system_image_merkle=$(cat "${fuchsia_build_dir}"/obj/build/images/fuchsia/fuchsia/base/package_manifest.json | scripts/fx jq -r '.blobs[] | select(.path == "meta/") | .merkle' )
+
+  local -r socket_dir="$WORKDIR/.update-ffx-daemon"
+  mkdir -p "$socket_dir"
+  mount --bind "$socket_dir" "$fuchsia_build_dir/.ffx-daemon"
+  ./scripts/fx --dir=out/default shell update check-now --monitor || true
+  ./scripts/fx --dir=out/default wait
+  ./scripts/fx --dir=out/default shell update wait-for-commit
+  if [[ $(./scripts/fx --dir=out/default shell 'read ver < /system/meta;echo $ver') != "${expected_system_image_merkle}" ]] ; then
+    echo "After update, system appears still out of date. OTA may have failed. Run 'fx log' for details." >&2
+    return 1
+  fi
+}
+
+function cleanup_repo() {
+  local -r checkout="$1"
+  local base_path
+  base_path="$(realpath "$checkout")"
+  local -r repo_path="$2"
+  local repo_relpath="${repo_path#$base_path}"
+  local expected_revision
+  expected_revision="$(git -C "$repo_path" rev-parse JIRI_HEAD)" || {
+    echo "error in '$repo_path'" >&2
+    return 1
+  }
+  local git_status
+  git_status="$(git -C "$repo_path" status -s)" || {
+    echo "error in '$repo_path'" >&2
+    return 1
+  }
+  local workdir_dirty
+  if [ -z "$git_status" ]; then
+    # clean
+    workdir_dirty="false"
+    true
+  else
+    # git -C "$repo_path" status
+    workdir_dirty="true"
+    result=1
+  fi
+  local repo_revision
+  repo_revision="$(git -C "$repo_path" rev-parse HEAD)" || return
+  local raw_missing_commits
+  raw_missing_commits="$(git -C "$repo_path" log "$expected_revision".. --format=format:%H)" || return
+  local missing_commits=( $raw_missing_commits )
+  if [ ${#missing_commits[*]} -gt 0 ] || [ "${workdir_dirty}" == "true" ] ; then
+    echo "${checkout}${repo_relpath}:" >&2
+  fi
+  if [ "${workdir_dirty}" == "true" ]; then
+    echo "  [dirty] working directory" >&2
+  fi
+  if [ ${#missing_commits[*]} -gt 20 ]; then
+    echo "  too many missing commits ${#missing_commits[*]}" >&2
+    result=1
+  else
+    for missing_commit in ${missing_commits[@]}; do
+      local commit_status
+      local change_id_trailer="$(
+          git -C "$repo_path" cat-file -p "$missing_commit" \
+          | git interpret-trailers --parse \
+          | (grep '^Change-Id: ' || true)
+      )"
+      if [ -z "$change_id_trailer" ]; then
+        commit_status="missing Change-Id"
+        result=1
+      else
+        local submitted_revision="$(git -C clean/$repo_relpath log "$expected_revision"..origin/main --format=format:%H --grep '^'"$change_id_trailer"'$')"
+        if [ -z "$submitted_revision" ]; then
+          commit_status="not submitted"
+          result=1
+        else
+          commit_status="submitted"
+          # already have this commit
+          true
+        fi
+      fi
+      echo "  [$commit_status] $(git -C "$repo_path" show --oneline --quiet "$missing_commit" --color=always)" >&2
+    done
+  fi
+  return $result
+}
+
+function cleanup_checkout() {
+  local checkout="$1"
+  local base_path="$(realpath "$checkout")"
+  readarray -d $'\0' -t git_dirs < <(find "$base_path" -path "$base_path/out" -prune -o -name '.git' -print0)
+  local result=0
+  for git_dir in ${git_dirs[@]}; do
+    local repo_path="${git_dir%/.git}"
+    if ! cleanup_repo "$checkout" "$repo_path"; then
+      result=1
+    fi
+  done
+  return $result
+}
+function cmd_cleanup() {
+  local to_clean=( )
+  (
+    cd "$WORKDIR"
+    if [ $# -eq 1 ] ; then
+      if cleanup_checkout "$1"; then
+        return 0
+      else
+        return $?
+      fi
+    elif [ $# -gt 1 ]; then
+      echo "Too many arguments" >&2
+      return 1
+    fi
+    for checkout in checkouts/* ; do
+      # echo "Considering $checkout for cleanup" >&2
+      if cleanup_checkout "$checkout"; then
+        to_clean+=( $checkout )
+      fi
+    done
+    if [ ${#to_clean[*]} -gt 0 ]; then
+      echo "To clean: ${to_clean[*]}"
+      echo "btrfs subvolume delete -c ${to_clean[*]} && git -C clean worktree prune"
+    fi
+  )
+}
+
+function cmd_enter() {
+  if [ "$#" -lt 1 ]; then
+    usage
+  fi
+  local -r checkout_name="$(strip_checkout_name "$1")"
+  shift
+  local checkout
+  checkout=$(lookup_checkout "$checkout_name")
+  # copy multifuchsia to a tempfile and run it out of there
+  # `./multifuchsia enter` tends to be a long-running script and this helpfully
+  # avoids us shooting ourselves in the foot if we edit it while running it.
+  local -r tmp_multifuchsia=$(mktemp "$WORKDIR/.multifuchsia_enter_helper.XXXXXX")
+  cp -p --reflink=auto "$WORKDIR/multifuchsia" "$tmp_multifuchsia"
+  local -r multifuchsia_src="$(dirname "$(realpath "$WORKDIR/multifuchsia")")"
+
+  local args=()
+
+  if [ ${ENTER_ISOLATED_NAMESPACE} == "true" ]; then
+    args+=( exec unshare --user --mount --map-current-user --keep-caps )
+  fi
+
+  args+=( "$tmp_multifuchsia" enter_helper "$multifuchsia_src" "$checkout" "$@" )
+
+  "${args[@]}"
+}
+
+function bind_mount() {
+  local -r source="$1"
+
+  if mount --bind "$source" "$MOUNTPOINT" ; then
+    # all good
+    true
+  else
+    if findmnt --raw --noheadings --output 'SOURCE' --mountpoint "$MOUNTPOINT" >/dev/null; then
+      echo "Working around mounted but broken $MOUNTPOINT" >&2
+      local -r mountpoint_parent="$(dirname $MOUNTPOINT)"
+      mount -t tmpfs fake_src "$mountpoint_parent"
+      mkdir -p "$MOUNTPOINT"
+      mount --bind "$source" "$MOUNTPOINT"
+    else
+      echo "Mount failed but nothing seems to be mounted on $MOUNTPOINT" >&2
+      return 1
+    fi
+  fi
+}
+
+function cmd_enter_helper() {
+  # we're running out of a tempfile, so unlink it as soon as possible.
+  rm "${BASH_SOURCE[0]}"
+
+  local -r multifuchsia_src="$1"
+  shift
+  local -r checkout="$1"
+  shift
+
+  if [ ! -e "$checkout" ]; then
+    echo "error: '$checkout' not found" >&2
+    return 1
+  fi
+
+  # Optionally set up an isolated namespace.
+  if [ $ENTER_ISOLATED_NAMESPACE == "true" ]; then
+    bind_mount "$checkout"
+    cd "$MOUNTPOINT"
+    export PATH="$MOUNTPOINT/.jiri_root/bin:$PATH"
+  else
+    cd "$checkout"
+    export PATH="$checkout/.jiri_root/bin:$PATH"
+    export FUCHSIA_DIR="$checkout"
+  fi
+
+  export MULTIFUCHSIA_ENTER_ENV="$(basename "$checkout")"
+  local retcode=0
+  if [ "$#" -gt 0 ]; then
+    if "$@" ; then
+      # success
+      retcode=0
+    else
+      retcode="$?"
+      echo "Failed, but still running cleanup" >&2
+    fi
+  else
+    local -r shell="${SHELL:-bash}"
+    case "$EDIT_SHELL_PROMPT" in
+      true)
+        case "$(basename "$shell")" in
+          bash)
+            "$shell" --rcfile "${multifuchsia_src}/enter.bashrc" -i || true
+            ;;
+          zsh)
+            ZDOTDIR="${multifuchsia_src}/enter.zsh" "$shell" -i || true
+            ;;
+          *)
+            # EDIT_SHELL_PROMPT doesn't support this shell yet.
+            "$shell" -i || true
+            ;;
+        esac
+        ;;
+      false)
+        "$shell" -i || true
+        ;;
+      *)
+        echo 'error: $EDIT_SHELL_PROMPT should be true or false' >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  return "$retcode"
+}
+
+function cmd_config_get_multifuchsia_root() {
+  (cd "$WORKDIR" && pwd)
+}
+
+function cmd_config_get_mountpoint() {
+  echo "$MOUNTPOINT"
+}
+
+function cmd_env_bash() {
+  local -r multifuchsia_src="$(dirname "$(realpath "$WORKDIR/multifuchsia")")"
+  cat "$multifuchsia_src/env/bash.template.sh" | sed 's|local -r MULTIFUCHSIA_ROOT={{placeholder}}$|local -r MULTIFUCHSIA_ROOT="'"$(cmd_config_get_multifuchsia_root)"'"|'
+}
+
+function cmd_env() {
+  local -r subcommand="$1"
+  shift
+
+  case "$subcommand" in
+    bash)
+      cmd_env_bash "$@"
+      ;;
+    zsh)
+      # Apparently zsh supports bash completions just fine lol
+      cmd_env_bash "$@"
+      ;;
+    *)
+      echo "error: unsupported shell '$subcommand' (contributions welcome)" >&2
+      return 1
+  esac
+}
+
+function find_service_unit() {
+  for candidate in $((systemctl --user list-units --type service --all --quiet fuchsia_update_and_build.service && systemctl --user list-units --type service --all --quiet fuchsia_update_and_build@'*') | sed 's/^..//' | cut -f1 -d" " ); do
+    if [ "$(systemctl --user show -P WorkingDirectory "$candidate")" == "$(realpath "$WORKDIR")" ]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  return 1
+}
+
+function cmd_status() {
+  git -C "$WORKDIR/snapshots/build.success/integration" log HEAD^..HEAD --abbrev-commit --color=always --pretty="tformat:snapshots/build.success/integration: %C(auto)%h %ar %s"
+  if [ ! -L "$WORKDIR/snapshots/update.success" ]; then
+    git -C "$WORKDIR/snapshots/update.success/integration" log HEAD^..HEAD --abbrev-commit --color=always --pretty="tformat:snapshots/update.success/integration: %C(auto)%h %ar %s"
+  fi
+  local service_unit=$(find_service_unit)
+  if [ ! -z "${service_unit}" ]; then
+    systemctl --user status "$service_unit"
+  fi
+}
+
+function main() {
+  if [ "$#" -lt 1 ]; then
+    usage
+  fi
+  local -r subcommand="$1"
+  shift
+
+  if [ "$subcommand" != "sync_and_build_here" ]; then
+    # note: cmd_sync_and_build_here isn't called from the workdir (and therefore
+    # wouldn't find the config). It'll pick up the config when it later
+    # re-enters the script by calling sync_and_build from the workdir.
+    if [ ! -f "$WORKDIR/multifuchsia.rc" ]; then
+      echo "error '$WORKDIR/multifuchsia.rc' does not exist. See $(dirname $(realpath "${BASH_SOURCE[0]}"))/multifuchsia.rc.example" >&2
+      exit 1
+    fi
+    source "$WORKDIR/multifuchsia.rc"
+    if [ -z "${MOUNTPOINT+x}" ]; then
+      echo "error: '$WORKDIR/multifuchsia.rc' does not set MOUNTPOINT." >&2
+      exit 1
+    fi
+    if [ -z "${DEFAULT_CHECKOUT_MODE+x}" ]; then
+      echo "error: '$WORKDIR/multifuchsia.rc' does not set DEFAULT_CHECKOUT_MODE." >&2
+      exit 1
+    fi
+    if [ -z "${EDIT_SHELL_PROMPT+x}" ]; then
+      echo "error: '$WORKDIR/multifuchsia.rc' does not set EDIT_SHELL_PROMPT." >&2
+      exit 1
+    fi
+  fi
+
+  case "$subcommand" in
+    sync_and_build)
+      cmd_sync_and_build "$@"
+      ;;
+    sync_and_build_here)
+      cmd_sync_and_build_here "$@"
+      ;;
+    checkout|co)
+      cmd_checkout "$@"
+      ;;
+    mount)
+      cmd_mount "$@"
+      ;;
+    umount)
+      cmd_umount "$@"
+      ;;
+    update)
+      cmd_update "$@"
+      ;;
+    update_helper)
+      cmd_update_helper "$@"
+      ;;
+    rebase)
+      cmd_rebase "$@"
+      ;;
+    cleanup)
+      cmd_cleanup "$@"
+      ;;
+    enter)
+      cmd_enter "$@"
+      ;;
+    enter_helper)
+      cmd_enter_helper "$@"
+      ;;
+    pack)
+      cmd_pack "$@"
+      ;;
+    config_get_multifuchsia_root)
+      cmd_config_get_multifuchsia_root "$@"
+      ;;
+    config_get_mountpoint)
+      cmd_config_get_mountpoint "$@"
+      ;;
+    env)
+      cmd_env "$@"
+      ;;
+    status)
+      cmd_status "$@"
+      ;;
+    *)
+      echo "unknown subcommand '$subcommand'" >&2
+      return 1
+  esac
+}
+
+main "$@"

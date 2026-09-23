@@ -1,0 +1,285 @@
+{{/*
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "UnionDeclaration" }}
+{{- if EmitType .IsValueType }}
+{{- range .DocComments }}
+///{{ . }}
+{{- end }}
+{{- if .HasSensitive }}
+  {{- if .IsFlexible }}
+{{ .Derives.RemoveCustom "PartialEq" "Debug" }}
+  {{- else }}
+{{ .Derives.RemoveCustom "Debug" }}
+  {{- end }}
+{{ else }}
+  {{- if .IsFlexible }}
+{{ .Derives.RemoveCustom "PartialEq" }}
+  {{- else }}
+{{ .Derives }}
+  {{- end }}
+{{- end }}
+pub enum {{ .Name }} {
+    {{- range .Members }}
+    {{- range .DocComments }}
+    ///{{ . }}
+    {{- end }}
+    {{ .Name }}({{ .Type.Owned }}),
+    {{- end }}
+    {{- if .IsFlexible }}
+    #[doc(hidden)]
+    __SourceBreaking {
+        unknown_ordinal: u64,
+    },
+    {{- end }}
+}
+
+{{- if .IsFlexible }}
+{{ "" }}
+/// Pattern that matches an unknown `{{ .Name }}` member.
+#[macro_export]
+macro_rules! {{ .Name }}Unknown {
+    () => { _ };
+}
+
+// Custom PartialEq so that unknown variants are not equal to themselves.
+impl PartialEq for {{ .Name }} {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            {{- range .Members }}
+            (Self::{{ .Name }}(x), Self::{{ .Name }}(y)) => *x == *y,
+            {{- end }}
+            _ => false,
+        }
+    }
+}
+{{- end }}
+
+impl {{ .Name }} {
+    #[inline]
+    pub fn ordinal(&self) -> u64 {
+        match *self {
+            {{- range .Members }}
+            Self::{{ .Name }}(_) => {{ .Ordinal }},
+            {{- end }}
+            {{- if .IsFlexible }}
+            Self::__SourceBreaking { unknown_ordinal } => unknown_ordinal,
+            {{- end }}
+        }
+    }
+    {{ "" }}
+    {{- if .IsFlexible }}
+    #[inline]
+    pub fn unknown_variant_for_testing() -> Self {
+        Self::__SourceBreaking { unknown_ordinal: 0 }
+    }
+
+    #[inline]
+    pub fn is_unknown(&self) -> bool {
+        match self {
+            Self::__SourceBreaking { .. } => true,
+            {{- if .Members }}
+            _ => false,
+            {{- end }}
+        }
+    }
+    {{- end }}
+}
+
+impl fidl::{{ if .IsValueType }}Persistable{{ else }}Standalone<{{ ResourceDialect }}>{{ end }} for {{ .Name }} {}
+
+{{- if .Serializable.IsSerializable }}
+impl fidl::Serializable for {{ .Name }} {
+      const SERIALIZABLE_NAME: &'static str = "{{ .Serializable.Name }}";
+}
+{{- end }}
+
+{{ if .HasSensitive }}
+impl std::fmt::Debug for {{ .Name }} {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        {{- if .Sensitive }}
+        f.write_str("SENSITIVE{")?;
+        match self {
+            {{- range .Members }}
+            Self::{{ .Name }}(x) => f.debug_tuple("{{ .Name }}").field(x).finish()?,
+            {{- end }}
+            {{- if .IsFlexible }}
+            Self::__SourceBreaking { unknown_ordinal } => {
+                f.debug_struct("__SourceBreaking")
+                    .field("unknown_ordinal", unknown_ordinal)
+                    .finish()?
+            }
+            {{- end }}
+        }
+        f.write_str("}")
+        {{- else }}
+        match self {
+            {{- range .Members }}
+            {{- if .Sensitive }}
+            Self::{{ .Name }}(x) => f.debug_tuple("{{ .Name }}").field(&fidl::marker::SensitiveDebug(x)).finish(),
+            {{- else }}
+            Self::{{ .Name }}(x) => f.debug_tuple("{{ .Name }}").field(x).finish(),
+            {{- end }}
+            {{- end }}
+            {{- if .IsFlexible }}
+            Self::__SourceBreaking { unknown_ordinal } => {
+                f.debug_struct("__SourceBreaking")
+                    .field("unknown_ordinal", unknown_ordinal)
+                    .finish()
+            }
+            {{- end }}
+        }
+        {{- end }}
+    }
+}
+{{- end }}
+
+{{- end }}
+{{- end }}
+
+{{- define "UnionInternal" }}
+{{- if EmitType .IsValueType }}
+{{ $resourceDialectName := "D" }}
+{{ $resourceDialectGeneric := "<D: fidl::encoding::ResourceDialect>" }}
+{{- if .IsResourceType }}
+{{ $resourceDialectName = ResourceDialect }}
+{{ $resourceDialectGeneric = "" }}
+impl fidl::encoding::ResourceTypeMarker for {{ .Name }} {
+    type Borrowed<'a> = &'a mut Self;
+    fn take_or_borrow<'a>(value: &'a mut <Self as fidl::encoding::TypeMarker>::Owned) -> Self::Borrowed<'a> {
+        value
+    }
+}
+{{- else }}
+impl fidl::encoding::ValueTypeMarker for {{ .Name }} {
+    type Borrowed<'a> = &'a Self;
+    fn borrow(value: &<Self as fidl::encoding::TypeMarker>::Owned) -> Self::Borrowed<'_> {
+        value
+    }
+}
+{{- end }}
+
+unsafe impl fidl::encoding::TypeMarker for {{ .Name }} {
+    type Owned = Self;
+
+    #[inline(always)]
+    fn inline_align(_context: fidl::encoding::Context) -> usize {
+        8
+    }
+
+    #[inline(always)]
+    fn inline_size(_context: fidl::encoding::Context) -> usize {
+        16
+    }
+}
+
+unsafe impl{{ $resourceDialectGeneric }} fidl::encoding::Encode<{{ .Name }}, {{ $resourceDialectName }}> for &{{ if .IsResourceType }}mut {{ end }}{{ .Name }} {
+    #[inline]
+    unsafe fn encode(self, encoder: &mut fidl::encoding::Encoder<'_, {{ $resourceDialectName }}>, offset: usize, _depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        encoder.debug_check_bounds::<{{ .Name }}>(offset);
+        encoder.write_num::<u64>(self.ordinal(), offset);
+        match self {
+            {{- range .Members }}
+            {{ $.Name }}::{{ .Name }}(ref {{ if .Type.IsResourceType }}mut {{ end }}val) => {
+                fidl::encoding::encode_in_envelope::<{{ .Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}>(
+                    {{- if .Type.IsResourceType }}
+                    <{{ .Type.Fidl $resourceDialectName }} as fidl::encoding::ResourceTypeMarker>::take_or_borrow(val),
+                    {{- else }}
+                    <{{ .Type.Fidl $resourceDialectName }} as fidl::encoding::ValueTypeMarker>::borrow(val),
+                    {{- end }}
+                    encoder, offset + 8, _depth
+                )
+            }
+            {{- end }}
+            {{- if .IsFlexible }}
+            {{ .Name }}::__SourceBreaking { .. } => Err(fidl::Error::UnknownUnionTag),
+            {{- end }}
+        }
+    }
+}
+
+impl{{ $resourceDialectGeneric }} fidl::encoding::Decode<Self, {{ $resourceDialectName }}> for {{ .Name }} {
+    #[inline(always)]
+    fn new_empty() -> Self {
+        {{- if .IsFlexible }}
+        Self::__SourceBreaking { unknown_ordinal: 0 }
+        {{- else }}
+        Self::{{ (index .Members 0).Name }}(fidl::new_empty!({{ (index .Members 0).Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}))
+        {{- end }}
+    }
+
+    #[inline]
+    unsafe fn decode(&mut self, decoder: &mut fidl::encoding::Decoder<'_, {{ $resourceDialectName }}>, offset: usize, mut depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        decoder.debug_check_bounds::<Self>(offset);
+        #[allow(unused_variables)]
+        let next_out_of_line = decoder.next_out_of_line();
+        let handles_before = decoder.remaining_handles();
+        let (ordinal, inlined, num_bytes, num_handles) = fidl::encoding::decode_union_inline_portion(decoder, offset)?;
+
+        let member_inline_size = match ordinal {
+            {{- range .Members }}
+            {{ .Ordinal }} => <{{ .Type.Fidl $resourceDialectName }} as fidl::encoding::TypeMarker>::inline_size(decoder.context),
+            {{- end }}
+            {{- if .IsFlexible }}
+            0 => return Err(fidl::Error::UnknownUnionTag),
+            _ => num_bytes as usize,
+            {{- else }}
+            _ => return Err(fidl::Error::UnknownUnionTag),
+            {{- end }}
+        };
+
+        if inlined != (member_inline_size <= 4) {
+            return Err(fidl::Error::InvalidInlineBitInEnvelope);
+        }
+        let _inner_offset;
+        if inlined {
+            decoder.check_inline_envelope_padding(offset + 8, member_inline_size)?;
+            _inner_offset = offset + 8;
+        } else {
+            depth.increment()?;
+            _inner_offset = decoder.out_of_line_offset(member_inline_size)?;
+        }
+        match ordinal {
+            {{- range .Members }}
+            {{ .Ordinal }} => {
+                #[allow(irrefutable_let_patterns)]
+                if let {{ $.Name }}::{{ .Name }}(_) = self {
+                    // Do nothing, read the value into the object
+                } else {
+                    // Initialize `self` to the right variant
+                    *self ={{ $.Name }}::{{ .Name }}(fidl::new_empty!({{ .Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}));
+                }
+                #[allow(irrefutable_let_patterns)]
+                if let {{ $.Name }}::{{ .Name }}(ref mut val) = self {
+                    fidl::decode!({{ .Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}, val, decoder, _inner_offset, depth)?;
+                } else {
+                    unreachable!()
+                }
+            }
+            {{- end }}
+            {{- if .IsFlexible }}
+            #[allow(deprecated)]
+            ordinal => {
+                for _ in 0..num_handles {
+                    decoder.drop_next_handle()?;
+                }
+                *self = {{ .Name }}::__SourceBreaking { unknown_ordinal: ordinal };
+            },
+            {{- else }}
+            ordinal => panic!("unexpected ordinal {:?}", ordinal)
+            {{- end }}
+        }
+        if !inlined && decoder.next_out_of_line() != next_out_of_line + (num_bytes as usize) {
+            return Err(fidl::Error::InvalidNumBytesInEnvelope);
+        }
+        if handles_before != decoder.remaining_handles() + (num_handles as usize) {
+            return Err(fidl::Error::InvalidNumHandlesInEnvelope);
+        }
+        Ok(())
+    }
+}
+{{- end }}
+{{- end }}

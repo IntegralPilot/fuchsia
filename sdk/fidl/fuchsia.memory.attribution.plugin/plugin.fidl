@@ -1,0 +1,245 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.memory.attribution.plugin;
+
+using zx;
+using fuchsia.kernel;
+
+@discoverable
+open protocol MemoryMonitor {
+    /// Returns a memory snapshot of the device. Computing this snapshot may be expensive.
+    GetSnapshot(resource struct {
+        /// `snapshot` will have a single `Snapshot` written into it, before being closed.
+        snapshot zx.Handle:SOCKET;
+    });
+
+    /// Returns system-level memory statistics for the device. Computing these statistics is less
+    /// expensive than computing a memory snapshot.
+    GetSystemStatistics() -> (struct {
+        statistics MemoryStatistics;
+    });
+
+    /// Returns a fast memory snapshot of the device that omits Starnix processes.
+    GetAbridgedSnapshot(resource struct {
+        /// `snapshot` will have a single `Snapshot` written into it, before being closed.
+        snapshot zx.Handle:SOCKET;
+    });
+};
+
+alias ResourceName = array<uint8, zx.MAX_NAME_LEN>;
+
+/// Snapshot of the memory usage of the system, as seen by the server.
+type Snapshot = table {
+    /// List of attribution claims.
+    1: attributions vector<Attribution>:MAX;
+    /// List of Principals on the system.
+    2: principals vector<Principal>:MAX;
+    /// List of kernel memory resources on the system. These resources are attributed to Principals
+    /// by other Principals.
+    3: resources vector<Resource>:MAX;
+    /// Map from the vector index to the name of kernel resources.
+    /// Resource names are often repeated across many resources; using this indirection reduces the
+    /// amount of duplication within a `Snapshot` object.
+    4: resource_names vector<ResourceName>:MAX;
+    /// System-wide memory statistics from the kernel.
+    5: kernel_statistics KernelStatistics;
+    /// Details of performance impact of memory usage (e.g. thrashing, stalling, etc)
+    6: performance_metrics PerformanceImpactMetrics;
+    /// Criteria for grouping VMO within buckets and for publishing aggregated metrics.
+    7: bucket_definitions vector<BucketDefinition>:MAX;
+};
+
+/// Globally-unique identifier used to refer to a specific [`Principal`]..
+type PrincipalIdentifier = struct {
+    id uint64;
+};
+
+/// Holds the list of resources attributed to a Principal (subject) by another Principal (source).
+type Attribution = table {
+    /// Principal making the attribution claim.
+    1: source PrincipalIdentifier;
+    /// Principal to which the resources are attributed.
+    2: subject PrincipalIdentifier;
+    /// List of resources attributed to `subject` by `source`.
+    3: resources vector<ResourceReference>:MAX;
+};
+
+/// References a kernel [`Resource`], or some subset of a [`Resource`] (such as a part of a process
+/// address space).
+type ResourceReference = flexible union {
+    /// Identifies a kernel object whose memory is being attributed.
+    ///
+    /// Refers to all memory held by VMOs reachable from the object
+    /// (currently a Job, Process or VMO).
+    1: kernel_object zx.Koid;
+
+    /// Identifies a part of a process address space.
+    2: process_mapped struct {
+        /// The KOID of the process that this VMAR lives in.
+        process zx.Koid;
+
+        /// Base address of the VMAR.
+        base uint64;
+
+        /// Length of the VMAR.
+        len uint64;
+
+        /// True if memory held via the handle-table may be ignored for this process.
+        ///
+        /// This should only be set if all memory accessible via the handle-table is
+        /// already attributed via some other reference (e.g. a memory-mapping or another
+        /// process' handle table).
+        ///
+        /// Clients may use the hint to skip querying the handle table, since all memory
+        /// it refers to is otherwise accounted for.
+        ///
+        /// This information is only used during the serve and is provided to the plugin
+        /// for debugging.
+        hint_skip_handle_table bool;
+    };
+};
+
+/// Defines a Principal, a part of a running system that can use memory.
+type Principal = table {
+    /// The identifier of this principal.
+    1: identifier PrincipalIdentifier;
+
+    /// The textual representation of a Principal. It does not need to be unique, but uniqueness is
+    /// desirable for user-friendliness. This string will used for display.
+    2: description flexible union {
+        /// If the Principal is a component, its moniker.
+        1: component string:MAX;
+        /// If the Principal is not a component, a user-understandable textual identifier.
+        2: part string:MAX;
+    };
+
+    3: principal_type flexible enum : uint32 {
+        /// A RUNNABLE Principal is a unit of computation that can be "run" and has some degree of
+        /// independence. For example: a Fuchsia component.
+        RUNNABLE = 1;
+        /// A PART Principal is a subsection of another Principal that does not operate
+        /// independently. For example: the internal cache of a larger process.
+        PART = 2;
+    };
+
+    /// Parent of the principal, if it has a parent.
+    4: parent PrincipalIdentifier;
+};
+
+/// Holds the description of a kernel resource.
+type Resource = table {
+    /// Unique identifier of the resource.
+    1: koid zx.Koid;
+    /// Index of the resource name in the `resource_names` vector.
+    2: name_index uint64;
+
+    3: resource_type flexible union {
+        /// Describes the set of Jobs & Processes within a Job resource.
+        1: job table {
+            /// List of child jobs of the job described.
+            1: child_jobs vector<zx.Koid>:MAX;
+            /// List of child processes of the job described.
+            2: processes vector<zx.Koid>:MAX;
+        };
+        /// Describes the memory of a Process.
+        /// One of these fields may be omitted if not necessary to resolve the snapshot's
+        /// attribution claims.
+        2: process table {
+            /// List of VMOs accessible to the process described.
+            1: vmos vector<zx.Koid>:MAX;
+            /// List of memory mappings in the address space of the process described.
+            2: mappings vector<Mapping>:MAX;
+        };
+        /// Describes the memory usage of a VMO, both in directly reference memory, and
+        /// via its parent VMO, if any.
+        3: vmo table {
+            /// If present, the parent VMO of this VMO.
+            1: parent zx.Koid;
+
+            /// Private number of committed bytes of this VMO.
+            2: private_committed_bytes uint64;
+            /// Private number of populated bytes of this VMO.
+            3: private_populated_bytes uint64;
+
+            /// Scaled number of committed bytes of this VMO.
+            4: scaled_committed_bytes uint64;
+            /// Scaled number of populated bytes of this VMO.
+            5: scaled_populated_bytes uint64;
+
+            /// Total number of committed bytes of this VMO.
+            6: total_committed_bytes uint64;
+            /// Total number of populated bytes of this VMO.
+            7: total_populated_bytes uint64;
+
+            /// Flags of this VMO, as a bitwise OR of ZX_INFO_VMO_* values.
+            8: flags uint32;
+        };
+    };
+};
+
+/// Information about a VMO mapped in a process address space.
+type Mapping = table {
+    /// Koid of the VMO mapped.
+    1: vmo zx.Koid;
+    /// Address at which the VMO is mapped.
+    2: address_base uint64;
+    /// Size of the VMO mapping.
+    3: size uint64;
+};
+
+/// Kernel internal and system-wide memory statistics.
+type KernelStatistics = table {
+    1: memory_stats fuchsia.kernel.MemoryStats;
+    2: compression_stats fuchsia.kernel.MemoryStatsCompression;
+};
+
+/// Metrics about the performance impact of memory usage, such as stalling.
+type PerformanceImpactMetrics = table {
+    /// Total time spent with at least one memory-stalled thread, in nanoseconds.
+    1: some_memory_stalls_ns int64;
+    /// Total time spent with all threads memory-stalled.
+    2: full_memory_stalls_ns int64;
+    // Estimated number of page faults handled by user-backed pagers, for pages
+    // that had been evicted due to memory pressure, after first being mapped.
+    // This is a lower-bound, since not all user-pagers report the metric.
+    3: page_refaults uint64;
+};
+
+/// Criteria for matching VMO within a bucket and for publishing aggregated metrics.
+/// For a VMO to be selected, it needs to match all the criteria in the definition:
+///   * It must belong to a process with a name matched by the process regex.
+///   * Its name must match the vmo regex.
+///   * It must be attributed to a principal with a name matched by the principal regex.
+type BucketDefinition = table {
+    /// Human-readable name of the bucket.
+    1: name string:MAX;
+    /// String saying which process to match. Will be interpreted as a regex.
+    /// Missing or empty string means ".*".
+    2: process string:MAX;
+    /// Regex saying which VMOs to match. Will be interpreted as a regex.
+    /// Missing or empty string means ".*".
+    3: vmo string:MAX;
+    /// Regex to match against the principals to which a VMO is attributed.
+    /// Missing or empty string means ".*".
+    4: principal string:MAX;
+};
+
+/// Holds the time of the different system clocks of the device.
+type Time = table {
+    1: boot_time zx.InstantBoot;
+    2: monotonic_time zx.InstantMono;
+};
+
+/// System-level memory statistics of a device, as seen by the server. This table does not contain
+/// any process, component or principal-level information, and is faster to compute than a memory
+/// snapshot.
+type MemoryStatistics = table {
+    /// Time of the device when this data was collected.
+    1: time Time;
+    /// System-wide memory statistics from the kernel.
+    2: kernel_statistics KernelStatistics;
+    /// Details of performance impact of memory usage (e.g. thrashing, stalling, etc)
+    3: performance_metrics PerformanceImpactMetrics;
+};

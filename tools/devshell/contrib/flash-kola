@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Other
+### Flash Fuchsia onto a Kola board that has an unmodified bootloader.
+
+## usage: fx flash-kola [--no-wipe]
+
+# Bash strict mode.
+set -eo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh || exit $?
+fx-config-read
+
+# Use the in-tree fastboot.
+readonly FASTBOOT="${FUCHSIA_DIR}/prebuilt/third_party/fastboot/fastboot"
+
+# When rebooting the device, we have to add a small delay to ensure the host actually drops the
+# device before the next fastboot command is executed. Without this delay, the next command may
+# execute before the host realizes the device is gone, causing the following command to fail.
+readonly DEVICE_REBOOT_DELAY=4
+
+if [[ $# -gt 1 ]]; then
+  fx-command-help
+  exit 1
+fi
+
+WIPE_USERDATA="yes"
+if [[ $# -eq 1 ]]; then
+  if [[ "$1" == "--no-wipe" ]]; then
+    WIPE_USERDATA="no"
+  else
+    fx-command-help
+    exit 1
+  fi
+fi
+
+
+# TODO(b/373727276): Change to use `ffx target flash` instead.
+FLASH_SOURCE="$(fx-command-run get-flash-source)"
+PRODUCT_BUNDLE="$(fx get-build-dir)/${FLASH_SOURCE#product-bundle:}"
+ARTIFACTS="${PRODUCT_BUNDLE}/product_bundle.json"
+DTBO_PATH="${PRODUCT_BUNDLE}/$(fx-command-run jq --raw-output '.system_a[] | select(.name=="dtbo-a") | .path' "${ARTIFACTS}")"
+FVM_PATH="${PRODUCT_BUNDLE}/$(fx-command-run jq --raw-output '.system_a[] | select(.name=="fxfs.fastboot") | .path' "${ARTIFACTS}")"
+ZBI_PATH="${PRODUCT_BUNDLE}/$(fx-command-run jq --raw-output '.system_a[] | select(.name=="zircon-a") | .path' "${ARTIFACTS}")"
+# Extract bootloaders into a {partition_name: artifact_path} map.
+declare -A BOOTLOADER_IMAGES
+while IFS=$'\t' read -r PART_NAME RELATIVE_PATH; do
+  BOOTLOADER_IMAGES["${PART_NAME}"]="${PRODUCT_BUNDLE}/${RELATIVE_PATH}"
+done < <(fx-command-run jq --raw-output '.partitions.bootloader_partitions[] | [.name, .image] | @tsv' "${ARTIFACTS}")
+
+RECOVERY_PATH=""
+if [[ -d "${PRODUCT_BUNDLE}/system_r" ]]; then
+  RECOVERY_PATH="${PRODUCT_BUNDLE}/$(fx-command-run jq --raw-output '.system_r[] | select(.name=="zircon-a") | .path' "${ARTIFACTS}")"
+fi
+
+readonly FVM_PATH ZBI_PATH DTBO_PATH RECOVERY_PATH WIPE_USERDATA
+
+if [[ "$WIPE_USERDATA" == "no" && -z "$RECOVERY_PATH" ]]; then
+  fx-error "The --no-wipe flag requires a recovery image for the product."
+  exit 1
+fi
+
+if [[ -z $ANDROID_SERIAL ]]; then
+  readonly DEVICE_COUNT=$(${FASTBOOT} devices | awk NF | wc -l)
+  if [[ ${DEVICE_COUNT} -gt 1 ]]; then
+    fx-error "Detected ${DEVICE_COUNT} devices in fastboot mode."
+    fx-error "Make sure there is only one device or set ANDROID_SERIAL."
+    exit 1
+  fi
+fi
+
+BOOTLOADER="$(${FASTBOOT} getvar product 2>&1 | grep '^product:' | awk '{print $2}')"
+IS_USERSPACE="$(${FASTBOOT} getvar is-userspace 2>&1 | grep '^is-userspace:' | awk '{print $2}')"
+
+# Only attempt to set bootmode if the bootloader is not 'sorrel' and mode is not 'factory'
+if [[ "${BOOTLOADER}" != "sorrel" ]]; then
+  # Ensure bootmode is set to factory before flashing partitions.
+  fx-info "Checking current bootmode..."
+  # Capture output and potential errors. Use awk to extract the value after 'bootmode='.
+  # Store the exit code separately.
+  if BOOTMODE_OUTPUT=$(${FASTBOOT} oem get_config bootmode 2>&1); then
+    BOOTMODE_EXIT_CODE=0
+  else
+    BOOTMODE_EXIT_CODE=$?
+  fi
+
+  INITIAL_BOOTMODE="" # Initialize to empty
+
+  if [[ ${BOOTMODE_EXIT_CODE} -eq 0 ]]; then
+    readonly CURRENT_BOOTMODE=$(echo "${BOOTMODE_OUTPUT}" | awk '/bootmode:/ {print $3}')
+    INITIAL_BOOTMODE="${CURRENT_BOOTMODE}" # Store the initial bootmode
+    if [[ "${CURRENT_BOOTMODE}" != "factory" ]]; then
+      fx-info "Current bootmode is '${CURRENT_BOOTMODE}', setting it to 'factory'."
+      ${FASTBOOT} oem set_config bootmode factory || {
+        fx-warn "Failed to set bootmode to factory. Attempting to flash anyway."
+      }
+    else
+      fx-info "Bootmode: 'factory'."
+    fi
+  else
+    fx-warn "Failed to get current bootmode (Exit code: ${BOOTMODE_EXIT_CODE}). Output: ${BOOTMODE_OUTPUT}"
+    fx-warn "Proceeding with flashing, but bootmode might not be 'factory'."
+  fi
+else
+  fx-info "Bootloader is '${BOOTLOADER}' (is-userspace: ${IS_USERSPACE})."
+fi
+
+readonly BOOTLOADER INITIAL_BOOTMODE IS_USERSPACE
+
+if [[ "${IS_USERSPACE}" == "yes" ]]; then
+  # If we started in userspace fastboot, go back to the bootloader to flash the boot partitions.
+  fx-info "Rebooting to bootloader from userspace fastboot"
+  ${FASTBOOT} reboot bootloader
+  sleep "${DEVICE_REBOOT_DELAY}" # Ensure host drops device before issuing next command.
+fi
+
+for PART_NAME in "${!BOOTLOADER_IMAGES[@]}"; do
+  ${FASTBOOT} flash "${PART_NAME}" "${BOOTLOADER_IMAGES[${PART_NAME}]}"
+done
+${FASTBOOT} flash boot_a "$ZBI_PATH"
+${FASTBOOT} flash boot_b "$ZBI_PATH"
+${FASTBOOT} flash dtbo_a "$DTBO_PATH"
+${FASTBOOT} flash dtbo_b "$DTBO_PATH"
+if [[ -n "$RECOVERY_PATH" ]]; then
+  ${FASTBOOT} flash vendor_boot_a "$RECOVERY_PATH"
+  ${FASTBOOT} flash vendor_boot_b "$RECOVERY_PATH"
+fi
+
+if [[ "$WIPE_USERDATA" == "no" ]]; then
+  fx-info "Rebooting into userspace fastboot"
+  ${FASTBOOT} reboot fastboot
+else
+  # Reboot back into the bootloader.
+  # Some builds put firmware in the boot image, in which case we reboot here to
+  # pick up the new firmware we just flashed. For builds that don't put firmware
+  # in boot, this is still fine and just triggers a reboot now rather than at the
+  # end of flashing.
+  fx-info "Rebooting to bootloader"
+  ${FASTBOOT} reboot bootloader
+fi
+
+sleep "${DEVICE_REBOOT_DELAY}" # Ensure host drops device before issuing next command.
+
+# Attempt to flash SSH keys. This is only supported on devices running custom
+# Fuchsia firmware, so if it doesn't work just log a warning.
+function push_ssh_keys {
+  AUTH_KEYS="$(get-ssh-authkeys)" || {
+    fx-warn "Failed to locate host SSH keys"
+    return 1
+  }
+
+  # Split this into two commands for clarity on which command fails.
+  # Staging a file failing is very different from the oem command failing
+  ${FASTBOOT} stage "${AUTH_KEYS}" || {
+    fx-warn "Failed to upload authorized keys"
+    return 1
+  }
+
+  ${FASTBOOT} oem add-staged-bootloader-file ssh.authorized_keys || {
+    fx-warn "Failed to stage SSH keys to fastboot"
+    fx-warn "Device bootloader may not support it"
+    return 1
+  }
+}
+
+if [[ "$WIPE_USERDATA" == "no" ]]; then
+  fx-info "Skipping provisioning of SSH keys because --no-wipe was specified."
+elif [[ "${BOOTLOADER}" == "sorrel" ]]; then
+  if push_ssh_keys; then
+    fx-info "Successfully provisioned SSH keys via bootloader"
+  else
+    fx-warn "Skipping bootloader provisioning of SSH keys"
+  fi
+else
+  fx-warn "Skipping bootloader provisioning of SSH keys because bootloader is ${BOOTLOADER}"
+  fx-warn "If you need to upload SSH keys, after flashing is done, reboot the device to the Fuchsia bootloader and re-run \`fx flash-kola\`."
+fi
+
+if [[ "$WIPE_USERDATA" == "no" ]]; then
+  # Only flash the blob volume if we aren't wiping the data volume. This command only works from
+  # userspace fastboot. The volume will be installed when the device next reboots normally.
+  ${FASTBOOT} flash blob "$FVM_PATH"
+else
+  # Flash the super partition last; some Kola devices exhibit USB instability
+  # after flashing large super partition data so we want to do as much as
+  # possible before this while the USB is more reliable (b/405436515).
+  #
+  # *WARNING*: This command will irreversibly destroy all data on the device!
+  # This does not securely wipe the device, but all userdata will be lost.
+  ${FASTBOOT} flash super "$FVM_PATH"
+fi
+
+# Attempt to restore the initial bootmode if it was changed
+if [[ -n "${INITIAL_BOOTMODE}" && "${INITIAL_BOOTMODE}" != "factory" ]]; then
+  fx-info "Attempting to restore initial bootmode to '${INITIAL_BOOTMODE}'..."
+  if [[ "$WIPE_USERDATA" == "no" ]]; then
+    # We flashed from userspace fastboot, go back to the bootloader to set the bootmode back.
+    ${FASTBOOT} reboot bootloader
+    sleep "${DEVICE_REBOOT_DELAY}" # Ensure host drops device before issuing next command.
+  fi
+  readonly CURRENT_BOOTLOADER="$(${FASTBOOT} getvar product 2>&1 | grep '^product:' | awk '{print $2}')"
+  if [[ "${CURRENT_BOOTLOADER}" == "sorrel" ]]; then
+    ${FASTBOOT} oem reboot-android-fastboot
+    sleep "${DEVICE_REBOOT_DELAY}" # Ensure host drops device before issuing next command.
+  fi
+  # Check the exit status of the set_config command
+  if ${FASTBOOT} oem set_config bootmode "${INITIAL_BOOTMODE}"; then
+    fx-info "Successfully restored bootmode to '${INITIAL_BOOTMODE}'."
+  else
+    fx-warn "Failed to restore initial bootmode to '${INITIAL_BOOTMODE}'. Device might remain in 'factory' mode."
+  fi
+fi
+
+# SSH keys require `fastboot continue`, since they are stored in RAM and would
+# get lost in a reboot. We rebooted earlier to ensure a complete boot chain
+# using the new images.
+${FASTBOOT} continue || {
+  fx-warn "Fastboot got a communication error, but this may be OK"
+  fx-warn "If the device is now booting then flash succeeded (b/405436515)"
+}
+
+fx-info "Done flashing Kola device."

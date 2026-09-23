@@ -1,0 +1,233 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/config/fuchsia/target_api_level.gni")
+import("//build/rust/rustc_dylib.gni")
+import("//build/rust/rustc_library.gni")
+
+declare_args() {
+  # Set this to true to enable some additional logs in the vfs crate and have it
+  # depend on the log crate. This should not be enabled in general for non-host
+  # builds because it causes the vfs crate, which is built as a dylib, to be the
+  # source of the global logger, which can cause problems for things that
+  # dynamically link rust libraries (like drivers) and cause link errors at
+  # worst, or incorrect log attribution at best.
+  vfs_rust_uses_log = is_host
+}
+
+common_vfs_args = {
+  output_name = "vfs_rust"
+  version = "0.1.0"
+  edition = "2024"
+  deps = [
+    "//sdk/rust/zx-status",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia-async",
+    "//src/lib/fuchsia-sync",
+    "//src/storage/lib/trace",
+    "//src/storage/lib/vfs/rust/name",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:futures",
+    "//third_party/rust_crates:itertools",
+    "//third_party/rust_crates:libc",
+    "//third_party/rust_crates:paste",
+    "//third_party/rust_crates:pin-project",
+    "//third_party/rust_crates:slab",
+    "//third_party/rust_crates:static_assertions",
+    "//third_party/rust_crates:thiserror",
+  ]
+
+  features = []
+  if (vfs_rust_uses_log) {
+    deps += [ "//third_party/rust_crates:log" ]
+    features += [ "use_log" ]
+  }
+
+  sources = [
+    "src/common.rs",
+    "src/directory.rs",
+    "src/directory/common.rs",
+    "src/directory/connection.rs",
+    "src/directory/dirents_sink.rs",
+    "src/directory/entry.rs",
+    "src/directory/entry_container.rs",
+    "src/directory/helper.rs",
+    "src/directory/immutable.rs",
+    "src/directory/immutable/connection.rs",
+    "src/directory/immutable/simple.rs",
+    "src/directory/immutable/simple/tests.rs",
+    "src/directory/mutable.rs",
+    "src/directory/mutable/connection.rs",
+    "src/directory/read_dirents.rs",
+    "src/directory/simple.rs",
+    "src/directory/test_utils.rs",
+    "src/directory/traversal_position.rs",
+    "src/directory/watchers.rs",
+    "src/directory/watchers/event_producers.rs",
+    "src/directory/watchers/watcher.rs",
+    "src/execution_scope.rs",
+    "src/file.rs",
+    "src/file/common.rs",
+    "src/file/connection.rs",
+    "src/file/simple.rs",
+    "src/file/simple/tests.rs",
+    "src/file/vmo.rs",
+    "src/file/vmo/tests.rs",
+    "src/lib.rs",
+    "src/node.rs",
+    "src/object_request.rs",
+    "src/path.rs",
+    "src/protocols.rs",
+    "src/remote.rs",
+    "src/remote/tests.rs",
+    "src/request_handler.rs",
+    "src/service.rs",
+    "src/service/tests.rs",
+    "src/service/tests/direct_connection.rs",
+    "src/service/tests/node_reference.rs",
+    "src/symlink.rs",
+    "src/temp_clone.rs",
+    "src/test_utils.rs",
+    "src/test_utils/assertions.rs",
+    "src/token_registry.rs",
+    "src/tree_builder.rs",
+  ]
+
+  test_deps = [
+    "//src/lib/fuchsia",
+    "//third_party/rust_crates:assert_matches",
+    "//third_party/rust_crates:bitflags",
+    "//third_party/rust_crates:log",
+  ]
+}
+
+if (is_fuchsia) {
+  rustc_dylib("vfs") {
+    forward_variables_from(common_vfs_args, "*")
+
+    deps += [
+      "//sdk/fidl/fuchsia.io:fuchsia.io_rust_flex",
+      "//sdk/rust/zx",
+      "//src/lib/fdomain/client:flex_fidl",
+    ]
+    test_deps += [
+      "//src/lib/fuchsia-fs",
+      "//src/testing/fidl:placeholders_rust_flex",
+    ]
+    public_deps = [
+      # TODO(https://fxbug.dev/42137337): Figure out why this is not properly
+      # propagated to dependents.
+      #
+      # Without this public dep, libtrace-engine doesn't seem to be properly
+      # propagated to dependents even it's a transitive dependency. E.g. There's
+      # the following dep path.
+      #
+      #   //src/storage/lib/vfs/rust:vfs --[public]-->
+      #   //src/storage/lib/vfs/rust:vfs.actual --[private]-->
+      #   //src/storage/lib/trace:trace --[public]-->
+      #   //src/storage/lib/trace:trace.actual --[private]-->
+      #   //src/lib/trace/rust:trace --[public]-->
+      #   //src/lib/trace/rust:trace.actual --[private]-->
+      #   //zircon/system/ulib/trace-engine:trace-engine
+      #
+      "//zircon/system/ulib/trace-engine",
+    ]
+    test_deps += [
+      "//src/lib/fdomain/local:local_fidl_flex",
+      "//src/lib/fuchsia-fs",
+      "//src/testing/fidl:placeholders_rust",
+    ]
+    configs += [ "//build/config/rust:bootfs" ]
+    with_unit_tests = true
+  }
+
+  # Statically linked version of the vfs.
+  #
+  # Filesystems interact frequently with the vfs. Due to this heavy usage,
+  # linking them against the dynamically linked vfs introduces significant
+  # performance overhead. To avoid this, filesystems should use this static
+  # version. Other components should use the dynamically linked vfs.
+  rustc_library("vfs_static") {
+    name = "vfs"
+    forward_variables_from(common_vfs_args, "*")
+    deps += [
+      "//sdk/fidl/fuchsia.io:fuchsia.io_rust_flex",
+      "//sdk/rust/zx",
+      "//src/lib/fdomain/client:flex_fidl",
+      "//src/lib/fidl/rust/fidl",
+      "//third_party/rust_crates:log",
+    ]
+    test_deps += [
+      "//src/lib/fdomain/local:local_fidl_flex",
+      "//src/lib/fuchsia-fs",
+      "//src/testing/fidl:placeholders_rust",
+    ]
+    features += [ "use_log" ]
+    visibility = [
+      ":*",
+      "//src/storage/fxfs/*",
+      "//src/storage/lib/pseudo_fs/*",
+    ]
+    configs += [ "//build/config/rust:bootfs" ]
+  }
+}
+
+if (is_host) {
+  rustc_library("vfs") {
+    name = "vfs"
+    forward_variables_from(common_vfs_args, "*")
+
+    deps += [
+      "//sdk/fidl/fuchsia.io:fuchsia.io_rust_fdomain_flex",
+      "//src/lib/fdomain/client:flex_fdomain",
+    ]
+
+    test_deps += [
+      "//src/lib/fdomain/local",
+      "//src/lib/fuchsia-fs:fuchsia-fs_fdomain",
+      "//src/testing/fidl:placeholders_rust_fdomain_flex",
+    ]
+
+    features += [ "fdomain" ]
+
+    test_deps += [
+      "//src/lib/fdomain/local:local_fdomain_flex",
+      "//src/lib/fuchsia-fs:fuchsia-fs_fdomain",
+      "//src/testing/fidl:placeholders_rust_fdomain_flex",
+    ]
+
+    # Avoid proliferation from where it is used already
+    visibility = [
+      "../*",
+      "//sdk/lib/device-watcher/rust:*",
+      "//src/developer/ffx/lib/target/behavior:*",
+      "//src/developer/ffx/playground:*",
+      "//src/developer/ffx/plugins/component/debug:*",
+      "//src/developer/ffx/tools/playground:*",
+      "//src/lib/fuchsia-fs:*",
+      "//src/storage/fvm:*",
+      "//src/sys/pkg/lib/update-package:*",
+    ]
+    with_unit_tests = true
+  }
+}
+
+fuchsia_unittest_package("vfs-tests") {
+  deps = [ ":vfs_test" ]
+  test_specs = {
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":vfs-tests",
+    ":vfs_test($host_toolchain)",
+    "name:tests",
+  ]
+}

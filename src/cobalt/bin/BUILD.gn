@@ -1,0 +1,228 @@
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/fuzz.gni")
+import("//third_party/cobalt/metrics_registry.gni")
+
+# Generates the global_metrics_registry.pb file.
+metrics_registry("global_metrics_registry") {
+  global = true
+}
+
+# The following two targets are only for tests, so we include them in the test
+# package directly via `resource` and serve them out of the test package,
+# rather than using the `config_data` template which would place them in the
+# system image.  See //src/cobalt/bin/meta/base/cobalt_testapp.shard.cml for
+# where we consume cobalt_tests_config_data from the package.
+# Include the global_metrics_registry.pb in the config data for Cobalt.
+resource("cobalt_registry_for_tests") {
+  deps = [ ":global_metrics_registry" ]
+  sources = [ "$target_gen_dir/global_metrics_registry.pb" ]
+  outputs = [ "cobalt_tests_config_data/global_metrics_registry.pb" ]
+}
+
+# In the default config, Cobalt will upload all metrics (including
+# max_release_stage=DEBUG metrics)
+resource("config_for_tests") {
+  sources = [ "app/configs/default_config.json" ]
+  outputs = [ "cobalt_tests_config_data/config.json" ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":cobalt-manual-tests",
+    ":cobalt_tests",
+    "testing:tests",
+    "utils:tests",
+  ]
+}
+
+fuchsia_test_component("cobalt_app_unittests") {
+  manifest = "meta/cobalt_app_unittests.cml"
+  deps = [ "app:cobalt_app_unittests" ]
+}
+
+fuchsia_test_component("cobalt_system_metrics_unittests") {
+  manifest = "meta/cobalt_system_metrics_unittests.cml"
+  deps = [ "system-metrics:cobalt_system_metrics_unittests" ]
+}
+
+fuchsia_unittest_component("cobalt_utils_unittests") {
+  deps = [ "utils:cobalt_utils_unittests" ]
+}
+
+fuchsia_test_component("cobalt_testapp_no_network") {
+  manifest = "meta/cobalt_testapp_no_network.cml"
+  deps = [ "testapp:cobalt_testapp" ]
+}
+
+template("testapp_cobalt_components") {
+  test_name = target_name
+  if (defined(invoker.name)) {
+    test_name = invoker.name
+  } else {
+    not_needed(invoker, "*")
+  }
+
+  fuchsia_test_component("variant_${test_name}_with_event_aggregator") {
+    component_name = "cobalt_with_event_aggregator_worker"
+    manifest =
+        "meta/cobalt_variants/${test_name}_with_event_aggregator_worker.cml"
+    deps = [ "app" ]
+  }
+
+  fuchsia_test_component("variant_${test_name}_no_event_aggregator") {
+    component_name = "cobalt_no_event_aggregator_worker"
+    manifest =
+        "meta/cobalt_variants/${test_name}_no_event_aggregator_worker.cml"
+    deps = [ "app" ]
+  }
+
+  group(target_name) {
+    testonly = true
+    deps = [
+      ":variant_${test_name}_no_event_aggregator",
+      ":variant_${test_name}_with_event_aggregator",
+    ]
+  }
+}
+
+testapp_cobalt_components("variants_networked_components") {
+  name = "networked"
+}
+testapp_cobalt_components("variants_no_network_components") {
+  name = "no_network"
+}
+
+resource("testapp_metrics_registry") {
+  sources = [ rebase_path(
+          get_label_info("app:testapp_metrics_registry", "target_gen_dir") +
+          "/testapp_metrics_registry.pb") ]
+  outputs = [ "data/testapp_metrics_registry.pb" ]
+}
+
+fuchsia_test_package("cobalt_tests") {
+  test_components = [
+    ":cobalt_app_unittests",
+    ":cobalt_system_metrics_unittests",
+    ":cobalt_utils_unittests",
+    ":cobalt_testapp_no_network",
+  ]
+  deps = [
+    ":cobalt_registry_for_tests",
+    ":config_for_tests",
+    ":testapp_metrics_registry",
+    ":variants_no_network_components",
+    "app:analyzer_devel_public",
+    "app:cobalt_devel_environment",
+    "app:shuffler_devel_public",
+    "app:testapp_metrics_registry",
+  ]
+  test_specs = {
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+}
+
+fuchsia_test_component("cobalt-testapp") {
+  manifest = "meta/cobalt_testapp.cml"
+  deps = [ "testapp:cobalt_testapp" ]
+  test_type = "system"
+}
+
+# Tests that should not be run on any bot.
+# These should be run locally to verify that the cobalt_testapp works with
+# networking.
+fuchsia_test_package("cobalt-manual-tests") {
+  test_components = [ ":cobalt-testapp" ]
+  deps = [
+    ":cobalt_registry_for_tests",
+    ":config_for_tests",
+    ":variants_networked_components",
+    "app:analyzer_devel_public",
+    "app:analyzer_prod_public",
+    "app:cobalt_environment",
+    "app:shuffler_devel_public",
+    "app:shuffler_prod_public",
+  ]
+  test_specs = {
+    build_only = true
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+}
+
+fuchsia_test_component("cobalt_testapp_for_prober_do_not_run_manually") {
+  manifest = "meta/cobalt_testapp_for_prober_do_not_run_manually.cml"
+  deps = [ "testapp:cobalt_testapp" ]
+  test_type = "system"
+}
+
+# Tests that should be run on a schedule for probing cobalt.
+# These should only be run in CQ to avoid polluting the data collected. To
+# verify that this still works, use cobalt-manual-tests instead.
+fuchsia_test_package("cobalt_tests_do_not_run_manually") {
+  test_components = [ ":cobalt_testapp_for_prober_do_not_run_manually" ]
+  deps = [
+    ":cobalt_registry_for_tests",
+    ":config_for_tests",
+    ":variants_networked_components",
+    "app:analyzer_devel_public",
+    "app:analyzer_prod_public",
+    "app:cobalt_environment",
+    "app:shuffler_devel_public",
+    "app:shuffler_prod_public",
+  ]
+  test_specs = {
+    # We don't want to run this version of cobalt_testapp in the Fuchsia
+    # CI/CQ  because it uses the real network. We run cobalt_testapp_no_network
+    # instead. This version is run in the Cobalt Prober.
+    # It should not be run outside of CI, since it populates a test pipeline
+    # whose output is inspected.
+    environments = [
+      {
+        dimensions = {
+          device_type = "Nelson"
+        }
+        tags = [ "cobalt-prober" ]
+      },
+      {
+        dimensions = {
+          device_type = "Intel NUC Kit NUC7i5DNHE"
+        }
+        tags = [ "cobalt-prober" ]
+      },
+      {
+        dimensions = {
+          device_type = "Intel NUC Kit NUC11TNHv5"
+        }
+        tags = [ "cobalt-prober" ]
+      },
+    ]
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+}
+
+fuchsia_fuzzer_component("logger-factory-fuzzer-component") {
+  manifest = "app/fuzzer/meta/logger_factory_fuzzer.cml"
+  deps = [ "app/fuzzer:logger_factory_fuzzer" ]
+}
+
+fuchsia_fuzzer_component("logger-fuzzer-component") {
+  manifest = "app/fuzzer/meta/logger_fuzzer.cml"
+  deps = [ "app/fuzzer:logger_fuzzer" ]
+}
+
+fuchsia_fuzzer_package("cobalt-fuzzers") {
+  cpp_fuzzer_components = [
+    ":logger-factory-fuzzer-component",
+    ":logger-fuzzer-component",
+  ]
+}

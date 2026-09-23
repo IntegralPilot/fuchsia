@@ -1,0 +1,95 @@
+
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be found in the LICENSE file.
+
+#ifndef SRC_DEVELOPER_DEBUG_DEBUG_AGENT_MOCK_EXCEPTION_HANDLE_H_
+#define SRC_DEVELOPER_DEBUG_DEBUG_AGENT_MOCK_EXCEPTION_HANDLE_H_
+
+#include <zircon/status.h>
+
+#include <functional>
+#include <utility>
+
+#include "sdk/lib/syslog/cpp/macros.h"
+#include "src/developer/debug/debug_agent/exception_handle.h"
+#include "src/developer/debug/debug_agent/mock_process_handle.h"
+#include "src/developer/debug/debug_agent/mock_thread_handle.h"
+#include "src/lib/fxl/macros.h"
+
+namespace debug_agent {
+
+// ExceptionHandle abstracts zx::exception, allowing for a more straightforward
+// implementation in tests in overrides of this class.
+class MockExceptionHandle : public ExceptionHandle {
+ public:
+  // std::function and not fit::, as it is more convenient for test logic to
+  // have MockExceptionHandle as copyable.
+  using SetStateCallback = std::function<void(Resolution)>;
+  using SetStrategyCallback = std::function<void(debug_ipc::ExceptionStrategy)>;
+
+  MockExceptionHandle() = default;
+
+  explicit MockExceptionHandle(uint64_t process_koid, uint64_t thread_koid,
+                               debug_ipc::ExceptionType type = debug_ipc::ExceptionType::kGeneral)
+      : process_koid_(process_koid), thread_koid_(thread_koid), type_(type) {}
+
+  explicit MockExceptionHandle(uint64_t thread_koid,
+                               debug_ipc::ExceptionType type = debug_ipc::ExceptionType::kGeneral)
+      : thread_koid_(thread_koid), type_(type) {}
+
+  MockExceptionHandle(SetStateCallback on_state_change, SetStrategyCallback on_strategy_change)
+      : on_state_change_(std::move(on_state_change)),
+        on_strategy_change_(std::move(on_strategy_change)) {}
+
+  ~MockExceptionHandle() = default;
+
+  std::unique_ptr<ProcessHandle> GetProcessHandle() const override {
+    return std::make_unique<MockProcessHandle>(process_koid_);
+  }
+
+  std::unique_ptr<ThreadHandle> GetThreadHandle() const override {
+    return std::make_unique<MockThreadHandle>(thread_koid_);
+  }
+
+  debug_ipc::ExceptionType GetType(const ThreadHandle& thread) const override { return type_; }
+
+  void set_type(debug_ipc::ExceptionType type) { type_ = type; }
+
+  fit::result<debug::Status, Resolution> GetResolution() const override {
+    return fit::ok(resolution_);
+  }
+
+  debug::Status SetResolution(Resolution resolution) override {
+    resolution_ = resolution;
+    on_state_change_(resolution);
+    return debug::Status();
+  }
+
+  fit::result<debug::Status, debug_ipc::ExceptionStrategy> GetStrategy() const override {
+    return fit::ok(strategy_);
+  }
+
+  debug::Status SetStrategy(debug_ipc::ExceptionStrategy strategy) override {
+    strategy_ = strategy;
+    on_strategy_change_(strategy);
+    return debug::Status();
+  }
+
+  debug_ipc::ExceptionRecord GetRecord() const override { return debug_ipc::ExceptionRecord(); }
+
+  uint64_t GetPid() const override { return process_koid_; }
+  uint64_t GetTid() const override { return thread_koid_; }
+
+ private:
+  uint64_t process_koid_ = ZX_KOID_INVALID;
+  uint64_t thread_koid_ = ZX_KOID_INVALID;
+  debug_ipc::ExceptionType type_ = debug_ipc::ExceptionType::kGeneral;
+  Resolution resolution_ = Resolution::kTryNext;
+  debug_ipc::ExceptionStrategy strategy_ = debug_ipc::ExceptionStrategy::kFirstChance;
+  SetStateCallback on_state_change_ = [](Resolution) {};
+  SetStrategyCallback on_strategy_change_ = [](debug_ipc::ExceptionStrategy) {};
+};
+
+}  // namespace debug_agent
+
+#endif  // SRC_DEVELOPER_DEBUG_DEBUG_AGENT_MOCK_EXCEPTION_HANDLE_H_

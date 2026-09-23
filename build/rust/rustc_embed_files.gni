@@ -1,0 +1,102 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/rust/rustc_library.gni")
+
+# Defines a Rust library that embeds the contents of some files as constants.
+#
+# Example:
+#
+#     rustc_embed_files("version-history-data") {
+#       version = "0.1.0"
+#       edition = "2024"
+#
+#       files = [
+#         {
+#           constant_name = "VERSION_HISTORY"
+#           source = "${root_build_dir}/vh.json"
+#           deps = [ "//sdk:generate_version_history($default_toolchain)" ]
+#         }
+#       ]
+#     }
+#
+# This produces a Rust library like:
+#
+#     pub const VERSION_HISTORY : &[u8] = include_bytes!("path/to/vh.json");
+#
+# `include_bytes` is usually sufficient on its own when the included file is
+# checked into the source tree, but that doesn't work for generated files. The
+# `include_str_from_working_dir` macro (which this build rule uses) supports
+# generated files, and may be more appropriate for some use cases, but requires
+# a bit more care in wiring everything together.
+#
+# Parameters
+#
+#   files
+#     List of scopes describing the files to embed in the Rust library, with
+#     the following schema:
+#
+#         constant_name
+#           string name of the constant that will hold the file's contents.
+#
+#         source
+#           path to the file to embed
+#
+#         deps (optional)
+#           deps necessary to generate `source`, if any.
+#
+#   version, edition, etc
+#     Any other parameters are forwarded to the underlying `rustc_libary` rule.
+template("rustc_embed_files") {
+  assert(defined(invoker.files), "Must specify files")
+
+  labels = {
+    rust_source = "${target_name}.generate_source"
+  }
+
+  paths = {
+    gen_dir = "${target_gen_dir}/${target_name}"
+    rust_source = "${gen_dir}/src/lib.rs"
+  }
+
+  _inputs = []
+  _deps = []
+  foreach(file, invoker.files) {
+    assert(defined(file.constant_name),
+           "Each file must specify a constant name")
+    assert(defined(file.source), "Each file must specify a source path")
+
+    if (defined(file.deps)) {
+      _deps += file.deps
+    }
+    _inputs += [ file.source ]
+  }
+  generated_file(labels.rust_source) {
+    contents = []
+
+    foreach(file, invoker.files) {
+      relative_path = rebase_path(file.source, root_build_dir)
+      contents += [ "pub const ${file.constant_name} : &[u8] = include_bytes_from_working_dir::include_bytes_from_working_dir_path!(\"${relative_path}\");" ]
+    }
+
+    outputs = [ paths.rust_source ]
+  }
+
+  rustc_library(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "deps",
+                             "files",
+                             "source_root",
+                             "sources",
+                             "inputs",
+                           ])
+    source_root = paths.rust_source
+    sources = [ paths.rust_source ]
+    inputs = _inputs
+    deps = [ ":${labels.rust_source}" ] + _deps +
+           [ "//src/lib/include_bytes_from_working_dir" ]
+  }
+}

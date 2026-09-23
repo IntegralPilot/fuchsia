@@ -1,0 +1,209 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/components.gni")
+import("//build/dist/resource.gni")
+import("//src/lib/testing/expectation/preprocess/preprocess.gni")
+import("//tools/cmc/build/expect_includes.gni")
+
+# Defines a fuchsia_test_package that carries a set of expectations to apply to
+# the results of tests in the package.
+#
+# Parameters
+#   test_components (required)
+#     `fuchsia_component()` targets to include in the package and also register
+#     as entry points for tests.
+#     Additional non-test components can be included via `deps`.
+#     Each target must `include` the `expectation_comparer` client shard
+#     (meta/client.shard.cml).
+#     Type: list(labels)
+#
+#  expectations (optional)
+#    Path to a JSON5 test expectations file. See
+#    //src/lib/testing/expectation/example_expectations.json5 for an example of
+#    the format. Either expectations or generated_expectations is required.
+#    Type: path
+#
+#  generated_expectations (optional)
+#    Name of the generated_expectations_file target that generates expectation file. Either
+#    expectations or generated_expectations is required.
+#    Type: target name
+#
+#   test_specs (optional)
+#     Additional test specifications to apply to tests defined above.
+#     See `test_spec.gni`.
+#     Type: scope
+#
+#   package_name (optional)
+#     The name of the package.
+#     Type: string
+#     Default: target_name
+#
+#   renameable_subpackages (optional)
+#      A list of subpackages defined by scoped variables `package` (a
+#     `fuchsia_package()` target) and an optional `name`. See
+#     `fuchsia_package()` for more details.
+#     Type: list of scopes
+#
+#   treatment_of_cases_with_error_logs (optional)
+#      Identifies how test cases that are expected to generate error logs should be run. Since most
+#      failed tests fail by panicking on a failed assertion, which generates error logs, this is
+#      useful for segregating expected-to-fail tests from expected-to-pass tests by marking the
+#      former as "expect_failure_with_err_log" and placing them in a separate test package that
+#      allows error logs without failing the whole suite.
+#      Type: string
+#      Options:
+#        - "SKIP_CASES_WITH_ERROR_LOGS" indicates that tests expected to
+#          generate error logs should be skipped.
+#        - "RUN_ONLY_CASES_WITH_ERROR_LOGS" indicates that only those tests
+#          expected to generate error logs should be run.
+#        - By default, all test cases will be run.
+#   data_deps
+#   deps
+#   visibility
+template("fuchsia_test_with_expectations_package") {
+  testonly = true
+
+  _base_target_name = target_name
+
+  _skip_err_logs_cases = "SKIP_CASES_WITH_ERROR_LOGS"
+  _run_err_logs_cases = "RUN_ONLY_CASES_WITH_ERROR_LOGS"
+  not_needed([
+               _skip_err_logs_cases,
+               _run_err_logs_cases,
+             ])
+
+  _expectations_target = "${target_name}_preprocessed_expectations"
+  preprocess_expectations(_expectations_target) {
+    if (defined(invoker.treatment_of_cases_with_error_logs)) {
+      assert(
+          invoker.treatment_of_cases_with_error_logs == _skip_err_logs_cases ||
+          invoker.treatment_of_cases_with_error_logs == _run_err_logs_cases)
+      if (invoker.treatment_of_cases_with_error_logs == _skip_err_logs_cases) {
+        cases_to_run = "NoErrLogs"
+      } else {
+        cases_to_run = "WithErrLogs"
+      }
+    }
+    if (defined(invoker.generated_expectations)) {
+      assert(!defined(invoker.expectations))
+
+      deps = [ invoker.generated_expectations ]
+      expectations =
+          get_label_info(invoker.generated_expectations, "target_gen_dir") +
+          "/" + get_label_info(invoker.generated_expectations, "name") +
+          ".json5"
+    } else {
+      expectations = invoker.expectations
+    }
+    output_path = "expectations.json5"
+  }
+
+  # The standard expect_includes build-time check allows you to enforce that, if
+  # a component depends on your client library, then its manifest must include
+  # your client shard. Unfortunately for us, there is no expectation client
+  # library -- the point of this framework is that use of the GN template to
+  # define the test package is sufficient, without you having to modify the test
+  # binary, as long as you include the client shard.
+  # Therefore, we have to discover each test component's manifest ourselves, and
+  # assert that each of those manifests includes the expectation client shard.
+
+  # We start by defining a target with metadata that will be included in our
+  # cmc_check_includes invocation's `deps`. cmc_check_includes will collect this
+  # as part of determining the set of shards that must be included in the
+  # checked manifest.
+  _expected_includes_metadata_target = "${_base_target_name}-expected-includes"
+  group(_expected_includes_metadata_target) {
+    metadata = {
+      cmc_expected_includes_cml =
+          [ "//src/lib/testing/expectation/meta/client.shard.cml" ]
+    }
+  }
+  _expected_includes_metadata_target = ":$_expected_includes_metadata_target"
+
+  _include_check_targets = []
+  _index = 0
+
+  foreach(test_component, invoker.test_components) {
+    _prefix = "${_base_target_name}-${_index}"
+
+    # Generates a JSON file that lists all the component manifest source paths
+    # that are transitively reachable along GN `deps` edges starting from
+    # test_component.
+    _find_manifest_target = "${_prefix}_locate_manifest"
+    generated_file(_find_manifest_target) {
+      outputs = [ "$target_out_dir/$_find_manifest_target.json" ]
+      data_keys = [ "component_manifest_path" ]
+      walk_keys = [ "component_manifest_path_barrier" ]
+      rebase = root_build_dir
+      output_conversion = "json"
+      deps = [ test_component ]
+
+      visibility = [ ":*" ]
+    }
+    _find_manifest_target = ":$_find_manifest_target"
+
+    # generated_file is guaranteed to emit the discovered component manifests in
+    # a postorder traversal, so the last manifest emitted will belong to the
+    # root component of the test, which is the component we want to ensure
+    # includes the expectation_comparer client shard.
+    # (See `fx gn help generated_file` which documents the postorder guarantee.)
+    _get_last_manifest_target = "${_prefix}_last_manifest"
+    action(_get_last_manifest_target) {
+      _jq_prebuilt = "//prebuilt/third_party/jq/${host_platform}/bin/jq"
+      script = "//src/lib/testing/expectation/get_last_manifest.sh"
+      sources = get_target_outputs(_find_manifest_target) + [ _jq_prebuilt ]
+      deps = [ _find_manifest_target ]
+      outputs = [ "$target_gen_dir/${_get_last_manifest_target}.txt" ]
+      args = [
+        rebase_path(_jq_prebuilt, root_build_dir),
+        rebase_path(sources[0], root_build_dir),
+        rebase_path(outputs[0], root_build_dir),
+      ]
+
+      visibility = [ ":*" ]
+    }
+    _get_last_manifest_target = ":$_get_last_manifest_target"
+
+    _include_check_target = "${_prefix}-check-includes"
+    cmc_check_includes(_include_check_target) {
+      _get_last_manifest_outputs = get_target_outputs(_get_last_manifest_target)
+      assert(
+          _get_last_manifest_outputs == [ _get_last_manifest_outputs[0] ],
+          "$_get_last_manifest_target should have yielded exactly one output")
+      manifest = _get_last_manifest_outputs[0]
+      deps = [
+        _expected_includes_metadata_target,
+        _get_last_manifest_target,
+      ]
+
+      visibility = [ ":*" ]
+    }
+    _include_check_target = ":$_include_check_target"
+
+    _include_check_targets += [ _include_check_target ]
+    _index += 1
+  }
+
+  fuchsia_test_package(_base_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "test_components",
+                             "test_specs",
+                             "package_name",
+                             "data_deps",
+                             "renameable_subpackages",
+                             "subpackages",
+                             "visibility",
+                           ])
+    deps = _include_check_targets + [
+             ":${_expectations_target}",
+             "//src/lib/testing/expectation:expectation_comparer",
+           ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+}

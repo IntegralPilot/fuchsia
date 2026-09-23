@@ -1,0 +1,308 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/fuzz.gni")
+import("../libc.gni")
+
+# TODO(https://fxbug.dev/502668972): It should be fine to have this be a
+# `libc_test`, but changing the target type leads to the fuzzer not being
+# able to start. We should look into why and try to change this to a
+# `libc_test`.
+source_set("thread-storage-test-utils") {
+  testonly = true
+  public = [ "thread-storage-test-utils.h" ]
+  sources = [ "thread-storage-test-utils.cc" ]
+  public_deps = [
+    ":thread-storage-allocate.testonly",
+    ":thread-storage.testonly",
+    "//src/lib/elfldltl",
+  ]
+  deps = [
+    "//sdk/lib/fit",
+    "//sdk/lib/ld:headers",
+  ]
+  configs += [
+    "..:llvm-libc.config",
+    "..:testonly.config",
+  ]
+}
+
+fuchsia_library_fuzzer("thread-storage-fuzzer") {
+  sources = [ "thread-storage-fuzzer.cc" ]
+  deps = [
+    ":thread-storage-test-utils",
+    "//sdk/lib/fit",
+    "//sdk/lib/ld:headers",
+    "//src/lib/elfldltl",
+    "//src/lib/elfldltl/testing:headers",
+  ]
+  configs += [
+    "..:llvm-libc.config",
+    "..:testonly.config",
+  ]
+}
+
+llvm_libc_source_set("threads") {
+  functions = [
+    "thrd_create",
+    "thrd_create_with_name",
+    "thrd_detach",
+    "thrd_exit",
+    "thrd_join",
+  ]
+  os_functions = functions
+  no_test_functions = functions
+
+  # This is a Fuchsia extension, so llvm-libc doesn't have an internal header.
+  preempt_header_functions = [ "thrd_create_with_name" ]
+
+  deps = [
+    ":thread-create",
+    ":thread-exit",
+    ":thread-join",
+    ":thread-storage",
+  ]
+
+  # Used by thrd_create*.
+  non_test_deps = [ "../zircon:zx-name.printf" ]
+  testonly_deps = [ "../zircon:zx-name.printf.testonly" ]
+}
+
+# This doesn't need to be libc_source_set() because it's just a header.
+source_set("stack-abi") {
+  public = [ "stack-abi.h" ]
+  public_deps = [ "//zircon/kernel/lib/arch" ]
+  sources = []
+}
+
+source_set("thread") {
+  public = [ "thread.h" ]
+  public_deps = [
+    "..:asm-linkage",
+    "../startup:headers",
+    "../zircon:vmar.headers",
+    "../zircon:zx-name",
+    "//zircon/system/ulib/zx",
+  ]
+}
+
+# This reaches only the self-contained code involved in the ThreadStorage
+# destructor and move operations, which has no dependencies on other libc code
+# except pure compiler dependencies and system calls and wrappers, etc.
+libc_source_set("thread-storage") {
+  public = [ "thread-storage.h" ]
+  libc_public_deps = [ "../zircon:vmar" ]
+  public_deps = [
+    ":stack-abi",
+    "//src/lib/elfldltl:headers",
+    "//zircon/system/ulib/zx",
+
+    # TODO(https://fxbug.dev/342469121): remove when :musl-tls is removed
+    "..:asm-linkage",
+  ]
+  sources = [ "thread-storage.cc" ]
+  deps = [ "//zircon/third_party/ulib/musl:musl_internal" ]
+}
+
+# This defines ThreadStorage::Allocate, which has dependencies that are not
+# available in every hermetic basic_abi libc_source_set() and is not needed
+# everywhere that the ThreadStorage destructor and such are needed.
+libc_source_set("thread-storage-allocate") {
+  sources = [ "thread-storage-allocate.cc" ]
+  libc_deps = [ ":thread-storage" ]
+  deps = [ "//zircon/third_party/ulib/musl:musl_internal" ]
+}
+
+libc_test("thread-storage.unittests") {
+  sources = [ "thread-storage-tests.cc" ]
+  include_dirs = [ "//sdk/lib/ld/test/modules" ]
+  deps = [
+    ":thread-storage-allocate.testonly",
+    ":thread-storage-test-utils",
+    ":thread-storage.testonly",
+    "../test:safe-zero-construction",
+    "//sdk/lib/fit",
+    "//sdk/lib/ld:headers",
+    "//sdk/lib/ld/test/modules:tls-desc-dep.shared_library",
+    "//sdk/lib/ld/testing:ld-abi-testing",
+    "//src/lib/elfldltl",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+}
+
+source_set("mutex") {
+  public = [ "mutex.h" ]
+  public_deps = [ "//zircon/system/ulib/sync:sync-cpp" ]
+  sources = []
+}
+
+libc_source_set("thread-list") {
+  public_deps = [ ":thread-list.headers" ]
+  sources = [ "thread-list.cc" ]
+}
+
+# This is separate so it can be used in the basic_abi :thread-exit-finish.  The
+# methods are in the header to be instantiated where and how they are used.
+# But the variables themselves are only defined in :thread-list, outside the
+# basic_abi bubble.
+source_set("thread-list.headers") {
+  visibility = [ ":*" ]
+  public = [ "thread-list.h" ]
+  public_deps = [
+    ":mutex",
+    "..:asm-linkage",
+    "..:weak",
+    "../dlfcn:dlfcn-abi",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+  deps = [ "..:asm-linkage" ]
+}
+
+# This is linked into the legacy libc.so to implement the entry points used by
+# the legacy implementation.
+libc_source_set("musl-glue") {
+  sources = [
+    "musl-dlfcn-cleanup.cc",
+    "musl-on-tls-segments.cc",
+  ]
+  deps = [
+    ":thread",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+  libc_deps = [ ":musl-tls" ]
+}
+
+# This implements the ThreadStorage methods for ELF TLS via the musl
+# integrated dynamic linker code.
+libc_source_set("musl-tls") {
+  visibility = [ ":*" ]
+
+  # TODO(https://fxbug.dev/342469121): When this goes away, all the
+  # asm-linkage shenanigans can be removed from thread-storage.h.
+  basic_abi = true
+  global_symbols = [
+    "${libc_namespace}_GetTlsLayout",
+    "${libc_namespace}_InitializeTls",
+  ]
+  undefined_symbols = [
+    "${libc_namespace}_gLog",
+    "_dl_tls_layout",
+    "_dl_copy_tls",
+  ]
+
+  sources = [ "musl-tls.cc" ]
+  deps = [ "//zircon/third_party/ulib/musl:musl_internal" ]
+  libc_deps = [ ":thread-storage" ]
+  non_test_deps = [ "../ld:log-panic" ]
+}
+
+source_set("zxr-tls") {
+  visibility = [
+    "../*",
+    "//zircon/third_party/ulib/musl/*",
+  ]
+  public = [ "zxr-tls.h" ]
+  public_deps = [ "//src/zircon/lib/zircon:headers" ]
+}
+
+libc_source_set("thread-exit") {
+  visibility = [ ":*" ]
+
+  public_deps = [ ":thread" ]
+
+  sources = [ "thread-exit.cc" ]
+  libc_deps = [
+    ":thread-exit-finish",
+    ":thread-list",
+    ":thread-storage",
+    "../stdlib:exit",
+  ]
+}
+
+libc_test("thread-exit.unittests") {
+  sources = []
+}
+
+libc_source_set("thread-exit-finish") {
+  visibility = [ ":*" ]
+
+  public_deps = [ ":thread" ]
+  basic_abi = true
+  global_symbols = [ "${libc_namespace}_ThreadExitFinish" ]
+  undefined_symbols = [
+    "${libc_namespace}_gAllThreadsLock",
+    "${libc_namespace}_gAllThreads",
+    "${libc_namespace}_gLog",
+    "__sanitizer_thread_exit_hook",
+    "_zx_thread_self",  # libsync uses this.
+  ]
+  undefined_symbols += libzircon_linkage_names
+
+  sources = [ "thread-exit-finish.cc" ]
+  deps = [
+    ":thread-list.headers",
+    "//src/lib/elfldltl:headers",
+  ]
+  libc_deps = [ ":thread-storage" ]
+  non_test_deps = [ "../ld:log-panic" ]
+}
+
+libc_source_set("thread-join") {
+  visibility = [ ":*" ]
+
+  public_deps = [ ":thread" ]
+  sources = [ "thread-join.cc" ]
+  libc_deps = [
+    ":thread-list",
+    ":thread-storage",
+  ]
+}
+
+libc_test("thread-join.unittests") {
+  sources = []
+}
+
+libc_source_set("thread-create") {
+  visibility = [ ":*" ]
+
+  public_deps = [ ":thread" ]
+
+  sources = [
+    "thread-create.cc",
+    "thread-start.cc",
+  ]
+  deps = [
+    ":stack-abi",
+    ":thread-list",
+    "..:weak",
+    "//src/lib/elfldltl:headers",
+  ]
+  libc_deps = [
+    ":thread-exit",
+    ":thread-list",
+    ":thread-storage",
+    ":thread-storage-allocate",
+  ]
+}
+
+libc_test("thread-create.unittests") {
+  sources = []
+}
+
+libc_source_set("thread-detach") {
+  visibility = [ ":*" ]
+
+  public_deps = [ ":thread" ]
+
+  sources = [ "thread-detach.cc" ]
+  deps = [ "//zircon/system/ulib/zircon-internal" ]
+  libc_deps = [
+    ":thread-list",
+    ":thread-storage",
+  ]
+}
+
+libc_test("thread-detach.unittests") {
+  sources = []
+}

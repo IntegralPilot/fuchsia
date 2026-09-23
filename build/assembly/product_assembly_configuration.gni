@@ -1,0 +1,561 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/product_assembly_config_file_impl.gni")
+import("//build/compiled_action.gni")
+import("//build/components/fuchsia_package.gni")
+import("//build/group_with_inputs.gni")
+import("//build/info/info.gni")
+
+# Create a product assembly config file from the lists of packages and config
+# passed into the template.
+#
+# This template specifically converts lists of labels for fuchsia_package() and
+# prebuilt_package() into the lists of output paths needed.  This keeps the
+# contract about where those two templates place the package manifest internal
+# to fuchsia.git.
+#
+# As outputs, this creates:
+#
+#  outputs = [
+#       "${target_out_dir}/${target_name}/product_assembly_config.json"
+#  ]
+#
+#
+# Arguments:
+#
+#   Product-specified Package Sets:
+#    These are optional lists of targets that produce Fuchsia Packages.  These
+#    are NOT walked for metadata, but must be the exact desired package-creating
+#    targets.
+#
+#   base_packages [optional]
+#     [list, GN scopes] A list of GN scopes that hold the information for a
+#     product-provided package to place into the base set. The scope must have a
+#     'package_target' field pointing to the GN target of the fuchsia_package.
+#
+#   base_driver_packages (optional)
+#     [list, GN scopes] A list of GN scopes that hold the driver packages to
+#     include in the base package set. Packages listed here should not be
+#     listed in the base_packages and will be included automatically in
+#     the base package set as driver packages.
+#
+#     Each scope added to this list needs to be in the following form:
+#       {
+#         # This is the label that creates the package, this can not be a group
+#         package_target = "//gn/label/that/to/the/driver:package"
+#
+#         # These are paths to the driver components within the above package.
+#         driver_components = [
+#           "meta/driver_1.cm",
+#           "meta/driver_2.cm",
+#         ]
+#       }
+#
+#   cache_packages [optional]
+#     [list, GN scopes] A list of GN scopes that hold the information for a
+#     product-provided package to place into the cache set. The scope must have a
+#     'package_target' field pointing to the GN target of the fuchsia_package.
+#
+#   bootfs_packages [optional]
+#     [list, GN labels] A list of GN labels for product-provided package to
+#     place into bootfs. Each label must be for a GN target defined with
+#     fuchsia_package.
+#
+#     Note: This is only usable on empty, embeddable, or bootstrap feature set
+#     levels.
+#
+#   bootfs_files_labels [optional]
+#     [list, GN labels] A list of GN labels of bootfs_files_for_assembly()
+#     targets to include in bootfs_files provided by this AIB.
+#
+#     Note: These are direct labels for specific targets, not deps to walk for
+#     metadata. If the target isn't a bootfs_files_for_assembly target, it will
+#     cause an error like:
+#       "no dependency provides the input <package_name>/bootfs_files.json"
+#
+#     Note: This is only usable on empty, embeddable, or bootstrap feature set
+#     levels.
+#
+#   font_asset_provider_packages [optional]
+#     [list, GN labels] A list of GN labels pointing at product-provided
+#     packages containing font assets.  These fonts end up as base packages,
+#     since that is the only font distribution method we support at the moment.
+#
+#   platform [optional]
+#   [scope] This is the platform configuration scope
+#
+#   product [optional]
+#   [scope] This is the product configuration scope
+#
+# GN Usual:
+#   deps
+#   testonly
+#   visibility
+template("product_assembly_configuration") {
+  labels = {
+    # So it can be reused.
+    target_name = target_name
+    assembly_config = "${target_name}.product_assembly_config.json"
+
+    # This is a second target created by the product_assembly_config_file()
+    # template that wraps up all the input file labels found in the product and
+    # platform config with the deps that are passed to this template.
+    assembly_config_inputs = "${assembly_config}.inputs"
+
+    # This is a publicly visible, test-only target, that allows the assembly
+    # config to be used without needing the deps used create it.
+    assembly_config_for_validation =
+        "${target_name}.product_assembly_config.json.for_validation"
+
+    base_package_set = "${target_name}.base_packages"
+    base_package_config_data = "${target_name}.base_packages.config_data"
+    base_driver_package_set = "${target_name}.base_driver_packages"
+    cache_package_set = "${target_name}.cache_packages"
+    cache_package_config_data = "${target_name}.cache_packages.config_data"
+    board_driver_package_set = "${target_name}.board_driver_packages"
+    bootfs_package_set = "${target_name}.bootfs_packages"
+
+    if (defined(invoker.bootfs_files_labels)) {
+      bootfs_files_package = "${target_name}.bootfs_files_package"
+    }
+
+    # Base packages specified by the invoker, used to create the list of
+    # manifests and as the deps for the package set targets.
+    base_package_labels = []
+    base_package_config_data_deps = []
+    if (defined(invoker.base_packages)) {
+      foreach(package, invoker.base_packages) {
+        assert(defined(package.package_target),
+               "package_target must be supplied")
+        base_package_labels += [ package.package_target ]
+
+        if (defined(package.config_data)) {
+          foreach(_config_data, package.config_data) {
+            if (defined(_config_data.label)) {
+              base_package_config_data_deps += [ _config_data.label ]
+            }
+          }
+        }
+      }
+    }
+
+    # Font packages to be included in base_packages.  These contain no
+    # config data.
+    if (defined(invoker.font_asset_provider_packages)) {
+      foreach(font_package, invoker.font_asset_provider_packages) {
+        base_package_labels += [ font_package ]
+      }
+    }
+
+    # Cache packages specified by the invoker, used to create the list of
+    # manifests and as the deps for the package set targets.
+    cache_package_labels = []
+    cache_package_config_data_deps = []
+    if (defined(invoker.cache_packages)) {
+      foreach(package, invoker.cache_packages) {
+        assert(defined(package.package_target),
+               "package_target must be supplied")
+        cache_package_labels += [ package.package_target ]
+
+        if (defined(package.config_data)) {
+          foreach(_config_data, package.config_data) {
+            if (defined(_config_data.label)) {
+              cache_package_config_data_deps += [ _config_data.label ]
+            }
+          }
+        }
+      }
+    }
+
+    # Driver packages specified by the invoker, used to create the list of
+    # manifests and as the deps for the package set targets.
+    base_driver_package_labels = []
+    if (defined(invoker.base_driver_packages)) {
+      foreach(package, invoker.base_driver_packages) {
+        base_driver_package_labels += [ package.package_target ]
+      }
+    }
+
+    # Packages for bootfs
+    bootfs_package_labels = []
+    if (defined(invoker.bootfs_packages)) {
+      bootfs_package_labels = invoker.bootfs_packages
+    }
+  }
+
+  files = {
+    outdir = "$target_out_dir/$target_name"
+
+    # We nest the hermetic output container so that the other files generated
+    # by this rule do not end up in the container as well.
+    assembly_config_dir = "$outdir/product_assembly_config"
+    assembly_config_file =
+        "$outdir/product_assembly_config/product_configuration.json"
+    assembly_config_file_intermediate = "$outdir/product_assembly_config.json"
+
+    # Compute the paths for the package manifests (as files).  This is
+    # closely coupled with how fuchsia_package() and prebuilt_package() both
+    # create a package manifest from their label.
+
+    base_packages = []
+    base_package_manifests = []
+    base_package_config_data_sources = []
+    if (defined(invoker.base_packages)) {
+      foreach(package, invoker.base_packages) {
+        assert(defined(package.package_target),
+               "package_target must be supplied")
+        _package_out_dir =
+            get_label_info(package.package_target, "target_out_dir")
+        _package_name = get_label_info(package.package_target, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+        _manifest_path_rebased = rebase_path(_manifest_path, root_build_dir)
+
+        _config_data = []
+        if (defined(package.config_data)) {
+          foreach(c, package.config_data) {
+            base_package_config_data_sources += [ c.source ]
+            _config_data += [
+              {
+                source = rebase_path(c.source, root_build_dir)
+                destination = c.destination
+              },
+            ]
+          }
+        }
+
+        base_package_manifests += [ _manifest_path ]
+        base_packages += [
+          {
+            manifest = _manifest_path_rebased
+            if (defined(package.config_data)) {
+              config_data = _config_data
+            }
+          },
+        ]
+      }
+    }
+
+    # Similar to above, except for font packages, and a bit simpler since
+    # invoker.font_asset_provider_packages is a list of labels, not a list
+    # of scopes.
+    if (defined(invoker.font_asset_provider_packages)) {
+      foreach(package, invoker.font_asset_provider_packages) {
+        _package_out_dir = get_label_info(package, "target_out_dir")
+        _package_name = get_label_info(package, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+        _manifest_path_rebased = rebase_path(_manifest_path, root_build_dir)
+
+        base_package_manifests += [ _manifest_path ]
+        base_packages += [
+          {
+            manifest = _manifest_path_rebased
+          },
+        ]
+      }
+    }
+
+    cache_packages = []
+    cache_package_manifests = []
+    cache_package_config_data_sources = []
+    if (defined(invoker.cache_packages)) {
+      foreach(package, invoker.cache_packages) {
+        assert(defined(package.package_target),
+               "package_target must be supplied")
+        _package_out_dir =
+            get_label_info(package.package_target, "target_out_dir")
+        _package_name = get_label_info(package.package_target, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+        _manifest_path_rebased = rebase_path(_manifest_path, root_build_dir)
+
+        _config_data = []
+        if (defined(package.config_data)) {
+          foreach(c, package.config_data) {
+            cache_package_config_data_sources += [ c.source ]
+            _config_data += [
+              {
+                source = rebase_path(c.source, root_build_dir)
+                destination = c.destination
+              },
+            ]
+          }
+        }
+
+        cache_package_manifests += [ _manifest_path ]
+        cache_packages += [
+          {
+            manifest = _manifest_path_rebased
+            if (defined(package.config_data)) {
+              config_data = _config_data
+            }
+          },
+        ]
+      }
+    }
+
+    base_driver_packages = []
+    driver_package_manifests = []
+    if (defined(invoker.base_driver_packages)) {
+      foreach(driver_package, invoker.base_driver_packages) {
+        assert(defined(driver_package.package_target),
+               "package target must be supplied")
+        _package_out_dir =
+            get_label_info(driver_package.package_target, "target_out_dir")
+        _package_name = get_label_info(driver_package.package_target, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+        _manifest_path_rebased = rebase_path(_manifest_path, root_build_dir)
+
+        driver_package_manifests += [ _manifest_path ]
+        base_driver_packages += [
+          # This scope needs to serialize to json and deserialize
+          # to a DriverDetails Assembly config struct
+          {
+            package = _manifest_path_rebased
+            components = driver_package.driver_components
+          },
+        ]
+      }
+    }
+
+    # bootfs_packages are just labels, not scopes, so the handling is slightly
+    # simpler.
+    bootfs_packages = []
+    bootfs_package_manifests = []
+    if (defined(invoker.bootfs_packages)) {
+      foreach(bootfs_package, invoker.bootfs_packages) {
+        _package_out_dir = get_label_info(bootfs_package, "target_out_dir")
+        _package_name = get_label_info(bootfs_package, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+        _manifest_path_rebased = rebase_path(_manifest_path, root_build_dir)
+
+        bootfs_package_manifests += [ _manifest_path ]
+        bootfs_packages += [
+          {
+            manifest = _manifest_path_rebased
+          },
+        ]
+      }
+    }
+  }
+
+  if (defined(labels.bootfs_files_package)) {
+    fuchsia_package(labels.bootfs_files_package) {
+      forward_variables_from(invoker, [ "testonly" ])
+      if (defined(invoker.bootfs_files_labels)) {
+        deps = invoker.bootfs_files_labels
+      }
+    }
+    bootfs_files_package_manifest =
+        "${target_out_dir}/${labels.bootfs_files_package}/package_manifest.json"
+  }
+
+  _assembly_config = {
+    # Create the platform configuration section from the caller's argument
+    platform = invoker.platform
+    assert(defined(platform.build_type),
+           "The platform build-type must be specified.")
+
+    # Create the product configuration section from the caller's arguments.
+    product = {
+      if (defined(invoker.product)) {
+        forward_variables_from(invoker.product, "*")
+      }
+      assert(!defined(packages),
+             "Packages cannot be directly supplied under product")
+
+      packages = {
+        base = files.base_packages
+        cache = files.cache_packages
+        if (files.bootfs_packages != []) {
+          bootfs = files.bootfs_packages
+        }
+      }
+
+      base_drivers = files.base_driver_packages
+
+      if (defined(labels.bootfs_files_package)) {
+        bootfs_files_package =
+            rebase_path(bootfs_files_package_manifest, root_build_dir)
+      }
+    }
+  }
+
+  # Generate the Product Assembly configuration file itself.
+  #
+  # While deps are passed to this, the target created with the target_name does
+  # depend on those deps, but creates a separate target (suffixed with
+  # `.inputs`) that wraps up the input labels and the dependencies.  This needs
+  # to be depended-upon by this template's `target_name`, with the validator
+  # target that's created depending on this file here, _without_ depending on
+  # the inputs and deps, so that the validation target can use the json file for
+  # textual comparison but without having the burden of all the compilation deps
+  # of this template.
+  #
+  product_assembly_config_file(labels.assembly_config) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "public_deps",
+                             "testonly",
+                           ])
+    visibility = [
+      ":${labels.assembly_config_for_validation}",
+      ":${labels.target_name}",
+    ]
+    outputs = [ files.assembly_config_file_intermediate ]
+    product_assembly_config = _assembly_config
+  }
+
+  # These are used to detect if the deps don't correspond to a set of input
+  # files (the deps can be larger than the set of files, but not the other way
+  # around).  Since we're computing the manifest paths from the labels, if the
+  # label to something other than a package is added, we'll compute a manifest
+  # path that doesn't exist.  This catches it here, instead of inside a build
+  # action which can't explain why it can't find a file.
+
+  # Create a target for the base packages, so they appear in the dep graph
+  # as distinct from the cache packages, and validate that they produce all of
+  # the manifests whose paths were computed from the labels.
+  group_with_inputs(labels.base_package_set) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":${labels.target_name}" ]
+    inputs = files.base_package_manifests
+    deps = labels.base_package_labels
+  }
+
+  group_with_inputs(labels.base_package_config_data) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":${labels.target_name}" ]
+    inputs = files.base_package_config_data_sources
+    deps = labels.base_package_config_data_deps
+  }
+
+  # Create a target for the base driver packages, so they appear in the dep
+  # graph as distinct from the cache packages, and validate that they produce
+  # all of the manifests whose paths were computed from the labels.
+  group_with_inputs(labels.base_driver_package_set) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":${labels.target_name}" ]
+    inputs = files.driver_package_manifests
+    deps = labels.base_driver_package_labels
+  }
+
+  # Create a target for the cache packages, so they appear in the dep graph
+  # as distinct from the base packages, and validate that they produce all of
+  # the manifests whose paths were computed from the labels.
+  group_with_inputs(labels.cache_package_set) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":${labels.target_name}" ]
+    inputs = files.cache_package_manifests
+    deps = labels.cache_package_labels
+  }
+
+  group_with_inputs(labels.cache_package_config_data) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":${labels.target_name}" ]
+    inputs = files.cache_package_config_data_sources
+    deps = labels.cache_package_config_data_deps
+  }
+
+  if (labels.bootfs_package_labels != []) {
+    group_with_inputs(labels.bootfs_package_set) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":${labels.target_name}" ]
+      inputs = files.bootfs_package_manifests
+      deps = labels.bootfs_package_labels
+    }
+  }
+
+  compiled_action(labels.target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "inputs",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    # The contents of these folders are dynamic, and managed entirely by this
+    # action.  Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    hermetic_action_ignored_prefixes = [ "${files.assembly_config_dir}" ]
+
+    tool = "//build/assembly/tools/assembly_config"
+    tool_output_name = "assembly_config"
+    outputs = [ files.assembly_config_file ]
+    depfile = "${target_out_dir}/${labels.target_name}.d"
+
+    args = [
+      "generate",
+      "product",
+      "--config",
+      rebase_path(files.assembly_config_file_intermediate, root_build_dir),
+      "--repo",
+      "fuchsia",
+      "--output",
+      rebase_path(files.assembly_config_dir, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+
+    if (defined(invoker.version) && invoker.version != "") {
+      args += [
+        "--version",
+        invoker.version,
+      ]
+    } else if (defined(invoker.version_file) && invoker.version_file != "") {
+      inputs += [ invoker.version_file ]
+      args += [
+        "--version-file",
+        invoker.version_file,
+      ]
+    }
+
+    public_deps = [ ":${labels.assembly_config}" ]
+    deps = [
+      # Add the group of inputs found by looking at the known config schema
+      # items that contain paths to files, so that they are guaranteed to be
+      # added to the ninja deps for the product assembly configuration.
+      ":${labels.assembly_config_inputs}",
+
+      # Add the groups of package manifests that validate that each set of
+      # package labels contain labels that produce package manifests in the
+      # expected location.
+      ":${labels.base_driver_package_set}",
+      ":${labels.base_package_config_data}",
+      ":${labels.base_package_set}",
+      ":${labels.cache_package_config_data}",
+      ":${labels.cache_package_set}",
+    ]
+    if (labels.bootfs_package_labels != []) {
+      deps += [ ":${labels.bootfs_package_set}" ]
+    }
+    if (defined(labels.bootfs_files_package)) {
+      deps += [ ":${labels.bootfs_files_package}" ]
+    }
+
+    # Block all metadata walks for packages, distribution entries, etc.  These
+    # inputs should not exist in metadata walks, as they are added via the paths
+    # in the assembly config itself.
+    metadata = {
+      package_barrier = []
+      assembly_package_barrier = []
+      config_package_barrier = []
+      distribution_entries_barrier = []
+    }
+  }
+
+  # A testonly group with no visibilty restrictions, that allows the use of the
+  # generated product assembly config file in validation actions that don't
+  # require the existence of the packages and binaries that it points to.
+  group(labels.assembly_config_for_validation) {
+    testonly = true
+    public_deps = [ ":${labels.assembly_config}" ]
+  }
+}

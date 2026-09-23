@@ -1,0 +1,473 @@
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/config/fuchsia/target_api_level.gni")
+import("//build/group_with_inputs.gni")
+import("//build/json/validate_json.gni")
+import("//build/python/python_action.gni")
+import("//build/testing/golden_files.gni")
+import("config.gni")
+
+_types_supporting_unstable_atoms = [
+  # LINT.IfChange(unstable_atom_types)
+  "cc_source_library",
+  "fidl_library",
+
+  # LINT.ThenChange(//build/bazel/rules/idk/private/idk_atom.bzl:unstable_atom_types,
+  # //build/sdk/generate_idk/__init__.py:unstable_atom_types,
+  # //build/sdk/generate_prebuild_idk/idk_generator.py)
+]
+_types_not_requiring_compatibility = [
+  # LINT.IfChange(non_compatibility_types)
+  "bind_library",
+  "companion_host_tool",
+  "dart_library",
+  "data",
+  "documentation",
+  "experimental_python_e2e_test",
+  "ffx_tool",
+  "host_tool",
+  "package",
+  "version_history",
+
+  # LINT.ThenChange(//build/bazel/rules/idk/private/idk_atom.bzl:non_compatibility_types)
+]
+
+# Atoms of type "data" specify the real type in `value.type`. These are the
+# valid values for `value.type`.
+_valid_data_atom_types = [
+  # LINT.IfChange
+  "component_manifest",
+  "config",
+
+  # LINT.ThenChange(//build/sdk/generate_idk/validate_idk.py)
+]
+
+# Atom types that may be cross-compiled in a single build directory (as opposed
+# to built for another CPU architecture in a sub-build).
+_cross_compiled_atom_types = [
+  "ffx_tool",
+  "host_tool",
+]
+
+# Defines an IDK element.
+#
+# Parameters
+#
+#   id
+#     Identifier of this element within SDKs.
+#     The identifier should represent the canonical base path of the element
+#     within SDKs according to the standard layout (https://fuchsia.dev/fuchsia-src/development/idk/layout.md).
+#     For an element at $ROOT/pkg/foo, the id should be "sdk://pkg/foo".
+#
+#   category
+#     Describes the availability of the element.
+#     Possible values, from most restrictive to least restrictive:
+#       - internal    : the atom is exposed in-tree to the Bazel SDK build via `@internal_sdk`.
+#       - compat_test : May be used to configure and run CTF tests but may not be exposed for use
+#                       in production in the SDK or used by host tools.
+#       - host_tool   : May be used by host tools (e.g., ffx) provided by the platform organization
+#                       but may not be used by production code or prebuilt binaries in the SDK.
+#       - prebuilt    : May be part of the ABI that prebuilt binaries included in the SDK use to
+#                       interact with the platform.
+#       - partner     : Included in the SDK for direct use of the API by out-of-tree developers.
+#
+#   sdk_area (optional)
+#     The API area responsible for maintaining this SDK atom. See
+#     docs/contribute/governance/areas/_areas.yaml for the list of areas.
+#     "Unknown" is also a valid option. By default, the area will be `null` in
+#     the build manifest.
+#
+#   meta
+#     Scope describing the element's metadata file.
+#     See the "Metadata scope" section for how to populate this attribute.
+#
+#   files
+#     List of scopes describing the contents of this element.
+#     See the "File scopes" section for how to describe files.
+#
+#   api (optional)
+#     Path to the file representing the API canonically exposed by this atom.
+#     This file is used to ensure modifications to the API are explicitly
+#     acknowledged.
+#     If this attribute is set, `api_contents` must be set as well.
+#
+#   api_contents (optional)
+#     List of scopes for the files making up the atom's API.
+#     This list will be used to verify that the API has not changed locally.
+#     This is very roughly approximated by checking whether the files themselves
+#     have changed at all.
+#     See the "File scopes" section for how to describe files.
+#     Required when when `api` is set.
+#
+#   deps (optional)
+#     List of GN labels for other SDK elements this element depends on at build
+#     time.
+#     These labels must point to "sdk_atom" targets.
+#
+#   non_sdk_deps (optional)
+#     List of GN labels which this target needs built.
+#
+# Metadata scope
+#
+# This scope describes a metadata file to be added to the SDK element. Its
+# supported attributes are:
+#
+#   value (optional)
+#     Scope representing the metadata contents.
+#
+#     This must be set for atom types not explicitly handled by
+#     generate_prebuild_idk.py.
+#
+#   dest (required)
+#     The path of the metadata file (usually `meta.json`) in the final IDK,
+#     relative to the IDK root.
+#
+#   type (required)
+#     Type of the atom. Used to determine schema for this file
+#     Metadata files are hosted under //build/sdk/meta.
+#     If the metadata conforms to //build/sdk/meta/foo.json, the
+#     present attribute should have a value of "foo".
+#
+#   stable (optional)
+#     Whether this sdk_atom is stabilized.
+#     Must be specified for types "fidl_library" and "cc_source_library" and
+#     otherwise unspecified.
+#     This is only informative. The value must match the `stable` value in the
+#     atom metadata specified by `source`/`value`. (That metadata is what
+#     controls whether the atom is marked as unstable in the final IDK.)
+#
+# File scopes
+#
+# Each scope describes a file to be added to the SDK element. The supported
+# attributes are:
+#
+#   source (required)
+#     Path to the original file.
+#     This path may be absolute or relative to the target's directory.
+#
+#   dest (required)
+#     Destination path of the file relative to the IDK root.
+
+template("sdk_atom") {
+  assert(defined(invoker.id), "Must define an SDK ID")
+
+  assert(defined(invoker.meta), "Must specify some metadata")
+  meta = invoker.meta
+  assert(defined(meta.type) && meta.type != "", "Must specify the atom type")
+  type = meta.type
+  assert(defined(meta.dest) && meta.dest != "",
+         "Must specify the atom destination in the IDK")
+
+  # Though the metadata files have a `type` key, the `meta.type` argument is not
+  # used for this when `meta.value` is specified. In this case, verify the
+  # `meta.type` argument and type specified in `meta.value` are
+  # consistent when possible.  The values of `type` must match if and only if
+  # the argument's value is not "data". For "data" atoms, an underlying type is
+  # specified in the metadata.
+  if (defined(meta.value)) {
+    value = meta.value
+    assert(defined(value.type) && value.type != "",
+           "`type` must be specified in `value`.")
+    if (type == "data") {
+      assert(value.type != type,
+             "'data' atoms must specify the actual type in `meta.value`.")
+
+      is_data_type_valid = _valid_data_atom_types + [ value.type ] -
+                           [ value.type ] != _valid_data_atom_types
+      assert(
+          is_data_type_valid,
+          "The `value.type` ('${value.type}') for 'data' atoms must be one of ${_valid_data_atom_types}.")
+    } else {
+      assert(value.type == type)
+    }
+  } else {
+    assert(type != "data", "'data' atoms must use `meta.value`.")
+  }
+
+  # Nested variables will not cause unused variable errors so explicitly assert
+  # that this obsolete value is not set.
+  assert(!defined(meta.source), "`meta.source` is obsolete.")
+
+  assert(defined(invoker.category), "Must define an SDK category")
+  category = invoker.category
+
+  _allowed_categories = [
+    # "internal" is deprecated; only specific legacy cases below are allowed.
+    "compat_test",
+    "host_tool",
+    "prebuilt",
+    "partner",
+  ]
+
+  assert(
+      _allowed_categories + [ category ] - [ category ] !=
+          _allowed_categories ||
+          # TODO(https://fxbug.dev/372986936): Remove once all exceptions in the
+          # assert below have been removed.
+          category == "internal",
+      "'${target_name}' has unsupported SDK category '${category}'. Must be one of ${_allowed_categories}.")
+
+  # Atom types other than FIDL must be in the "partner" SDK category because
+  # they are exposed directly to developers. If you have a use case for another
+  # type in a different category, contact the Platform Versioning team.
+  assert(
+      category == "partner" || type == "fidl_library" ||
+          # TODO(https://fxbug.dev/372986936): Remove once all exceptions in the
+          # assert below have been removed.
+          category == "internal",
+      "Atoms of type '${type}' must be in the 'partner' SDK category ('${category}').")
+
+  target_label = get_label_info(":${target_name}", "label_no_toolchain")
+
+  if (category == "internal") {
+    # TODO(https://fxbug.dev/376105715): Remove once devicetree is in
+    # "partner" or no longer using loadable modules.
+    is_devicetree_visitor_loadable_module =
+        type == "loadable_module" &&
+        target_label != string_replace(target_label, "devicetree", "", 1)
+
+    # TODO(https://fxbug.dev/376105715): Remove once devicetree is in "partner".
+    is_devicetree =
+        type == "cc_prebuilt_library" &&
+        target_label == "//zircon/kernel/lib/devicetree:devicetree_sdk"
+
+    # TODO(https://fxbug.dev/42070500): Remove once shard is in "partner".
+    is_realm_builder_shard =
+        type == "data" &&
+        target_label == "//sdk/lib/sys/component:realm_builder_shard"
+
+    # TODO(https://fxbug.dev/331991540): Remove once a different
+    # solution for the Firmware SDK is implemented.
+    is_firmware_docs =
+        type == "documentation" && target_label == "//sdk/docs:firmware"
+
+    assert(
+        # `sdk_source_set()` enforces an allowlist.
+        type == "cc_source_library" ||
+            # Handle individual exceptions for types with only one "internal"
+            # instance.
+            is_devicetree_visitor_loadable_module || is_devicetree ||
+            is_realm_builder_shard || is_firmware_docs,
+        "`${target_label}` of type `${type}` is not allowed to use the \"internal\" SDK category. No new uses are allowed.")
+    not_needed([
+                 "is_devicetree_visitor_loadable_module",
+                 "is_realm_builder_shard",
+                 "is_firmware_docs",
+               ])
+  }
+
+  # For support unstable atoms, ensure that `meta.stable`is always
+  # specified and either it is true and an `api` file was specified or the
+  # category supports unstable atoms.
+  is_type_supporting_unstable = _types_supporting_unstable_atoms + [ type ] -
+                                [ type ] != _types_supporting_unstable_atoms
+  assert(
+      is_type_supporting_unstable == defined(meta.stable) ||
+          # loadable_module does not support unstable atoms, but there are some
+          # in the internal only IDK.
+          # TODO(https://fxbug.dev/376105715): Remove once devicetree is in
+          # "partner" or no longer using loadable modules.
+          (type == "loadable_module" &&
+               target_label !=
+                   string_replace(target_label, "devicetree", "", 1) &&
+               defined(meta.stable) && !meta.stable),
+      "`meta.stable` must be set if and only if the type ('${type}') is one of ${_types_supporting_unstable_atoms}.")
+  if (defined(meta.stable)) {
+    if (meta.stable) {
+      # TODO(https://fxbug.dev/372986936): Remove when no more uses.
+      assert(category != "internal",
+             "Atoms in SDK category '${category}' cannot be `stable`.")
+      is_stable = true
+
+      # For types that specify stable, ensure the `api` file was specified for
+      # stable atoms.
+      assert(defined(invoker.api))
+    } else {
+      # Categories other than "partner" exist only to ensure stability and thus
+      # should not have unstable atoms. If you have a use case for unstable
+      # atoms in another category, contact the Platform Versioning team.
+      assert(
+          category == "partner" ||
+              # TODO(https://fxbug.dev/372986936): Remove when no more uses.
+              category == "internal",
+          "`meta.stable` must be true unless the SDK category ('${category}') is 'partner'.")
+      is_stable = false
+    }
+  } else {
+    # Atom types that do not support unstable are always stable, but this is not
+    # reported in their `meta.json` file.
+    is_stable = true
+  }
+
+  # Handle types that are not in _types_not_requiring_compatibility. Their
+  # templates do not support specifying `meta.stable`, so override it here.
+  if (category == "internal" &&
+      (is_devicetree || is_realm_builder_shard || is_firmware_docs)) {
+    assert(is_stable)
+    is_stable = false
+  }
+
+  # TODO(https://fxbug.dev/372986936): Remove when no more uses of "internal".
+  assert(category != "internal" || !is_stable,
+         "Internal atoms must be unstable.")
+
+  is_type_not_requiring_compatibility =
+      _types_not_requiring_compatibility + [ type ] - [ type ] !=
+      _types_not_requiring_compatibility
+  if ((type == "cc_prebuilt_library" && (target_label == "//src/devices/bin/driver_runtime:driver_runtime_sdk" || target_label == "//third_party/Vulkan-Loader/src:libvulkan_sdk" || target_label == "//src/performance/memory/sampler/instrumentation:instrumentation_sdk")) || (type == "loadable_module" && target_label == "//src/lib/vulkan:vulkan_layers")) {
+    # These few targets specify `no_headers` (or would if using a template).
+    # Since this list is unlikely to change much, just exempt them.
+    is_type_not_requiring_compatibility = true
+  }
+
+  assert(
+      defined(invoker.api) || !is_stable || is_type_not_requiring_compatibility,
+      "All atoms with types ('${type}') requiring compatibility must specify an `api` file unless explicitly unstable.")
+  not_needed([
+               "is_type_not_requiring_compatibility",
+               "target_label",
+             ])
+
+  _default_forward_from_invoker = [
+    "assert_no_deps",
+    "testonly",
+  ]
+
+  gn_deps = []
+  if (defined(invoker.deps)) {
+    gn_deps += invoker.deps
+  }
+  if (defined(invoker.non_sdk_deps)) {
+    gn_deps += invoker.non_sdk_deps
+  }
+
+  # Some elements contain only the metadata.
+  if (!defined(invoker.files)) {
+    files = []
+  } else {
+    files = invoker.files
+  }
+
+  _idk_atom_prebuild_info = {
+    atom_id = invoker.id
+    atom_label = get_label_info(":${target_name}", "label_no_toolchain")
+    atom_type = type
+    meta_dest = meta.dest
+    if (defined(meta.value)) {
+      meta_contents = meta.value
+    }
+    if (defined(invoker.idk_name)) {
+      idk_name = invoker.idk_name
+    }
+    if (defined(meta.source_prebuild_info)) {
+      prebuild_info = meta.source_prebuild_info
+    }
+    atom_files = []
+    foreach(file, files) {
+      atom_files += [
+        {
+          source = rebase_path(file.source, root_build_dir)
+          dest = file.dest
+        },
+      ]
+    }
+    is_stable = is_stable
+    category = category
+
+    if (defined(invoker.sdk_area)) {
+      api_area = invoker.sdk_area
+    }
+
+    # Ensure tools that may be built multiple times in the same build directory
+    # have unique labels.
+    if (_cross_compiled_atom_types + [ atom_type ] - [ atom_type ] !=
+        _cross_compiled_atom_types) {
+      atom_label += "-${current_cpu}"
+    }
+
+    if (defined(invoker.deps)) {
+      atom_deps = invoker.deps
+    }
+  }
+
+  assert(defined(invoker.api) == defined(invoker.api_contents),
+         "Must set only one of 'api' and 'api_contents' together")
+
+  _verify_api = defined(invoker.api)
+  if (_verify_api) {
+    assert(invoker.api_contents != [], "api_contents cannot be empty")
+
+    generate_api_target_name = "${target_name}_generate_api"
+    current_api_file = "$target_gen_dir/$target_name.api"
+
+    action(generate_api_target_name) {
+      forward_variables_from(invoker, _default_forward_from_invoker)
+
+      script = "//build/sdk/compute_atom_api.py"
+
+      inputs = []
+
+      outputs = [ current_api_file ]
+
+      args = [
+        "--output",
+        rebase_path(current_api_file, root_build_dir),
+      ]
+      deps = gn_deps
+
+      foreach(file, invoker.api_contents) {
+        inputs += [ file.source ]
+        args += [
+          "--file",
+          file.dest,
+          rebase_path(file.source, root_build_dir),
+        ]
+      }
+    }
+
+    verify_api_target_name = "${target_name}_verify_api"
+    golden_files(verify_api_target_name) {
+      forward_variables_from(invoker, _default_forward_from_invoker)
+      comparisons = [
+        {
+          candidate = current_api_file
+          golden = invoker.api
+        },
+      ]
+      warn_on_changes = warn_on_sdk_changes
+
+      deps = [ ":$generate_api_target_name" ]
+    }
+  }
+
+  group_with_inputs(target_name) {
+    forward_variables_from(invoker, _default_forward_from_invoker)
+
+    public_deps = gn_deps
+    if (_verify_api) {
+      public_deps += [ ":$verify_api_target_name" ]
+    }
+
+    # Ensure that changes to the `.so` file for shared libraries will cause
+    # anything that depends on the atom to be rebuilt.
+    # See https://fxbug.dev/450294636 for details.
+    inputs = []
+    foreach(file, files) {
+      inputs += [ file.source ]
+    }
+
+    metadata = {
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata,
+                               "*",
+                               [ "idk_atom_prebuild_info" ])
+      }
+
+      # Used by idk_prebuild_manifest() template.
+      idk_atom_prebuild_info = [ _idk_atom_prebuild_info ]
+    }
+  }
+}

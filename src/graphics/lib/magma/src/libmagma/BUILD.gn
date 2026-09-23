@@ -1,0 +1,190 @@
+# Copyright 2016 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/cpp/extract_imported_symbols.gni")
+import("//build/cpp/verify_imported_symbols.gni")
+import("//build/cpp/verify_public_symbols.gni")
+import("//src/graphics/lib/magma/gnbuild/magma.gni")
+import("//src/graphics/lib/magma/src/libmagma/hermetic_static_library.gni")
+
+group("libmagma") {
+  public_deps = [ ":libmagma_static" ]
+}
+
+# Magma ICDs are only allowed to depend on (parts of) libc and libzircon, and no
+# other shared libraries.
+disallowed_dependencies = [
+  "//sdk/lib/fdio",
+  "//sdk/lib/async-default",
+]
+
+config("static_lib_config") {
+  # All functions should be declared in magma.h or magma_sysmem.h, so warn about
+  # unnecessary functions.
+  cflags = [ "-Wmissing-prototypes" ]
+
+  # TODO(https://fxbug.dev/450424760): TUs which would be part of a hermetic static library for magma
+  # should not be instrumented, hence we disable ASan here. Ideally, we should
+  # have build rules that ensure these sources and anything which link in
+  # libmagma_static would be excluded from instrumented builds. This is not a
+  # stable solution, but it prevents libmagma_static from having a mix of ASan-
+  # instrumented and non-asan instrumented libc++ functions.
+  cflags += [ "-fno-sanitize=address" ]
+
+  defines = [ "MAGMA_EXPORT=__attribute__((visibility(\"default\")))" ]
+}
+
+static_library("libmagma_static") {
+  public_deps = [ "//sdk/lib/magma_client:magma_headers" ]
+
+  configs += [ ":static_lib_config" ]
+
+  # This allows the library to be used as a dependency by rust build rules.
+  public_configs = [ "//build/config/fuchsia:static_cpp_standard_library" ]
+
+  sources = [
+    "enumerator.cc",
+    "enumerator.h",
+    "magma.cc",
+  ]
+
+  deps = [
+    "//sdk/fidl/fuchsia.io:fuchsia.io_cpp",
+    "//src/graphics/magma/lib/magma/platform:buffer",
+    "//src/graphics/magma/lib/magma/platform:connection_client",
+    "//src/graphics/magma/lib/magma/platform:device_client",
+    "//src/graphics/magma/lib/magma/platform:handle",
+    "//src/graphics/magma/lib/magma/platform:logger_impl",
+    "//src/graphics/magma/lib/magma/platform:port",
+    "//src/graphics/magma/lib/magma/platform:semaphore",
+    "//src/graphics/magma/lib/magma/platform:thread",
+    "//src/graphics/magma/lib/magma/platform:trace",
+    "//src/graphics/magma/lib/magma/platform:trace_provider",
+    "//src/graphics/magma/lib/magma/util:short_macros",
+  ]
+
+  if (is_fuchsia) {
+    deps += [ ":magma_sysmem" ]
+  }
+
+  assert_no_deps = disallowed_dependencies
+}
+
+# Factored out from ":libmagma_static" in order to support Lavapipe. See
+# "visibility" labels.
+source_set("magma_sysmem") {
+  visibility = [
+    "./*",
+    "//third_party/mesa-migrating/build/src/gallium/frontends/lavapipe:*",
+  ]
+
+  configs += [ ":static_lib_config" ]
+
+  # This allows the library to be used as a dependency by rust build rules.
+  public_configs = [ "//build/config/fuchsia:static_cpp_standard_library" ]
+
+  sources = [ "magma_sysmem.cc" ]
+
+  deps = [
+    "//src/graphics/magma/lib/magma/platform:sysmem_connection",
+    "//src/graphics/magma/lib/magma/util:short_macros",
+    "//zircon/system/ulib/trace:trace-with-static-engine",
+    "//zircon/system/ulib/trace-vthread:trace-vthread-with-static-engine",
+  ]
+
+  assert_no_deps = disallowed_dependencies
+}
+
+# This library is complete, so it's usable outside BUILD.gn.
+# TODO(https://fxbug.dev/42173923): Remove in favor of magma_client, which is hermetic and usable when linking
+# against code built with a different C++ ABI and standard library version.
+static_library("libmagma_complete") {
+  complete_static_lib = true
+
+  deps = [ ":libmagma_static" ]
+}
+
+# TODO(https://fxbug.dev/42145712): Remove once zxio is available in the SDK and ICDs can use that instead.
+static_library("zxio") {
+  complete_static_lib = true
+
+  deps = [ "//sdk/lib/zxio" ]
+}
+
+config("libmagma_lib") {
+  libs = [ "$target_out_dir/libmagma_client.a" ]
+}
+
+# The libmagma static library uses the C++ standard library. That library
+# doesn't necessarily have a static ABI (on Fuchsia), so combining the current
+# version with a Vulkan ICD built in a different toolchain could break. To avoid
+# that, link it statically against the C++ standard library, then use
+# --localize-hidden to hide all the unwanted symbols.
+hermetic_static_library("magma_client") {
+  deps = [ ":libmagma_static" ]
+  localize_symbols = [
+    "trace_generate_nonce",
+    "trace_time_based_id",
+  ]
+}
+
+# Targets can depend on this to link in the hermetic magma client library.
+group("magma_hermetic") {
+  deps = [ ":magma_client" ]
+  public_configs = [ ":libmagma_lib" ]
+}
+
+# This is a set of extra dependencies that ICDs may use. It's depended on by
+# out-of-tree targets.
+group("magma_deps") {
+  deps = [ ":zxio($shlib_toolchain)" ]
+}
+
+shared_library("magma_shared") {
+  # This library is only used to generate a .ifs file, so it shouldn't be used
+  # anywhere outside this file.
+  visibility = [ ":*" ]
+  deps = [ ":magma_client" ]
+  inputs = [ "$target_out_dir/libmagma_client.a" ]
+  ldflags = [
+    "-Wl,--whole-archive",
+    rebase_path("$target_out_dir/libmagma_client.a", root_build_dir),
+    "-Wl,--no-whole-archive",
+  ]
+}
+
+shared_lib_target = ":magma_shared($shlib_toolchain)"
+
+verify_public_symbols("magma_verify_exported_symbols") {
+  testonly = true
+  deps = [ shared_lib_target ]
+  shared_out_dir = get_label_info(shared_lib_target, "root_out_dir")
+  current = "$shared_out_dir/libmagma_shared.ifs"
+  reference = "magma.ifs"
+  library_name = "magma_shared"
+}
+
+generated_imported_symbols_file = "$target_gen_dir/magma.imported_symbols.list"
+extract_imported_symbols("magma_extract_imported_symbols") {
+  library_target = shared_lib_target
+  symbols = generated_imported_symbols_file
+}
+
+verify_imported_symbols("magma_verify_imported_symbols") {
+  current = generated_imported_symbols_file
+  allowlist = "//src/graphics/lib/magma/gnbuild/imported_symbols.allowlist"
+  library_name = "magma_shared"
+  deps = [ ":magma_extract_imported_symbols" ]
+}
+
+group("verify_magma") {
+  testonly = true
+  deps = [ ":magma_verify_exported_symbols" ]
+
+  # Only verify the imported symbols in uninstrumented variants as some variants
+  # such as ASan / UBSan insert additional runtime dependencies.
+  if (!toolchain_variant.instrumented) {
+    deps += [ ":magma_verify_imported_symbols" ]
+  }
+}

@@ -1,0 +1,1 @@
+../../bazel_sdk/bazel_rules_fuchsia/fuchsia/workspace/sdk_templates/generate_sdk_build_rules.bzl

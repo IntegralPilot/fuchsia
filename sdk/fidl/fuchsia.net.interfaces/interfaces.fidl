@@ -1,0 +1,252 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=7)
+library fuchsia.net.interfaces;
+
+using fuchsia.hardware.network;
+using fuchsia.net;
+using zx;
+
+/// The maximum length of an interface name.
+// `sizeof((struct ifreq).ifr_name) == 16`; the last byte is reserved for the
+// null terminator.
+const INTERFACE_NAME_LENGTH uint8 = 15;
+
+/// An interface name as a sequence of bytes.
+alias Name = string:INTERFACE_NAME_LENGTH;
+
+// TODO(https://fxbug.dev/42159332): Use built-in empty struct when available.
+type Empty = struct {};
+
+/// Information about the preferred lifetime of an IP address or delegated
+/// prefix.
+@available(added=9)
+@strict_audit(bug="https://fxbug.dev/467128725", state="PENDING_REVIEW")
+type PreferredLifetimeInfo = strict union {
+    /// The end of the preferred lifetime.
+    ///
+    /// The address/prefix should *not* be considered deprecated if `zx.Time`
+    /// is in the past. `preferred_until` is exchanged as a means to inform
+    /// the deadline where deprecation is expected to happen.
+    ///
+    /// The preferred lifetime of addresses is defined in
+    /// [RFC 4862, section 2](https://tools.ietf.org/html/rfc4862#section-2).
+    ///
+    /// Addresses configured using a delegated prefix must have a preferred
+    /// lifetime no longer than that of the prefix according to
+    /// [RFC 8415, section 6.3](https://datatracker.ietf.org/doc/html/rfc8415#section-6.3).
+    ///
+    /// Must be greater than 0. If `zx.Time.INFINITE`, the preferred lifetime
+    /// does not expire.
+    1: preferred_until zx.Time;
+
+    /// The address/prefix is deprecated.
+    ///
+    /// Deprecated addresses should no longer be used for initiating
+    /// new connections unless explicitly requested, or if no other
+    /// non-deprecated addresses are assigned (as described in
+    /// [RFC 4862, section 1](https://tools.ietf.org/html/rfc4862#section-1)).
+    ///
+    /// Addresses configured using a deprecated delegated prefix must also be
+    /// deprecated according to
+    /// [RFC 8415, section 6.3](https://datatracker.ietf.org/doc/html/rfc8415#section-6.3).
+    ///
+    /// An address/prefix can become undeprecated if its preferred lifetime is
+    /// extended.
+    2: deprecated Empty;
+};
+
+/// Assignment state of an IP address.
+@available(added=HEAD)
+type AddressAssignmentState = strict enum {
+    // TODO(https://fxbug.dev/42163322): Replace this comment with FIDL that
+    // actually reserves 0.
+    //
+    // The value of 0 is reserved and should never be added to avoid the
+    // ambiguity of 0 being the default integer value in some languages. See:
+    // https://fuchsia.dev/fuchsia-src/concepts/api/fidl#enum.
+
+    /// Address assignment is in progress, e.g. Duplicate Address Detection
+    /// is being performed. The address cannot be used when in this state
+    /// (cannot bind to it yet or receive packets destined to it).
+    ///
+    /// The Duplicate Address Detection mechanism is described in
+    /// [RFC 4862, section 5.4](https://tools.ietf.org/html/rfc4862#section-5.4)
+    TENTATIVE = 1;
+
+    /// The address is assigned to an interface.
+    ASSIGNED = 2;
+
+    /// The address is unavailable, e.g. if the interface holding the address
+    /// is offline.
+    UNAVAILABLE = 3;
+};
+
+/// Properties of a network interface.
+type Properties = table {
+    /// An opaque identifier for the interface. Its value will not be reused
+    /// even if the device is removed and subsequently re-added. Immutable.
+    1: id fuchsia.net.InterfaceId;
+    /// The addresses currently installed on the interface.
+    ///
+    /// Addresses are sorted on [`Address.addr`], and no two addresses can have
+    /// the same `Address.addr` value.
+    ///
+    /// Only assigned addresses are included unless the watcher was created with
+    /// [`WatcherOptions.include_non_assigned_addresses`] set to `true`.
+    2: addresses vector<@generated_name("Address") table {
+        /// The address and prefix length.
+        ///
+        /// Required.
+        1: addr fuchsia.net.Subnet;
+        /// The time after which the address will no longer be valid.
+        ///
+        /// Its value must be greater than 0. A value of `ZX_TIME_INFINITE`
+        /// indicates that the address will always be valid. The value is
+        /// derived from the monotonic clock.
+        ///
+        /// As a `zx.Time`, the value has
+        /// [monotonic clock semantics](https://fuchsia.dev/fuchsia-src/concepts/time/monotonic),
+        /// which implies that it has no meaning outside of the host on which it
+        /// was generated and no meaning across host restarts.
+        ///
+        /// Optional; may be omitted due to disinterest.
+        2: valid_until zx.Time;
+        /// Preferred lifetime information.
+        ///
+        /// Optional; may be omitted due to disinterest.
+        @available(added=9)
+        3: preferred_lifetime_info PreferredLifetimeInfo;
+        /// The address's assignment state.
+        ///
+        /// Required.
+        @available(added=HEAD)
+        4: assignment_state AddressAssignmentState;
+    }>:MAX;
+    /// The device is enabled and its physical state is online.
+    3: online bool;
+    /// Whether there is a default IPv4 route through this interface.
+    5: has_default_ipv4_route bool;
+    /// Whether there is a default IPv6 route through this interface.
+    6: has_default_ipv6_route bool;
+    /// The name of the interface. Immutable.
+    7: name Name;
+    /// The port class of the interface. Immutable.
+    @available(added=22)
+    8: port_class PortClass;
+    /// The KOID of the identity event vended out by the interface's backing
+    /// [`fuchsia.hardware.network/Port`].
+    ///
+    /// Callers may use this identifier to correlate port instances to installed
+    /// interfaces.
+    ///
+    /// Immutable. Present for interfaces backed by a
+    /// [`fuchsia.hardware.network/Port`], absent otherwise.
+    @available(added=HEAD)
+    9: port_identity_koid zx.Koid;
+};
+
+/// The port class of an interface.
+@available(added=22)
+type PortClass = flexible union {
+    /// The interface is loopback.
+    1: loopback Empty;
+    /// The interface's network device port class.
+    2: device fuchsia.hardware.network.PortClass;
+    /// The interface is a blackhole interface.
+    @available(added=HEAD)
+    3: blackhole Empty;
+};
+
+/// Network interface state inspection and observation.
+@discoverable
+closed protocol State {
+    /// Initialize a watcher for interface state.
+    ///
+    /// The server enqueues interface addition, deletion and property changes as
+    /// they occur, which can then be retrieved via the pipelined protocol.
+    ///
+    /// + request `options` specifies the behavior of the [`Watcher`].
+    /// + request `watcher` grants access to a [`Watcher`]. Closed if the queue
+    ///     cannot be allocated or if the queue is full when the server attempts
+    ///     to enqueue an event.
+    strict GetWatcher(resource struct {
+        /// Options for configuring the interface state watcher.
+        options @generated_name("WatcherOptions") table {
+            /// Bitfield for registering interest in address properties.
+            ///
+            /// Optional; interpreted as all bits set to 0 if not present.
+            @available(added=HEAD)
+            1: address_properties_interest flexible bits : uint64 {
+                VALID_UNTIL = 0x01;
+                PREFERRED_LIFETIME_INFO = 0x02;
+            };
+            /// Flag to determine if only assigned addresses are returned (where
+            /// the assignment state is [`AddressAssignmentState::Assigned`]) or
+            /// all addresses are returned.
+            ///
+            /// Optional; interpreted as false if not present.
+            @available(added=HEAD)
+            2: include_non_assigned_addresses bool;
+            /// If specified, only events pertaining the interface whose port
+            /// identity event matches the provided `port_identity_koid_filter`
+            /// are yielded.
+            ///
+            /// Optional; no port identity filtering is performed if absent.
+            @available(added=HEAD)
+            3: port_identity_koid_filter zx.Koid;
+            // TODO(https://fxbug.dev/42061481): Add bitfield for registering
+            // interest in the other interface property fields.
+        };
+        watcher server_end:Watcher;
+    });
+};
+
+/// Observer protocol for changes to network interfaces (addition, deletion, and
+/// interface property changes).
+closed protocol Watcher {
+    /// Hanging get for an interface addition/deletion change.
+    ///
+    /// Clients should only have one call of this method at a time; a second
+    /// call to this method while a call is already pending will cause the
+    /// server end of the protocol to be closed.
+    ///
+    /// If there are N interfaces present at the time the server end of the
+    /// protocol is initialized, then the first N invocations of this method
+    /// will return [`Event.existing`] followed by a single [`Event.idle`]
+    /// indicating that all existing interfaces have been sent. Subsequent calls
+    /// will immediately return if there is a change to be reported, or block
+    /// until a change occurs.
+    ///
+    /// The server may choose to coalesce property change events, e.g. when
+    /// multiple independent property changes occur. As a result, clients cannot
+    /// assume that the order in which they observe the interface changes is the
+    /// order in which the changes occurred.
+    ///
+    /// - response `event` the interface change event.
+    strict Watch() -> (struct {
+        event
+                @strict_audit(bug="https://fxbug.dev/467128725", state="PENDING_REVIEW")
+                strict union {
+            /// Properties of an interface that existed when watching started.
+            ///
+            /// All interested fields and [`Properties.id`] are set.
+            1: existing Properties;
+            /// Properties of an interface that was added while watching.
+            ///
+            /// All interested fields and [`Properties.id`] are set.
+            2: added Properties;
+            /// ID of an interface that was removed while watching.
+            3: removed fuchsia.net.InterfaceId;
+            /// Properties of an interface that changed while watching.
+            ///
+            /// Only [`Properties.id`] and interested fields which have changed
+            /// are set with the new values.
+            4: changed Properties;
+            /// Sentinel value indicating no more [`existing`] events will be
+            /// sent.
+            5: idle Empty;
+        };
+    });
+};

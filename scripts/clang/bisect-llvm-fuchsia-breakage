@@ -1,0 +1,81 @@
+#!/bin/bash
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+set -e
+set -o pipefail
+
+function usage {
+  cat <<EOF
+Usage: $(basename "$0") <toolchain_builder> <fuchsia_builder>
+
+Description:
+  This script is intended to be used with 'git bisect run' to find the
+  LLVM commit that introduced a breakage in a Fuchsia build.
+  It uses led to build a toolchain at the current LLVM commit, then
+  uses led to launch a Fuchsia build using that toolchain, and reports
+  the Fuchsia build status back to git bisect.
+
+Arguments:
+  <toolchain_builder>  (e.g., clang-linux-x64)
+  <fuchsia_builder>    (e.g., core.x64)
+
+Examples:
+  # Run the script directly (e.g., for testing)
+  $(basename "$0") clang-linux-x64 core.x64
+
+  # Use with git bisect run
+  git bisect start
+  git bisect bad <commit-where-breakage-occurs>
+  git bisect good <commit-before-breakage>
+  git bisect run $(basename "$0") clang-linux-x64 core.x64
+EOF
+} # end usage
+
+if [[ "$#" -ne 2 ]]; then
+  echo "Error: Incorrect number of arguments." >&2
+  usage
+  exit 125
+fi
+
+readonly TOOLCHAIN_BUILDER=$1
+readonly FUCHSIA_BUILDER=$2
+
+# Get the current LLVM commit hash. This script is intended to be run
+# from within the LLVM repository during a git bisect session.
+readonly LLVM_COMMIT="$(git rev-parse HEAD)"
+echo "Current LLVM commit: $LLVM_COMMIT"
+
+echo "Building toolchain using $TOOLCHAIN_BUILDER at LLVM commit $LLVM_COMMIT..."
+
+readonly DIRNAME="$(dirname "$0")"
+
+# Launch the toolchain build at the specific LLVM commit and wait for its CAS digest.
+# We replicate the led-try-head launch logic but pipe the output of led launch
+# to led-wait-for-cas to get the digest.
+TOOLCHAIN_DIGEST="$(
+  led get-builder fuchsia/toolchain.ci:$TOOLCHAIN_BUILDER | \
+    led edit -pa revision="$LLVM_COMMIT" | \
+    led launch | \
+    "$DIRNAME/led-wait-for-cas"
+)"
+
+# Check if we successfully obtained a digest. led-wait-for-cas exits non-zero
+# on failure, which set -e will catch, but an explicit check is also good.
+if [[ -z "$TOOLCHAIN_DIGEST" ]]; then
+  echo "error: failed to get toolchain CAS digest from led-wait-for-cas"
+  exit 125
+fi
+
+echo "Toolchain built successfully. CAS digest: $TOOLCHAIN_DIGEST"
+echo "Launching Fuchsia build using $FUCHSIA_BUILDER with this toolchain..."
+
+# TODO(https://fxbug.dev/447666217): differentiate between expected vs
+# unexpected failures when checking the status of the fuchsia build.
+
+# Run led-launch-fuchsia with the Fuchsia builder and the captured digest,
+# and pipe the output (build ID) to led-wait-for-status to wait for the build
+# and get its exit status for git bisect run.
+"$DIRNAME/led-launch-fuchsia" "$FUCHSIA_BUILDER" "$TOOLCHAIN_DIGEST" \
+  | "$DIRNAME/led-wait-for-status"

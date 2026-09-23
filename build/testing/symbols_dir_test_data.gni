@@ -1,0 +1,95 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/testing/host_test_data.gni")
+import("//build/toolchain/rbe.gni")
+import("//build/zircon/c_utils.gni")
+import("//sdk/lib/c/libc_toolchain.gni")
+
+# Produces a directory of debug symbols for the given deps wrapped in
+# host_test_data().
+#
+# Arguments
+#
+#    output_dir (required)
+#      a path to an output directory for all of the symbols, will be wiped if it already exists.
+#
+#    deps (required)
+#      labels for which symbols will be collected
+template("symbols_dir_test_data") {
+  assert(defined(invoker.output_dir))
+  _output_dir = invoker.output_dir
+  assert(defined(invoker.deps))
+  _deps_needing_symbols = invoker.deps
+
+  _copy_unstripped_target = "${target_name}_copy_unstripped"
+  _rspfile_target = "${target_name}_rspfile"
+
+  host_test_data(target_name) {
+    sources = [ _output_dir ]
+    deps = [ ":${_copy_unstripped_target}" ]
+  }
+
+  _unstripped_binaries_list_file = "$target_gen_dir/unstripped_binaries.list"
+  _copy_unstripped_stamp_file = "$target_out_dir/copy_unstripped_binaries.stamp"
+
+  # This action takes the output of the link_output_rspfile target and copies
+  # them into the $symbol_dir directory.
+  action(_copy_unstripped_target) {
+    testonly = true
+    script = "//build/testing/copy_unstripped_binaries.py"
+
+    inputs = [
+      _unstripped_binaries_list_file,
+      "//build/python/modules/elf/elfinfo.py",
+    ]
+    deps = [ ":${_rspfile_target}" ]
+
+    outputs = [ _copy_unstripped_stamp_file ]
+
+    # depfile lists the copied files so the action is hermetic.
+    depfile = "$target_out_dir/copy_unstripped_binaries.d"
+
+    args = [
+      rebase_path(_unstripped_binaries_list_file, root_build_dir),
+      rebase_path(_output_dir, root_build_dir),
+      rebase_path(depfile, root_build_dir),
+
+      # To also copy libc.so.debug, we should be able to add
+      # |sysroot_libc_target| to the deps of link_output_rspfile below and reuse
+      # the same logic. However, that target is not visible to us. As a
+      # workaround, we can tell the copy_unstripped_binaries.py script where the
+      # unstripped libc is and the script could create the dependency in its
+      # depfile.
+      rebase_path(sysroot_libc_unstripped, root_build_dir),
+      rebase_path(_copy_unstripped_stamp_file, root_build_dir),
+    ]
+
+    # When fetching of unstripped binaries is delayed,
+    # use dlwrap to explicitly fetch them just-in-time.
+    if (!rust_rbe_download_unstripped_binaries) {
+      inputs += [ script ] + rbe_dlwrap_inputs
+      _args = [
+                "--download_list",
+                rebase_path(_unstripped_binaries_list_file, root_build_dir),
+                "--",
+                rebase_path(python_exe_src, root_build_dir),
+                "-S",
+                rebase_path(script, root_build_dir),
+              ] + args
+      deps += [ "//build/rbe:dlwrap" ]
+      script = rbe_dlwrap
+      args = []
+      args = _args
+    }
+  }
+
+  # This action generates a file that contains a list of all unstripped binaries
+  # (symbol files) that get linked in its dependency.
+  link_output_rspfile(_rspfile_target) {
+    testonly = true
+    outputs = [ _unstripped_binaries_list_file ]
+    deps = _deps_needing_symbols
+  }
+}

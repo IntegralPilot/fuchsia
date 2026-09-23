@@ -1,0 +1,120 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/host.gni")
+import("//build/product.gni")
+import("//build/python/python_action.gni")
+
+# Declares metadata for a set of tests and the product bundle to run them on.
+#
+# By default tests will run on the default product bundle from the build.
+# With multi-product builds, we may want to target a specific non-default
+# product bundle for a set of tests.
+
+# We can now use this GN template for declaring this desire.
+
+# product_bundle_test_group("target") {
+#   product_bundle_name = "foo"
+#   tests = [ ... ]
+# }
+
+#
+# Parameters:
+#
+#   tests (optional; default=[])
+#     DEPRECATED: prefer target_tests or host_tests
+#     [list] List of targets to walk to find test specs.
+#
+#   target_tests (optional; default=[])
+#     [list] List of target targets to walk to find test specs.
+#     Either this or host_tests must be defined.
+#
+#   host_tests (optional; default=[])
+#     [list] List of host targets to walk to find test specs.
+#     Either this or target_tests must be defined.
+#
+#   product_bundle (optional)
+#     [label] The product_bundle target to run the tests against.
+#     This is preferred over `product_bundle_name`.
+#
+#   product_bundle_name (optional; default = target_name)
+#     [str] The name of the product bundle to assign the tests to.
+#     DEPRECATED: Use `product_bundle` instead.
+#
+#   environments (optional; default = [])
+#     [list of scopes] The environments to run these tests on.
+#     See //docs/contribute/testing/environments.md.
+#
+template("product_bundle_test_group") {
+  assert(defined(invoker.tests) || defined(invoker.target_tests) ||
+             defined(invoker.host_tests),
+         "Either 'tests' or 'target_tests' or 'host_tests' must be defined")
+  assert(
+      !(defined(invoker.product_bundle) && defined(invoker.product_bundle_name)),
+      "Cannot define both 'product_bundle' and 'product_bundle_name) in ${target_name}")
+
+  # The test_spec should always be generate in the default toolchain even if
+  # these are e2e (host) tests, because we want to avoid accidentally creating
+  # two test specs for the same test.
+  if (is_host) {
+    group(target_name) {
+      testonly = true
+      not_needed(invoker, "*")
+      public_deps = [ ":${target_name}($default_toolchain)" ]
+    }
+  } else {
+    _product_bundle_deps = []
+    if (defined(invoker.product_bundle)) {
+      # The name of the product bundle is the name of the target.
+      _product_bundle_name = get_label_info(invoker.product_bundle, "name")
+      _product_bundle_deps += [ invoker.product_bundle ]
+    } else if (defined(invoker.product_bundle_name)) {
+      _product_bundle_name = invoker.product_bundle_name
+    } else {
+      # The default product_bundle_name is the target_name.
+      _product_bundle_name = target_name
+    }
+
+    _environments = []
+    if (defined(invoker.environments)) {
+      _environments = invoker.environments
+    }
+
+    _tests_json = "${target_out_dir}/${target_name}/tests.json"
+
+    generated_file(target_name) {
+      testonly = true
+      data_keys = [ "tests" ]
+      walk_keys = [ "tests_barrier" ]
+      outputs = [ _tests_json ]
+      output_conversion = "json"
+
+      deps = _product_bundle_deps
+      if (defined(invoker.tests)) {
+        deps += invoker.tests
+      }
+      if (defined(invoker.target_tests)) {
+        deps += invoker.target_tests
+      }
+      if (defined(invoker.host_tests)) {
+        foreach(host_test, invoker.host_tests) {
+          host_test_label = get_label_info(host_test, "label_no_toolchain") +
+                            "($host_toolchain)"
+          deps += [ host_test_label ]
+        }
+      }
+
+      metadata = {
+        tests_barrier = []
+        pb_test_groups = [
+          {
+            product_bundle_name = _product_bundle_name
+            environments = _environments
+            tests_json = rebase_path(_tests_json, root_build_dir)
+          },
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,373 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/toolchain/rbe_modes.gni")
+
+# Defines the configuration of RBE and related global variables.
+
+_host_platform = "${host_os}-${host_cpu}"
+
+# Prebuilt RBE binaries
+rbe_common_tools = [
+  "//prebuilt/third_party/reclient/${_host_platform}/bootstrap",
+  "//prebuilt/third_party/reclient/${_host_platform}/reproxy",
+  "//prebuilt/third_party/reclient/${_host_platform}/rewrapper",
+]
+
+rewrapper_config_file = "//build/rbe/fuchsia-rewrapper.cfg"
+reproxy_config_file = "//build/rbe/fuchsia-reproxy.cfg"
+rbe_metrics_summary_script = "//build/rbe/rbe_metrics_summary_json.sh"
+
+declare_args() {
+  ############################
+  ### General RBE controls ###
+  ############################
+
+  # Additional reproxy configuration files.
+  # These are effectively concatenated with the main `reproxy_config_file`
+  # in order of appearance.  Settings in later files in this list take
+  # precedence over those earlier in the list.
+  rbe_extra_reproxy_configs = []
+
+  # By default our RBE wrappers record the digest of remote action outputs
+  # in an xattr to save tools from having to re-hashing these files.
+  # In circumstances where xattr cannot be used (e.g. FUSE limitations),
+  # set this to True to disable use of xattr.
+  disable_xattr_for_rbe = false
+}
+
+rbe_common_configs = [
+                       rewrapper_config_file,
+                       reproxy_config_file,
+                     ] + rbe_extra_reproxy_configs
+
+# Toolchain-agnostic RBE scripts and configuration.
+# This is used by both the shell and Python implementations.
+rbe_common_scripts = [ "//build/rbe/fuchsia-reproxy-wrap.sh" ]
+
+rbe_common_py_scripts = [
+  "//build/rbe/remote_action.py",
+  "//build/rbe/cl_utils.py",
+  "//build/rbe/depfile.py",
+  "//build/rbe/fuchsia.py",
+  "//build/rbe/linker.py",
+  "//build/rbe/output_leak_scanner.py",
+]
+
+# `log-it.sh LOGFILE -- command`
+# is the same as `command >& LOGFILE`
+# but without using the redirection operator.
+log_it_script = "//build/rbe/log-it.sh"
+
+rustc_remote_wrapper = "//build/rbe/rustc_remote_wrapper.py"
+
+# Dependencies for all RBE-enabled rust actions.
+rust_rbe_deps =
+    rbe_common_tools + rbe_common_scripts + rbe_common_py_scripts + [
+      # prebuilt_tool_remote_wrapper is needed for remote stripping binaries,
+      # which is a second remote action inside a rust executable action,
+      # in build/toolchain/clang_toolchain.gni.
+      "//build/rbe/prebuilt_tool_remote_wrapper.py",
+      "//build/rbe/rustc.py",
+      rustc_remote_wrapper,
+    ]
+
+cxx_remote_wrapper = "//build/rbe/cxx_remote_wrapper.py"
+cxx_link_remote_wrapper = "//build/rbe/cxx_link_remote_wrapper.py"
+
+# Lower overhead, simpler wrapper.
+cxx_remote_wrapper_minimalist = "//build/rbe/reclient_cxx.sh"
+
+prebuilt_tool_remote_wrapper = "//build/rbe/prebuilt_tool_remote_wrapper.py"
+
+rbe_dlwrap = "//build/rbe/dlwrap.py"
+rbe_dlwrap_inputs =
+    [
+      "//prebuilt/third_party/reclient/${_host_platform}/remotetool",
+      reproxy_config_file,
+    ] + rbe_extra_reproxy_configs
+
+declare_args() {
+  #########################
+  ### Rust RBE controls ###
+  #########################
+
+  # Set to true to enable distributed compilation of Rust using RBE.
+  rust_rbe_enable = rbe_settings.rust_enable
+
+  # One of:
+  #
+  #   * "remote": Execute action remotely on cache miss.
+  #         The remote cache is always updated with this result.
+  #
+  #   * "local": Lookup action in the remote cache, but execute action
+  #         locally on cache miss.  The locally produced result is
+  #         not uploaded to the remote cache.
+  #
+  #   * "remote_local_fallback": Execute action remotely first.
+  #         If that fails, run locally instead.  The locally produced
+  #         results are not uploaded to the remote cache.
+  #
+  #   * "racing": Race local vs. remote execution, take the first to finish.
+  #
+  #   * "nocache": Force remote execution without using cached results.
+  #         This can be useful for benchmarking cache-miss scenarios.
+  #
+  #   (There are other rewrapper options that are not exposed.)
+  rust_rbe_exec_strategy = rbe_settings.rust_exec_strategy
+
+  # Run one of the more expensive checks, intended for CI.
+  # All of these require rust_rbe_enable=true.
+  #
+  # One of:
+  #
+  #   * "none": No additional check.
+  #
+  #   * "determinism":
+  #       Check of determinism of rustc targets by running locally twice
+  #       and comparing outputs, failing if any differences are found.
+  #       Even though this check doesn't involve RBE, it uses the same
+  #       wrapper script, which knows what output files to expect and
+  #       compare.
+  #
+  #       Build outputs that depend on time are discouraged because they
+  #       impact caching.
+  #       If your result depends on the current time, this check will
+  #       definitely fail.  If it depends on only the date, there is still
+  #       a nonzero chance of failure, if the rerun falls on the next day.
+  #
+  #   * "consistency":
+  #       Check consistency between local and remote rust compiles,
+  #       by running both and comparing results.
+  #
+  rust_rbe_check = "none"
+
+  # Controls whether or not to download (often large) unstripped Rust
+  # binaries.  When downloading is disabled, the build produces stubs
+  # that be used to retrieve remote artifacts later using build/rbe/dlwrap.py.
+  # TODO(b/284994230): This option is only available to developers,
+  # and not restricted environments that lack direct network access.
+  rust_rbe_download_unstripped_binaries =
+      rbe_settings.rust_download_unstripped_binaries
+
+  # TODO(b/42084033): Controls whether or not to download (intermediate)
+  # rlibs from remote Rust build actions.
+  rust_rbe_download_rlibs = rbe_settings.rust_download_rlibs
+
+  ########################
+  ### C++ RBE controls ###
+  ########################
+
+  # Set to true to enable distributed compilation of C++ using RBE.
+  # Remote execution offers increased build parallelism and caching.
+  cxx_rbe_enable = rbe_settings.cxx_enable
+
+  # Set to true to use a fast, minimalist wrapper, that lacks features
+  # of the python-based wrapper, and is close to a bare call to rewrapper.
+  # This flag is only meaningful when `cxx_rbe_enable` is true.
+  cxx_rbe_minimalist_wrapper = rbe_settings.cxx_minimalist_wrapper
+
+  # One of:
+  #
+  #   * "remote": Execute action remotely on cache miss.
+  #         The remote cache is always updated with this result.
+  #
+  #   * "local": Lookup action in the remote cache, but execute action
+  #         locally on cache miss.  The locally produced result is
+  #         not uploaded to the remote cache.
+  #
+  #   * "remote_local_fallback": Execute action remotely first.
+  #         If that fails, run locally instead.  The locally produced
+  #         results are not uploaded to the remote cache.
+  #
+  #   * "racing": Race local vs. remote execution, take the first to finish.
+  #
+  #   * "nocache": Force remote execution without using cached results.
+  #         This can be useful for benchmarking cache-miss scenarios.
+  #
+  #   (There are other rewrapper options that are not exposed.)
+  cxx_rbe_exec_strategy = rbe_settings.cxx_exec_strategy
+
+  # Run one of the more expensive checks, intended for CI.
+  # All of these require cxx_rbe_enable=true.
+  #
+  # One of:
+  #
+  #   * "none": No additional check.
+  #
+  #   * "determinism":
+  #       Check of determinism of C++ targets by running locally twice
+  #       and comparing outputs, failing if any differences are found.
+  #       Even though this check doesn't involve RBE, it uses the same
+  #       wrapper script, which knows what output files to expect and
+  #       compare.
+  #
+  #       Build outputs that depend on time are discouraged because they
+  #       impact caching.  Known bad preprocessing macros include
+  #       __DATE__ and __TIME__.
+  #
+  #   * "consistency":
+  #       Check consistency between local and remote C++ compiles,
+  #       by running both and comparing results.
+  #
+  cxx_rbe_check = "none"
+
+  # reclient owns the logic for deciding what inputs are needed for
+  # remote compilation, but in some cases, it may fall behind
+  # upstream toolchain development.
+  # This option forces the *entire* toolchain directory to be included
+  # as an input, which is generally guaranteed to work as it bears
+  # no assumptions about how the toolchain works, but it comes at the
+  # cost of performance overhead.
+  # Use this primarily for debugging and as an emergency workaround.
+  cxx_rbe_full_toolchain = false
+
+  # When any of the {Rust,C++} {determinism,consistency} checks fail,
+  # copy the artifacts' difference-pairs to this directory for exporting
+  # from infra builds, and later inspection.
+  comparison_diagnostics_dir = "$root_build_dir/comparison-reports"
+
+  # Controls whether or not to download intermediate .o files.
+  # When downloading is disabled, the build produces stubs
+  # that be used to retrieve remote artifacts later using build/rbe/dlwrap.py.
+  # TODO(b/284994230): This option is only available to developers,
+  # and not restricted environments that lack direct network access.
+  cxx_rbe_download_obj_files = rbe_settings.cxx_download_objects
+
+  ############################
+  ### Linking RBE controls ###
+  ############################
+
+  # Set to true to enable remote linking using RBE.
+  # This covers actions that use `ar`, or use `clang` to drive
+  # linkers like `lld`.
+  link_rbe_enable = rbe_settings.link_enable
+
+  # One of:
+  #
+  #   * "remote": Execute action remotely on cache miss.
+  #         The remote cache is always updated with this result.
+  #
+  #   * "local": Lookup action in the remote cache, but execute action
+  #         locally on cache miss.  The locally produced result is
+  #         not uploaded to the remote cache.
+  #
+  #   * "remote_local_fallback": Execute action remotely first.
+  #         If that fails, run locally instead.  The locally produced
+  #         results are not uploaded to the remote cache.
+  #
+  #   * "racing": Race local vs. remote execution, take the first to finish.
+  #
+  #   * "nocache": Force remote execution without using cached results.
+  #         This can be useful for benchmarking cache-miss scenarios.
+  #
+  #   (There are other rewrapper options that are not exposed.)
+  link_rbe_exec_strategy = rbe_settings.link_exec_strategy
+
+  # Run one of the more expensive checks, intended for CI.
+  # All of these require link_rbe_enable=true.
+  #
+  # One of:
+  #
+  #   * "none": No additional check.
+  #
+  #   * "determinism":
+  #       Check of determinism of linking by running locally twice
+  #       and comparing outputs, failing if any differences are found.
+  #       Even though this check doesn't involve RBE, it uses the same
+  #       wrapper script, which knows what output files to expect and
+  #       compare.
+  #
+  #   * "consistency":
+  #       Check consistency between local and remote link actions,
+  #       by running both and comparing results.
+  #
+  link_rbe_check = "none"
+
+  # reclient owns the logic for deciding what inputs are needed for
+  # remote linking, but in some cases, it may fall behind
+  # upstream toolchain development.
+  # This option forces the *entire* toolchain directory to be included
+  # as an input, which is generally guaranteed to work as it bears
+  # no assumptions about how the toolchain works, but it comes at the
+  # cost of performance overhead.
+  # Use this primarily for debugging and as an emergency workaround.
+  link_rbe_full_toolchain = false
+
+  # Controls whether or not to download (often large) unstripped linker
+  # outputs.  When downloading is disabled, the build produces stubs
+  # that be used to retrieve remote artifacts later using build/rbe/dlwrap.py.
+  link_rbe_download_unstripped_outputs =
+      rbe_settings.link_download_unstripped_binaries
+}
+
+RBE_EXEC_STRATEGY_MAP = {
+  remote = [ "--exec_strategy=remote" ]
+  remote_local_fallback = [ "--exec_strategy=remote_local_fallback" ]
+  local = [
+    "--exec_strategy=local",
+    "--remote_update_cache=false",
+  ]
+  racing = [ "--exec_strategy=racing" ]
+  nocache = [
+    "--exec_strategy=remote",
+    "--remote_accept_cache=false",
+  ]
+}
+
+# Dependencies for all RBE-enabled C++ actions.
+if (cxx_rbe_minimalist_wrapper) {
+  cxx_rbe_deps =
+      rbe_common_tools + rbe_common_scripts + [ cxx_remote_wrapper_minimalist ]
+} else {
+  cxx_rbe_deps =
+      rbe_common_tools + rbe_common_scripts + rbe_common_py_scripts + [
+        "//build/rbe/cxx.py",
+        cxx_remote_wrapper,
+      ]
+}
+
+cxx_link_rbe_deps =
+    rbe_common_tools + rbe_common_scripts + rbe_common_py_scripts + [
+      "//build/rbe/cxx.py",
+      cxx_link_remote_wrapper,
+    ]
+
+assert(rust_rbe_exec_strategy == "remote" ||
+           rust_rbe_exec_strategy == "remote_local_fallback" ||
+           rust_rbe_exec_strategy == "local" ||
+           rust_rbe_exec_strategy == "racing" ||
+           rust_rbe_exec_strategy == "nocache",
+       "Unsupported Rust RBE exec_strategy: \"$rust_rbe_exec_strategy\".")
+assert(
+    rust_rbe_check == "none" || rust_rbe_check == "consistency" ||
+        rust_rbe_check == "determinism",
+    "rust_rbe_check must be one of {none,consistency,determinism}, but got: ${rust_rbe_check}.")
+
+assert(
+    cxx_rbe_exec_strategy == "remote" || cxx_rbe_exec_strategy == "local" ||
+        cxx_rbe_exec_strategy == "remote_local_fallback" ||
+        cxx_rbe_exec_strategy == "racing" || cxx_rbe_exec_strategy == "nocache",
+    "Unsupported C++ RBE exec_strategy: \"$cxx_rbe_exec_strategy\".")
+
+assert(
+    cxx_rbe_check == "none" || cxx_rbe_check == "consistency" ||
+        cxx_rbe_check == "determinism",
+    "cxx_rbe_check must be one of {none,consistency,determinism}, but got: ${cxx_rbe_check}.")
+
+assert(
+    cxx_rbe_download_obj_files || !cxx_rbe_minimalist_wrapper,
+    "Skipping downloading .o files is only available with the non-minimalist cxx_remote_wrapper.py wrapper.  Set cxx_rbe_minimalist_wrapper=false if this is what you intended.")
+
+assert(
+    link_rbe_exec_strategy == "remote" || link_rbe_exec_strategy == "local" ||
+        link_rbe_exec_strategy == "remote_local_fallback" ||
+        link_rbe_exec_strategy == "racing" ||
+        link_rbe_exec_strategy == "nocache",
+    "Unsupported link RBE exec_strategy: \"$link_rbe_exec_strategy\".")
+
+assert(
+    link_rbe_check == "none" || link_rbe_check == "consistency" ||
+        link_rbe_check == "determinism",
+    "link_rbe_check must be one of {none,consistency,determinism}, but got: ${link_rbe_check}.")

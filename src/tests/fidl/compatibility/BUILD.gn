@@ -1,0 +1,231 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/export_fuchsia_package_to_bazel.gni")
+import("//build/components.gni")
+import("//build/rust/rustc_binary.gni")
+
+# Shared between the hlcpp test server and the test harness.
+source_set("hlcpp_client_app") {
+  testonly = true
+  visibility = [
+    ":*",
+    "hlcpp:*",
+  ]
+  sources = [
+    "hlcpp_client_app.cc",
+    "hlcpp_client_app.h",
+  ]
+
+  deps = [
+    "fidl:fidl_service_hlcpp",
+    "//sdk/lib/sys/cpp",
+    "//zircon/system/ulib/zx",
+  ]
+}
+
+# Categories of behaviors to be tested for compatibility.
+fidl_compatibility_tests_categories = [
+  "minimal",
+  "struct",
+  "array",
+  "vector",
+  "table",
+  "union",
+]
+
+# Binding implementations under test.
+# LINT.IfChange
+fidl_compatibilty_test_impls = [
+  "cpp",
+  "hlcpp",
+  "go",
+  "llcpp",
+  "rust",
+]
+
+# LINT.ThenChange(test_driver.rs)
+
+rustc_binary("test_driver_bin") {
+  testonly = true
+  output_name = "test_driver"
+  edition = "2024"
+  source_root = "test_driver.rs"
+
+  deps = [
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-component",
+    "//src/tests/fidl/compatibility/fidl:fidl_service_rust",
+    "//third_party/rust_crates:futures",
+  ]
+
+  sources = [ "test_driver.rs" ]
+}
+
+# This loop will generate the following:
+#
+# - A test-running component for each category. This is meant to be used by the in-tree test
+#   package in charge of executing all tests.
+#
+# - A harness package containing the test for each category. This can be used OOT in a similar
+#   fashion to the in-tree approach to test a FIDL binding implementation against other
+#   implementations.
+#
+# These lists will contain the labels for the test components and the harness
+# packages.
+test_component_labels = []
+test_harness_labels = []
+foreach(test, fidl_compatibility_tests_categories) {
+  # Harness related
+  #
+  # NOTE: The harness package target names are known to the terminal
+  # product configuration, and directly used by it.
+  #
+  harness_package_name = "fidl-compatibility-${test}-harness"
+  generate_harness_label = "generate_${test}_harness"
+  generate_harness_output = "${target_gen_dir}/${test}_harness.cml"
+  harness_component_label = "${test}_harness_component"
+  harness_package_label = "${harness_package_name}_pkg"
+  gnerate_harness_label = "generate_${test}_harness"
+  executable_name = "${test}_harness_executable"
+  output = "${test}_harness_output"
+
+  # Test component related
+  component_name = "fidl_compatibility_test_${test}"
+  component_label = "${component_name}_component"
+  generate_test_label = "generate_${test}"
+
+  # Build the test runner binary for this test category.
+  executable(executable_name) {
+    output_name = output
+
+    testonly = true
+
+    sources = [
+      "${test}_test.cc",
+      "helpers.cc",
+      "helpers.h",
+    ]
+
+    deps = [
+      ":hlcpp_client_app",
+      "fidl:fidl_service_cpp",
+      "fidl:fidl_service_hlcpp",
+      "//sdk/lib/async-default",
+      "//sdk/lib/async-loop:async-loop-cpp",
+      "//sdk/lib/async-loop:async-loop-default",
+      "//sdk/lib/component/incoming/cpp",
+      "//sdk/lib/sys/component/cpp/testing:cpp",
+      "//sdk/lib/sys/cpp",
+      "//src/lib/files",
+      "//src/lib/fxl",
+      "//src/lib/fxl/test:test_settings",
+      "//third_party/googletest:gtest",
+      "//third_party/re2",
+    ]
+  }
+
+  # Generate the test harness CML.
+  fuchsia_test_component_manifest(generate_harness_label) {
+    metadata = {
+      test_component_manifest_cml = [
+        {
+          include = [ "//src/tests/fidl/compatibility/meta/harness.shard.cml" ]
+          program = {
+            binary = "bin/$output"
+
+            # TODO(https://fxbug.dev/42077626): do not hardcode this here. These args must come from
+            # structured config and will look different in-tree and OOT. For
+            # now, we hardcode it given that there's no support for structured
+            # config values for components using a test runner.
+            args = fidl_compatibilty_test_impls
+          }
+        },
+      ]
+    }
+  }
+  generate_harness_output = get_target_outputs(":$generate_harness_label")
+  generate_harness_output = generate_harness_output[0]
+
+  generate_harness_manifest_compile = "${generate_harness_label}_compile"
+  fuchsia_component_manifest(generate_harness_manifest_compile) {
+    testonly = true
+    component_name = "harness"
+    manifest = "${generate_harness_output}"
+    deps = [ ":${generate_harness_label}" ]
+  }
+
+  fuchsia_component(harness_component_label) {
+    testonly = true
+    component_name = "harness"
+    cm_label = ":${generate_harness_manifest_compile}"
+    deps = [ ":${executable_name}" ]
+
+    # We need to disable this. The realm builder server and collection are
+    # created in the test root. The reasoning for this is to be able to resolve
+    # the subpackages which are part of the test package, but not part of the
+    # harness package.
+    check_includes = false
+  }
+
+  fuchsia_package(harness_package_label) {
+    testonly = true
+    package_name = "${harness_package_name}"
+    deps = [ ":${harness_component_label}" ]
+  }
+
+  export_fuchsia_package_to_bazel("${harness_package_label}.bazel_input") {
+    testonly = true
+    package = ":${harness_package_label}"
+  }
+
+  test_harness_labels += [ ":${harness_package_label}" ]
+
+  fuchsia_test_component_manifest(generate_test_label) {
+    metadata = {
+      test_component_manifest_cml = [
+        {
+          include = [ "//src/tests/fidl/compatibility/meta/test.shard.cml" ]
+          children = [
+            {
+              name = "harness"
+              url = "${harness_package_name}#meta/harness.cm"
+            },
+          ]
+        },
+      ]
+    }
+  }
+  generate_test_output = get_target_outputs(":$generate_test_label")
+  generate_test_output = generate_test_output[0]
+
+  # Define the test component for this category.
+  fuchsia_test_component(component_label) {
+    visibility = [ ":*" ]
+    component_name = component_name
+    manifest = generate_test_output
+    manifest_deps = [ ":$generate_test_label" ]
+    deps = [ ":test_driver_bin" ]
+
+    # We manually create a realm builder topology due to our needs of the server
+    # living in the root, while the collection being in the harness.
+  }
+
+  # Save the component label, so that it may be included as a dependency of the
+  # test package.
+  test_component_labels += [ ":${component_label}" ]
+}
+
+fuchsia_test_package("fidl_compatibility_test_package") {
+  package_name = "fidl-compatibility-test"
+  subpackages =
+      [ "//src/lib/fuchsia-component-test/realm_builder_server:pkg" ] +
+      fidl_compatibilty_test_impls + test_harness_labels
+  test_components = test_component_labels
+}
+
+group("compatibility") {
+  testonly = true
+  deps = [ ":fidl_compatibility_test_package" ]
+}

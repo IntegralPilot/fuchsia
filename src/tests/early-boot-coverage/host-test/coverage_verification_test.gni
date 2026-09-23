@@ -1,0 +1,160 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/go/go_test.gni")
+import("//build/zircon/c_utils.gni")
+import("//src/storage/fshost/generated_fshost_config.gni")
+
+template("coverage_verification_test") {
+  instrumented_binary_label = "${target_name}.binary-instrumented"
+  instrumented_binary_link_rsp_action =
+      "${target_name}.instrumented_binary_link_rsp"
+  instrumented_binary_rsp_file =
+      "${target_out_dir}/${target_name}.binary-instrumented.rsp"
+  link_output_rspfile(instrumented_binary_link_rsp_action) {
+    testonly = true
+    deps = [ "${invoker.instrumented_target}" ]
+    outputs = [ instrumented_binary_rsp_file ]
+  }
+
+  instrumented_binary_path =
+      "$target_out_dir/${target_name}.binary-instrumented"
+  instrumented_binary_copy_action = "${target_name}.instrumented_binary_copy"
+  action(instrumented_binary_copy_action) {
+    testonly = true
+    sources = [ instrumented_binary_rsp_file ]
+    deps = [ ":${instrumented_binary_link_rsp_action}" ]
+    script = "//src/tests/coverage/copy_coverage_test_binary.py"
+    outputs = [ instrumented_binary_path ]
+    depfile = "${outputs[0]}.d"
+    args = [
+      "--input",
+      rebase_path(sources[0], root_build_dir),
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+  }
+
+  host_test_data(instrumented_binary_label) {
+    sources = [ instrumented_binary_path ]
+    deps = [
+      ":${instrumented_binary_copy_action}",
+      "${invoker.instrumented_target}",
+    ]
+  }
+
+  instrumented_binary_rebased_path =
+      rebase_path(instrumented_binary_path, root_build_dir)
+
+  product_bundle_name = get_label_info(invoker.product_bundle, "name")
+  product_bundle_dir =
+      get_label_info(invoker.product_bundle, "target_out_dir") + "/" +
+      product_bundle_name
+
+  # Host test data for the product bundle.
+  system_image_label = "${target_name}.system-images"
+  host_test_data(system_image_label) {
+    sources = [ product_bundle_dir ]
+    deps = [ invoker.product_bundle ]
+  }
+
+  assert(defined(invoker.expectations) && invoker.expectations != [])
+
+  # List of sources that need to be provided as input for a host test data, that
+  # is used for llvm-cov invocations.
+  expectation_sources_path = []
+
+  new_expectations = []
+  foreach(expectation, invoker.expectations) {
+    expectation_sources_path += [ expectation.source ]
+
+    # Rebase the expecatations such that they can be resolved at runtime.
+    new_expectation = expectation
+    new_expectation.source = rebase_path(expectation.source, root_build_dir)
+    new_expectations += [ new_expectation ]
+  }
+
+  # List of sources to be provided to the test, such that they can be provided
+  # to llvm-cov invocations.
+  expectation_sources_label = "${target_name}.expectation_sources_label"
+  host_test_data(expectation_sources_label) {
+    sources = expectation_sources_path
+  }
+
+  # Configuration to be parsed by |coverage_verifier_test.go|.
+  test_config = {
+    # Binaries used for the test.
+    bin = {
+      simg2img_host_tool =
+          rebase_path("${host_out_dir}/test_data/storage/sparse/simg2img",
+                      root_build_dir)
+      llvm_profdata =
+          rebase_path("${clang_prefix}/llvm-profdata", root_build_dir)
+      llvm_cov = rebase_path("${clang_prefix}/llvm-cov", root_build_dir)
+      llvm_cxxfilt = rebase_path("${clang_prefix}/llvm-cxxfilt", root_build_dir)
+      ffx = rebase_path("${host_tools_dir}/ffx", root_build_dir)
+      zbi_host_tool = rebase_path("${host_out_dir}/zbi", root_build_dir)
+    }
+
+    _block_image = "fxfs.fastboot"
+    if (defined(invoker.block_image)) {
+      _block_image = invoker.block_image
+    }
+
+    # Test specific artifacts.
+    test = {
+      path = instrumented_binary_rebased_path
+      name = invoker.test_uri
+      block_image = _block_image
+    }
+
+    # Represents the validation to be performed on the coverage data.
+    expectations = new_expectations
+  }
+
+  # Config file to be embedded as host test data for the generated test target.
+  config_file_label = "$target_name.test_config"
+  output_config = "$root_out_dir/$config_file_label.json"
+  generated_file(config_file_label) {
+    outputs = [ output_config ]
+    contents = test_config
+    output_conversion = "json"
+  }
+
+  test_config_host_label = "$config_file_label.host-test-data"
+  host_test_data(test_config_host_label) {
+    sources = [ output_config ]
+    deps = [ ":$config_file_label" ]
+  }
+
+  extra_deps = []
+  if (defined(invoker.deps)) {
+    extra_deps = invoker.deps
+  }
+
+  # Instantiate the host interaction helper with the parameters and images
+  # generated for this target.
+  go_test(target_name) {
+    embed = [ "//src/tests/early-boot-coverage/host-test:lib" ]
+    non_go_deps = [
+                    ":$expectation_sources_label",
+                    ":$instrumented_binary_label",
+                    ":$system_image_label",
+                    ":$test_config_host_label",
+                    "//src/developer/ffx:test_data",
+                    "//src/developer/ffx/plugins/test:ffx_test_tool_test_data",
+                    "//src/tests/early-boot-coverage/host-test:coverage_tools",
+                    "//src/tests/early-boot-coverage/host-test:zbi",
+                  ] + extra_deps
+    args = [
+      "--emulator.pb-path",
+      rebase_path(product_bundle_dir, root_build_dir),
+      "-config",
+      rebase_path(output_config, root_build_dir),
+    ]
+  }
+}

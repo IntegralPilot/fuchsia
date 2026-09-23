@@ -1,0 +1,297 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/assembled_system.gni")
+import("//build/assembly/product_assembly_configuration.gni")
+import("//build/assembly/product_bundle.gni")
+import("//build/board.gni")
+import("//build/images/args.gni")
+import("//build/product.gni")
+import("//build/testing/boot_tests/zbi_test.gni")
+import("//src/storage/fshost/generated_fshost_config.gni")
+
+declare_args() {
+  # Defines the default value of `kernel_zbi_test()` template `generate_cuckoo`
+  # parameters. When true, all instances of `kernel_zbi_tests()` will default to
+  # generating a `cuckoo_zbi_test()` which is a full system image generated for
+  # exfiltrating instrumentation data from a target system.
+  generate_cuckoo_tests = false
+
+  # Each kernel_zbi_test() will stamp out a zbi_test() per entry in the provided
+  # list of kernel images; this list unconditionally extends that selection.
+  # This enables devs and builders to introduce more kinds of tests in the GN
+  # graph without affecting gen times by default.
+  extra_kernel_test_images = []
+}
+
+# The kernel switchset with the most development options enabled.
+default_test_kernel_switchset = "lk_debug_level_2"
+
+# The full toolchain label of that switchset for $currnet_cpu.
+default_test_kernel_toolchain = "//zircon/kernel/switch/set/$default_test_kernel_switchset:kernel_$current_cpu.$default_test_kernel_switchset"
+
+# The default kernel_elf_binary() label of the kernel proper in that switchset.
+default_test_vmzircon_label =
+    "//zircon/kernel/bin:vmzircon.with-tests($default_test_kernel_toolchain)"
+
+# The kernel image with the most development options enabled.
+default_kernel_test_image = "eng"
+
+template("_cuckoo_product_bundle") {
+  assert(current_toolchain == default_toolchain)
+  assert(defined(invoker.kernel_zbi))
+
+  main_target = target_name
+  assembled_system_target = "${target_name}.assembled_system"
+  stub_test_target = "${target_name}.test"
+
+  assembled_system_namespace = assembled_system_target
+
+  # This creates the target test to run against the cuckoo images, the purpose
+  # of this test is to trigger coverage collection.
+  fuchsia_unittest_package(stub_test_target) {
+    deps = [
+      "//src/sys/early_boot_instrumentation/test:early-boot-collector-stub",
+    ]
+    test_specs = {
+      if (defined(invoker.disabled) && invoker.disabled) {
+        # A disabled test is still built.
+        build_only = true
+      } else {
+        forward_variables_from(invoker, [ "environments" ])
+      }
+      isolated = true
+      product_bundle = main_target
+      is_boot_test = true
+
+      bootup_timeout_secs = default_boot_test_timeout_secs
+      if (defined(invoker.timeout)) {
+        bootup_timeout_secs = invoker.timeout
+      }
+    }
+  }
+
+  product_assembly_configuration("${main_target}.product_config") {
+    testonly = true
+    platform = {
+      build_type = "eng"
+      intl = {
+        # A fake intl_services will be injected
+        config_type = "none"
+      }
+      development_support = {
+        enable_userboot_next_component_manager = true
+      }
+    }
+    product = {
+    }
+    base_packages = [
+      {
+        package_target = "//src/testing/fidl/intl_property_manager:fake_intl_services_package"
+      },
+      {
+        package_target = ":$stub_test_target"
+      },
+    ]
+  }
+
+  # Generate the assembled system with the provided kernel_zbi.
+  assembly_kernel_zbi = invoker.kernel_zbi
+
+  assembled_system(assembled_system_target) {
+    testonly = true
+    namespace = assembled_system_namespace
+    image_name = "fuchsia"
+    kernel_zbi = assembly_kernel_zbi
+    board_config_label = board_configuration_label
+
+    product_assembly_config_label = ":${main_target}.product_config"
+
+    generate_fxfs = true
+    generate_vbmeta = use_vbmeta
+  }
+
+  product_bundle(main_target) {
+    testonly = true
+
+    name = main_target
+    system_a = "${target_out_dir}/${assembled_system_namespace}"
+
+    deps = [
+      ":$assembled_system_target",
+
+      # While it is already a transitive dependency of the assembled system,
+      # that dependency is subject to package metadata barrier. Accordingly, we
+      # also depend directly the stub test package so it ends up in main
+      # repository.
+      ":$stub_test_target",
+    ]
+  }
+}
+
+# Defines ZBI tests using actual kernel images, along with a custom userspace.
+#
+# Subtargets
+#
+#   * `${target_name}.${image}.cuckoo.assembled_system`
+#     Specifies a "cuckoo assembled system": an `assembled_system()` that
+#     contains a test package with a stub test component, and which boots the
+#     associated ZBI to a full Fuchsia system. This subtarget is only emitted
+#     if `generate_cuckoo = true`.
+#
+#   * `${target_name}.${image}`
+#     The zbi_test() target associated with a kernel image listed in `images`.
+#
+# Parameters
+#
+#   * deps
+#     - Optional: As for zbi_test().
+#     - Type: list(label)
+#
+#   * cuckoo_deps, non_cuckoo_deps
+#     - Optional: Added to $deps, but only for the cuckoo and non-cuckoo
+#     - incarnations of the test, respectively.
+#     - Type: list(label)
+#
+#   * generate_cuckoo
+#     - Optional: Whether to generate a cuckoo assembled system and emit the
+#       `.cuckoo.assembled_system` subtarget (see above).
+#     - Type: boolean
+#     - Default: `kernel_zbi_test_generates_cuckoo`
+#
+#  * kernel_images
+#    - Optional: The list of kernel image names - as enumerated under
+#      //zircon/kernel/image as directory names - to define the kernel ZBI test
+#      for: a zbi_test() instance will be stamped out for each listed image.
+#    - Type: list(string)
+#    - Default: `[ default_kernel_test_image ] + extra_kernel_test_images`
+#
+# See zbi_test() for additional parameters.
+#
+template("kernel_zbi_test") {
+  main_target = target_name
+
+  forward_variables_from(invoker,
+                         [
+                           "cuckoo_deps",
+                           "non_cuckoo_deps",
+                           "generate_cuckoo",
+                           "kernel_images",
+                         ])
+  if (!defined(kernel_images)) {
+    kernel_images = [ default_kernel_test_image ] + extra_kernel_test_images
+  }
+  if (!defined(generate_cuckoo)) {
+    generate_cuckoo = generate_cuckoo_tests
+  }
+  if (!defined(cuckoo_deps)) {
+    cuckoo_deps = []
+  }
+  if (!defined(non_cuckoo_deps)) {
+    non_cuckoo_deps = []
+  }
+
+  if (defined(invoker.deps)) {
+    common_deps = invoker.deps
+  } else {
+    common_deps = []
+  }
+
+  zbi_tests = [
+    {
+      name = main_target
+      deps = common_deps + non_cuckoo_deps
+    },
+  ]
+
+  if (generate_cuckoo) {
+    # If we're also generating the cuckoo test and it has different deps, it
+    # needs a separately-constructed kernel ZBI.
+    need_cuckoo_zbi = cuckoo_deps != non_cuckoo_deps
+    if (need_cuckoo_zbi) {
+      # Generate a second zbi_test() just to simplify the plumbing, though only
+      # its zbi() is really used.  Mark that boot test as disabled so it won't
+      # be run on its own.
+      zbi_tests += [
+        {
+          name = "$main_target.cuckoo-kernel"
+          deps = common_deps + cuckoo_deps
+          disabled = true
+        },
+      ]
+      cuckoo_zbi_label = ":$main_target.cuckoo-kernel"
+    } else {
+      cuckoo_zbi_label = ":$main_target"
+    }
+  } else {
+    # Invokers can set this even if generation was disabled.
+    not_needed([ "cuckoo_deps" ])
+  }
+
+  main_deps = []
+  foreach(image, kernel_images) {
+    main_deps += [ ":$main_target.$image" ]
+
+    if (generate_cuckoo) {
+      cuckoo_target_name = "$main_target.$image.cuckoo"
+      if (default_toolchain == current_toolchain) {
+        _cuckoo_product_bundle(cuckoo_target_name) {
+          forward_variables_from(invoker,
+                                 [
+                                   "disabled",
+                                   "environments",
+                                   "timeout",
+                                   "visibility",
+                                 ])
+          if (defined(visibility)) {
+            visibility += [ ":* " ]
+          }
+
+          kernel_zbi = "$cuckoo_zbi_label.$image.zbi"
+        }
+      } else {
+        group(cuckoo_target_name) {
+          testonly = true
+          deps = [ ":$cuckoo_target_name($default_toolchain)" ]
+        }
+        not_needed([ "cuckoo_zbi_label" ])
+      }
+      main_deps += [ ":$cuckoo_target_name($default_toolchain)" ]
+    }
+
+    foreach(test, zbi_tests) {
+      zbi_test("${test.name}.$image") {
+        assert(current_cpu != "")
+        forward_variables_from(invoker,
+                               "*",
+                               [
+                                 "deps",
+                                 "generate_cuckoo",
+                                 "visibility",
+                               ])
+        forward_variables_from(invoker, [ "visibility" ])
+        if (defined(visibility)) {
+          visibility += [ ":* " ]
+        }
+
+        forward_variables_from(test, [ "disabled" ])
+
+        # Order matters: whe deliberately append the invoker's deps after the
+        # image-specific test data deps, as the invoker may intend to override
+        # certain settings.
+        deps = [
+          "//zircon/kernel/image/$image",
+          "//zircon/kernel/image/$image:$image.test-data-deps",
+        ]
+        deps += test.deps
+      }
+    }
+  }
+
+  group(main_target) {
+    forward_variables_from(invoker, [ "visibility" ])
+    testonly = true
+    deps = main_deps
+  }
+}

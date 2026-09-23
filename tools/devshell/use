@@ -1,0 +1,164 @@
+#!/bin/bash
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Build
+### re-use a previous build directory set up by `fx set`
+
+## usage: fx use DIR
+##    or: fx --dir DIR use
+##    or: fx use
+##
+## Switches further `fx` commands to using a different build directory.
+## This only works if `fx --dir DIR set ...` succeeded previously
+## (and DIR has not been removed since).  The next `fx build` or other
+## such command will now refer to DIR.  The previous build directory is
+## left in place, so you can switch back again with `fx use` later.
+##
+## fx use without arguments will list the available build directories, naming
+## the current active build directory (if any).
+##
+## fx use with `ffx.ui.mode = tui` set will prompt you to choose a build director.
+## ffx.ui.mode can be set using `ffx config set ffx.ui.mode tui`
+## The UI mode for just fx use can be set with e.g.
+## `ffx config set ffx.ui.overrides.fx-use text`
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+
+function main {
+  local build_dir="$1"
+
+  case "${build_dir}" in
+  -h | --help)
+    fx-command-help
+    return 0
+    ;;
+  esac
+
+  if [[ -z "${build_dir}" ]]; then
+    build_dir="${_FX_BUILD_DIR}"
+  fi
+
+  if [[ -z "${build_dir}" ]]; then
+
+    fx-build-dir-if-present
+    local possible_build_dirs=()
+    local current="${FUCHSIA_BUILD_DIR##"${FUCHSIA_DIR}"/}"
+    if [[ -n "${current}" ]]; then
+      possible_build_dirs+=("${current} (current)")
+    fi
+
+    shopt -s nullglob
+    for d in "${FUCHSIA_DIR}"/out/*; do
+      local item_rel_path="${d##"${FUCHSIA_DIR}"/}"
+      # Skip known invalid directories
+      if [[ "${item_rel_path}" == */*.zircon ||
+        "${item_rel_path}" == */*.device ||
+        "${item_rel_path}" == "${current}" ||
+        "${item_rel_path}" == */*crash.log ||
+        "${item_rel_path}" == */*.json ||
+        "${item_rel_path}" == out/_* ||
+        "${item_rel_path}" == out/repro_*.instructions ||
+        "${item_rel_path}" == out/.*build_lock ||
+        "${item_rel_path}" == out/rust-analyzer ]]; then
+        continue #skip
+      fi
+      possible_build_dirs+=("${item_rel_path}")
+    done
+    shopt -u nullglob
+
+    use_tui=$(fx-get-ui-mode "fx-use")
+    if [[ "$use_tui" == "tui" ]]; then
+      # TUI picker
+      # check if we have any possible build directories to choose from.
+      if [ "${#possible_build_dirs[@]}" -eq 0 ]; then
+        fx-error "There are no current build directories. Make sure you have run fx set."
+        exit 1
+      fi
+
+      chosen_dir="$(fx-choose-tui "${possible_build_dirs[@]}" --select-if-one --header="Select a build dir:")"
+      # strip off any trailing spaces and the '(current)' string
+      local suffix=" (current)"
+      if [[ "${chosen_dir}" == *"${suffix}" ]]; then
+        build_dir="${chosen_dir%${suffix}}"
+      else
+        build_dir="${chosen_dir}"
+      fi
+
+      if [[ -z "${build_dir}" ]]; then
+        # This can happen if users close out of the picker without selecting anything
+        fx-error "No build directory picked. If you still want to change directories,\nrun this command again and select a directory."
+        exit 1
+      fi
+    else
+      # Non-TUI default
+      fx-info "listing build directories:"
+      for d in "${possible_build_dirs[@]}"; do
+        echo "$d"
+      done
+      return 1
+    fi
+  fi
+
+  # Remove trailing slash.
+  # This can potentially lead to the file `out/foo/.device` being written to
+  # when calling `fx set-device` instead `out/foo.device`.
+  # shellcheck disable=SC2001
+  build_dir="$(echo "$build_dir" | sed 's:/*$::')"
+
+  if [[ "$build_dir" == /* ]]; then
+    local -r full_build_dir="${build_dir}"
+  else
+    local -r full_build_dir="${FUCHSIA_DIR}/${build_dir}"
+  fi
+
+  if [[ ! -e "${full_build_dir}/args.gn" ]]; then
+    fx-error "\"${build_dir}\" is not a valid build dir."
+    echo >&2
+    fx-command-help
+    exit 1
+  fi
+
+  fx-change-build-dir "${build_dir}"
+
+  # Refresh $FUCHSIA_NODENAME to ensure the below checks will report the correct
+  # error message.
+  if [[ -e "${FUCHSIA_BUILD_DIR}.device" ]]; then
+    FUCHSIA_NODENAME="$(<"${FUCHSIA_BUILD_DIR}.device")"
+  else
+    FUCHSIA_NODENAME=""
+  fi
+
+  # Print the default target status message.
+  # If it's already been printed before, do nothing.
+  has_default_target_status_been_printed="false"
+  function print-default-target-status-once {
+    [[ $has_default_target_status_been_printed == "true" ]] && return
+    out_dir="$(realpath -s --relative-to="$FUCHSIA_DIR" "$FUCHSIA_BUILD_DIR")"
+    if [[ -n "${FUCHSIA_NODENAME}" ]]; then
+      fx-info "The default device for ${out_dir} is \"${FUCHSIA_NODENAME}\"."
+    else
+      fx-info "The default device for ${out_dir} is not set."
+    fi
+    has_default_target_status_been_printed="true"
+  }
+  if [[ -n "${FUCHSIA_NODENAME}" ]]; then
+    print-default-target-status-once
+  fi
+
+  # Check if the user has set a default target via environment variable(s)
+  # which can override default targets set by `fx set-device`.
+  function external-default-target-env-warning {
+    print-default-target-status-once
+    fx-warn "However, you've overridden this by setting ${ENV_VARS}."
+    if [[ -n "${FUCHSIA_NODENAME}" ]]; then
+      fx-warn "If you want to use \"${FUCHSIA_NODENAME}\", please unset the ${ENV_VAR_NAMES} environment variable."
+    else
+      fx-warn "If you want to use leave it unset, please unset the ${ENV_VAR_NAMES} environment variable."
+    fi
+  }
+  fx-if-target-set-by-env external-default-target-env-warning
+}
+
+main "$@"

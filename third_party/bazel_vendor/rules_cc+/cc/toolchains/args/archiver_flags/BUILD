@@ -1,0 +1,144 @@
+load("@bazel_skylib//lib:selects.bzl", "selects")
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+load("//cc/toolchains:args.bzl", "cc_args")
+load("//cc/toolchains:args_list.bzl", "cc_args_list")
+load("//cc/toolchains:feature.bzl", "cc_feature")
+load("//cc/toolchains:nested_args.bzl", "cc_nested_args")
+
+package(default_visibility = ["//visibility:private"])
+
+bool_flag(
+    name = "use_libtool_on_macos",
+    build_setting_default = True,
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "use_libtool_setting",
+    flag_values = {":use_libtool_on_macos": "true"},
+)
+
+selects.config_setting_group(
+    name = "use_libtool_on_apple_setting",
+    match_all = [
+        "//cc/settings:apple_constraint",
+        ":use_libtool_setting",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_feature(
+    name = "feature",
+    args = [":archiver_flags"],
+    overrides = "//cc/toolchains/features/legacy:archiver_flags",
+    visibility = ["//visibility:public"],
+)
+
+cc_args_list(
+    name = "archiver_flags",
+    args = [
+        ":create_static_archive",
+        ":output_execpath",
+        ":objc_fully_link_archive_path",
+        ":libraries_to_link",
+        ":objc_fully_link_objc_library_exec_paths",
+        ":objc_fully_link_cc_library_exec_paths",
+        ":objc_fully_link_imported_library_exec_paths",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_args(
+    name = "create_static_archive",
+    actions = ["//cc/toolchains/actions:ar_actions"],
+    args = select({
+        ":use_libtool_on_apple_setting": [
+            "-D",
+            "-no_warning_for_no_symbols",
+            "-static",
+        ],
+        "//conditions:default": ["rcsD"],
+    }),
+)
+
+cc_args(
+    name = "output_execpath",
+    actions = ["//cc/toolchains/actions:cpp_link_static_library"],
+    args = select({
+        ":use_libtool_on_apple_setting": ["-o"],
+        "//conditions:default": [],
+    }) + ["{output_execpath}"],
+    format = {"output_execpath": "//cc/toolchains/variables:output_execpath"},
+    requires_not_none = "//cc/toolchains/variables:output_execpath",
+)
+
+cc_args(
+    name = "libraries_to_link",
+    actions = ["//cc/toolchains/actions:cpp_link_static_library"],
+    nested = ["libraries_to_link_expansion"],
+    requires_not_none = "//cc/toolchains/variables:libraries_to_link",
+)
+
+cc_nested_args(
+    name = "libraries_to_link_expansion",
+    iterate_over = "//cc/toolchains/variables:libraries_to_link",
+    nested = [
+        ":link_obj_file",
+        ":link_object_file_group",
+    ],
+)
+
+cc_nested_args(
+    name = "link_obj_file",
+    args = ["{object_file}"],
+    format = {"object_file": "//cc/toolchains/variables:libraries_to_link.name"},
+    requires_equal = "//cc/toolchains/variables:libraries_to_link.type",
+    requires_equal_value = "object_file",
+)
+
+cc_nested_args(
+    name = "link_object_file_group",
+    args = ["{object_files}"],
+    format = {"object_files": "//cc/toolchains/variables:libraries_to_link.object_files"},
+    iterate_over = "//cc/toolchains/variables:libraries_to_link.object_files",
+    requires_equal = "//cc/toolchains/variables:libraries_to_link.type",
+    requires_equal_value = "object_file_group",
+)
+
+cc_args(
+    name = "objc_fully_link_archive_path",
+    actions = ["//cc/toolchains/actions:objc_fully_link"],
+    args = select({
+        ":use_libtool_on_apple_setting": ["-o"],
+        "//conditions:default": [],
+    }) + ["{fully_linked_archive_path}"],
+    format = {"fully_linked_archive_path": "//cc/toolchains/variables:fully_linked_archive_path"},
+    requires_not_none = "//cc/toolchains/variables:fully_linked_archive_path",
+)
+
+cc_args(
+    name = "objc_fully_link_objc_library_exec_paths",
+    actions = ["//cc/toolchains/actions:objc_fully_link"],
+    args = ["{objc_library_exec_paths}"],
+    format = {"objc_library_exec_paths": "//cc/toolchains/variables:objc_library_exec_paths"},
+    iterate_over = "//cc/toolchains/variables:objc_library_exec_paths",
+    requires_not_none = "//cc/toolchains/variables:objc_library_exec_paths",
+)
+
+cc_args(
+    name = "objc_fully_link_cc_library_exec_paths",
+    actions = ["//cc/toolchains/actions:objc_fully_link"],
+    args = ["{cc_library_exec_paths}"],
+    format = {"cc_library_exec_paths": "//cc/toolchains/variables:cc_library_exec_paths"},
+    iterate_over = "//cc/toolchains/variables:cc_library_exec_paths",
+    requires_not_none = "//cc/toolchains/variables:cc_library_exec_paths",
+)
+
+cc_args(
+    name = "objc_fully_link_imported_library_exec_paths",
+    actions = ["//cc/toolchains/actions:objc_fully_link"],
+    args = ["{imported_library_exec_paths}"],
+    format = {"imported_library_exec_paths": "//cc/toolchains/variables:imported_library_exec_paths"},
+    iterate_over = "//cc/toolchains/variables:imported_library_exec_paths",
+    requires_not_none = "//cc/toolchains/variables:imported_library_exec_paths",
+)

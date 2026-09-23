@@ -1,0 +1,273 @@
+#!/bin/bash
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Source tree
+### updates rustc_library and rustc_binary third_party dependencies
+
+## usage: fx update-rustc-third-party [--no-min-publish-age] [--min-publish-age <DAYS>]
+## Updates third_party/rust_crates based on the contents of
+## third_party/rust_crates/Cargo.toml
+##
+## Options:
+##   --no-min-publish-age, --skip-min-publish-age
+##       Skip minimum publish age verification for crates.
+##   --min-publish-age <DAYS>
+##       Override the minimum publish age (in days).
+##
+## See https://fuchsia.dev/fuchsia-src/development/languages/rust/third_party.md
+## for more details.
+
+set -eo pipefail
+
+function preserve_files {
+  local tmp=$1
+  local filename=$2
+  # Some crates can vendor dependnecies in them, so limit max depth to avoid
+  # picking up files from nested dependencies.
+  find . -maxdepth 2 -type f -name "$filename" -print0 | while read -d $'\0' file_to_preserve; do
+    local dir=$(dirname "$file_to_preserve")
+    local version=$(sed -n "s/^version = \"\(.*\)\"$/\\1/p" "$dir/Cargo.toml" | head -n 1)
+    # + in directory names are replaced with -, so they are supported in Bazel
+    # labels.
+    version="${version/+/-}"
+    if [[ $dir != *-"$version" ]]; then
+      dir="$dir-$version"
+    fi
+    local temp_dir="$tmp/$dir"
+    mkdir -p "$temp_dir"
+    cp "$file_to_preserve" "$temp_dir"
+  done
+}
+
+function latest_version_dir {
+  local crate=$1
+  local crate_name=$(echo "$crate" | sed -rn "s/^([a-zA-Z][a-zA-Z0-9_\\-]*)-[0-9]+\\.[0-9]+\\.[0-9]+.*$/\\1/p")
+  local semver_regex="s/^$crate_name-([0-9]+)\\.([0-9]+)\\.([0-9]+)(.*$)/\\1 \\2 \\3 \\4/p"
+  local latest_version=$(echo "$crate_name"-* | tr ' ' '\n' | sed -rn "$semver_regex" | sort -rn -k 1,1 -k 2,2 -k 3,3 -k 4,4 | sed -rn "s/^(.+) (.+) (.+) (.*$)/$crate_name-\\1.\\2.\\3\\4/p" | head -n1)
+  echo "$latest_version"
+}
+
+# This function looks for any vendored crates that are missing OWNERS files and
+# attempts to source one from the previous latest version of that crate.
+function propagate_owner_files {
+  local owners_tmp=$1
+  local vendor_dir=$2
+  cd "$vendor_dir"
+  for crate in *; do
+    # vendor_dir can have generated Bazel build files in it, filter them out.
+    # i.e. Only walk into subdirectories, which are vendored third-party crates.
+    local path="${vendor_dir}/${crate}"
+    if [[ -d "${path}" && ! -f "${path}/OWNERS" ]]; then
+      cd "${owners_tmp}"
+      local latest_version="$(latest_version_dir $crate)"
+      local owners_to_copy="${owners_tmp}/${latest_version}/OWNERS"
+      if [[ "${latest_version}" != "${crate}" && -f "${owners_to_copy}" ]]; then
+        cp "${owners_to_copy}" "${vendor_dir}/${crate}"
+      fi
+    fi
+  done
+}
+
+# This function looks for any vendored crates that are missing LICENSE files and
+# attempts to source one from the previous latest version of that crate.
+#
+# NOTE: This function is only intended for LICENSE files created by us, which
+# are always named LICENSE, so it skips copying if one does exist. This is OK
+# because we later rely on check_rust_licenses.py to check other possible
+# license file included by upstream.
+function propagate_license_files {
+  local license_tmp=$1
+  local vendor_dir=$2
+  cd "$vendor_dir"
+  for crate in *; do
+    if [[ ! -f "$vendor_dir/$crate/LICENSE" ]]; then
+      cd "$license_tmp"
+      local latest_version="$(latest_version_dir $crate)"
+      local src="$license_tmp/$latest_version/LICENSE"
+      if [[ "$latest_version" != "$crate" && -f "$src" ]]; then
+        cp "$src" "$vendor_dir/$crate"
+      fi
+    fi
+  done
+}
+
+# Prepares a temporary workspace to run `crates_vendor` to generate BUILD.bazel
+# files for third-party Rust crates.
+function prepare_bazel_workspace {
+  local workspace_dir=$1
+
+  sed '/default_applicable_licenses/d' "${FUCHSIA_DIR}/build/bazel/update-rustc-third-party/BUILD.bazel" > "${workspace_dir}/BUILD.bazel"
+  ln -s "${FUCHSIA_DIR}/build/bazel/update-rustc-third-party/MODULE.bazel" "${workspace_dir}/MODULE.bazel"
+  ln -s "${FUCHSIA_DIR}/build/bazel/update-rustc-third-party/crate_annotations.bzl" "${workspace_dir}/crate_annotations.bzl"
+  ln -s "${FUCHSIA_DIR}/build/bazel/update-rustc-third-party/crate_annotation_overwrites.bzl" "${workspace_dir}/crate_annotation_overwrites.bzl"
+
+  ln -s "${FUCHSIA_DIR}/prebuilt/third_party/bazel/linux-x64/bazel-real" "${workspace_dir}/bazel"
+  ln -s "${FUCHSIA_DIR}/prebuilt/third_party/buildifier/linux-x64/buildifier" "${workspace_dir}/buildifier"
+  ln -s "${FUCHSIA_DIR}/prebuilt/third_party/rust/linux-x64" "${workspace_dir}/rust_toolchain"
+  ln -s "${FUCHSIA_DIR}/third_party/bazel_vendor/rules_rust+" "${workspace_dir}/rules_rust"
+
+  # Relative paths of rust_crates need to be the same to $FUCHSIA_DIR and
+  # $workspace_dir, so the generated BUILD.bazel would have correct paths when
+  # used in the platform build.
+  mkdir "${workspace_dir}/third_party"
+  ln -s "${FUCHSIA_DIR}/third_party/rust_crates" "${workspace_dir}/third_party/rust_crates"
+
+  # Download the cargo-bazel from upstream release. This avoids the bootstrap
+  # process from crate_universe, which always does a slow full rebuild of
+  # cargo-bazel.
+  cargo_bazel_version=$(cat "${workspace_dir}/rules_rust/version.bzl" | grep 'VERSION =' | awk -F ' = ' '{print $2}' | tr -d '"')
+  case "$(uname -s)" in
+  Linux*)
+    curl -sSL "https://github.com/bazelbuild/rules_rust/releases/download/${cargo_bazel_version}/cargo-bazel-x86_64-unknown-linux-gnu" -o "${workspace_dir}/cargo-bazel"
+    ;;
+  Darwin*)
+    curl -sSL "https://github.com/bazelbuild/rules_rust/releases/download/${cargo_bazel_version}/cargo-bazel-aarch64-apple-darwin" -o "${workspace_dir}/cargo-bazel"
+    ;;
+  *)
+    fx-error "unrecognized OS"
+    exit 1
+    ;;
+  esac
+  chmod +x "${workspace_dir}/cargo-bazel"
+}
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh || exit $?
+fx-config-read
+fx-standard-switches "$@"
+set -- "${FX_ARGV[@]}"
+
+extra_gnaw_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-min-publish-age|--skip-min-publish-age)
+      extra_gnaw_args+=("--min-publish-age" "0")
+      shift
+      ;;
+    --min-publish-age)
+      if [[ -z "$2" ]]; then
+        fx-error "Missing value for --min-publish-age"
+        exit 1
+      fi
+      extra_gnaw_args+=("--min-publish-age" "$2")
+      shift 2
+      ;;
+    --help|-h)
+      fx-command-help
+      exit 0
+      ;;
+    *)
+      fx-error "Unrecognized option: $1"
+      fx-command-help
+      exit 1
+      ;;
+  esac
+done
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/bazel_utils.sh || exit $?
+
+case "$(uname -s)" in
+Linux*) ;;
+Darwin*)
+  if ! [[ -x "$(command -v brew)" ]]; then
+    fx-error "'brew' binary not found"
+    fx-error "A homebrew <https://brew.sh> installation of opensslis required in order to update"
+    fx-error "Rust third party crates on the Mac."
+    exit 1
+  fi
+
+  declare -x LDFLAGS="-L$(brew --prefix)/opt/openssl/lib"
+  declare -x CPPFLAGS="-I$(brew --prefix)/opt/openssl/include"
+  ;;
+*)
+  fx-error "unrecognized OS"
+  exit 1
+  ;;
+esac
+
+declare -x PATH=$PREBUILT_CMAKE_DIR/cmake/bin:$PATH
+export RUSTC=$PREBUILT_RUST_DIR/bin/rustc
+export CARGO=$PREBUILT_RUST_DIR/bin/cargo
+
+export VENDOR_DIR=$FUCHSIA_DIR/third_party/rust_crates/vendor
+export TMP=$(mktemp -d)
+trap "rm -rf ${TMP}" EXIT
+
+# Preserve both OWNERS and LICENSE files.
+(
+  cd $VENDOR_DIR
+  $(preserve_files $TMP 'OWNERS')
+)
+(
+  cd $VENDOR_DIR
+  $(preserve_files $TMP 'LICENSE')
+)
+
+# Generate Bazel crate annotations from Cargo.toml and validate manual overrides.
+"${FUCHSIA_DIR}/scripts/fuchsia-vendored-python" \
+  "${FUCHSIA_DIR}/build/bazel/update-rustc-third-party/generate_crate_annotations.py" \
+  --cargo-toml "${FUCHSIA_DIR}/third_party/rust_crates/Cargo.toml" \
+  --annotation-overwrites "${FUCHSIA_DIR}/build/bazel/update-rustc-third-party/crate_annotation_overwrites.bzl" \
+  --output "${FUCHSIA_DIR}/build/bazel/update-rustc-third-party/crate_annotations.bzl" \
+  --buildifier "${FUCHSIA_DIR}/prebuilt/third_party/buildifier/linux-x64/buildifier"
+
+bazel_workspace="${TMP}/bazel_workspace"
+mkdir "${bazel_workspace}"
+prepare_bazel_workspace "${bazel_workspace}"
+(
+  cd "${bazel_workspace}" &&
+    ./bazel run \
+      --enable_bzlmod=true \
+      --vendor_dir=$FUCHSIA_DIR/third_party/bazel_vendor \
+      :crates_vendor
+)
+# TODO(https://github.com/bazelbuild/rules_rust/issues/3732): Remove this
+# workaround when upstream issue is fixed.
+#
+# This is necessary because the generated BUILD.bazel file has aliases that
+# point to non-existent targets for patched crates. Remove them to avoid
+# confusion. Users can use the targets from patched locations directly,
+# e.g. `//third_party/rust_crates/ask2patch/walkdir`.
+"${FUCHSIA_DIR}/scripts/fuchsia-vendored-python" \
+  "${FUCHSIA_DIR}/build/bazel/update-rustc-third-party/remove_incorrect_aliases.py" \
+  --search-dir="${VENDOR_DIR}" \
+  --fuchsia-dir="${FUCHSIA_DIR}"
+
+# Restore files for unchanged directories.
+shopt -s nullglob
+for f in $TMP/*; do
+  crate_dir=$(basename "$f")
+  # if the exact same version of the crate still exists
+  if [ -d "${VENDOR_DIR}/${crate_dir}" ]; then
+    # put the OWNERS file back
+    cp -r "$f" "${VENDOR_DIR}/"
+  fi
+done
+
+# Copy the OWNERS and LICENSE from the previous latest version for the new
+# latest version for newly-vendored versions
+$(propagate_owner_files $TMP $VENDOR_DIR)
+$(propagate_license_files $TMP $VENDOR_DIR)
+
+# ensure LICENSE* files exist
+"${FUCHSIA_DIR}/scripts/fuchsia-vendored-python" \
+  "${FUCHSIA_DIR}/scripts/rust/check_rust_licenses.py" \
+  --directory "${VENDOR_DIR}"
+
+# regenerate BUILD.gn
+(
+  cd $FUCHSIA_DIR
+  fx-run-bazel false "$(fx-get-bazel)" run --config=host '//tools/cargo-gnaw:cargo-gnaw-bin' -- \
+    --manifest-path $FUCHSIA_DIR/third_party/rust_crates/Cargo.toml \
+    --project-root $FUCHSIA_DIR \
+    --cargo $CARGO \
+    --output $FUCHSIA_DIR/third_party/rust_crates/BUILD.gn \
+    --emit-metadata $FUCHSIA_BUILD_DIR/rustlang/3p-crates-metadata.json \
+    --gn-bin $PREBUILT_GN \
+    --skip-root \
+    "${extra_gnaw_args[@]}"
+)
+
+# Add to gnaw invocation to enable third-party SDK metadata generation:
+# --output-fuchsia-sdk-metadata $FUCHSIA_DIR/third_party/rust_crates/sdk_metas \

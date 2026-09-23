@@ -1,0 +1,149 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_build_action.gni")
+import("//build/bazel/bazel_workspace.gni")
+import("//build/components.gni")
+
+# Compares a GN built driver with a Bazel built driver.
+#
+# Example:
+# ```
+# verify_driver_package("verify_example_libc_driver") {
+#   gn_driver_package = "//examples/drivers/v2/demo-libc:component"
+#   bazel_driver_package_target =
+#       "//examples/drivers/v2/demo-libc:pkg_fuchsia_package"
+#   bazel_package_name = "demo_libc"
+#   blobs_to_ignore = [
+#     "lib/ld.so.1",
+#   ]
+# }
+# ```
+# Parameters
+#
+# gn_driver_package (required)
+#   The GN target for the driver package
+#   Type: string (GN label)
+#
+# bazel_driver_package_target (required)
+#   The bazel target for the package containing the driver
+#   Type: string (Bazel label)
+#
+# bazel_package_name (required)
+#   The name of the bazel package being built. This is needed so that we can create
+#     a gn package with the same name
+#   Type: string
+#
+# blobs_to_ignore (optional)
+#   A list of blobs to ignore during validation. The values should be the install
+#     path of the blob
+#
+# testonly
+# visibility
+#
+template("verify_driver_package") {
+  assert(defined(invoker.gn_driver_package), "gn_driver_package is required")
+  assert(defined(invoker.bazel_driver_package_target),
+         "bazel_driver_package_target is required")
+
+  labels = {
+    # The gn package provided by the user
+    gn_package_target_name = invoker.gn_driver_package
+
+    # The target inside fuchsia_package which builds the manifest
+    gn_package_manifest_target_name = invoker.gn_driver_package + ".pkg"
+
+    # The bazel driver package provided by the user
+    bazel_driver_package_target_name = invoker.bazel_driver_package_target
+
+    # The bazel_build_action to build the bazel package
+    bazel_action_target_name = "${target_name}.bazel_package"
+
+    # The main target
+    main_target_name = target_name
+  }
+
+  _gn_package_out_dir =
+      get_label_info(labels.gn_package_manifest_target_name, "target_out_dir")
+  _gn_package_name = get_label_info(labels.gn_package_target_name, "name")
+
+  files = {
+    # The built gn package manifest
+    gn_package_manifest =
+        "${_gn_package_out_dir}/${_gn_package_name}/package_manifest.json"
+
+    # The bazel built package manifest in the bazel sandbox
+    bazel_built_package_manifest = "{{BAZEL_TARGET_OUT_DIR}}/{{BAZEL_TARGET_NAME}}_pkg/package_manifest.json"
+
+    # The bazel built package manifest after copying back to ninja
+    bazel_ninja_package_manifest = "${target_name}/bazel_package_manifest.json"
+
+    # The diff output file
+    diff = "${target_out_dir}/${target_name}/diff"
+  }
+
+  # Build out driver package with bazel
+  bazel_build_action(labels.bazel_action_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "testonly",
+                           ])
+    visibility = [ ":${labels.main_target_name}" ]
+    bazel_target = labels.bazel_driver_package_target_name
+    copy_outputs = [
+      {
+        bazel = files.bazel_built_package_manifest
+        ninja = files.bazel_ninja_package_manifest
+      },
+    ]
+  }
+
+  action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    # Keep inputs in sync with args below.
+    inputs = [
+      files.gn_package_manifest,
+      "${target_out_dir}/${files.bazel_ninja_package_manifest}",
+    ]
+    outputs = [ files.diff ]
+
+    deps = [
+      ":${labels.bazel_action_target_name}",
+      labels.gn_package_manifest_target_name,
+    ]
+
+    script = "//build/bazel/drivers/verify_driver_package.py"
+
+    args = [
+      "--gn-package-manifest",
+      rebase_path(inputs[0], root_build_dir),
+      "--bazel-package-manifest",
+      rebase_path(inputs[1], root_build_dir),
+      "--output",
+      rebase_path(outputs[0], root_build_dir),
+    ]
+
+    if (defined(invoker.blobs_to_ignore)) {
+      args += [ "--blobs-to-ignore" ]
+      args += invoker.blobs_to_ignore
+    }
+
+    if (defined(invoker.size_check_blobs)) {
+      # This is needed to soft-transition
+      not_needed(invoker.size_check_blobs)
+    }
+
+    if (!is_debug) {
+      # In debug mode the gn drivers are larger, we just want to check that
+      # bazel doesn't grow larger than gn in this case
+      args += [ "--require-exact-sizes" ]
+    }
+  }
+}

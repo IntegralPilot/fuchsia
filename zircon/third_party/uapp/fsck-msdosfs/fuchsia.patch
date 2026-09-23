@@ -1,0 +1,124 @@
+--- sbin/fsck_msdosfs/boot.c
++++ sbin/fsck_msdosfs/boot.c
+@@ -33,6 +33,7 @@
+ 
+ #include <sys/param.h>
+ 
++#include <sys/endian.h>
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -127,12 +128,10 @@
+ 	boot->bpbHeads = block[26] + (block[27] << 8);
+ 
+ 	/* Hidden sectors: ignored */
+-	boot->bpbHiddenSecs = block[28] + (block[29] << 8) +
+-	    (block[30] << 16) + (block[31] << 24);
++	boot->bpbHiddenSecs = le32dec(&block[28]);
+ 
+ 	/* Total sectors (32 bits) */
+-	boot->bpbHugeSectors = block[32] + (block[33] << 8) +
+-	    (block[34] << 16) + (block[35] << 24);
++	boot->bpbHugeSectors = le32dec(&block[32]);
+ 	if (boot->bpbHugeSectors == 0) {
+ 		if (boot->flags & FAT32) {
+ 			pfatal("FAT32 with sector count of zero");
+@@ -158,8 +157,7 @@
+ 		}
+ 
+ 		/* 32-bit count of sectors per FAT */
+-		boot->FATsecs = block[36] + (block[37] << 8)
+-				+ (block[38] << 16) + (block[39] << 24);
++		boot->FATsecs = le32dec(&block[36]);
+ 
+ 		if (block[40] & 0x80)
+ 			boot->ValidFat = block[40] & 0x0f;
+@@ -176,8 +174,7 @@
+ 		 *
+ 		 * Should be 2 but do not require it.
+ 		 */
+-		boot->bpbRootClust = block[44] + (block[45] << 8)
+-			       + (block[46] << 16) + (block[47] << 24);
++		boot->bpbRootClust = le32dec(&block[44]);
+ 
+ 		/* Sector number of the FSInfo structure, usually 1 */
+ 		boot->bpbFSInfo = block[48] + (block[49] << 8);
+@@ -236,12 +233,8 @@
+ 				boot->bpbFSInfo = 0;
+ 		} else {
+ 			/* We appear to have a valid FSInfo block, decode */
+-			boot->FSFree = fsinfo[0x1e8] + (fsinfo[0x1e9] << 8)
+-				       + (fsinfo[0x1ea] << 16)
+-				       + (fsinfo[0x1eb] << 24);
+-			boot->FSNext = fsinfo[0x1ec] + (fsinfo[0x1ed] << 8)
+-				       + (fsinfo[0x1ee] << 16)
+-				       + (fsinfo[0x1ef] << 24);
++			boot->FSFree = le32dec(&fsinfo[0x1e8]);
++			boot->FSNext = le32dec(&fsinfo[0x1ec]);
+ 		}
+ 	} else {
+ 		/* !FAT32: FAT12/FAT16 */
+@@ -330,6 +323,28 @@
+ 	boot->NumFiles = 1;
+ 	boot->NumFree = 0;
+ 
++	// @localmod begin
++	// The BSD FAT driver follows the FAT specification of the "dirty bit"
++	// exactly. The Linux FAT driver, however, marks a bit in the boot sector as
++	// "dirty", which is outside the typical FAT specification. For maximum
++	// compatibility, this modification allows fsck to detect (and clean) the
++	// unspecified Linux dirty bit.
++	int dirtybyte = boot->flags&FAT32 ? 0x41 : 0x25;
++	if (block[dirtybyte] & 0x01) {
++		if (ask(1, "MARK BOOT BLOCK CLEAN") == 0) {
++			pwarn("\n***** BOOT BLOCK IS LEFT MARKED AS DIRTY *****\n");
++			return FSERROR;
++		}
++		pwarn("MARKING BOOT BLOCK CLEAN\n");
++		block[dirtybyte] &= ~0x01;
++		if (lseek(dosfs, 0, SEEK_SET) != 0
++			|| write(dosfs, block, sizeof block) != sizeof block) {
++			perr("could not write boot block");
++			return FSFATAL;
++		}
++	}
++	// @localmod end
++
+ 	return ret;
+ }
+ 
+--- sbin/fsck_msdosfs/check.c
++++ sbin/fsck_msdosfs/check.c
+@@ -181,7 +181,10 @@
+     out:
+ 	if (finish_dosdirsection)
+ 		finishDosDirSection();
+-	free(fat);
++	if (fat) {
++		releasefat(fat);
++		free(fat);
++	}
+ 	close(dosfs);
+ 
+ 	if (mod & (FSFATMOD|FSDIRMOD))
+--- sbin/fsck_msdosfs/ext.h
++++ sbin/fsck_msdosfs/ext.h
+@@ -109,6 +109,7 @@
+  * descriptor of it.
+  */
+ int readfat(int, struct bootblock *, struct fat_descriptor **);
++void releasefat(struct fat_descriptor *);
+ 
+ /*
+  * Write back FAT entries
+--- sbin/fsck_msdosfs/fat.c
++++ sbin/fsck_msdosfs/fat.c
+@@ -783,7 +783,7 @@
+ 	return 0;
+ }
+ 
+-static void
++void
+ releasefat(struct fat_descriptor *fat)
+ {
+ 	if (fat->is_mmapped) {

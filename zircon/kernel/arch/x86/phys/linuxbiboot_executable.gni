@@ -1,0 +1,195 @@
+# Copyright 2024 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//zircon/kernel/phys/phys_executable.gni")
+
+_x86_phys = "//zircon/kernel/arch/x86/phys"
+
+_phys32_toolchain = "$_x86_phys:kernel.phys32"
+
+# Build a bi-arch Linux/x86 bzImage as a "fat" binary containing both 32-bit
+# (with 16-bit entry support) and 64-bit versions of the same executable.
+#
+# This is used just like phys_executable(), but it implicitly gets the right
+# dependencies to be a "linuxboot" bootable image.  At the same time, a hidden
+# second phys_executable() is built in the kernel.phys (64-bit) environment.
+# To the C++ (and start.S) code it looks like it was built as a "linuxboot64"
+# bootable image, but it's linked a bit differently from those.  That second
+# image is embedded in the "linuxboot" bootable image.  The result is that a
+# boot loader reading the outer image's "linuxboot" header fields will see it
+# can use 16-bit, 32-bit, or 64-bit boot protocols as it chooses.  When it uses
+# the 64-bit boot protocol, the rest of the outer image will be ignored (though
+# copied into memory by the boot loader) and control will go to the 64-bit
+# executable image inside.  When it instead uses the 32-bit or 16-bit boot
+# protocol, the whole 64-bit executable image will just be some dead-weight
+# unused RODATA in the outer image that runs as a kernel.phys32 executable.
+#
+# This target must be evaluated in both kernel.phys and kernel.phys32
+# environments, and can be harmlessly evaluated in others too.  Thus, the GN
+# code setting its parameters to be forwarded to phys_executable() can behave
+# differently in the two environments, as well as compiling common source code
+# that uses `#if` et al to distinguish.
+#
+# None of the subtargets really needs to be used, but all are public:
+#
+#  * "$target_name" is the main (32-bit) phys_executable() and redirects from
+#    any other toolchain to the kernel.phys32 environment.  This is the only
+#    target generated in environments other than kernel.phys or kernel.phys32.
+#
+#  * "$target_name.linuxbiboot64" is defined only in $phys_toolchain and is the
+#    phys_executable() for the 64-bit version.
+#
+#  * "$target_name.linuxbiboot64.rsp" is defined only in kernel.phys32
+#    and is a link_output_rspfile() for the underlying 64-bit ELF executable.
+#
+#  * "$target_name.embed64" is a source_set() defined only in kernel.phys32
+#    that embeds the .linuxbiboot64 image file into the phys32 link.
+#
+#  * "$target_name.embed64.ld" is an action() defined only in kernel.phys32
+#    that generates an input linker script derived from the 64-bit executable,
+#    used in $libs of the .embed64 target.
+#
+# Parameters
+#
+# See phys_executable().
+#
+template("linuxbiboot_executable") {
+  fat_target = target_name
+
+  if (toolchain_environment == "kernel.phys32") {
+    # In kernel.phys32, the final fat phys_executable() is built.
+    phys_executable(fat_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      deps = []
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      if (defined(visibility)) {
+        # Be sure to allow the redirect below.
+        visibility += [ ":$fat_target" ]
+      }
+
+      deps += [
+        # The source_set() below will embed the linuxbiboot64 image.
+        ":$fat_target.embed64",
+
+        # This is a linuxboot (32) bzImage.
+        "$_x86_phys:linuxboot",
+      ]
+    }
+
+    # Compute the output path of the .linuxbiboot64 subtarget below.  That
+    # whole binary will be embedded using .incbin in linuxbiboot.S, in the
+    # .embed64 subtarget below.
+
+    phys_label = ":$fat_target.linuxbiboot64($phys_toolchain)"
+    phys_out_dir = get_label_info(phys_label, "root_out_dir")
+    phys_output_name = get_label_info(phys_label, "name")
+    phys_image_file = "$phys_out_dir/$phys_output_name.bin"
+    phys_image_path = rebase_path(phys_image_file, root_build_dir)
+
+    # Collect the path to the .linuxbiboot64 subtarget's unstripped ELF file.
+    rsp_target = "$fat_target.linuxbiboot64.rsp"
+    link_output_rspfile(rsp_target) {
+      visibility = [ ":*" ]
+      forward_variables_from(invoker, [ "testonly" ])
+      outputs = [ "$target_gen_dir/$target_name" ]
+      deps = [ phys_label ]
+    }
+
+    # Use that file to generate the embed64.ld linker script.
+    ld_target = "$fat_target.embed64.ld"
+    toolchain_utils_action(ld_target) {
+      visibility = [ ":*" ]
+      forward_variables_from(invoker, [ "testonly" ])
+
+      script = "$_x86_phys/linuxbiboot32.py"
+      utils = [ "llvm-readelf" ]
+      outputs = [ "$target_gen_dir/$target_name" ]
+      depfile = "$target_gen_dir/$target_name.d"
+      deps = [ ":$rsp_target" ]
+      sources = get_target_outputs(deps[0])
+      args = [
+        "--output=" + rebase_path(outputs[0], root_build_dir),
+        "--depfile=" + rebase_path(depfile, root_build_dir),
+        "--rspfile=" + rebase_path(sources[0], root_build_dir),
+      ]
+    }
+
+    source_set("$fat_target.embed64") {
+      visibility = [ ":*" ]
+      forward_variables_from(invoker, [ "testonly" ])
+
+      # This assembly file embeds the image file and defines symbols to
+      # override the weak ones in linuxboot-header.S.
+      sources = [ "$_x86_phys/linuxbiboot.S" ]
+      defines = [ "LINUXBIBOOT64_FILENAME=\"$phys_image_path\"" ]
+      inputs = [ phys_image_file ]
+      deps = [
+        "$_x86_phys:linuxboot-asm",
+        "//zircon/kernel/lib/arch",
+        phys_label,
+      ]
+
+      # To go with those symbols, the generated embed64.ld linker script
+      # overrides a symbol from linuxboot32.ld.
+      libs = get_target_outputs(":$ld_target")
+      deps += [ ":$ld_target" ]
+
+      metadata = {
+        # The linuxboot64 image may have its own metadata for when it's used as
+        # an image in its own right.  But don't let that show through when the
+        # linuxbiboot image embedding it is being used.
+        images_barrier = []
+      }
+    }
+  } else {
+    # Outside of kernel.phys32, just redirect to the real kernel.phys32 target.
+    group(fat_target) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      public_deps = [ ":$fat_target($_phys32_toolchain)" ]
+    }
+
+    if (toolchain_environment == "kernel.phys") {
+      # In the 64-bit kernel.phys environment, define the .linuxbiboot64
+      # subtarget.  It's mostly the same phys_executable() as the main target
+      # in kernel.phys32, just compiled in the other environment.  This inner
+      # target doesn't use the invoker's output_* or images_metadata.
+      phys_executable("$fat_target.linuxbiboot64") {
+        visibility = [ ":*" ]
+        forward_variables_from(invoker, [ "testonly" ])
+
+        deps = []
+        forward_variables_from(invoker,
+                               "*",
+                               [
+                                 "images_metadata",
+                                 "output_dir",
+                                 "output_extension",
+                                 "output_name",
+                                 "testonly",
+                                 "visibility",
+                               ])
+
+        # Link in the 64-bit Linux/x86 compatibility code.
+        deps += [ "$_x86_phys:linuxbiboot64" ]
+      }
+    } else {
+      not_needed(invoker, "*")
+    }
+  }
+}

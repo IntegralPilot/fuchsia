@@ -1,0 +1,869 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=7)
+library fuchsia.component.test;
+
+using fuchsia.component;
+using fuchsia.component.decl;
+using fuchsia.component.runner;
+using fuchsia.data;
+using fuchsia.mem;
+using fuchsia.io;
+using fuchsia.url;
+
+// The Realm Builder Server will include a local component's name in its
+// program dictionary under this string. Clients should use this value when
+// extracting a local component's name.
+const LOCAL_COMPONENT_NAME_KEY string = "LOCAL_COMPONENT_NAME";
+
+/// This protocol can be used to instruct the Realm Builder Server to begin
+/// creating a new realm.
+// Realm Builder Server is built both in tree and as part of the SDK.
+//
+// NOTE on `server="platform"`:
+// This protocol is served by platform in the sense that either the full url to the realm builder
+// server component is used, in which case it is actually the platform, or if it is used as a
+// subpackage through the sdk, it will be on the same version as the realm builder library being
+// used by the test. In both cases ABI compatibility is not a concern.
+@discoverable(server="platform")
+closed protocol RealmBuilderFactory {
+    /// Creates a new RealmBuilder. The client end of `realm_server_end` can be
+    /// used to mutate the realm that is being constructed, by doing things such
+    /// as adding new children to the realm or adding capability routes between
+    /// them. The client end of `builder_server_end` is used to finalize the
+    /// realm, after which point it can be launched in a collection.
+    ///
+    /// `pkg_dir_handle` is a handle to the test package. The realm builder
+    /// client typically passes a handle to its own `/pkg` directory, and
+    /// bundles the `other-component` into the same package.
+    strict Create(resource struct {
+        pkg_dir_handle client_end:fuchsia.io.Directory;
+        realm_server_end server_end:Realm;
+        builder_server_end server_end:Builder;
+    }) -> () error RealmBuilderError;
+
+    /// Identical to `Create`, but instead of the realm being empty by default
+    /// it contains the contents of the manifest located in the test package at
+    /// the path indicated by `relative_url`, which must be a fragment-only URL
+    /// (for example, `#meta/other-component.cm`; see
+    /// https://fuchsia.dev/fuchsia-src/reference/components/url#relative-fragment-only).
+    strict CreateFromRelativeUrl(resource struct {
+        pkg_dir_handle client_end:fuchsia.io.Directory;
+        relative_url fuchsia.url.Url;
+        realm_server_end server_end:Realm;
+        builder_server_end server_end:Builder;
+    }) -> () error RealmBuilderError;
+};
+
+/// Errors that may be returned by the `Realm` and `Builder` protocols.
+type RealmBuilderError = strict(removed=20) flexible(added=20) enum : uint32 {
+    /// Child cannot be added to the realm, as there is already a child in the
+    /// realm with that name.
+    CHILD_ALREADY_EXISTS = 0;
+
+    /// A legacy component URL was given to `AddChild`, or a modern component
+    /// url was given to `AddLegacyChild`.
+    INVALID_MANIFEST_EXTENSION = 1;
+
+    /// A component declaration failed validation.
+    INVALID_COMPONENT_DECL = 2;
+
+    /// The referenced child does not exist.
+    NO_SUCH_CHILD = 3;
+
+    /// The component declaration for the referenced child cannot be viewed nor
+    /// manipulated by RealmBuilder, because the child was added to the realm
+    /// using an URL that was neither a fragment-only nor a legacy URL.
+    CHILD_DECL_NOT_VISIBLE = 4;
+
+    /// The source does not exist.
+    NO_SUCH_SOURCE = 5;
+
+    /// A target does not exist.
+    NO_SUCH_TARGET = 6;
+
+    /// The `capabilities` field is empty.
+    CAPABILITIES_EMPTY = 7;
+
+    /// The `targets` field is empty.
+    TARGETS_EMPTY = 8;
+
+    /// The `from` value is equal to one of the elements in `to`.
+    SOURCE_AND_TARGET_MATCH = 9;
+
+    /// The test package does not contain the component declaration referenced
+    /// by a fragment-only component URL.
+    DECL_NOT_FOUND = 10;
+
+    /// Encountered an I/O error when attempting to read a component declaration
+    /// referenced by a fragment-only component URL from the test package.
+    DECL_READ_ERROR = 11;
+
+    /// The `Build` function has been called multiple times on this channel.
+    BUILD_ALREADY_CALLED = 12;
+
+    /// A capability is invalid. This may occur if a required field is empty or
+    /// if an unsupported type is received.
+    CAPABILITY_INVALID = 13;
+
+    /// The handle the client provided for the child realm is not usable.
+    INVALID_CHILD_REALM_HANDLE = 14;
+
+    /// `ReplaceComponentDecl` was called on a legacy or local component with a
+    /// program declaration that did not match the one from the old component
+    /// declaration. This could render a legacy or local component
+    /// non-functional, and is disallowed.
+    IMMUTABLE_PROGRAM = 15;
+
+    /// The URL provided to `RealmBuilderFactory.CreateFromRelativeURL` is not a
+    /// fragment-only component URL.
+    URL_IS_NOT_RELATIVE = 16;
+
+    /// The handle the client provided for the test's pkg directory is not
+    /// usable.
+    INVALID_PKG_DIR_HANDLE = 17;
+
+    /// The component does not have a config schema defined. Attempting to
+    /// set a config value is not allowed.
+    NO_CONFIG_SCHEMA = 18;
+
+    /// The component's config schema does not have a field with that name.
+    NO_SUCH_CONFIG_FIELD = 19;
+
+    /// A config value is invalid. This may mean a type mismatch or an issue
+    /// with constraints like string/vector length.
+    CONFIG_VALUE_INVALID = 20;
+
+    /// A config value cannot be set because the realm has not chosen its override
+    /// policy.
+    @available(added=9)
+    CONFIG_OVERRIDE_UNSUPPORTED = 21;
+};
+
+// NOTE on `server="platform"`:
+// This protocol is served by platform in the sense that either the full url to the realm builder
+// server component is used, in which case it is actually the platform, or if it is used as a
+// subpackage through the sdk, it will be on the same version as the realm builder library being
+// used by the test. In both cases ABI compatibility is not a concern.
+@discoverable(server="platform")
+closed protocol Builder {
+    /// Assembles the realm being constructed and returns the URL for the root
+    /// component in the realm, which may then be used to create a new component
+    /// in any collection where fuchsia-test-component is properly set up. Once
+    /// this is called, any Realm channels for the realm will no longer be
+    /// usable. The `runner` argument must be provided if the `AddLocalChild`
+    /// function has been used in this realm, as this runner channel will be
+    /// used to inform the client when to start and stop running any local
+    /// component implementations.
+    ///
+    /// Errors:
+    /// - `INVALID_COMPONENT_DECL`: A component declaration failed validaiton.
+    /// - `BUILD_ALREADY_CALLED`: The `Build` function has been called multiple
+    ///   times on this channel.
+    strict Build(resource struct {
+        runner client_end:fuchsia.component.runner.ComponentRunner;
+    }) -> (struct {
+        root_component_url string:fuchsia.url.MAX_URL_LENGTH;
+    }) error RealmBuilderError;
+};
+
+/// A capability that can be routed around a realm using `AddRoute`.
+///
+/// Will be renamed to `Capability` once the other definition under this name
+/// earlier in this file is removed.
+type Capability = flexible union {
+    1: protocol Protocol;
+    2: directory Directory;
+    3: storage Storage;
+    4: service Service;
+    @available(added=9)
+    6: event_stream EventStream;
+    @available(added=20)
+    7: config Config;
+    @available(added=25)
+    8: dictionary Dictionary;
+    @available(added=24)
+    9: resolver Resolver;
+    @available(added=24)
+    10: runner Runner;
+};
+
+/// A protocol capability
+type Protocol = table {
+    /// The name of the capability. This is usually the name of the FIDL
+    /// protocol, e.g. `fuchsia.logger.LogSink`. If path is not set, the
+    /// protocol will be installed in a target component's namespace at
+    /// `/svc/{name}`.
+    1: name fuchsia.component.name;
+
+    /// A rename of the capability, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// For information on this type, see
+    /// https://fuchsia.dev/go/components/declaration#DependencyType.
+    /// This field is optional and defaults to `STRONG`.
+    3: type fuchsia.component.decl.DependencyType;
+
+    /// Override the path in which the protocol is installed. Instead of
+    /// `/svc/{name}`, this value will be used. Path should begin with a
+    /// leading slash and omit a trailing slash, e.g.
+    /// `/foo/fuchsia.logger.LogSink`. This field is optional.
+    4: path string:fuchsia.component.MAX_PATH_LENGTH;
+
+    /// Optional. Cannot be set to `SameAsTarget` if `to` contains a local
+    /// component.
+    @available(added=10)
+    5: availability fuchsia.component.decl.Availability;
+
+    /// Optional. If set, the path to the dictionary routed by `from` which contains
+    /// the capability. Superseded by [`Realm.AddRouteFromDictionary`].
+    @available(added=25, removed=29)
+    6: from_dictionary string:MAX;
+};
+
+/// A directory capability.
+type Directory = table {
+    /// The name of the capability. This is not the path of the directory.
+    /// Instead it is a name used for routing.
+    1: name fuchsia.component.name;
+
+    /// A rename of the capability, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// For information on this type, see
+    /// https://fuchsia.dev/go/components/declaration#DependencyType.
+    /// This field is optional and defaults to `STRONG`.
+    3: type fuchsia.component.decl.DependencyType;
+
+    /// The subdirectory of this directory to offer instead of the root. For
+    /// example, if you set `bar/baz` as the subdir of `foo`, then `bar/baz`
+    /// will be the root of the target's `foo`. This field is optional.
+    4: subdir string:fuchsia.component.MAX_PATH_LENGTH;
+
+    /// The maximum rights that can be set by a component using this directory.
+    /// This field is required if it is being routed to a local component,
+    /// otherwise, it is optional.
+    5: rights fuchsia.io.Rights;
+
+    /// The path in which to install the directory. The path should have a
+    /// leading slash but no trailing slash, e.g. `/config/data`. This field
+    /// is required.
+    6: path string:fuchsia.component.MAX_PATH_LENGTH;
+
+    /// Optional. Cannot be set to `SameAsTarget` if `to` contains a local
+    /// component.
+    @available(added=10)
+    7: availability fuchsia.component.decl.Availability;
+
+    /// Optional. If set, the path to the dictionary routed by `from` which contains
+    /// the capability. Superseded by [`Realm.AddRouteFromDictionary`].
+    @available(added=25, removed=29)
+    8: from_dictionary string:MAX;
+};
+
+/// A storage capability
+type Storage = table {
+    /// The name of the capability. This is not the path of the directory.
+    /// Instead it is a name used for routing.
+    1: name fuchsia.component.name;
+
+    /// A rename of the capability, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// The path in which to install the directory. The path should have a
+    /// leading slash but no trailing slash, e.g. `/config/data`. This field
+    /// is required.
+    3: path fuchsia.component.name;
+
+    /// Optional. Cannot be set to `SameAsTarget` if `to` contains a local
+    /// component.
+    @available(added=10)
+    4: availability fuchsia.component.decl.Availability;
+};
+
+/// A service capability
+type Service = table {
+    /// The name of the capability. This is usually the name of the FIDL
+    /// service, e.g. `fuchsia.echo.EchoService`. If path is not set, the
+    /// service will be installed in a target component's namespace at
+    /// `/svc/{name}`.
+    1: name fuchsia.component.name;
+
+    /// A rename of the capability, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// Override the path in which the service is installed. Instead of
+    /// `/svc/{name}`, this value will be used. Path should begin with a
+    /// leading slash and omit a trailing slash, e.g.
+    /// `/foo/fuchsia.echo.EchoService`. This field is optional.
+    3: path string:fuchsia.component.MAX_PATH_LENGTH;
+
+    /// Optional. Cannot be set to `SameAsTarget` if `to` contains a local
+    /// component.
+    @available(added=10)
+    4: availability fuchsia.component.decl.Availability;
+
+    /// Optional. If set, the path to the dictionary routed by `from` which contains
+    /// the capability. Superseded by [`Realm.AddRouteFromDictionary`].
+    @available(added=25, removed=29)
+    5: from_dictionary string:MAX;
+};
+
+/// An event capability
+type Event = table {
+    /// The name of the capability.
+    1: name fuchsia.component.name;
+
+    /// A rename of the capability, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// A filter to apply on the event.
+    3: filter fuchsia.data.Dictionary;
+
+    /// Optional. Cannot be set to `SameAsTarget` if `to` contains a local
+    /// component.
+    @available(added=10)
+    4: availability fuchsia.component.decl.Availability;
+};
+
+/// An event_stream capability
+@available(added=9)
+type EventStream = table {
+    /// The name of the capability.
+    1: name fuchsia.component.name;
+
+    /// A rename of the capability, which can be set when routing to another
+    // component. This field is optional.
+    2: as fuchsia.component.name; // optional
+
+    /// Sets the path in which the event_stream is installed.
+    3: path string:fuchsia.component.MAX_PATH_LENGTH;
+
+    /// A filter to apply on the event.
+    4: filter fuchsia.data.Dictionary;
+
+    /// A list of objects underneath this component to downscope the event to.
+    /// Example: #my_child_component, #my_child_collection.
+    5: scope vector<fuchsia.component.decl.Ref>:MAX;
+};
+
+/// A configuration capability
+@available(added=20)
+type Config = table {
+    /// The name of the capability.
+    1: name fuchsia.component.name;
+
+    /// A rename of the capability, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// Optional. Cannot be set to `SameAsTarget` if `to` contains a local
+    /// component.
+    3: availability fuchsia.component.decl.Availability;
+};
+
+/// A dictionary capability
+@available(added=25)
+type Dictionary = table {
+    /// The name of the dictionary.
+    1: name fuchsia.component.name;
+
+    /// A rename of the dictionary, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// For information on this type, see
+    /// https://fuchsia.dev/go/components/declaration#DependencyType.
+    /// This field is optional and defaults to `STRONG`.
+    3: type fuchsia.component.decl.DependencyType;
+
+    /// Optional. Cannot be set to `SameAsTarget` if `to` contains a local
+    /// component.
+    4: availability fuchsia.component.decl.Availability;
+
+    /// Optional. If set, the path to the dictionary routed by `from` which contains
+    /// the capability. Superseded by [`Realm.AddRouteFromDictionary`].
+    @available(added=25, removed=29)
+    5: from_dictionary string:MAX;
+
+    /// Optional. The path at which this dictionary is used (if the target is a
+    /// local component).
+    @available(added=HEAD)
+    6: path string:fuchsia.component.MAX_PATH_LENGTH;
+};
+
+/// A resolver capability
+@available(added=24)
+type Resolver = table {
+    /// The name of the resolver.
+    1: name fuchsia.component.name;
+
+    /// A rename of the resolver, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// Override the path in which the resolver is installed. Instead of
+    /// `/svc/{name}`, this value will be used. Path should begin with a
+    /// leading slash and omit a trailing slash, e.g.
+    /// `/foo/fuchsia.logger.LogSink`. This field is optional.
+    3: path string:fuchsia.component.MAX_PATH_LENGTH;
+
+    /// Optional. If set, the path to the dictionary routed by `from` which contains
+    /// the capability. Superseded by [`Realm.AddRouteFromDictionary`].
+    @available(added=25, removed=29)
+    4: from_dictionary string:MAX;
+};
+
+/// A runner capability
+@available(added=24)
+type Runner = table {
+    /// The name of the runner.
+    1: name fuchsia.component.name;
+
+    /// A rename of the runner, which can be set when routing to another
+    /// component. This field is optional.
+    2: as fuchsia.component.name;
+
+    /// Override the path in which the runner is installed. Instead of
+    /// `/svc/{name}`, this value will be used. Path should begin with a
+    /// leading slash and omit a trailing slash, e.g.
+    /// `/foo/fuchsia.logger.LogSink`. This field is optional.
+    3: path string:fuchsia.component.MAX_PATH_LENGTH;
+
+    /// Optional. If set, the path to the dictionary routed by `from` which contains
+    /// the capability. Superseded by [`Realm.AddRouteFromDictionary`].
+    @available(added=25, removed=29)
+    4: from_dictionary string:MAX;
+};
+
+
+/// Properties that may be set on a child when it is added to a realm.
+// TODO(https://fxbug.dev/42078374): Consider deprecating this type.
+type ChildOptions = table {
+    /// For information on this type, see
+    /// https://fuchsia.dev/go/components/declaration#StartupMode.
+    /// Defaults to `LAZY`.
+    1: startup fuchsia.component.decl.StartupMode;
+
+    /// Specify a custom environment for the child to run under.
+    2: environment fuchsia.component.name;
+
+    /// For information on this type, see
+    /// https://fuchsia.dev/go/components/declaration#OnTerminate.
+    /// Defaults to `NONE`.
+    3: on_terminate fuchsia.component.decl.OnTerminate;
+
+    /// Structured Configuration overrides to be applied to the child.
+    /// Only keys declared by the child component as overridable by parent may
+    /// be provided. For information on overrides, see
+    /// [fuchsia.component.decl/ConfigOverride].
+    @available(added=13)
+    4: config_overrides vector<fuchsia.component.decl.ConfigOverride>:MAX;
+};
+
+/// Maximum number of entries allowed in one call of `Realm.ReadOnlyDirectory`.
+const MAX_DIRECTORY_ENTRIES uint32 = 1024;
+
+/// The contents of a directory that should be provided by the realm builder
+/// server.
+type DirectoryContents = resource struct {
+    entries vector<DirectoryEntry>:MAX_DIRECTORY_ENTRIES;
+};
+
+/// An entry in a directory.
+type DirectoryEntry = resource struct {
+    /// The path to the file. Valid examples include `foo.txt` and
+    /// `foo/bar.json`.
+    file_path fuchsia.component.name;
+
+    /// The contents of the file.
+    file_contents fuchsia.mem.Buffer;
+};
+
+// NOTE on `server="platform"`:
+// This protocol is served by platform in the sense that either the full url to the realm builder
+// server component is used, in which case it is really in the platform, or if it is used as a
+// subpackage through the sdk, it will be on the same version as the realm builder library being
+// used by the test. In both cases ABI compatibility is not a concern.
+@discoverable(server="platform")
+closed protocol Realm {
+    /// Adds a component to the realm.
+    ///
+    /// The `url` can be in one of the following formats:
+    ///
+    /// - an absolute component URL (such as,
+    ///   "fuchsia-pkg://fuchsia.com/some-package#meta/some-component.cm")
+    /// - a relative path component URL to a subpackaged component (like,
+    ///   "some-subpackage#meta/subpackaged-component.cm"); or
+    /// - a relative fragment-only URL (like, `#meta/other-component.cm`;
+    ///   see https://fuchsia.dev/fuchsia-src/reference/components/url#relative-fragment-only)
+    ///   indicating the path to a component manifest in the `pkg_dir` supplied
+    ///   to `RealmBuilderFactory::Create*()`.
+    ///
+    /// The realm builder client typically passes a handle to its own `/pkg`
+    /// directory, and bundles the `other-component` into the same package.
+    ///
+    /// Of the three URL types, _only_ component declarations added via the
+    /// fragment-only URL can be modified, via
+    /// `GetComponentDecl`/`ReplaceComponentDecl` because realm builder actually
+    /// performs its own component resolution from the component's manifest and
+    /// files bundled in the provided `pkg_dir` (typically from the package
+    /// shared by the realm builder client component and the components added
+    /// via fragment-only URL).
+    ///
+    /// Errors:
+    /// - `CHILD_ALREADY_EXISTS`: this realm already contains a child with the
+    ///   given name.
+    /// - `INVALID_MANIFEST_EXTENSION`: `url` does not end with `.cm`
+    /// - `DECL_NOT_FOUND`: The test package does not contain the component
+    ///   declaration referenced by a fragment-only component URL.
+    /// - `DECL_READ_ERROR`: Encountered an I/O error when attempting to read a
+    ///   component declaration referenced by a fragment-only component URL from
+    ///   the test package.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict AddChild(struct {
+        /// The name of the child that is being added.
+        name fuchsia.component.child_name;
+
+        /// The component's URL.
+        url fuchsia.url.Url;
+
+        /// Additional properties for the child.
+        options ChildOptions;
+    }) -> () error RealmBuilderError;
+
+    /// Adds a component to this realm whose declaration is set to `decl`. When
+    /// launched, the component will share the test package as its package
+    /// directory, and may access any resources from it.
+    ///
+    /// Errors:
+    /// - `CHILD_ALREADY_EXISTS`: this realm already contains a child with the
+    ///   given name.
+    /// - `INVALID_COMPONENT_DECL`: `decl` failed validation.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict AddChildFromDecl(struct {
+        /// The name of the child that is being added.
+        name fuchsia.component.child_name;
+
+        /// The component's declaration.
+        decl fuchsia.component.decl.Component;
+
+        /// Additional properties for the child.
+        options ChildOptions;
+    }) -> () error RealmBuilderError;
+
+    /// Adds a component to the realm whose implementation will be provided by
+    /// the client. When this component should be started, the runner channel
+    /// passed into `Build` will receive a start request for a component whose
+    /// `ProgramDecl` contains the moniker from the root of the
+    /// constructed realm for the child that is to be run under the `program`
+    /// key `LOCAL_COMPONENT_NAME`.
+    ///
+    /// Errors:
+    /// - `CHILD_ALREADY_EXISTS`: this realm already contains a child with the
+    ///   given name.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict AddLocalChild(struct {
+        /// The name of the child that is being added.
+        name fuchsia.component.child_name;
+
+        /// Additional properties for the child.
+        options ChildOptions;
+    }) -> () error RealmBuilderError;
+
+    /// Adds a child realm which can be built with the client end of
+    /// `child_realm`.
+    ///
+    /// Errors:
+    /// - `CHILD_ALREADY_EXISTS`: this realm already contains a child with the
+    ///   given name.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict AddChildRealm(resource struct {
+        /// The name of the child realm that is being added.
+        name fuchsia.component.name;
+
+        /// Additional properties for the child.
+        options ChildOptions;
+
+        /// The server end of the `Realm` channel that will be used to build the
+        /// sub-realm.
+        child_realm server_end:Realm;
+    }) -> () error RealmBuilderError;
+
+    /// Adds a child realm which can be built with the client end of
+    /// `child_realm`, and whose contents are initialized from `relative_url`.
+    /// `relative_url` must be a fragment-only URL.
+    @available(added=26)
+    strict AddChildRealmFromRelativeUrl(resource struct {
+        /// The name of the child realm that is being added.
+        name fuchsia.component.name;
+
+        /// The relative (fragment-only) URL.
+        relative_url fuchsia.url.Url;
+
+        /// Additional properties for the child.
+        options ChildOptions;
+
+        /// The server end of the `Realm` channel that will be used to build the
+        /// sub-realm.
+        child_realm server_end:Realm;
+    }) -> () error RealmBuilderError;
+
+    /// Adds a child realm which can be built with the client end of
+    /// `child_realm`, and whose contents are initialized from `decl`.
+    @available(added=26)
+    strict AddChildRealmFromDecl(resource struct {
+        /// The name of the child realm that is being added.
+        name fuchsia.component.name;
+
+        /// The component's declaration.
+        decl fuchsia.component.decl.Component;
+
+        /// Additional properties for the child.
+        options ChildOptions;
+
+        /// The server end of the `Realm` channel that will be used to build the
+        /// sub-realm.
+        child_realm server_end:Realm;
+    }) -> () error RealmBuilderError;
+
+
+    /// Returns the component decl for the given component. `name` must refer to
+    /// a component that is one of the following:
+    ///
+    /// - A component with a local implementation
+    /// - A legacy component
+    /// - A component added with a fragment-only URL (typically, components
+    ///   bundled in the same package as the realm builder client, sharing the
+    ///   same `/pkg` directory, for example, `#meta/other-component.cm`; see
+    ///   https://fuchsia.dev/fuchsia-src/reference/components/url#relative-fragment-only)
+    /// - An automatically generated realm (ex: the root)
+    ///
+    /// Errors:
+    /// - `NO_SUCH_CHILD`: This realm does not contain a child with the given
+    ///   name.
+    /// - `CHILD_DECL_NOT_VISIBLE`: The component decl cannot be fetched for
+    ///   the referenced child, because the child was added to the realm using
+    ///   a modern (not legacy) absolute URL or subpackaged component's relative
+    ///   path URL.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict GetComponentDecl(struct {
+        /// The name of the component whose declaration is being retrieved.
+        name fuchsia.component.child_name;
+    }) -> (struct {
+        component_decl fuchsia.component.decl.Component;
+    }) error RealmBuilderError;
+
+    /// Replaces the component decl for the given component. `name` must
+    /// refer to a component that is one of the following:
+    ///
+    /// - A component with a local implementation
+    /// - A legacy component
+    /// - A component added with a fragment-only URL (typically, components
+    ///   bundled in the same package as the realm builder client, sharing the
+    ///   same `/pkg` directory, for example, `#meta/other-component.cm`; see
+    ///   https://fuchsia.dev/fuchsia-src/reference/components/url#relative-fragment-only)
+    /// - An automatically generated realm (ex: the root)
+    ///
+    /// Errors:
+    /// - `NO_SUCH_CHILD`: This realm does not contain a child with the given
+    ///   name.
+    /// - `CHILD_ALREADY_EXISTS`: The component whose decl is being replaced has
+    ///   had a child added to it through realm builder with the same name as an
+    ///   element in `component_decl.children`.
+    /// - `CHILD_DECL_NOT_VISIBLE`: The component decl cannot be manipulated for
+    ///   the referenced child, because the child was added to the realm using
+    ///   an absolute (not relative) and modern (not legacy) URL.
+    /// - `INVALID_COMPONENT_DECL`: `component_decl` failed validation.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict ReplaceComponentDecl(struct {
+        /// The name of the component whose declaration is being replaced.
+        name fuchsia.component.child_name;
+
+        /// The new component declaration for `name`.
+        component_decl fuchsia.component.decl.Component;
+    }) -> () error RealmBuilderError;
+
+    /// Returns the component decl for this realm.
+    ///
+    /// Errors:
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict GetRealmDecl() -> (struct {
+        component_decl fuchsia.component.decl.Component;
+    }) error RealmBuilderError;
+
+    /// Replaces the component decl for this realm.
+    ///
+    /// Errors:
+    /// - `INVALID_COMPONENT_DECL`: `component_decl` failed validation.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict ReplaceRealmDecl(struct {
+        /// The new component declaration for this realm.
+        component_decl fuchsia.component.decl.Component;
+    }) -> () error RealmBuilderError;
+
+    /// Inform the realm builder server that this realm is using a nested component manager. It's
+    /// expected that the client library has already replaced the realm's declaration with a
+    /// passthrough component manager declaration, with the exception of the root url.
+    /// This method will arrange for [Builder.Build] to install the realm's generated url as the
+    /// root url in this component manager.
+    @available(added=26)
+    strict UseNestedComponentManager(struct {
+        component_manager_relative_url fuchsia.url.Url;
+    }) -> () error RealmBuilderError;
+
+    /// Identical to `AddRouteFromDictionary`, except it does not accept `from_dictionary` which
+    /// it always sets to ".".
+    @available(deprecated=29)
+    @deprecated("use AddRouteFromDictionary instead")
+    strict AddRoute(struct {
+        /// The capabilities that are to be routed.
+        capabilities vector<Capability>:MAX;
+
+        /// The location where the elements of `capabilities` are available.
+        from fuchsia.component.decl.Ref;
+
+        /// The locations that should be able to access `capabilities`.
+        to vector<fuchsia.component.decl.Ref>:MAX;
+    }) -> () error RealmBuilderError;
+
+    /// Mutates component manifests in the realm such that every component in
+    /// `to` will have a valid capability route for each item in `capabilities`
+    /// provided by `from`.
+    ///
+    /// Errors:
+    /// - `NO_SUCH_SOURCE`: `from` references a non-existent child.
+    /// - `NO_SUCH_TARGET`: `to` references a non-existent child.
+    /// - `CAPABILITIES_EMPTY`: `capabilities` is empty.
+    /// - `TARGETS_EMPTY`: `to` is empty.
+    /// - `SOURCE_AND_TARGET_MATCH`: `from` is equal to one of the elements in
+    ///   `to`.
+    /// - `INVALID_COMPONENT_DECL`: The requested route caused one of the
+    ///   involved manifests to fail validation.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    @available(added=29)
+    strict AddRouteFromDictionary(struct {
+        /// The capabilities that are to be routed.
+        capabilities vector<Capability>:MAX;
+
+        /// The location where the elements of `capabilities` are available.
+        from fuchsia.component.decl.Ref;
+
+        /// A path. If ".", `capabilities` are routed directly from `from`.
+        /// Otherwise, this represents a path in a dictionary routed by `from`
+        /// which contains the `capabilities`.
+        from_dictionary fuchsia.component.decl.dictionary_path;
+
+        /// The locations that should be able to access `capabilities`.
+        to vector<fuchsia.component.decl.Ref>:MAX;
+    }) -> () error RealmBuilderError;
+
+    /// Offers a directory capability to a component in this realm. The
+    /// directory will be read-only (i.e. have `r*` rights), and will have the
+    /// contents described in `directory_contents`.
+    ///
+    /// Errors:
+    /// - `NO_SUCH_TARGET`: `offer-to` references a non-existent child.
+    /// - `BUILD_ALREADY_CALLED`: The `Builder.Build` function has been called
+    ///   for this realm, and thus this `Realm` channel can no longer be used.
+    strict ReadOnlyDirectory(resource struct {
+        /// The name of the directory capability.
+        name fuchsia.component.name;
+
+        /// The target that this directory will be offered to.
+        to vector<fuchsia.component.decl.Ref>:MAX;
+
+        /// The contents of the directory.
+        directory_contents DirectoryContents;
+    }) -> () error RealmBuilderError;
+
+
+    /// Creates and routes a new storage capability to the provided targets.
+    /// Optionally can connect the provided channel the the
+    /// `fuchsia.sys2.StorageAdmin` protocol for this storage capability.
+    @available(added=HEAD)
+    strict AddStorage(resource struct {
+        /// The name of the storage capability.
+        name fuchsia.component.name;
+
+        /// The target that this storage capability will be offered to.
+        to vector<fuchsia.component.decl.Ref>:MAX;
+
+        /// The server end to connect to this storage capability's
+        /// `fuchsia.sys2.StorageAdmin` protocol.
+        storage_admin server_end:<fuchsia.component.StorageAdmin, optional>;
+    }) -> () error RealmBuilderError;
+
+    /// Load any packaged configuration for `name` before using values provided to
+    /// the builder.
+    ///
+    /// Allows calling `SetConfigValue` to override packaged configuration.
+    @available(added=9)
+    strict InitMutableConfigFromPackage(struct {
+        name fuchsia.component.name;
+    }) -> () error RealmBuilderError;
+
+    /// Use only values provided to the builder for `name`'s configuration.
+    ///
+    /// Allows calling `SetConfigValue` to provide configuration.
+    @available(added=9)
+    strict InitMutableConfigToEmpty(struct {
+        name fuchsia.component.name;
+    }) -> () error RealmBuilderError;
+
+    /// Add a capability to the realm.
+    @available(added=20)
+    strict AddCapability(struct {
+        capability fuchsia.component.decl.Capability;
+    }) -> () error RealmBuilderError;
+
+    /// Adds a collection to the realm.
+    @available(added=25)
+    strict AddCollection(struct {
+        collection fuchsia.component.decl.Collection;
+    }) -> () error RealmBuilderError;
+
+    /// Adds an environment to the realm.
+    @available(added=25)
+    strict AddEnvironment(struct {
+        environment fuchsia.component.decl.Environment;
+    }) -> () error RealmBuilderError;
+
+    /// Sets the configuration value for a field specified by `key`.
+    /// The component specified must have a config schema with this field.
+    /// The value must conform to all constraints as defined by the schema.
+    ///
+    /// This method must be called after either `InitMutableConfigFromPackage` or
+    /// `InitMutableConfigToEmpty`.
+    ///
+    /// Errors:
+    /// - `NO_CONFIG_SCHEMA`: component does not have a config schema
+    /// - `NO_SUCH_CONFIG_FIELD`: `key` could not be found in component's config schema
+    /// - `CONFIG_VALUE_INVALID`: `value` does not meet config schema constraints
+    @available(added=9)
+    strict SetConfigValue(struct {
+        /// The name of the component whose config value is being replaced.
+        name fuchsia.component.name;
+
+        /// The key of the config field whose value is being replaced.
+        key fuchsia.component.decl.ConfigKey;
+
+        /// The config value being replaced.
+        value fuchsia.component.decl.ConfigValueSpec;
+    }) -> () error RealmBuilderError;
+};

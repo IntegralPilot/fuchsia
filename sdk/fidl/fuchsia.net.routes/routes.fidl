@@ -1,0 +1,179 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=7)
+library fuchsia.net.routes;
+
+using fuchsia.net;
+using zx;
+
+/// The ID of a route table.
+///
+/// `TableId`s are globally unique non-reusable identifiers for a route table.
+@available(added=HEAD)
+alias TableId = uint32;
+
+/// Maximum length of a table name.
+@available(added=HEAD)
+const MAX_TABLE_NAME_LEN uint64 = 255;
+
+/// The name of a route table.
+@available(added=HEAD)
+alias TableName = string:MAX_TABLE_NAME_LEN;
+
+/// A placeholder for empty values.
+@available(added=HEAD)
+type Empty = struct {};
+
+/// The properties of the route that were explicitly specified at the time the
+/// route was created.
+@available(added=HEAD)
+type SpecifiedRouteProperties = table {
+    /// The route's effective metric will be determined by whichever value is
+    /// specified below.
+    1: metric
+            @generated_name("SpecifiedMetric")
+            @strict_audit(bug="https://fxbug.dev/467128725", state="PENDING_REVIEW")
+            strict union {
+        /// The route's metric will be this explicitly specified value.
+        1: explicit_metric fuchsia.net.RouteMetric;
+        /// The route's metric is inherited from its outbound interface, and
+        /// will track this value as it changes throughout the route's lifetime.
+        /// Clients may prefer this approach if they wish to offload the
+        /// responsibility of "which route is best" to the system.
+        2: inherited_from_interface Empty;
+    };
+};
+
+/// The effective properties of a route installed in the system.
+@available(added=HEAD)
+type EffectiveRouteProperties = table {
+    /// The route's effective metric, dependent on the value of the route's
+    /// [`SpecifiedRouteProperties`]. If the `specified_metric` is
+    /// `explicit_metric`, this value will be identical to the provided value;
+    /// if the `specified_metric` is `inherited_from_interface` this value will
+    /// be the interface's routing metric.
+    1: metric fuchsia.net.RouteMetric;
+};
+
+/// The maximum number of events that can be returned by one call to `Watch()`.
+// Rationale for the current value:
+// Prefer an "as large as possible" value for `MAX_EVENTS`, because FIDL
+// `vectors` are variable length, meaning a `vector` of one event won't waste
+// space on the wire. Both [`InstalledRouteV4`] and [`InstalledRouteV6`] are
+// less than 64 bytes, and the maximum FIDL message size is 64K. While we could
+// probably squeeze in 1024 events, 512 is a nice compromise that allows the
+// the types to grow as more fields are added.
+@available(added=HEAD)
+const MAX_EVENTS uint16 = 512;
+
+/// Collection of addresses and identifiers describing a network destination.
+///
+/// A `Destination` is the "next-hop" for a routed packet.
+type Destination = table {
+    /// The IP address of the destination.
+    1: address fuchsia.net.IpAddress;
+    /// The MAC address of the destination. Only set if the destination is on a
+    /// link that requires a MAC address.
+    2: mac fuchsia.net.MacAddress;
+    /// The interface identifier over which the destination can be reached.
+    3: interface_id fuchsia.net.InterfaceId;
+    /// The preferred local IP address used to communicate with the destination.
+    4: source_address fuchsia.net.IpAddress;
+};
+
+/// Provides access to the system's routing state.
+@discoverable(server="platform")
+closed protocol State {
+    /// Resolves the route to a destination.
+    ///
+    /// + request `destination` the IP address to resolve a route to. If the
+    ///     unspecified address (all zeroes) is provided, the default route will
+    ///     be returned. The variant of `destination` determines variant of
+    ///     [`fuchsia.net/IpAddress`] fields in the resolved route.
+    /// - response `result` contains the resolved route to `destination`.
+    /// * error `ZX_ERR_ADDRESS_UNREACHABLE` if `destination` can't be resolved.
+    strict Resolve(struct {
+        destination fuchsia.net.IpAddress;
+    }) -> (struct {
+        /// A resolved route.
+        ///
+        /// Contains the information for the "next-hop" or immediate-destination
+        /// that is the result of a route resolution. A resolved route is only
+        /// meaningful in the context of a requested destination.
+        result
+                @generated_name("Resolved")
+                @strict_audit(bug="https://fxbug.dev/467128725", state="PENDING_REVIEW")
+                strict union {
+            /// The requested destination is directly reachable.
+            1: direct Destination;
+            /// The requested destination is reachable through a gateway, thus
+            /// the next hop is the gateway.
+            2: gateway Destination;
+        };
+    }) error zx.Status;
+
+    /// Resolves the route to a destination.
+    ///
+    /// + request `destination` the IP address to resolve a route to. If the
+    ///     unspecified address (all zeroes) is provided, the default route will
+    ///     be returned. The variant of `destination` determines variant of
+    ///     [`fuchsia.net/IpAddress`] fields in the resolved route.
+    /// + request `options` contains optional information used for the route resolution.
+    /// - response `result` contains the resolved route to `destination`.
+    /// * error `ADDRESS_UNREACHABLE` if `destination` can't be resolved.
+    // TODO(https://fxbug.dev/396228984): Stabilize this API and deprecate the one above.
+    @available(added=HEAD)
+    strict Resolve2(struct {
+        destination fuchsia.net.IpAddress;
+        options @generated_name("ResolveOptions") table {
+            /// The marks used for the route resolution.
+            ///
+            /// For mark domains that are not present, the route resolution will
+            /// happen with no marks for the domain. This field is also optional.
+            /// If absent, all mark domains are considered to be unmarked for the
+            /// route resolution.
+            1: marks fuchsia.net.Marks;
+        };
+    }) -> (struct {
+        /// A resolved route.
+        ///
+        /// Contains the information for the "next-hop" or immediate-destination
+        /// that is the result of a route resolution. A resolved route is only
+        /// meaningful in the context of a requested destination.
+        result @generated_name("ResolveResult") flexible union {
+            /// The requested destination is directly reachable.
+            1: direct Destination;
+            /// The requested destination is reachable through a gateway, thus
+            /// the next hop is the gateway.
+            2: gateway Destination;
+        };
+    }) error @generated_name("ResolveError") flexible enum : uint32 {
+        ADDRESS_UNREACHABLE = 1;
+    };
+    /// Gets the route table name by its ID.
+    ///
+    /// + request `table_id` the ID of the route table in question.
+    /// - response `table_name` the name of the route table, if the route table
+    /// does not have a name, an empty string is returned.
+    /// * error `NO_TABLE` if the route table does not exist.
+    @available(added=HEAD)
+    strict GetRouteTableName(struct {
+        table_id TableId;
+    }) -> (struct {
+        table_name TableName;
+    }) error @strict_audit(bug="https://fxbug.dev/467128725", state="PENDING_REVIEW") strict enum {
+        NO_TABLE = 1;
+    };
+};
+
+/// Specifies which table(s) the watcher is interested in.
+@available(added=HEAD)
+type TableInterest = flexible union {
+    /// Only watch for events on the specified table.
+    1: only TableId;
+    /// Watches on the main table without knowing the table ID.
+    2: main struct {};
+    /// Watches for all routing tables.
+    3: all struct {};
+};

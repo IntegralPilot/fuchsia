@@ -1,0 +1,172 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.audio.mixer;
+
+using fuchsia.audio;
+using fuchsia.math;
+using fuchsia.audio.effects;
+using fuchsia.hardware.audio;
+using zx;
+
+/// A Producer node can pull from a StreamSink or a RingBuffer.
+type ProducerDataSource = flexible resource union {
+    1: stream_sink StreamSinkProducer;
+    2: ring_buffer fuchsia.audio.RingBuffer;
+};
+
+/// A Consumer node can write to a StreamSink or a RingBuffer.
+type ConsumerDataSink = flexible resource union {
+    1: stream_sink StreamSinkConsumer;
+    2: ring_buffer fuchsia.audio.RingBuffer;
+};
+
+/// A producer driven by a [`fuchsia.audio.StreamSink`].
+type StreamSinkProducer = resource table {
+    /// Channel to receive packets.
+    ///
+    /// Required.
+    1: server_end server_end:fuchsia.audio.StreamSink;
+
+    /// Encoding of this audio stream.
+    ///
+    /// Required.
+    2: format fuchsia.audio.Format;
+
+    /// Clock for this node's destination streams.
+    ///
+    /// Required.
+    3: reference_clock ReferenceClock;
+
+    /// Payload buffer used by packets on this StreamSink.
+    ///
+    /// Required.
+    4: payload_buffer zx.Handle:VMO;
+
+    /// Packet timestamps use "media time", which has
+    /// `media_ticks_per_second.numerator` ticks every
+    /// `media_ticks_per_second.denominator` seconds.
+    ///
+    /// Required.
+    5: media_ticks_per_second fuchsia.math.RatioU64;
+
+    /// Initial segment ID for the StreamSink.
+    ///
+    /// Optional. If not specified, defaults to zero.
+    6: initial_segment_id int64;
+};
+
+/// A consumer driven by a [`fuchsia.audio.StreamSink`].
+type StreamSinkConsumer = resource table {
+    /// Channel to send packets.
+    ///
+    /// Required.
+    1: client_end client_end:fuchsia.audio.StreamSink;
+
+    /// Encoding of this audio stream.
+    ///
+    /// Required.
+    2: format fuchsia.audio.Format;
+
+    /// Clock for this node's source stream.
+    ///
+    /// Required.
+    3: reference_clock ReferenceClock;
+
+    /// Payload buffer used by packets on this StreamSink.
+    ///
+    /// Required.
+    4: payload_buffer zx.Handle:VMO;
+
+    /// Packet timestamps use "media time", which has
+    /// `media_ticks_per_second.numerator` ticks every
+    /// `media_ticks_per_second.denominator` seconds.
+    ///
+    /// Required.
+    5: media_ticks_per_second fuchsia.math.RatioU64;
+
+    /// Numer of frames to produce in each packet.
+    ///
+    /// Optional.
+    6: frames_per_packet uint32;
+};
+
+/// A handle to a reference clock.
+type ReferenceClock = resource table {
+    /// Name of this clock, used for diagnostics only. See "IDs and names" in the
+    /// comments for [`Graph`].
+    ///
+    /// Optional. If not specified, a default name is derived from whatever node
+    /// is using this clock.
+    1: name string:MAX_NAME_LENGTH;
+
+    /// The clock must be ZX_CLOCK_OPT_MONOTONIC and ZX_CLOCK_OPT_CONTINUOUS
+    /// with ZX_RIGHT_READ. See "Clocks" under the description for [`Graph`].
+    ///
+    /// Required.
+    2: handle zx.Handle:CLOCK;
+
+    /// Domain of the clock, if known.
+    ///
+    /// Optional. If not specified, defaults to `CLOCK_DOMAIN_EXTERNAL`.
+    3: domain fuchsia.hardware.audio.ClockDomain;
+};
+
+/// Used to watch for changes in delay from an external source.
+///
+/// If the delay is fixed (it never changes), then `initial_delay` contains the
+/// fixed delay and `client_end` should not be specified.
+///
+/// If the delay is variable, then `initial_delay` contains the initial delay
+/// value (if known) and `client_end` should be queried to watch for updates.
+type ExternalDelayWatcher = resource table {
+    /// The initial delay value. Optional if `client_end` is specified,
+    /// otherwise required.
+    1: initial_delay zx.Duration;
+
+    /// A channel to query for delay updates. Optional.
+    2: client_end client_end:fuchsia.audio.DelayWatcher;
+};
+
+/// Return value for CreateCustom.
+type CustomNodeProperties = resource table {
+    /// IDs for each source node. See comments at [`Graph.CreateCustom`].
+    ///
+    /// Required.
+    1: source_ids vector<NodeId>:fuchsia.audio.effects.MAX_INPUT_STREAMS;
+
+    /// IDs for each destination node. See comments at [`Graph.CreateCustom`].
+    ///
+    /// Required.
+    2: dest_ids vector<NodeId>:fuchsia.audio.effects.MAX_OUTPUT_STREAMS;
+};
+
+/// Every node is part of an output pipeline or an input pipeline.
+///
+/// Output pipelines, also known as "render" pipelines, produce audio that is
+/// written to an output device, usually some kind of speaker. Output pipelines
+/// operate on audio that should be rendered to an output device at some time
+/// in the future.
+///
+/// Input pipelines, also known as "capture" pipelines, consume audio that is
+/// read from an input device, usually some kind of microphone. Input pipelines
+/// operate on audio that was captured from an input device at some time in the
+/// past.
+///
+/// Input pipelines can read from output pipelines. This is commonly known as a
+/// "loopback" capture.
+///
+/// Input pipelines cannot write to output pipelines. This is not allowed
+/// because it creates a timestamp paradox: When an input pipeline reads a
+/// frame, it assigns the frame timestamp `T`, which represents the time at
+/// which the frame was captured from an input device. Timestamp `T` occurred in
+/// the past. When we forward that frame to an output pipeline, the frame will
+/// underflow because time `T` is in the past. It can sometimes be useful to
+/// connect pipelines in this way, but this must be done by the client, who is
+/// responsible for re-timstamping captured frames in an appropriate way before
+/// forwarding those frames to an output pipeline.
+type PipelineDirection = strict enum {
+    OUTPUT = 1;
+    INPUT = 2;
+};

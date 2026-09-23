@@ -1,0 +1,154 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+
+# Builds a starnix container that can boot an Android system image.
+#
+# Given an Android system image, a package to "base" off of, and an optional
+# set of HAL packages, build a starnix container.
+#
+# Parameters:
+#
+#   base (required)
+#     [label] A label to a fuchsia package whose contents should be included.
+#
+#   system (required)
+#     [label] Path to an Android system image.
+#
+#   hals (optional; default=[])
+#     [list of labels] Labels of HAL fuchsia packages to add as subpackages.
+#
+#   fstab (optional)
+#     [path] fstab file to place in /odm
+#
+#   init (optional; default=[])
+#     [list of paths] Paths of additional init files to place in /odm/etc/init.
+#
+#     The resulting container package will also have an ODM filesystem with
+#     configurations for HALs. See /src/starnix/tools/gen_android_starnix_container/README.md
+#     for details.
+#
+#   skip_subpackages (optional; default=false)
+#     [bool] Whether to skip including HALs as subpackages
+#
+#     If not set, the HALs must be included as base packages and the container CML should
+#     refer to absolute package URLs accordingly.
+#
+template("android_starnix_container") {
+  if (current_toolchain == default_toolchain) {
+    assert(defined(invoker.base), "Need to define base")
+    assert(defined(invoker.system), "Need to define system")
+
+    compiled_action(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "deps",
+                               "testonly",
+                             ])
+      if (!defined(deps)) {
+        deps = []
+      }
+
+      depfile = "$target_gen_dir/$target_name.d"
+      tool = "//src/starnix/tools/gen_android_starnix_container:gen_android_starnix_container_bin"
+      tool_output_name = "gen-android-starnix-container"
+
+      _outdir = "${target_out_dir}/${target_name}"
+      inputs = [ invoker.system ]
+      outputs = [
+        # List the meta.far file as an output to avoid flaky incremental builds.
+        # See b/324512578 for details.
+        "${_outdir}/meta.far",
+        "${_outdir}/package_manifest.json",
+      ]
+
+      args = [
+        "--name",
+        target_name,
+        "--outdir",
+        rebase_path(_outdir, root_build_dir),
+        "--system",
+        rebase_path(invoker.system, root_build_dir),
+        "--depfile",
+        rebase_path(depfile, root_build_dir),
+      ]
+
+      ramdisks = []
+      if (defined(invoker.ramdisk)) {
+        ramdisks += [ invoker.ramdisk ]
+      }
+      if (defined(invoker.ramdisks)) {
+        ramdisks += invoker.ramdisks
+      }
+      foreach(ramdisk, ramdisks) {
+        args += [
+          "--ramdisk",
+          rebase_path(ramdisk, root_build_dir),
+        ]
+      }
+
+      _base_manifest =
+          get_label_info(invoker.base, "target_out_dir") + "/" +
+          get_label_info(invoker.base, "name") + "/package_manifest.json"
+      _base_meta_far = get_label_info(invoker.base, "target_out_dir") + "/" +
+                       get_label_info(invoker.base, "name") + "/meta.far"
+      args += [
+        "--base",
+        rebase_path(_base_manifest, root_build_dir),
+      ]
+      inputs += [
+        _base_manifest,
+        _base_meta_far,
+      ]
+      deps += [ invoker.base ]
+
+      foreach(hal, invoker.hals) {
+        _hal_manifest = get_label_info(hal, "target_out_dir") + "/" +
+                        get_label_info(hal, "name") + "/package_manifest.json"
+        args += [
+          "--hal",
+          rebase_path(_hal_manifest, root_build_dir),
+        ]
+        inputs += [ _hal_manifest ]
+        deps += [ hal ]
+      }
+
+      if (defined(invoker.fstab)) {
+        args += [
+          "--fstab",
+          rebase_path(invoker.fstab, root_build_dir),
+        ]
+        inputs += [ invoker.fstab ]
+      }
+
+      if (defined(invoker.init)) {
+        inputs += invoker.init
+        foreach(i, invoker.init) {
+          args += [
+            "--init",
+            rebase_path(i, root_build_dir),
+          ]
+        }
+      }
+
+      if (defined(invoker.skip_subpackages) && invoker.skip_subpackages) {
+        args += [ "--skip-subpackages" ]
+      }
+    }
+  } else {
+    # Redirect to a toolchain where the dependency packages exist.
+    group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      deps = [ ":${target_name}(${default_toolchain})" ]
+    }
+
+    # Suppress unused variable warnings.
+    not_needed(invoker, "*")
+  }
+}

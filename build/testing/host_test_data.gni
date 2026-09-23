@@ -1,0 +1,98 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Declares host-side test data and makes them available at test runtime.
+#
+# It is a requirement that host tests with runtime dependencies express this
+# by depending on instances of this template.
+#
+# Parameters
+#
+#   * sources
+#     - Required: List of source data files to serve as host test data.
+#     - Type: list(path)
+#
+#   * outputs
+#     - Optional: Where to copy the provided sources. If provided, these
+#       locations (and not those of sources) will be declared as runtime
+#       dependencies.
+#     - Type: list(path relative to $root_build_dir)
+#
+#   * testonly
+#     - Optional: GN Usual. Allow option to set to false for IDK inclusion.
+#       See https://cs.opensource.google/fuchsia/fuchsia/+/main:sdk/BUILD.gn;l=161-167;drc=aa7ba9d998556f7124fe8e2edc6604c9c1592d01
+#     - Type: boolean
+#     - Default: true
+#
+#   * deps
+#   * visibility
+#     - Optional: Usual GN meanings.
+#
+template("host_test_data") {
+  assert(defined(invoker.sources), "sources are required")
+  assert(
+      !is_fuchsia,
+      "host_test_data should only be used on host, to fix this, wrap you target with `if (is_host) { ... }`")
+
+  _testonly = true
+  if (defined(invoker.testonly)) {
+    _testonly = invoker.testonly
+  }
+
+  if (defined(invoker.outputs)) {
+    main_target_name = target_name
+    metadata_target_name = "${target_name}.metadata"
+
+    # The main target that copies test data to the build directory.
+    # It depends on the generated group `group_target_name`, which
+    # carries the `test_runtime_deps` metadata.
+    # The copy rule is the main target so that clients can still
+    # call `get_target_outputs` on it.
+    copy(main_target_name) {
+      testonly = _testonly
+      forward_variables_from(invoker, "*")
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += [ ":$metadata_target_name" ]
+
+      # If we are in the context of a variant, also perform the copy for the
+      # base toolchain, as we want both the variant-selected and normal
+      # versions of the associated test to have its test data available at the
+      # prescribed relative paths.
+      if (current_toolchain != toolchain_variant.base) {
+        deps += [ ":$main_target_name(${toolchain_variant.base})" ]
+      }
+    }
+
+    # This group exists because the metadata needed by test_spec cannot be
+    # generated within the copy() action, as 'process_file_pattern()' rejects
+    # 'source_path_relative', which is valid for 'copy()'.
+    group(metadata_target_name) {
+      testonly = _testonly
+      visibility = [ ":$main_target_name" ]
+      metadata = {
+        test_runtime_deps = get_target_outputs(":$main_target_name")
+      }
+    }
+  } else {
+    # This group exists only to carry the `test_runtime_deps` metadata, which
+    # is aggregated by test_spec().
+    group(target_name) {
+      testonly = _testonly
+      forward_variables_from(invoker,
+                             [
+                               "assert_no_deps",
+                               "deps",
+                               "data_deps",
+                               "public_deps",
+                               "visibility",
+                             ])
+      metadata = {
+        test_runtime_deps = invoker.sources
+        test_runtime_deps_barrier = []
+      }
+    }
+  }
+}

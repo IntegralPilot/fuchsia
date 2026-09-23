@@ -1,0 +1,71 @@
+#!/bin/bash
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Build
+### Build and upload to GCS.
+
+set -e
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh
+fx-config-read
+
+## usage: fx build-and-upload [--bucket gs://bucket-name]
+##
+## Arguments:
+##   -b|--bucket    GCS bucket to upload to. Defaults to gs://fuchsia-build-stage
+
+# Reset parallel composite upload enabled to initial value on exit.
+parallel_upload_enabled=$(gcloud config get storage/parallel_composite_upload_enabled)
+trap 'gcloud config set storage/parallel_composite_upload_enabled "${parallel_upload_enabled}" > /dev/null 2>&1' EXIT
+
+main() {
+  local bucket="fuchsia-build-stage"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -b|--bucket)
+        bucket="$2"
+        shift
+        ;;
+      *)
+        echo "Unknown argument: $1"
+        fx-command-help
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  if ! command -v gcloud >/dev/null; then
+    fx-error "gcloud not found in PATH."
+    fx-error "Please install Google Cloud CLI: https://cloud.google.com/sdk/docs/install"
+    exit 1
+  fi
+
+  fx-command-run build
+
+  local product
+  product=$(fx-command-run jq -r .build_info_product "${FUCHSIA_BUILD_DIR}/args.json")
+  local board
+  board=$(fx-command-run jq -r .build_info_board "${FUCHSIA_BUILD_DIR}/args.json")
+
+  # Use the build directory for the output zip file
+  pb_zip_name="${USER}-${product}.${board}-$(date +%Y%m%d-%H%M%S).zip"
+  local pb_zip_path="${FUCHSIA_BUILD_DIR}/${pb_zip_name}"
+
+  fx-command-run create-pb-zip -o "${pb_zip_path}" -g all
+
+  fx-info "Uploading ${pb_zip_path} to gs://${bucket}..."
+  # Disable parallel composite upload to avoid deleting the segments.
+  gcloud config set storage/parallel_composite_upload_enabled False > /dev/null 2>&1
+  gcloud storage cp -c "${pb_zip_path}" "gs://${bucket}"
+
+  fx-info "Download URL: https://storage.mtls.cloud.google.com/${bucket}/${pb_zip_name}"
+  fx-info "GS URL: gs://${bucket}/${pb_zip_name}"
+
+  # Clean up the zip file
+  rm -f "${pb_zip}"
+}
+
+main "$@"

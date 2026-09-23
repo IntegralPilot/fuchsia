@@ -1,0 +1,147 @@
+# Copyright 2019 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/cpp/library_headers.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//zircon/kernel/kernel_rust_mod.gni")
+
+library_headers("headers") {
+  headers = [
+    "lib/unittest/unittest.h",
+    "lib/unittest/user_memory.h",
+  ]
+  public_deps = [
+    # <lib/unittest/unittest.h> has #include
+    # <lib/special-sections/special-sections.h>.
+    "//zircon/kernel/lib/special-sections:headers",
+  ]
+  if (toolchain_environment == "kernel") {
+    public_deps += [
+      # <lib/unittest/user_memory.h> has #include <lib/crypto/prng.h>.
+      "//zircon/kernel/vm:headers",
+
+      # <lib/unittest/user_memory.h> has #include <lib/instrumentation/asan.h>.
+      "//zircon/kernel/lib/instrumentation:headers",
+
+      # <lib/unittest/user_memory.h> has #include <ktl/utility.h>.
+      "//zircon/kernel/lib/ktl:headers",
+    ]
+  }
+}
+
+source_set("unittest") {
+  public_deps = [ ":headers" ]
+
+  sources = [ "unittest.cc" ]
+  deps = [ "//zircon/system/ulib/pretty" ]
+  if (toolchain_environment == "kernel") {
+    sources += [
+      "user_memory.cc",
+      "user_memory_tests.cc",
+    ]
+    deps += [
+      ":unittest_console",
+      ":user-memory-rs",
+      "//zircon/kernel/lib/console",
+      "//zircon/kernel/lib/page",
+    ]
+  } else {
+    sources += [ "phys.cc" ]
+    deps += [
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+    ]
+  }
+}
+
+kernel_rust_mod("unittest_console") {
+  source_root = "console.rs"
+  sources = [ "console.rs" ]
+  deps = [
+    "//sdk/rust/zx-status",
+    "//sdk/rust/zx-types",
+    "//src/lib/kalloc",
+    "//src/lib/kprint",
+    "//src/lib/ksync",
+    "//src/lib/zr",
+    "//zircon/kernel/lib/debug",
+  ]
+  test_deps = [ ":unittest-rs" ]
+}
+
+kernel_rust_mod("user-memory-rs") {
+  output_name = "user_memory"
+  source_root = "user_memory.rs"
+  sources = [ "user_memory.rs" ]
+  deps = [
+    "//sdk/rust/zx-status",
+    "//src/lib/kprint",
+    "//src/lib/zr",
+    "//third_party/rust_crates:zerocopy",
+    "//zircon/kernel/lib/page:page-rs",
+    "//zircon/system/ulib/fbl/rust:fbl",
+  ]
+  if (current_cpu == "arm64") {
+    test_deps = [ "//zircon/kernel/arch/arm64:arch-arm64-vm-bindings" ]
+  }
+}
+
+rustc_library("unittest-rs") {
+  edition = "2024"
+  name = "unittest"
+
+  source_root = "src/lib.rs"
+  sources = [ "src/lib.rs" ]
+  deps = [
+    "unittest-macro",
+    "//sdk/rust/zx-status",
+    "//src/lib/kprint",
+  ]
+
+  if (is_kernel) {
+    features = [ "kernel" ]
+
+    # TODO(https://fxbug.dev/548748442): remove when all fixed in the code
+    configs += [ "//zircon/kernel/switch:allow-test-attr-in-doctest" ]
+    configs += [ "//zircon/kernel/switch:allow-too-many-arguments" ]
+  }
+
+  with_unit_tests = true
+  test_configs = [ ":unittest-rs.test" ]
+}
+
+config("unittest-rs.test") {
+  visibility = [ ":*" ]
+
+  ld_script = rebase_path("unittest-test.ld", root_build_dir)
+  rustflags = [
+    # Ensures the special test metadata section is retained.
+    "-C",
+    "link-arg=-T${ld_script}",
+
+    # Enables the unit tests themselves.
+    "--cfg",
+    "ktest",
+  ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [ ":unittest-rs_test($host_toolchain)" ]
+}
+
+group("kernel-tests") {
+  testonly = true
+}
+
+group("phys-tests") {
+  testonly = true
+}
+
+group("boot_tests") {
+  testonly = true
+}

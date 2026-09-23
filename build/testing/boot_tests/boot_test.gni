@@ -1,0 +1,504 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/assembly/assembled_system.gni")
+import("//build/assembly/hybrid_board_configuration.gni")
+import("//build/assembly/product_bundle.gni")
+import("//build/images/vbmeta.gni")
+import("//build/testing/environments.gni")
+import("//build/testing/test_spec.gni")
+import("//zircon/kernel/phys/qemu.gni")
+
+declare_args() {
+  # Default value for `disabled` parameter for generated `boot_test()`.
+  # TODO(https://fxbug.dev/320511796): Cleanup when no longer necessary.
+  disable_boot_tests = false
+}
+
+# The test runners have no better way to determine that a boot test succeeded
+# than to look for an exact string in the console log output.  zbi_test()
+# targets produce metadata to drive the test runners, which tells them to
+# match this particular string.  When booted in standalone mode, userboot
+# prints this message after the initial process exits iff its return_code was
+# zero, but shutting down.  This string includes some random data that
+# shouldn't appear elsewhere, to avoid false-positive matches.
+boot_test_success_string =
+    "***Boot-test-successful!-MDd7/O65SuVZ23yGAaQG4CedYQGH9E1/58r73pSAVK0=***"
+
+# The default timeout for boot tests, which is also the bootup timeout for
+# cuckoo tests.
+default_boot_test_timeout_secs = 600
+
+_emu_device_types = [
+  device_types.aemu,
+  device_types.crosvm,
+  device_types.qemu,
+]
+
+# Helper template defining a boot test for a particular host architecture. This
+# flexibility is needed as we wish to define one for emulators on $target_cpu
+# hosts even when $target_cpu != $host_cpu in order to take advantage of KVM,
+# HVF, etc.
+#
+# Parameters
+#
+#  * output_name
+#    - Optional: The name of the associated test.
+#    - Default: target_name
+#
+#  * cpu_for_host
+#    - Required: The host CPU to generate the test for.
+#
+#  * data_deps, deps
+#    - Optional: The usual GN meaning.
+#
+# See boot_test() for all other parameters.
+template("_boot_test") {
+  main_target = target_name
+  script_target = "_boot_test.${target_name}.create_script"
+
+  toolchain = "//build/toolchain:host_${invoker.cpu_for_host}"
+  test_script = "$root_out_dir/$main_target.sh"
+
+  timeout_secs = default_boot_test_timeout_secs
+  if (defined(invoker.timeout)) {
+    if (invoker.timeout != false) {
+      timeout_secs = invoker.timeout
+    }
+  }
+
+  action(script_target) {
+    visibility = [ ":*" ]
+    testonly = true
+
+    deps = [ "//tools/testing/seriallistener($toolchain)" ]
+    inputs = [ get_label_info(deps[0], "root_out_dir") + "/seriallistener" ]
+    outputs = [ test_script ]
+
+    script = "//build/testing/create_test.sh"
+    args = [
+      rebase_path(outputs[0], root_build_dir),
+      rebase_path(inputs[0], root_build_dir),
+      "-success-str",
+      boot_test_success_string,
+      "-failure-str",
+      "FAILED TEST",
+      "-timeout",
+      "${timeout_secs}s",
+    ]
+
+    metadata = {
+      test_runtime_deps = []
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+      test_runtime_deps += inputs + outputs
+    }
+  }
+
+  test_spec(main_target) {
+    target = get_label_info(invoker.label, "label_with_toolchain")
+    name = target_name
+    if (defined(invoker.output_name)) {
+      name = invoker.output_name
+    }
+    path = test_script
+    os = host_os
+    cpu = invoker.cpu_for_host
+    isolated = true
+    is_boot_test = true
+    product_bundle = name
+    expects_ssh = false
+
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "data_deps",
+                             "deps",
+                             "visibility",
+                           ])
+
+    if ((defined(invoker.disabled) && invoker.disabled) || disable_boot_tests) {
+      # A disabled test is still built.
+      build_only = true
+
+      # But acknowledge that we're ignoring it's environments.
+      not_needed(invoker, [ "environments" ])
+    } else {
+      forward_variables_from(invoker, [ "environments" ])
+    }
+
+    timeout_secs = timeout_secs
+
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [ ":$script_target" ]
+
+    if (defined(invoker.efi_disk)) {
+      deps += [ invoker.efi_disk ]
+    }
+    if (defined(invoker.qemu_kernel)) {
+      deps += [ invoker.qemu_kernel ]
+    }
+    if (defined(invoker.zbi)) {
+      deps += [ invoker.zbi ]
+    }
+    if (defined(invoker.ramdisk)) {
+      deps += [ invoker.ramdisk ]
+    }
+  }
+}
+
+# Specifies a boot test.
+#
+# A boot test is a general category of test defined by booting select images on
+# a device and declaring success if a certain magic string is written by the
+# booted system. This set-up allows us to execute test logic in constrained
+# environments (e.g., in physical memory or UEFI) that lack finer
+# command-control options for driving testing from the outside or a robust means
+# of exfiltrating test results for later analysis.
+#
+# While this template does define host-side test target(s) for listening on
+# serial for the success string, the contained logic expects to already be run
+# after the associated system has been booted as a 'host-target interaction'
+# test, specifically with the environment variables of `$FUCHSIA_SERIAL_SOCKET`
+# and `$FUCHSIA_DEVICE_TYPE` set, specifying a Unix socket path from which
+# serial can be read and a device type (as spelled in
+# //build/testing/environments.gni). This eventually define a test that is
+# less geared towards automation, but for now boot tests can be discovered and
+# run locally with `fx run-boot-test`.
+#
+# Subtargets
+#
+#   * $target_name.product_bundle
+#     - The associated product_bundle() target, creating a testing product
+#       bundle based on the images comprising the boot test.
+#
+# Parameters:
+#
+#  * environments
+#    - Required: A list of environments from those defined as `*_env` variables
+#      in //build/testing/environments.gni.
+#    - Type: list of strings
+#
+#  * zbi, ramdisk, qemu_kernel, dtbo, efi_disk
+#    - Optional: A label specifying a ZBI, QEMU kernel, dtbo, UEFI executable,
+#      or a bootable UEFI filesystem or disk image, respectively.
+#      At least one of these parameters must be set, but each on their own is
+#      optional.
+#
+#      `ramdisk` is distinct from `zbi` in that it indicates an arbitrary,
+#      possibly non-ZBI ramdisk to be interpreted in the emulated context by
+#      QEMU kernel alone; in particular, it should be passed through the
+#      assembly machinery as-is.
+#
+#      An `efi_disk` must provide `efi_input` metadata entry consisting of a
+#      `name`, `path` and `type`.
+#    - Type: label
+#
+#  * timeout
+#    - Optional: The test's timeout, in seconds.
+#      TODO(ihuh): Once we have more data, we can override this with a more
+#      sensible timeout for each test.
+#    - Type: int
+#    - Default: 600 (10 minutes)
+#
+#  * disabled
+#    - Optional: When true, the generated image is considered disabled, that
+#      is any associated test should not be run automatically. Useful for
+#      generating build artifacts.
+#    - Type: boolean
+#    - Default: `disable_boot_tests`
+#
+#  * assert_no_deps, data_deps, metadata, visibility
+#    - Optional: Usual GN meanings.
+#
+#  Metadata Protocol:
+#
+#  * efi_input
+#    - Optional: Protocol for identifying the presence of a EFI disk, that shall be used
+#      instead of a ZBI. Using `efi_input` data key and `efi_input_barrier`, a single entry must
+#      be provided. This entry will be used to generated the partition configuration for the product
+#      bundle of this `boot_test()`.
+#    - Type: list[scope]
+#      * name
+#        - Required: partition name assigned to the bootloader partition entries in the partitionconfig.
+#        - Type: string
+#      * path
+#        - Required: relative path to $root_build_dir of the image of the partition.
+#        - Type: string
+#      * type
+#        - Required: type of the partition as defined in the bootloader partition entry.
+#        - Type: string
+#
+template("boot_test") {
+  assert(defined(invoker.environments),
+         "boot_test(\"$target_name\") must define `environments`")
+  assert(
+      defined(invoker.zbi) || defined(invoker.ramdisk) ||
+          defined(invoker.qemu_kernel) || defined(invoker.efi_disk) ||
+          defined(invoker.dtbo),
+      "boot_test(\"$target_name\") must define at least one of `zbi`, `ramdisk`, `qemu_kernel`, `efi_disk`, `dtbo`")
+
+  main_target = target_name
+  product_bundle_target = "$target_name.product_bundle"
+
+  # If the boot test specifies an EFI disk image, then this should be regarded
+  # as the contents of a bootloader partition. Otherwise, default to the
+  # board-specific partition contents.
+  if (defined(invoker.efi_disk)) {
+    efi_disk_manifest_target = "_boot_test.${target_name}.efi_disk_manifest"
+    efi_disk_manifest = "${target_gen_dir}/${main_target}.efi_disks.json"
+    generated_file(efi_disk_manifest_target) {
+      testonly = true
+
+      data_keys = [ "efi_input" ]
+      walk_keys = [ "efi_input_barrier" ]
+      output_conversion = "json"
+
+      deps = [ invoker.efi_disk ]
+      outputs = [ efi_disk_manifest ]
+    }
+
+    partition_config_intermediate_path =
+        "${target_out_dir}/${main_target}.partition_config_intermediate.json"
+    partition_config_intermediate_target =
+        "_boot_test.${target_name}.create_efi_partition_config_intermediate"
+    action(partition_config_intermediate_target) {
+      testonly = true
+
+      sources = [ efi_disk_manifest ]
+      outputs = [ partition_config_intermediate_path ]
+
+      script = "//build/testing/boot_tests/create_efi_partition_config.py"
+      args = [
+        "--metadata",
+        rebase_path(sources[0], root_build_dir),
+        "--output",
+        rebase_path(outputs[0], root_build_dir),
+        "--hardware-revision",
+        current_cpu,
+      ]
+
+      deps = [ ":$efi_disk_manifest_target" ]
+    }
+
+    partition_config_path = "${target_out_dir}/${main_target}.partitions_config"
+    partition_config_target = "${main_target}.partitions_config"
+    compiled_action(partition_config_target) {
+      testonly = true
+
+      # The contents of these folders are dynamic, and managed entirely by this
+      # action.  Further, this action will need to delete items from these
+      # directories that are not added back (on an incremental build, if an item
+      # is removed from one of these sets)
+      hermetic_action_ignored_prefixes = [ partition_config_path ]
+
+      tool = "//build/assembly/tools/assembly_config"
+      tool_output_name = "assembly_config"
+
+      depfile_path = "$target_out_dir/$target_name.depfile"
+      depfile = depfile_path
+
+      outputs = [ "$partition_config_path/partitions_config.json" ]
+      inputs = [ partition_config_intermediate_path ]
+
+      args = [
+        "generate",
+        "partitions",
+        "--config",
+        rebase_path(inputs[0], root_build_dir),
+        "--output",
+        rebase_path(partition_config_path, root_build_dir),
+        "--depfile",
+        rebase_path(depfile_path, root_build_dir),
+      ]
+
+      deps = [ ":$partition_config_intermediate_target" ]
+    }
+
+    # Take the existing board, and shove the new partitions config in.
+    board_config_target = "_boot_test.${target_name}.create_board_config"
+    recovery_board_config_target = "${board_config_target}.recovery"
+    hybrid_board_configuration(board_config_target) {
+      board_config = board_configuration_label
+      replace_partitions_config = ":$partition_config_target"
+    }
+    hybrid_board_configuration(recovery_board_config_target) {
+      board_config = recovery_board_configuration_label
+      replace_partitions_config = ":$partition_config_target"
+    }
+    _board_config_label = ":${board_config_target}"
+    _recovery_board_config_label = ":${recovery_board_config_target}"
+  } else {
+    # Configurations that don't declare a board would fail to generate
+    # a hybrid board below. Passing an invalid board to assembled_system
+    # is alright for GN as long as it isn't built.
+    _board_config_label = board_configuration_label
+    _recovery_board_config_label = recovery_board_configuration_label
+  }
+
+  if (current_toolchain == default_toolchain) {
+    assembled_system_target = "_$main_target.assembled_system"
+    recovery_assembled_system_target = "${assembled_system_target}.recovery"
+
+    assembly_mode = "test-zbi"
+    assembled_system_kernel_zbi = "//build/testing/boot_tests:empty-zbi"
+    if (defined(invoker.zbi)) {
+      assembled_system_kernel_zbi = invoker.zbi
+    } else if (defined(invoker.ramdisk)) {
+      assembly_mode = "test-ramdisk"
+      assembled_system_kernel_zbi = invoker.ramdisk
+    }
+
+    assembled_system(assembled_system_target) {
+      visibility = [ ":*" ]
+      testonly = true
+      image_name = "fuchsia"
+      namespace = assembled_system_target
+      board_config_label = _board_config_label
+      product_assembly_config_label =
+          "//build/testing/boot_tests:product_config"
+      kernel_zbi = assembled_system_kernel_zbi
+      generate_vbmeta = use_vbmeta
+      assembly_mode = assembly_mode
+
+      generate_signed_zbi = false
+      forward_variables_from(invoker, [ "qemu_kernel" ])
+    }
+
+    # Mirrors ${assembled_system_target} but using the recovery board config.
+    #
+    # Recovery isn't important for the test itself so the contents are largely
+    # irrelevant, but some boards require a valid image in the recovery slot
+    # in order to boot (b/450614346).
+    assembled_system(recovery_assembled_system_target) {
+      visibility = [ ":*" ]
+      testonly = true
+      image_name = "fuchsia"
+      namespace = recovery_assembled_system_target
+
+      # Must use the recovery board config to ensure the final artifact is a
+      # valid recovery image.
+      board_config_label = _recovery_board_config_label
+
+      # Product and ZBI contents can be the same as the main target.
+      product_assembly_config_label =
+          "//build/testing/boot_tests:product_config"
+      kernel_zbi = assembled_system_kernel_zbi
+      generate_vbmeta = use_vbmeta
+      assembly_mode = assembly_mode
+
+      generate_signed_zbi = false
+      forward_variables_from(invoker, [ "qemu_kernel" ])
+    }
+
+    product_bundle(product_bundle_target) {
+      testonly = true
+
+      name = main_target
+      system_a = "$target_out_dir/$assembled_system_target"
+      system_r = "$target_out_dir/$recovery_assembled_system_target"
+
+      deps = [
+        ":$assembled_system_target",
+        ":$recovery_assembled_system_target",
+      ]
+    }
+  } else {
+    not_needed([
+                 "_board_config_label",
+                 "_recovery_board_config_label",
+               ])
+    group(product_bundle_target) {
+      testonly = true
+      deps = [ ":${product_bundle_target}($default_toolchain)" ]
+    }
+  }
+
+  # If host_cpu != target_cpu, then we make sure to define a separate boot
+  # test for a target_cpu host in order to take advantage of KVM, HVF, etc.
+  #
+  # TODO(mcgrathr): No riscv64 hosts are available yet.
+  if (host_cpu != target_cpu && target_cpu != "riscv64") {
+    target_cpu_envs = []
+    foreach(env, invoker.environments) {
+      # Clear from any previous iteration.
+      dims = {
+      }
+      dims = env.dimensions
+
+      # Things get more complicated if we permit environment dimensions to
+      # specify their own architecture to run on. We don't have a use-case for
+      # that, so we bar it from happening for now.
+      assert(!defined(dims.cpu))
+
+      device_type = dims.device_type
+      if ([ device_type ] + _emu_device_types - _emu_device_types == []) {
+        accel = true
+        if (defined(env.emulator)) {
+          # Clear from any previous iteration.
+          emulator_spec = {
+          }
+          emulator_spec = env.emulator
+          accel = !defined(emulator_spec.accel) || emulator_spec.accel != "none"
+        }
+
+        # If hardware acceleration is explicitly disabled for an emulator
+        # environment, no point in running it on a target_cpu host.
+        if (accel) {
+          target_cpu_envs += [ env ]
+        }
+      }
+    }
+    host_cpu_envs = invoker.environments - target_cpu_envs
+
+    common_params = {
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "assert_no_deps",
+                               "environments",
+                               "visibility",
+                             ])
+      visibility = [ ":*" ]
+      output_name = main_target
+      label = ":$main_target"
+      deps = [ ":$product_bundle_target" ]
+    }
+
+    _boot_test("$main_target.host-$target_cpu") {
+      cpu_for_host = target_cpu
+      environments = target_cpu_envs
+      forward_variables_from(common_params, "*")
+    }
+
+    _boot_test("$main_target.host-$host_cpu") {
+      cpu_for_host = host_cpu
+      environments = host_cpu_envs
+      forward_variables_from(common_params, "*")
+    }
+
+    group(main_target) {
+      forward_variables_from(invoker,
+                             [
+                               "assert_no_deps",
+                               "visibility",
+                             ])
+      testonly = true
+      deps = [
+        ":$main_target.host-$host_cpu",
+        ":$main_target.host-$target_cpu",
+      ]
+    }
+  } else {
+    _boot_test(main_target) {
+      label = ":$main_target"
+      forward_variables_from(invoker, "*")
+      cpu_for_host = host_cpu
+      deps = [ ":$product_bundle_target" ]
+    }
+  }
+}

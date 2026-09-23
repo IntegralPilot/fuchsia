@@ -1,0 +1,411 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components/fuchsia_unittest_package.gni")
+import("//build/dist/distribution_manifest.gni")
+import("//build/test.gni")
+import("//build/testing/golden_files.gni")
+import("//build/toolchain/zircon/user_basic_redirect.gni")
+import("//build/zircon/c_utils.gni")
+import("//sdk/lib/ld/distribution_manifest_prefix.gni")
+import("//sdk/lib/ld/remote_perfect_symbol_filter.gni")
+import("//sdk/lib/ld/testing/test_elf_object.gni")
+
+group("tests") {
+  testonly = true
+
+  deps = [
+    ":ld-tests",
+    ":ld-unittests($host_toolchain)",
+  ]
+}
+
+test("ld-unittests") {
+  sources = [ "abi-tests.cc" ]
+  deps = [
+    "..:headers",
+    "../testing",
+    "//src/lib/elfldltl/testing",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/symbolizer-markup",
+    "//third_party/googletest:gmock",
+  ]
+
+  if (is_elf) {
+    deps += [ ":load-tests" ]
+  }
+  if (is_fuchsia) {
+    sources += [
+      "debugdata-tests.h",
+      "fuchsia-debugdata-tests.cc",
+      "mock-debugdata-tests.cc",
+      "mock-loader-service-tests.cc",
+      "vmar-tests.cc",
+    ]
+    deps += [
+      "..:fuchsia-debugdata",
+      "//zircon/system/ulib/zx",
+    ]
+  }
+}
+
+fuchsia_unittest_package("ld-tests") {
+  deps = [ ":ld-unittests" ]
+  manifest = "meta/ld-tests.cml"
+
+  # By default the packaging step will do checks that try to detect bugs in the
+  # build system by verifying that ELF files in a package match a bunch of
+  # hard-coded assumptions about the old dynamic linker and libc implementation
+  # that don't hold true for the test binaries here.
+  disable_elf_binaries_checks = true
+}
+
+source_set("load-tests") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  sources = [
+    "ld-load-tests-base.cc",
+    "ld-load-tests-base.h",
+    "load-tests-abi.cc",
+    "load-tests-basic.cc",
+    "load-tests-deps.cc",
+    "load-tests-failure.cc",
+    "load-tests-reloc.cc",
+    "load-tests-symbolizer.cc",
+    "load-tests-tls.cc",
+    "load-tests.h",
+  ]
+  deps = [
+    ":load-tests.load-sets",
+    "..:abi-headers",
+    "..:headers",
+    "..:posix.headers",
+    "../testing",
+    "//src/lib/elfldltl",
+    "//src/lib/elfldltl/testing",
+    "//third_party/googletest:gtest",
+    "//zircon/system/ulib/fbl",
+  ]
+  data_deps = [ ":load-tests.test-data" ]
+  if (is_fuchsia) {
+    sources += [
+      "ld-load-zircon-ldsvc-tests-base.cc",
+      "ld-load-zircon-ldsvc-tests-base.h",
+      "ld-load-zircon-process-tests-base.cc",
+      "ld-load-zircon-process-tests-base.h",
+      "ld-remote-process-tests.cc",
+      "ld-remote-process-tests.h",
+      "ld-startup-create-process-tests.cc",
+      "ld-startup-create-process-tests.h",
+      "ld-startup-in-process-tests-zircon.cc",
+      "ld-startup-in-process-tests-zircon.h",
+      "ld-startup-spawn-process-tests-zircon.cc",
+      "ld-startup-spawn-process-tests-zircon.h",
+      "load-tests-ldsvc.cc",
+      "load-tests-libc.cc",
+      "load-tests-llvm-profdata.cc",
+      "remote-tests.cc",
+    ]
+    deps += [
+      ":load-tests-libc-needed",
+      ":remote-perfect-symbol-filter-test",
+      "..:fuchsia-debugdata",
+      "..:remote",
+      "//sdk/lib/fdio",
+      "//sdk/lib/fit",
+      "//zircon/system/ulib/zx",
+    ]
+
+    data_deps += [
+      ":libc-tests.test-data",
+      ":remote-tests.test-data",
+    ]
+  } else {
+    sources += [
+      "ld-load-tests-posix-base.cc",
+      "ld-load-tests-posix-base.h",
+      "ld-startup-in-process-tests-posix.cc",
+      "ld-startup-in-process-tests-posix.h",
+      "ld-startup-spawn-process-tests-posix.cc",
+      "ld-startup-spawn-process-tests-posix.h",
+    ]
+    deps += [ ":test-chdir-guard" ]
+  }
+
+  # Let gtest describe TYPED_TEST cases nicely.
+  configs += [ "//build/config:no_rtti" ]
+  configs -= [ "//build/config:no_rtti" ]
+}
+
+# Collect all the .test-data deps used by load-tests.
+load_tests_in_process = [
+  "basic-dep",
+  "indirect-deps",
+  "init-fini",
+  "ld-dep",
+  "many-deps",
+  "partial-page-bss",
+  "partial-page-bss-garbage-at-eof",
+  "passive-abi-basic",
+  "passive-abi-many-deps",
+  "passive-abi-preinit-array",
+  "passive-abi-rdebug",
+  "passive-abi-stack-size",
+  "relative-reloc",
+  "ret17",
+  "symbolic-namespace",
+  "one-weak-symbol",
+  "all-weak-symbols",
+  "symbolic-reloc",
+  "tls-desc",
+  "tls-exec-only",
+  "tls-exec-only",
+  "tls-exec-shlib",
+  "tls-gd",
+  "tls-ie",
+  "tls-ie",
+  "tls-ld",
+  "tls-shlib-only",
+]
+
+load_tests = [
+  "missing-dep",
+  "missing-sym",
+  "missing-transitive-dep",
+  "relro",
+  "fixed-load-address",
+  "backtrace",
+]
+
+if (is_fuchsia) {
+  load_tests_in_process += [
+    "ldsvc-config",
+    "llvm-profdata",
+  ]
+  load_tests += [
+    "second-session",
+    "second-session-module",
+    "symbol-filter",
+    "zygote",
+    "zygote-secondary",
+  ]
+}
+
+user_basic_redirect("load-tests.test-data") {
+  visibility = [ ":*" ]
+  testonly = true
+  public_deps = []
+  foreach(test, load_tests_in_process + load_tests) {
+    public_deps += [ "modules:$test.test-data" ]
+  }
+  foreach(test, load_tests_in_process) {
+    public_deps += [ "modules:$test.in-process.test-data" ]
+  }
+}
+
+# This gets the ld::testing::TestElfLoadSet data used by the
+# load-tests-symbolizer.cc test cases.
+test_elf_source_set("load-tests.load-sets") {
+  visibility = [ ":*" ]
+  deps = [ ":load-tests.load-sets.basic" ]
+}
+
+user_basic_redirect("load-tests.load-sets.basic") {
+  visibility = [ ":*" ]
+  testonly = true
+  public_deps = [
+    "modules:indirect-deps.in-process.load-set",
+    "modules:indirect-deps.load-set",
+    "modules:ldsvc-config.in-process.load-set",
+    "modules:ldsvc-config.load-set",
+  ]
+  if (is_fuchsia) {
+    public_deps += [
+      "modules:second-session-module.load-set",
+      "modules:symbol-filter.load-set",
+    ]
+  }
+}
+
+config("gen-includes.config") {
+  visibility = [ ":*" ]
+  include_dirs = [ target_gen_dir ]
+}
+
+if (is_fuchsia) {
+  group("libc-tests.test-data") {
+    visibility = [ ":*" ]
+    testonly = true
+    deps = [
+      ":libc-noop-test.test-data",
+      "modules:libc-hello-world.test-data",
+      "modules:libc-start-main.test-data",
+      "modules:libcxx-hello-world.test-data",
+    ]
+  }
+
+  # This generates a file that is used via #include to fill in the initializer
+  # list between { and } in a load-tests-libc.cc Needed() call.
+  generated_file("libc-noop-test-needed.inc") {
+    visibility = [ ":*" ]
+    testonly = true
+    outputs = [ "$target_gen_dir/$target_name" ]
+    output_conversion = "list lines"
+    data_keys = [ "ld_load_tests_needed" ]
+    data_deps = [ ":libc-noop-test" ]
+  }
+
+  source_set("load-tests-libc-needed") {
+    visibility = [ ":*" ]
+    testonly = true
+    public_configs = [ ":gen-includes.config" ]
+    deps = [ ":libc-noop-test-needed.inc" ]
+  }
+
+  # This collects the production libc's noop-test along with the production
+  # libc / dynamic linker within the test sandbox tree for this test case.
+  distribution_manifest_prefix("libc-noop-test.test-data") {
+    testonly = true
+    prefix = "lib/test/libc-noop-test"
+    deps = [ ":libc-noop-test" ]
+  }
+
+  fdio_config = [ "//build/config/fuchsia:fdio_config" ]
+
+  # This is the same as //sdk/lib/c/test:noop-test but placed in bin/ instead
+  # of test/, so ld::testing::GetExecutableVmo will find it.
+  executable("libc-noop-test") {
+    testonly = true
+    configs += fdio_config
+    configs -= fdio_config
+    deps = [
+      ":libc-needed",
+      "//sdk/lib/c/test:noop-test.common",
+    ]
+  }
+
+  # This just delivers a ld_load_tests_needed list in metadata.  Each entry
+  # gives a quoted string in a comma-separated list of expected DT_NEEDED
+  # strings for a Needed call in a load-tests-libc.cc test case.
+  group("libc-needed") {
+    visibility = [ ":*" ]
+    testonly = true
+    libc_needed = []
+    foreach(tag, toolchain_variant.tags) {
+      if (tag == "hwasan" && libc_needed == []) {
+        libc_needed = [
+          "libclang_rt.hwasan.so",
+          "libunwind.so.1",
+          "libc++abi.so.1",
+        ]
+      } else if (tag == "asan" && libc_needed == []) {
+        libc_needed = [
+          "libclang_rt.asan.so",
+          "libunwind.so.1",
+          "libc++abi.so.1",
+        ]
+      } else if (tag == "ubsan" && libc_needed == []) {
+        libc_needed = [
+          "libclang_rt.ubsan_standalone.so",
+          "libunwind.so.1",
+          "libc++abi.so.1",
+        ]
+      }
+    }
+    metadata = {
+      ld_load_tests_needed = []
+      foreach(soname, libc_needed) {
+        ld_load_tests_needed += [ "\"$soname\"," ]
+      }
+    }
+  }
+
+  resource("remote-tests.test-data") {
+    visibility = [
+      ":*",
+      "//src/lib/zxdump/*",
+    ]
+    testonly = true
+
+    sources = [
+      "data/32be",
+      "data/32le",
+      "data/64be",
+      "data/64le",
+    ]
+    outputs = [ "lib/test/elf{{source_file_part}}" ]
+
+    # LdRemoteTests.RemotePerfectSymbolFilterTestElf32 needs an Elf32 object,
+    # but it doesn't really matter what machine or OS it's for.  The Elf32
+    # target that conveniently works out of the box is armv7-linux-gnu.
+    elf32_tc = "//build/toolchain:linux_arm"
+    data_deps = [ "modules:symbol-filter-elf32.fuchsia-test-data($elf32_tc)" ]
+
+    # LdRemoteTests.ForeignMachine expects that to be ET_ARM in particular,
+    # and also uses the matching stub dynamic linker.
+    data_deps += [ "..:ld-stub.user($elf32_tc)" ]
+
+    # This also rolls up via load-tests.load-sets, but this gets it here for
+    # the //src/lib/zxdump reuse of this test data.
+    data_deps += [ ":remote-tests.test-data.basic" ]
+  }
+
+  user_basic_redirect("remote-tests.test-data.basic") {
+    visibility = [ ":*" ]
+    testonly = true
+    public_deps = [ "modules:symbol-filter.test-data" ]
+  }
+}
+
+source_set("test-chdir-guard") {
+  testonly = true
+  public = [ "test-chdir-guard.h" ]
+  sources = [ "test-chdir-guard.cc" ]
+  deps = [
+    "//src/lib/elfldltl/testing",
+    "//third_party/googletest:gtest",
+  ]
+}
+
+remote_perfect_symbol_filter("remote-perfect-symbol-filter-test") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  includes = [ "<lib/elfldltl/testing/diagnostics.h>" ]
+  deps = [ "//src/lib/elfldltl/testing" ]
+  diagnostics = "elfldltl::testing::ExpectOkDiagnostics"
+
+  namespace = "ld::testing"
+  output_name = "PerfectSymbolFilterTest"
+  soname = "libsymbol-filter-dep17.so"
+  symbols = [
+    "first",
+    "third",
+  ]
+  elves = [
+    "elfldltl::Elf64<>",
+    "elfldltl::Elf32<>",
+  ]
+
+  data_deps =
+      [ ":remote-perfect-symbol-filter-test.ifs-check($default_toolchain)" ]
+}
+
+if (current_toolchain == default_toolchain) {
+  golden_files("remote-perfect-symbol-filter-test.ifs-check") {
+    visibility = [ ":*" ]
+    testonly = true
+
+    deps = [ ":remote-perfect-symbol-filter-test.ifs" ]
+    ifs_outputs = get_target_outputs(deps[0])
+
+    comparisons = [
+      {
+        golden = "goldens/remote-perfect-symbol-filter-test.ifs"
+        candidate = ifs_outputs[0]
+      },
+    ]
+  }
+}

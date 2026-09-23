@@ -1,0 +1,153 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/fidl/toolchain.gni")
+import("//build/python/python_library.gni")
+
+# Generates Python bindings for a FIDL library.
+#
+# Parameters
+#
+#  * library_name
+#    - Required: The name of the FIDL library.
+#    - Type: string
+#
+#  * fidl_gen_dir
+#    - Required: The directory under which bindings should be generated.
+#    - Type: path
+#
+#  * fidl_ir_json
+#    - Required: The path to the associated FIDL IR JSON file.
+#    - Type: path
+#
+#  * fidl_ir_target
+#    - Required: The label of the target that generates the FIDL IR JSON file.
+#    - Type: label
+#  * deps
+#    - Optional: Dependencies added unaltered to the deps for this library.
+#         Used only to set non-fidl python bindings. The use of public_deps is
+#         instead of deps is strongly advised.
+#
+#  * testonly, visibility, public_deps
+#    - Optional: Usual GN meanings.
+#
+template("fidl_python") {
+  assert(defined(invoker.library_name),
+         "fidl_python(\"$target_name\") must define `library_name`")
+  assert(defined(invoker.fidl_gen_dir),
+         "fidl_python(\"$target_name\") must define `fidl_gen_dir`")
+  assert(defined(invoker.fidl_ir_json),
+         "fidl_python(\"$target_name\") must define `fidl_ir_json`")
+  assert(defined(invoker.fidl_ir_target),
+         "fidl_python(\"$target_name\") must define `fidl_ir_target`")
+
+  generation_target = "${target_name}_generate"
+
+  forward_variables_from(invoker, [ "fidl_gen_dir" ])
+
+  python_library_name = "fidl_" + string_replace(invoker.library_name, ".", "_")
+
+  if (is_fidl_toolchain) {
+    not_needed(invoker,
+               [
+                 "deps",
+                 "visibility",
+                 "fidl_target",
+               ])
+    compiled_action(generation_target) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "fidl_ir_json",
+                               "fidl_ir_target",
+                               "public_deps",
+                             ])
+      visibility = [
+        ":*",
+        "//tools/fidl/fidlgen_python:*",
+      ]
+
+      tool = "//tools/fidl/fidlgen_python"
+      tool_output_name = "fidlgen_python"
+      mnemonic = "FIDLGEN"
+
+      inputs = [
+        fidl_ir_json,
+        "//prebuilt/third_party/black/linux-x64/black",
+        "//.gitignore",
+        "//pyproject.toml",
+      ]
+
+      output = "$fidl_gen_dir/$python_library_name/__init__.py"
+      outputs = [ output ]
+
+      args = [
+        "--fidl-ir-json",
+        rebase_path(fidl_ir_json, root_build_dir),
+        "--output",
+        rebase_path(output, root_build_dir),
+        "--black",
+        rebase_path("//prebuilt/third_party/black/linux-x64/black",
+                    root_build_dir),
+        "--pyproject-toml",
+        rebase_path("//pyproject.toml", root_build_dir),
+      ]
+
+      deps = [ fidl_ir_target ]
+
+      metadata = {
+        generated_sources = rebase_path(outputs, root_build_dir)
+        fidl_python_output = [ rebase_path(fidl_gen_dir, root_build_dir) ]
+      }
+    }
+  } else {
+    not_needed(invoker,
+               [
+                 "fidl_ir_json",
+                 "fidl_ir_target",
+               ])
+
+    python_library(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                               "visibility",
+                               "deps",
+                               "library_name",
+                               "fidl_target",
+                             ])
+
+      library_name = python_library_name
+      source_root = "$fidl_gen_dir/$python_library_name"
+
+      # TODO(https://fxbug.dev/394425397): These dependencies should be lifted into proper
+      # locations adjacent or within fidlgen_python. Ideally, this can be done
+      # when the dependency on dynamic Python bindings is removed. Otherwise,
+      # the dynamic Python bindings would have to point to the new location,
+      # causing similar dissonance.
+      library_deps = [
+        "//src/developer/ffx/lib/fuchsia-controller:fidl_bindings",
+        "//src/developer/ffx/lib/fuchsia-controller:fuchsia_controller_py",
+      ]
+      data_deps = [
+        ":${fidl_target}_host_test_data",
+        "//src/developer/ffx/lib/fuchsia-controller/tests:fuchsia_controller_test_data",
+      ]
+      if (defined(invoker.public_deps)) {
+        foreach(dep, invoker.public_deps) {
+          label = get_label_info(dep, "label_no_toolchain")
+          library_deps += [ "${label}_python" ]
+        }
+      }
+      sources = [ "__init__.py" ]
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += [ ":$generation_target($fidl_toolchain)" ]
+    }
+  }
+}

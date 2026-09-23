@@ -1,0 +1,161 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_host_test.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/testing/host_test_data.gni")
+
+# Note that all of the Rust targets in this module pass quiet_clippy=true. This
+# prevents the lints produced by these targets from failing the build when
+# deny_warnings=true or from being printed
+# when deny_warnings=false.
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":clippy_test($host_toolchain)",
+
+    # This tests fx rustdoc-link
+    "//build/rust/tests/rustdoc-link($host_toolchain)",
+
+    # This tests the .rustdoc subtargets
+    "//build/rust/tests/rustdoc($host_toolchain)",
+  ]
+}
+
+# The dep chain A->B->C will exercise the functionality of both direct and
+# transitive deps for A
+rustc_binary("a") {
+  edition = "2024"
+  name = "a"
+  with_unit_tests = true
+  deps = [ ":b" ]
+  source_root = "a/main.rs"
+  sources = [
+    "a/main.rs",
+    "a/other.rs",
+  ]
+  quiet_clippy = true
+}
+
+rustc_library("b") {
+  edition = "2024"
+  name = "b"
+  deps = [ ":c" ]
+  source_root = "b/lib.rs"
+  sources = [ "b/lib.rs" ]
+  quiet_clippy = true
+}
+
+rustc_library("c") {
+  edition = "2024"
+  name = "c"
+  source_root = "c/lib.rs"
+  sources = [ "c/lib.rs" ]
+  quiet_clippy = true
+}
+
+if (is_host) {
+  rustc_library("d") {
+    edition = "2024"
+    name = "d"
+    source_root = "d/lib.rs"
+    sources = [ "d/lib.rs" ]
+    quiet_clippy = true
+  }
+
+  gen_dir = "gen/build/rust/tests"
+  host = "host_${host_cpu}"
+
+  python_host_test("clippy_test") {
+    main_source = "clippy_test.py"
+    extra_args = [ host ]
+    deps = [
+      ":copy_clippy",
+      ":copy_default_toolchain",
+      ":copy_other_toolchain",
+      ":copy_rust_target_mapping",
+      ":copy_script",
+    ]
+    metadata = {
+      # Exclude the test universe crates from the global
+      # rust_target_mapping.json since they have intentional errors.
+      rust_test_barrier = []
+    }
+  }
+
+  host_test_data("copy_clippy") {
+    sources = [
+      "$root_build_dir/$gen_dir/a.aux.deps.deps",
+      "$root_build_dir/$gen_dir/a.aux.deps.transdeps",
+      "$root_build_dir/$gen_dir/a.clippy",
+      "$root_build_dir/$gen_dir/a_test.clippy",
+      "$root_build_dir/$gen_dir/b.aux.deps.deps",
+      "$root_build_dir/$gen_dir/b.clippy",
+      "$root_build_dir/$gen_dir/c.clippy",
+    ]
+    deps = [
+      # explicit dependency on "a" is required so that the metadata walk finds
+      # it and its deps even though we never need to build them
+      ":a($default_toolchain)",
+      ":a.aux.deps($default_toolchain)",
+      ":a.clippy($default_toolchain)",
+      ":a_test($default_toolchain)",
+      ":a_test.clippy($default_toolchain)",
+      ":b.aux.deps($default_toolchain)",
+      ":b.clippy($default_toolchain)",
+      ":c.clippy($default_toolchain)",
+    ]
+    outputs = [ "$target_gen_dir/out/default/$gen_dir/{{source_file_part}}" ]
+  }
+
+  host_test_data("copy_other_toolchain") {
+    sources = [ "$root_build_dir/$host/$gen_dir/d.clippy" ]
+    deps = [
+      # "d" dep necessary for metadata collection
+      ":d($host_toolchain)",
+      ":d.clippy($host_toolchain)",
+    ]
+    outputs =
+        [ "$target_gen_dir/out/default/$host/$gen_dir/{{source_file_part}}" ]
+  }
+
+  host_test_data("copy_script") {
+    sources = [
+      "//tools/devshell/contrib/lib/rust/clippy.py",
+      "//tools/devshell/contrib/lib/rust/rust.py",
+    ]
+    outputs = [
+      "$target_gen_dir/tools/devshell/contrib/lib/rust/{{source_file_part}}",
+    ]
+  }
+
+  host_test_data("copy_default_toolchain") {
+    sources = [ "$root_build_dir/default_toolchain_name.txt" ]
+    deps = [ "//:default_toolchain_name.txt($default_toolchain)" ]
+    outputs = [ "$target_gen_dir/out/default/{{source_file_part}}" ]
+  }
+
+  _rust_target_mapping = "$target_gen_dir/rust_target_mapping.json"
+  host_test_data("copy_rust_target_mapping") {
+    sources = [ _rust_target_mapping ]
+    deps = [ ":gen_rust_target_mapping" ]
+    outputs = [ "$target_gen_dir/out/default/{{source_file_part}}" ]
+  }
+
+  # Create a version of //${build_dir}/rust_target_mapping.json which has
+  # this test's "universe", which consists of only the crates defined here.
+  generated_file("gen_rust_target_mapping") {
+    outputs = [ _rust_target_mapping ]
+    output_conversion = "json"
+    testonly = true
+    data_keys = [ "rust_target_mapping" ]
+    walk_keys = [ "rust_test_barrier" ]
+    deps = [
+      ":copy_clippy",
+      ":copy_other_toolchain",
+    ]
+  }
+}

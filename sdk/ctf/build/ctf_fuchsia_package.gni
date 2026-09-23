@@ -1,0 +1,108 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//sdk/ctf/build/ctf_output_directory.gni")
+
+# Creates a FAR archive from a ctf_fuchsia_package_archive target.
+#
+# Parameters
+#   package
+#     The fuchsia_package target to archive. This must be declared in the same file.
+#     Type: label
+#
+#   package_name
+#     The name of the fuchsia_package to archive.
+#     This is also used as the archive name.
+#     Type: string
+#
+#   test_component_names (optional)
+#     The names of components in the package that represent tests.
+#     If $test_component_name exists in this list, templates should expect to
+#     find a test component called $test_component_name.cm.
+#     Type: list[string]
+template("ctf_fuchsia_package_archive") {
+  assert(defined(invoker.package),
+         "you must specify a package target to archive")
+  assert(defined(invoker.package_name),
+         "you must specify the name of the package to archive")
+
+  archive_name = invoker.package_name
+  archive_target = "${target_name}_archive"
+
+  fuchsia_package_archive(archive_target) {
+    testonly = true
+    package = invoker.package
+    archive_name = archive_name
+  }
+
+  copy_target = "${target_name}_copy"
+  copy(copy_target) {
+    testonly = true
+    sources = get_target_outputs(":$archive_target")
+    outputs = [ "$root_out_dir/cts/{{source_file_part}}" ]
+    deps = [ ":$archive_target" ]
+  }
+
+  group(target_name) {
+    testonly = true
+    deps = [ ":$copy_target" ]
+    metadata = {
+      _ctf_artifacts = []
+      foreach(out_target, get_target_outputs(":$copy_target")) {
+        out_target = rebase_path(out_target, root_out_dir)
+        _ctf_artifacts += [ "${ctf_output_directory}/${out_target}" ]
+      }
+      ctf_artifacts = _ctf_artifacts
+
+      # For usage, see generate_ctf_packages.gni and generate_ctf_tests.gni
+      package_archives = [
+        {
+          archive_name = archive_name
+          package_name = invoker.package_name
+          archive_gn_label =
+              get_label_info(":$copy_target", "label_no_toolchain")
+          if (defined(invoker.test_component_names)) {
+            test_component_names = invoker.test_component_names
+          }
+        },
+      ]
+    }
+  }
+}
+
+# A Fuchsia package that can be used in CTF.
+#
+# An equivalent to fuchsia_package, but ensures dependencies are allowed in CTF.
+# To build a FAR archive of this package, depend on ${target_name}_archive.
+#
+# Additional arguments:
+#
+#   test_component_names (optional)
+#     The names of components in the package that represent tests.
+#     If $test_component_name exists in this list, templates should expect to
+#     find a test component called $test_component_name.cm.
+#     Type: list[string]
+template("ctf_fuchsia_package") {
+  assert(defined(invoker.package_name), "package_name must be defined.")
+
+  main_target_name = target_name
+
+  if (!defined(invoker.deps)) {
+    invoker.deps = []
+  }
+
+  fuchsia_package(target_name) {
+    forward_variables_from(invoker, "*", [ "test_component_names" ])
+  }
+
+  # Optional FAR archive that can be released in CTF.
+  ctf_fuchsia_package_archive("${target_name}_archive") {
+    package = ":$main_target_name"
+    package_name = invoker.package_name
+    if (defined(invoker.test_component_names)) {
+      test_component_names = invoker.test_component_names
+    }
+  }
+}

@@ -1,0 +1,257 @@
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/drivers/verify_shared_libraries.gni")
+import("//build/rust/rustc_cdylib.gni")
+import("//build/rust/rustc_staticlib.gni")
+import("//build/zircon/c_utils.gni")
+
+# The inner implementation for `fuchsia_driver` and `fuchsia_rust_driver`.
+#
+# Those two templates largely share the same implementation, only differing in
+# what template they use internally to build the .so file.
+#
+# Parameters
+#
+#   target_type (required)
+#     The inner target type to be used to build the .so file. For C++ this should be
+#     "loadable_module" and for rust it should be "rustc_cdylib".
+#
+# In addition, the appropriate parameters for the inner template specified.
+template("_fuchsia_driver") {
+  check_target = "_driver.shlib-allowlist-check.$target_name"
+  shared_libraries_used_target = "_driver.shlib-used.$target_name"
+
+  driver_label = get_label_info(":$target_name", "label_with_toolchain")
+  shared_libraries_used_file =
+      "${target_gen_dir}/${target_name}.driver-shlib-used"
+
+  # Generates a list of all of the things our driver links against.
+  link_output_rspfile(shared_libraries_used_target) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "testonly",
+                           ])
+    outputs = [ shared_libraries_used_file ]
+  }
+
+  # Checks the driver's shared libraries against an allowlist.
+  verify_shared_libraries(check_target) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "testonly",
+                           ])
+    target_label = driver_label
+    libraries_used_file = shared_libraries_used_file
+    libraries_allowlist_file = "//build/drivers/driver_shared_library_allowlist"
+    output_file = "$target_gen_dir/${check_target}.dynamic_libs"
+
+    deps = [ ":$shared_libraries_used_target" ]
+  }
+
+  # This is the actual driver module.
+  target(invoker.target_type, target_name) {
+    variant_selector_target_type = "fuchsia_driver"
+
+    # Save the target name as forward_variables_from below might override it.
+    _target_name = target_name
+
+    if (invoker.target_type == "rustc_cdylib") {
+      is_loadable_module = true
+    }
+
+    # Explicitly forward applicable_licenses and visibility, implicitly forward
+    # everything else. See comment in //build/config/BUILDCONFIG.gn for details
+    # on this pattern.
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "applicable_licenses",
+                             "legacy",
+                             "test",
+                             "visibility",
+                           ])
+
+    # Restore the target name.
+    target_name = _target_name
+
+    if (!defined(deps)) {
+      deps = []
+    }
+
+    if (!defined(output_dir)) {
+      output_dir = root_out_dir
+    }
+    if (!defined(output_name)) {
+      output_name = target_name
+    }
+    if (!defined(output_extension)) {
+      output_extension = "so"
+    }
+
+    _output_file_name = output_name
+    if (output_extension != "") {
+      _output_file_name += ".$output_extension"
+    }
+    _output_file = "$output_dir/$_output_file_name"
+    _rebased_output_file = rebase_path(_output_file, root_build_dir)
+
+    if (!defined(ldflags)) {
+      ldflags = []
+    }
+    if (!defined(inputs)) {
+      inputs = []
+    }
+
+    _version_script = "//build/drivers/fuchsia_driver.ld"
+    if (defined(invoker.legacy) && invoker.legacy) {
+      _version_script = "//build/drivers/fuchsia_driver_legacy.ld"
+    }
+    ldflags += [ "-Wl,--version-script=" +
+                 rebase_path(_version_script, root_build_dir) ]
+    inputs += [ _version_script ]
+
+    deps += [ ":$check_target" ]
+
+    if (!defined(assert_no_deps)) {
+      assert_no_deps = []
+    }
+    assert_no_deps += [ "//src/devices/bin/driver_runtime" ]
+
+    metadata = {
+      # Used by the check_included_drivers template.
+      fuchsia_driver_labels =
+          [ get_label_info(":$_target_name", "label_no_toolchain") ]
+
+      # Used by the distribution_manifest template.
+      distribution_entries = [
+        {
+          source = _rebased_output_file
+          destination = "driver/$_output_file_name"
+          label = get_label_info(":$_target_name", "label_with_toolchain")
+          elf_runtime_dir = "lib/${toolchain_variant.libprefix}"
+        },
+      ]
+    }
+  }
+}
+
+# Define a fuchsia driver built as a C++ loadable module
+#
+# This target allows you to create an ELF shared library that can be used as a
+# driver that is loaded at runtime.
+#
+# Parameters
+#
+# Flags: cflags, cflags_c, cflags_cc,  asmflags, defines, include_dirs,
+#        ldflags, lib_dirs, libs
+# Deps: data_deps, deps, public_deps
+# Dependent configs: all_dependent_configs, public_configs
+# General: check_includes, configs, data, inputs, output_name,
+#          output_extension, public, sources, testonly, visibility
+template("fuchsia_cc_driver") {
+  _fuchsia_driver(target_name) {
+    target_type = "loadable_module"
+
+    # Explicitly forward applicable_licenses and visibility, implicitly forward
+    # everything else. See comment in //build/config/BUILDCONFIG.gn for details
+    # on this pattern.
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "applicable_licenses",
+                             "test",
+                             "visibility",
+                           ])
+  }
+}
+
+set_defaults("fuchsia_cc_driver") {
+  # Sets the default configs for fuchsia_driver, which can be modified later
+  # by the invoker. This overrides the loadable_module default.
+  configs = default_shared_library_configs
+}
+
+# Define a fuchsia driver built as a rust cdylib.
+#
+# This target allows you to create an ELF shared library that can be used as a
+# driver that is loaded at runtime.
+#
+# See `rustc_cdylib`'s parameters for more information on what can be passed in
+# here.
+#
+# This template will also generate an extra target called
+# `$target_name-test-staticlib` that can be used to link the driver code into
+# separate unit tests that depend on finding the driver registration.
+template("fuchsia_rust_driver") {
+  _fuchsia_driver(target_name) {
+    target_type = "rustc_cdylib"
+
+    # Explicitly forward applicable_licenses and visibility, implicitly forward
+    # everything else. See comment in //build/config/BUILDCONFIG.gn for details
+    # on this pattern.
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "applicable_licenses",
+                             "test",
+                             "visibility",
+                           ])
+  }
+
+  rustc_staticlib("${target_name}-test-staticlib") {
+    # This should only be used from unit tests.
+    testonly = true
+
+    # Explicitly forward applicable_licenses and visibility, implicitly forward
+    # everything else. See comment in //build/config/BUILDCONFIG.gn for details
+    # on this pattern.
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "visibility",
+                           ])
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "applicable_licenses",
+                             "test",
+                             "visibility",
+                           ])
+  }
+}
+
+set_defaults("fuchsia_rust_driver") {
+  # Sets the default configs for fuchsia_rust_driver, which can be modified
+  # later by the invoker. This overrides the rustc_cdylib default.
+  configs = default_shared_library_configs + [
+              # TODO(https://fxbug.dev/42055130): Figure out why this is necessary. The build fails
+              # if unused crates are removed at call sites.
+              "//build/config/rust/lints:allow_unused_crate_dependencies",
+            ]
+
+  # Drivers cannot dynamically link against the Rust standard library. This
+  # config tells the linker to link against it statically. This is safe for
+  # drivers which don't depend on the standard library as well as the linker
+  # will not have any symbols to resolve.
+  configs += [ "//build/config/fuchsia:static_rust_standard_library" ]
+}

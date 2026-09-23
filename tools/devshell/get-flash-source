@@ -1,0 +1,92 @@
+#!/bin/bash
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Internal API
+### Builds and returns a list of a desired set of build artifacts
+
+## usage: fx get-flash-source [--build] [--allow-empty | --expect-one]
+##
+## Builds and returns the source file for `fx flash` with an appropriate
+## prefix. This returns 'flash-manifest:<path>' or 'product-bundle:<path>'
+## depending on the type of source relevant for the current build
+## configuration.
+##
+##  --build       build the artifacts as well as returning a list of them
+##
+set -o errexit
+
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh
+fx-config-read
+
+readonly ARGS_JSON="args.json"
+readonly PRODUCT_BUNDLES_JSON="product_bundles.json"
+
+build=false
+while [[ $# -ne 0 ]]; do
+  case "$1" in
+  --help|-h)
+      fx-command-help
+      exit 0
+      ;;
+  --build)
+    build=true
+    ;;
+  -*)
+    fx-error "Unknown flag: $1"
+    fx-command-help
+    exit 1
+    ;;
+  *)
+    if [[ -z "${mode}" ]]; then
+      mode="$1"
+    else
+      fx-error "unexpected argument: '$1'"
+      exit 1
+    fi
+    ;;
+  esac
+  shift
+done
+
+function _query_manifest {
+  local manifest="$1"
+  local jq_filter="$2"
+  local paths
+  fx-command-stdout-to-array paths fx-command-run jq --raw-output "${jq_filter}" "${FUCHSIA_BUILD_DIR}/${manifest}"
+  # At most one path is supported.
+  if [[ ${#paths[@]} -gt 1 ]]; then
+    fx-error "More than one path found!"
+    exit 1
+  fi
+  printf %s "${paths[0]}"
+}
+
+function _build_gn_label {
+  # Important: redirect stdout to stderr to avoid polluting this script's
+  # output. See https://fxbug.dev/42076242
+  >&2 fx-command-run build "$1"
+}
+
+main_pb_label="$(_query_manifest "${ARGS_JSON}" .main_pb_label)"
+if [[ "${main_pb_label}" != "null" ]]; then
+  product_bundle_label="$(_query_manifest "${PRODUCT_BUNDLES_JSON}" ".[] | select(.label | startswith(\"${main_pb_label}\")) | .label")"
+  product_bundle="$(_query_manifest "${PRODUCT_BUNDLES_JSON}" ".[] | select(.label | startswith(\"${main_pb_label}\")) | .path")"
+else
+  product="$(_query_manifest "${ARGS_JSON}" .build_info_product)"
+  board="$(_query_manifest "${ARGS_JSON}" .build_info_board)"
+  product_bundle_name="${product}.${board}"
+  product_bundle="$(_query_manifest "${PRODUCT_BUNDLES_JSON}" ".[] | select(.name == \"${product_bundle_name}\") | .path")"
+  product_bundle_label="$(_query_manifest "${PRODUCT_BUNDLES_JSON}" ".[] | select(.name == \"${product_bundle_name}\")| .label")"
+  if [[ -z "${product_bundle}" ]]; then
+    fx-error "Failed to find a product bundle."
+    fx-error "Use \"ffx product list\" to see the list of available product bundles then run \"ffx target flash -b <product-bundle>\"."
+    exit 1
+  fi
+fi
+if $build ; then
+  _build_gn_label "${product_bundle_label}"
+fi
+echo "product-bundle:${product_bundle}"

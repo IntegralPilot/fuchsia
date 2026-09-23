@@ -1,0 +1,236 @@
+// Copyright 2017 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include <lib/magma/platform/platform_mmio.h>
+#include <lib/magma_service/mock/mock_bus_mapper.h>
+#include <lib/magma_service/mock/mock_mmio.h>
+
+#include <gtest/gtest.h>
+
+#include "driver_logger_harness.h"
+#include "src/graphics/drivers/msd-arm-mali/src/address_manager.h"
+#include "src/graphics/drivers/msd-arm-mali/src/address_space.h"
+#include "src/graphics/drivers/msd-arm-mali/src/registers.h"
+
+namespace {
+
+const size_t kPageSize = zx_system_get_page_size();
+
+}  // namespace
+
+class FakeAddressSpaceOwner : public std::enable_shared_from_this<FakeAddressSpaceOwner>,
+                              public AddressSpace::Owner {
+ public:
+  FakeAddressSpaceOwner() : address_manager_(nullptr, 8) {}
+  AddressSpaceObserver* GetAddressSpaceObserver() override { return &address_manager_; }
+  std::shared_ptr<AddressSpace::Owner> GetSharedPtr() override { return shared_from_this(); }
+  magma::PlatformBusMapper* GetBusMapper() override { return &bus_mapper_; }
+
+ private:
+  AddressManager address_manager_;
+  MockBusMapper bus_mapper_;
+};
+
+class TestAddressSpace {
+ public:
+  static mali_pte_t get_pte(AddressSpace* address_space, gpu_addr_t gpu_addr) {
+    mali_pte_t result;
+    EXPECT_TRUE(address_space->ReadPteForTesting(gpu_addr, &result));
+    return result;
+  }
+
+  static void check_pte_entries_clear(AddressSpace* address_space, uint64_t gpu_addr,
+                                      uint64_t size) {
+    ASSERT_NE(address_space, nullptr);
+    auto page_directory = address_space->root_page_directory_.get();
+    constexpr uint32_t kRootDirectoryShift =
+        AddressSpace::kPageOffsetBits * (AddressSpace::kPageDirectoryLevels - 1) + kMaliPageShift;
+    uint64_t offset = (gpu_addr >> kRootDirectoryShift) & AddressSpace::kPageTableMask;
+
+    // This are no other buffers nearby, so levels 2, 1, and 0 should have
+    // been cleared and removed.
+    EXPECT_EQ(2u, page_directory->gpu()->entry[offset]);
+    EXPECT_EQ(nullptr, page_directory->next_levels_[offset]);
+  }
+
+  static void check_pte_entries(AddressSpace* address_space,
+                                magma::PlatformBusMapper::BusMapping* bus_mapping,
+                                uint64_t gpu_addr, uint64_t page_offset, uint64_t flags) {
+    ASSERT_NE(address_space, nullptr);
+
+    std::vector<uint64_t>& bus_addr = bus_mapping->Get();
+
+    for (unsigned int i = 0; i < bus_addr.size(); i++) {
+      uint64_t pte = get_pte(address_space, gpu_addr + i * kPageSize);
+      static constexpr uint64_t kFlagBits = (1l << 54) | (0xf << 6);
+      EXPECT_EQ(pte & ~kFlagBits & ~(kPageSize - 1), bus_addr[i]);
+
+      EXPECT_EQ(1u, pte & 3);
+      EXPECT_EQ(flags, pte & kFlagBits);
+    }
+  }
+
+  static void Init() {
+    FakeAddressSpaceOwner owner;
+    auto address_space = AddressSpace::Create(&owner, false);
+
+    check_pte_entries_clear(address_space.get(), 0, 1024);
+  }
+
+  static void CoherentPageTable() {
+    FakeAddressSpaceOwner owner;
+    auto coherent_address_space = AddressSpace::Create(&owner, true);
+    EXPECT_EQ((1u << 4) | (1u << 2) | (3u),
+              0x1f & coherent_address_space->translation_table_entry());
+
+    auto address_space = AddressSpace::Create(&owner, false);
+    EXPECT_EQ((1u << 2) | (3u), 0x1f & address_space->translation_table_entry());
+  }
+
+  static void Insert() {
+    FakeAddressSpaceOwner owner;
+    auto address_space = AddressSpace::Create(&owner, false);
+
+    // create some buffers
+    std::vector<uint64_t> addr = {kPageSize * 0xbdefcccef, kPageSize * 100};
+    std::vector<std::unique_ptr<magma::PlatformBuffer>> buffer(2);
+    std::vector<std::unique_ptr<magma::PlatformBusMapper::BusMapping>> bus_mapping(2);
+
+    buffer[0] = magma::PlatformBuffer::Create(1000, "test");
+    buffer[1] = magma::PlatformBuffer::Create(10000, "test");
+
+    bus_mapping[0] =
+        owner.GetBusMapper()->MapPageRangeBus(buffer[0].get(), 0, buffer[0]->size() / kPageSize);
+    bus_mapping[1] =
+        owner.GetBusMapper()->MapPageRangeBus(buffer[1].get(), 0, buffer[1]->size() / kPageSize);
+
+    EXPECT_TRUE(address_space->Insert(addr[0], bus_mapping[0].get(), 0, buffer[0]->size(),
+                                      kAccessFlagRead | kAccessFlagNoExecute));
+
+    check_pte_entries(address_space.get(), bus_mapping[0].get(), addr[0], 0, (1 << 6) | (1l << 54));
+
+    EXPECT_TRUE(address_space->Insert(addr[1], bus_mapping[1].get(), 0, buffer[1]->size(),
+                                      kAccessFlagWrite | kAccessFlagShareBoth));
+
+    check_pte_entries(address_space.get(), bus_mapping[1].get(), addr[1], 0, (2 << 8) | (1 << 7));
+
+    auto page_directory = address_space->root_page_directory_.get();
+    for (int i = 3; i >= 0; i--) {
+      uint64_t offset = (addr[0] >> (9 * i + kMaliPageShift)) & AddressSpace::kPageTableMask;
+
+      uint64_t entry_flags = i > 0 ? 3u : 1u;
+      EXPECT_EQ(entry_flags, page_directory->gpu()->entry[offset] & 3u);
+      EXPECT_TRUE(page_directory->gpu()->entry[offset] & ~511);
+      if (i > 0)
+        page_directory = page_directory->next_levels_[offset].get();
+      else
+        EXPECT_EQ(0u, page_directory->next_levels_.size());
+    }
+
+    EXPECT_TRUE(address_space->Clear(addr[1], buffer[1]->size()));
+
+    check_pte_entries_clear(address_space.get(), addr[1], buffer[1]->size());
+
+    EXPECT_TRUE(address_space->Clear(addr[0], buffer[0]->size()));
+
+    check_pte_entries_clear(address_space.get(), addr[0], buffer[0]->size());
+
+    // Clear entries that don't exist yet.
+    EXPECT_TRUE(address_space->Clear(kPageSize * 1024, kPageSize * 5));
+
+    EXPECT_TRUE(address_space->Clear((1l << 48) - kPageSize * 10, kPageSize * 10));
+
+    // Extend outside of address space.
+    EXPECT_FALSE(address_space->Clear((1l << 48) - kPageSize * 10, kPageSize * 11));
+
+    EXPECT_FALSE(address_space->Insert((1l << 48) - kPageSize, bus_mapping[1].get(), 0,
+                                       buffer[1]->size(), kAccessFlagRead | kAccessFlagNoExecute));
+  }
+
+  static void InsertOffset() {
+    FakeAddressSpaceOwner owner;
+    auto address_space = AddressSpace::Create(&owner, false);
+
+    const uint64_t kAddr = kPageSize * 100;
+
+    auto buffer = magma::PlatformBuffer::Create(10000, "test");
+    auto bus_mapping = owner.GetBusMapper()->MapPageRangeBus(
+        buffer.get(), 1, (buffer->size() - kPageSize) / kPageSize);
+
+    EXPECT_TRUE(address_space->Insert(kAddr, bus_mapping.get(), kPageSize,
+                                      buffer->size() - kPageSize,
+                                      kAccessFlagRead | kAccessFlagNoExecute));
+
+    check_pte_entries(address_space.get(), bus_mapping.get(), kAddr, 1, (1 << 6) | (1l << 54));
+  }
+
+  static void GarbageCollect() {
+    FakeAddressSpaceOwner owner;
+    auto address_space = AddressSpace::Create(&owner, false);
+
+    // buffer[0] should overlap two level 0 page tables.
+    const uint64_t kInitialAddress = kPageSize * 511;
+    // create some buffers
+    std::vector<uint64_t> addr = {kInitialAddress, kInitialAddress + kPageSize * 5};
+    std::vector<std::unique_ptr<magma::PlatformBuffer>> buffer(2);
+    std::vector<std::unique_ptr<magma::PlatformBusMapper::BusMapping>> bus_mapping(2);
+
+    buffer[0] = magma::PlatformBuffer::Create(kPageSize * 5, "test");
+    buffer[1] = magma::PlatformBuffer::Create(kPageSize * 10, "test");
+
+    bus_mapping[0] =
+        owner.GetBusMapper()->MapPageRangeBus(buffer[0].get(), 0, buffer[0]->size() / kPageSize);
+    bus_mapping[1] =
+        owner.GetBusMapper()->MapPageRangeBus(buffer[1].get(), 0, buffer[1]->size() / kPageSize);
+
+    EXPECT_TRUE(address_space->Insert(addr[0], bus_mapping[0].get(), 0, buffer[0]->size(),
+                                      kAccessFlagRead | kAccessFlagNoExecute));
+    check_pte_entries(address_space.get(), bus_mapping[0].get(), addr[0], 0, (1 << 6) | (1l << 54));
+
+    EXPECT_TRUE(address_space->Insert(addr[1], bus_mapping[1].get(), 0, buffer[1]->size(),
+                                      kAccessFlagRead | kAccessFlagNoExecute));
+
+    EXPECT_TRUE(address_space->Clear(addr[0], buffer[0]->size()));
+
+    // Buffer 1 should remain mapped.
+    check_pte_entries(address_space.get(), bus_mapping[1].get(), addr[1], 0, (1 << 6) | (1l << 54));
+
+    auto page_directory3 = address_space->root_page_directory_.get();
+
+    EXPECT_EQ(3u, page_directory3->gpu()->entry[0] & 3u);
+    EXPECT_TRUE(page_directory3->gpu()->entry[0] & ~511);
+    auto page_directory2 = page_directory3->next_levels_[0].get();
+
+    EXPECT_EQ(3u, page_directory2->gpu()->entry[0] & 3u);
+    EXPECT_TRUE(page_directory2->gpu()->entry[0] & ~511);
+    auto page_directory1 = page_directory2->next_levels_[0].get();
+
+    // The level 0 that's now empty should be removed.
+    EXPECT_EQ(2u, page_directory1->gpu()->entry[0] & 3u);
+    EXPECT_EQ(0u, page_directory1->gpu()->entry[0] & ~511);
+    EXPECT_EQ(nullptr, page_directory1->next_levels_[0].get());
+
+    EXPECT_TRUE(address_space->Clear(addr[1], buffer[1]->size()));
+
+    for (uint32_t i = 0; i < AddressSpace::kPageTableEntries; ++i) {
+      EXPECT_EQ(2u, address_space->root_page_directory_->gpu()->entry[i]);
+      EXPECT_EQ(nullptr, address_space->root_page_directory_->next_levels_[i]);
+    }
+  }
+};
+
+class AddressSpaceTest : public testing::Test {
+  void SetUp() override { logger_harness_ = DriverLoggerHarness::Create(); }
+  std::unique_ptr<DriverLoggerHarness> logger_harness_;
+};
+
+TEST_F(AddressSpaceTest, Init) { TestAddressSpace::Init(); }
+
+TEST_F(AddressSpaceTest, CoherentPageTable) { TestAddressSpace::CoherentPageTable(); }
+
+TEST_F(AddressSpaceTest, Insert) { TestAddressSpace::Insert(); }
+
+TEST_F(AddressSpaceTest, InsertOffset) { TestAddressSpace::InsertOffset(); }
+
+TEST_F(AddressSpaceTest, GarbageCollect) { TestAddressSpace::GarbageCollect(); }

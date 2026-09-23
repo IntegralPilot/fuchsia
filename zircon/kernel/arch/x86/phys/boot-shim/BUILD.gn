@@ -1,0 +1,287 @@
+# Copyright 2021 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/images/args.gni")
+import("//build/test.gni")
+import("//build/testing/boot_tests/kernel_zbi_test.gni")
+import("//build/testing/boot_tests/zbi_test.gni")
+import("//build/testing/environments.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//zircon/kernel/phys/phys_executable.gni")
+import("//zircon/kernel/phys/qemu.gni")
+import("//zircon/kernel/phys/shim_executable.gni")
+import("//zircon/kernel/phys/zbi_executable.gni")
+
+# The 32-bit legacy shims can be booted directly by QEMU and other things.
+legacy_shims = [
+  {
+    name = "multiboot-shim"
+    format = "multiboot"
+  },
+
+  # This boot shim is not meant to be used with qemu, but it works with it.
+  # So we test it via qemu just to get some automated testing of it at all.
+  # Its logic that differs from multiboot-shim won't really be exercised
+  # this way, so it needs direct testing on Chromebook devices too.
+  {
+    name = "depthcharge-multiboot-shim"
+    format = "multiboot"
+  },
+]
+
+linux_thin_shims = [
+  # The 32-bit Linux/x896 shim can be booted directly by QEMU and others.
+  # It supports the 16-bit and 32-bit Linux/x86 boot protocols.
+  {
+    name = "linux-x86-32-boot-shim"
+    format = "linuxboot"
+  },
+
+  # The 64-bit Linux/x86 shim can be booted directly by crosvm and others.
+  # It supports only the 64-bit Linux/x86 boot protocol.
+  {
+    name = "linux-x86-64-boot-shim"
+    format = "linuxboot64"
+  },
+]
+legacy_shims += linux_thin_shims
+
+legacy_shims += [
+  # The best of both worlds!  This supports 16-bit, 32-bit, or 64-bit boots.
+  {
+    name = "linux-x86-boot-shim"
+    format = "linuxbiboot"
+  },
+]
+
+group("boot-shim") {
+  deps = []
+  foreach(shim, legacy_shims) {
+    deps += [ ":${shim.name}" ]
+  }
+}
+
+source_set("legacy-mem-config") {
+  visibility = [ ":*" ]
+  sources = [ "legacy-mem-config.cc" ]
+  public_deps = [
+    # legacy-mem-config.h has #include <lib/zbi-format/zbi.h>
+    "//sdk/lib/zbi-format",
+
+    # legacy-mem-config.h has #include <efi/boot-services.h>
+    "//zircon/kernel/lib/efi",
+
+    # legacy-mem-config.h has #include <lib/zbitl/storage-traits.h>
+    "//src/lib/zbitl",
+
+    # legacy-mem-config.h has #include <lib/fit/result.h>
+    "//zircon/system/ulib/zx",
+
+    # mem-config.h has #include <lib/zircon-internal/e820.h>
+    "//zircon/system/ulib/zircon-internal",
+  ]
+
+  deps = [ "//zircon/kernel/phys/efi:page-size" ]
+  if (is_kernel) {
+    deps += [
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+    ]
+    public_deps += [ "//zircon/kernel/lib/ktl:headers" ]
+  }
+}
+
+if (toolchain_environment == "kernel.phys32" ||
+    toolchain_environment == "kernel.phys") {
+  source_set("legacy-boot-shim") {
+    public = [ "legacy-boot-shim.h" ]
+    sources = [ "legacy-boot-shim.cc" ]
+    public_deps = [
+      ":stdout",
+      "..:legacy-boot",
+      "//zircon/kernel/lib/acpi_lite",
+      "//zircon/kernel/lib/arch",
+      "//zircon/kernel/lib/boot-options",
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/libc",
+      "//zircon/kernel/phys:acpi",
+      "//zircon/kernel/phys:address-space",
+      "//zircon/kernel/phys:boot-zbi",
+      "//zircon/kernel/phys:main",
+      "//zircon/kernel/phys:symbolize",
+      "//zircon/kernel/phys:uart-console",
+      "//zircon/kernel/phys:zbi",
+      "//zircon/kernel/phys/lib/boot-shim",
+      "//zircon/system/ulib/hwreg",
+    ]
+    deps = [ "//zircon/kernel/phys:uart" ]
+    friend = [ ":legacy-boot-shim-tests" ]
+  }
+
+  source_set("stdout") {
+    sources = [ "stdout.cc" ]
+    public = [ "stdout.h" ]
+    deps = [
+      "//zircon/kernel/arch/x86/phys:legacy-boot",
+      "//zircon/kernel/lib/boot-options",
+      "//zircon/kernel/phys:boot-options",
+      "//zircon/kernel/phys:stdio",
+      "//zircon/kernel/phys:uart",
+      "//zircon/kernel/phys/lib/boot-shim",
+    ]
+  }
+
+  foreach(shim, linux_thin_shims) {
+    foreach(qemu, qemu_boot_formats) {
+      if (qemu.name == shim.format &&
+          toolchain_variant.base == qemu.environment) {
+        shim_executable(shim.name) {
+          sources = [ "linux-x86-boot-shim.cc" ]
+          defines = [ "BI=\"\"" ]
+          deps = [
+            ":legacy-boot-shim",
+            "..:${shim.format}",
+          ]
+        }
+      }
+    }
+  }
+
+  shim_executable("linux-x86-boot-shim") {
+    import = "../linuxbiboot_executable.gni"
+    target_type = "linuxbiboot_executable"
+
+    sources = [ "linux-x86-boot-shim.cc" ]
+    defines = [ "BI=\"[bi]\"" ]
+    deps = [ ":legacy-boot-shim" ]
+  }
+
+  if (toolchain_environment == "kernel.phys32") {
+    shim_executable("multiboot-shim") {
+      sources = [ "multiboot-shim.cc" ]
+      deps = [
+        ":legacy-boot-shim",
+        "..:multiboot",
+      ]
+    }
+
+    shim_executable("depthcharge-multiboot-shim") {
+      sources = [ "depthcharge-multiboot-shim.cc" ]
+      deps = [
+        ":legacy-boot-shim",
+        "..:multiboot",
+        "//sdk/lib/fit",
+        "//sdk/lib/zbi-format",
+        "//zircon/kernel/phys:stdio",
+        "//zircon/kernel/phys:symbolize",
+        "//zircon/kernel/phys:uart-console",
+        "//zircon/kernel/phys:zbi",
+        "//zircon/system/ulib/uart",
+      ]
+    }
+  }
+} else {
+  foreach(shim, legacy_shims) {
+    foreach(qemu, qemu_boot_formats) {
+      if (qemu.name == shim.format) {
+        group(shim.name) {
+          public_deps = [ ":${shim.name}(${qemu.environment})" ]
+        }
+      }
+    }
+  }
+}
+
+test("legacy-boot-shim-tests") {
+  defines = [ "UART_ALL_DRIVERS=1" ]
+  sources = [ "legacy-boot-shim-tests.cc" ]
+  deps = [
+    "//zircon/kernel/lib/acpi_lite",
+    "//zircon/kernel/phys/lib/boot-shim",
+    "//zircon/kernel/phys/lib/boot-shim:boot-shim-test",
+    "//zircon/system/ulib/zxtest",
+  ]
+}
+
+test("legacy-mem-config-tests") {
+  sources = [ "legacy-mem-config-tests.cc" ]
+  deps = [
+    ":legacy-mem-config",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/zbitl",
+    "//third_party/googletest:gmock",
+    "//third_party/googletest:gtest",
+  ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":legacy-boot-shim-tests($host_toolchain)",
+    ":legacy-mem-config-tests($host_toolchain)",
+  ]
+}
+
+if (current_toolchain != host_toolchain) {
+  qemu_shim_tests = [
+    "core-tests",
+    "phys-unittests",
+  ]
+
+  template("qemu_shim_test") {
+    foreach(shim, legacy_shims) {
+      zbi_test("${shim.name}-$target_name") {
+        foreach(qemu, qemu_boot_formats) {
+          if (qemu.name == shim.format) {
+            qemu_kernel = ":${shim.name}(${qemu.environment})"
+            forward_variables_from(qemu,
+                                   [
+                                     "disabled",
+                                     "supported_environments",
+                                     "timeout",
+                                   ])
+          }
+        }
+        assert(defined(qemu_kernel), "$shim not in $qemu_boot_formats")
+
+        forward_variables_from(invoker,
+                               "*",
+                               [
+                                 "qemu_kernel",
+                                 "supported_environments",
+                               ])
+        if (!defined(environments)) {
+          environments = supported_environments
+        }
+      }
+    }
+  }
+
+  group("boot_tests") {
+    testonly = true
+    deps = [ "depthcharge-tests:tests" ]
+    foreach(shim, legacy_shims) {
+      deps += [ ":${shim.name}" ]
+      foreach(test, qemu_shim_tests) {
+        deps += [ ":${shim.name}-$test" ]
+      }
+    }
+  }
+
+  qemu_shim_test("phys-unittests") {
+    deps =
+        [ "//zircon/kernel/phys/test:zbi-phys-unittests.zbi($phys_toolchain)" ]
+  }
+
+  qemu_shim_test("core-tests") {
+    deps = [ "//zircon/system/utest/core:core-tests.${default_kernel_test_image}.zbi($default_toolchain)" ]
+
+    # This runs the real kernel with full hardware reboot/shutdown support and
+    # it isn't necessarily really quick, so don't impose the short timeout used
+    # for raw phys tests.
+    timeout = false
+  }
+}

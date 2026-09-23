@@ -1,0 +1,271 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=23)
+library fuchsia.bluetooth.host;
+
+using fuchsia.bluetooth as bt;
+using fuchsia.bluetooth.sys as sys;
+
+using fuchsia.bluetooth.bredr;
+using fuchsia.bluetooth.gatt;
+using fuchsia.bluetooth.gatt2;
+using fuchsia.bluetooth.le;
+using fuchsia.bluetooth.test;
+
+/// Receives a bt-host by protocol for use in the Bluetooth Host Subsystem
+@discoverable(client="platform,external", server="platform")
+open protocol Receiver {
+    /// Adds a new bt-host. If `request` cannot be handled, it should be closed.
+    flexible AddHost(resource struct {
+        request client_end:Host;
+    });
+};
+
+type ProtocolRequest = flexible resource union {
+    1: central server_end:fuchsia.bluetooth.le.Central;
+    2: peripheral server_end:fuchsia.bluetooth.le.Peripheral;
+    3: gatt_server server_end:fuchsia.bluetooth.gatt.Server;
+    4: gatt2_server server_end:fuchsia.bluetooth.gatt2.Server;
+    5: profile server_end:fuchsia.bluetooth.bredr.Profile;
+    @available(added=24)
+    6: privileged_peripheral server_end:fuchsia.bluetooth.le.PrivilegedPeripheral;
+    @available(added=32)
+    7: test_gatt_server server_end:fuchsia.bluetooth.test.Gatt;
+};
+
+/// A token protocol representing discovery being enabled.
+open protocol DiscoverySession {
+    /// Closes this DiscoverySession on the server end, ending discovery if this is the last open
+    /// DiscoverySession. This can be used to synchronize the closure on both ends of the protocol.
+    /// If synchronization is not required, the DiscoverySession protocol can simply be closed
+    /// instead.
+    flexible Stop();
+};
+
+open protocol BondingDelegate {
+    /// Restores existing bonded devices to the host. An authenticated session will be established
+    /// for future connections using the provided bonding data.
+    ///
+    /// If bonding data for the LE transport is available, then the host will establish a connection
+    /// if the peer directs connectable advertisements to us.
+    ///
+    /// If any of the entries in `bonds` could not be restored, then they will be returned in
+    /// `errors`. This can happen for entries that are malformed and for peers that are already
+    /// known to the bt-host. An empty `errors` list indicates that all bonds were successfully
+    /// restored.
+    flexible RestoreBonds(struct {
+        bonds vector<sys.BondingData>:MAX;
+    }) -> (struct {
+        errors vector<sys.BondingData>:MAX;
+    });
+
+    /// Get the next bonding update. The request will hang until the next update.
+    flexible WatchBonds() -> (flexible union {
+        /// Notifies when bonding data for a peer has been added/updated.
+        1: updated sys.BondingData;
+        /// Notifies when a bond is removed due to authentication failures.
+        2: removed bt.PeerId;
+    });
+};
+
+open protocol PeerWatcher {
+    /// Get the next peer update. The request will hang until the next update.
+    flexible GetNext() -> (flexible union {
+        /// Peers are added and updated as new information is obtained during discovery, connection
+        /// establishment, and bonding procedures.
+        1: updated vector<sys.Peer>:MAX;
+        /// Peers are removed either:
+        ///   a. explicitly via [`fuchsia.bluetooth.host.Host/Forget`], or
+        ///   b. bt-host has not seen the peer recently and the peer is not bonded or connected
+        2: removed vector<bt.PeerId>:MAX;
+    });
+};
+
+/// Interface for interacting with a Bluetooth host device (bt-host)
+open protocol Host {
+    /// Fulfills a given protocol request. bt-host will start processing FIDL messages. If the
+    /// request cannot be fulfilled, the bt-host device will close its end of the given channel.
+    flexible RequestProtocol(ProtocolRequest);
+
+    /// Shuts down the host, ending all active Bluetooth procedures:
+    ///
+    /// * All FIDL interface handles associated with this host are closed and all
+    ///   connections initiated via FIDL clients are severed.
+    /// * All scan, discovery, and advertising procedures are stopped.
+    /// * Bonded devices are cleared and removed from the auto-connect lists.
+    /// * Auto-connected peripherals are disconnected.
+    ///
+    /// This effectively resets the host to its initial state and the host remains
+    /// available for future requests.
+    ///
+    /// The Host will continue to send OnDeviceUpdated events as procedures get
+    /// terminated.
+    ///
+    /// The Host protocol will close when shutdown is complete.
+    strict Shutdown();
+
+    /// Returns information about the Bluetooth host subsystem and controller managed by this Host
+    /// instance. If there has been no change to the state since the last call to this method, the
+    /// response will be deferred until there is a change.
+    ///
+    /// The returned `info` structure will be populated with the current state of the bt-host
+    /// device. However the `active` parameter will never be populated. This field is managed
+    /// by a higher layer.
+    flexible WatchState() -> (struct {
+        info sys.HostInfo;
+    });
+
+    /// Assigns local data to this host.
+    strict SetLocalData(sys.HostData);
+
+    /// Sets a PeerWatcher protocol that will be notified of changes to peers.
+    /// Only 1 PeerWatcher can be configured at a time.
+    // TODO(https://fxbug.dev/340585537): Support multiple PeerWatchers.
+    flexible SetPeerWatcher(resource struct {
+        peer_watcher server_end:PeerWatcher;
+    });
+
+    /// Sets the local name for this host device.
+    flexible SetLocalName(struct {
+        local_name bt.DeviceName;
+    }) -> () error sys.Error;
+
+    /// Sets the device class for this host device.
+    flexible SetDeviceClass(struct {
+        device_class bt.DeviceClass;
+    }) -> () error sys.Error;
+
+    /// Initiates a general discovery procedure for BR/EDR and LE devices. On success, discovered
+    /// peers can be monitored using the [`fuchsia.bluetooth.host/Host.WatchPeers`] method. On Error,
+    /// an epitaph will be returned from `token`. If the device does not support BR/EDR, only LE
+    /// discovery will be performed.
+    ///
+    /// On the LE transport, only general-discoverable and connectable peripherals will be reported.
+    ///
+    /// Discovery will continue until all discovery sessions are closed.
+    ///
+    /// + request `token` The DiscoverySession protocol that must be held open as long as
+    ///     discovery should be enabled. Closing it will stop discovery if no other sessions
+    ///     are open.
+    flexible StartDiscovery(resource table {
+        /// Required.
+        1: token server_end:DiscoverySession;
+    });
+
+    /// Sets whether this host should be connectable.
+    flexible SetConnectable(struct {
+        enabled bool;
+    }) -> () error sys.Error;
+
+    /// Sets whether this host should be discoverable.
+    flexible SetDiscoverable(struct {
+        enabled bool;
+    }) -> () error sys.Error;
+
+    /// Establish a BR/EDR and/or LE connection to the peer with identifier `id`:
+    ///
+    ///   - If the peer is known to support the BR/EDR transport then a logical link over that
+    ///     transport will be established to the device. If the connection attempt is successful,
+    ///     local services registered using "RequestProfile()" will be available to the peer.
+    ///     Traditional services discovered on the peer will be notified to local services
+    ///     asynchronously.
+    ///
+    ///   - If the peer is known to support the LE transport then a logical link over that
+    ///     transport will be established to the device. If the connection attempt is successful,
+    ///     GATT services in the local database (populated via RequestGattServer()) will become
+    ///     available to the peer. Similarly, remote GATT services that are discovered on the
+    ///     peer will become available to holders of a gatt.Client capability and to device drivers
+    ///     that can bind to the bt-gatt-svc class of devices.
+    ///
+    /// The result of the procedure will be communicated via `status`. If the remote device
+    /// supports both BR/EDR and LE transports and a link cannot be established over both, then an
+    /// error Status will be returned and neither transport will be connected.
+    flexible Connect(struct {
+        id bt.PeerId;
+    }) -> () error sys.Error;
+
+    /// Terminate all connections (BR/EDR or LE) to the remote peer with identifier `id`.
+    ///
+    /// + request `id` The identifier of the peer to disconnect.
+    /// - response `status` Contains an error if either LE or BR/EDR transport fails to disconnect.
+    ///                     Contains success when both transports are successfully disconnected or
+    ///                     if the peer is already disconnected.
+    flexible Disconnect(struct {
+        id bt.PeerId;
+    }) -> () error sys.Error;
+
+    /// Initiates pairing to the peer with the supplied `id` and `options`. Returns an error if no
+    /// connected peer with `id` is found or the pairing procedure fails.
+    ///
+    /// If `options` specifies a higher security level than the current pairing, this method
+    /// attempts to raise the security level. Otherwise this method has no effect and returns
+    /// success.
+    ///
+    /// NOTE: This is intended to satisfy test scenarios that require pairing procedures to be
+    /// initiated without relying on service access. In normal operation, Bluetooth security is
+    /// enforced during service access.
+    flexible Pair(struct {
+        id bt.PeerId;
+        options sys.PairingOptions;
+    }) -> () error sys.Error;
+
+    /// Deletes a peer from the Bluetooth host. If the peer is connected, it will be disconnected.
+    /// `device_id` will no longer refer to any peer, even if a device with the same address is
+    /// discovered again.
+    ///
+    /// Returns success after no peer exists that's identified by `device_id` (even if it didn't
+    /// exist before Forget), failure if the peer specified by `device_id` could not be
+    /// disconnected or deleted and still exists.
+    flexible Forget(struct {
+        id bt.PeerId;
+    }) -> () error sys.Error;
+
+    /// Enable or disable a passive LE background scan. When enabled, the bt-host
+    /// device will continuously perform a passive LE scan in the background when
+    /// no device discovery sessions are active and accept connection requests from
+    /// bonded peripherals.
+    flexible EnableBackgroundScan(struct {
+        enabled bool;
+    });
+
+    /// Enable or disable the LE privacy feature. When enabled, the bt-host device will use a
+    /// private device address in all LE procedures. When disabled, the public identity address will
+    /// be used instead (which is the default).
+    strict EnablePrivacy(struct {
+        enabled bool;
+    });
+
+    /// Set the GAP BR/EDR Security Mode of the host. bt-host only supports encrypted,
+    /// connection-based security modes, i.e. Mode 4 and Secure Connections Only mode. If the
+    /// security mode is set to Secure Connections Only, any existing encrypted connections which
+    /// do not meet the security requirements of Secure Connections Only mode will be disconnected.
+    strict SetBrEdrSecurityMode(struct {
+        bredr_security_mode sys.BrEdrSecurityMode;
+    });
+
+    /// Set the GAP LE Security Mode of the host. bt-host only supports encrypted, connection-based
+    /// security modes, i.e. Mode 1 and Secure Connections Only mode. If the security mode is set
+    /// to Secure Connections Only, any existing encrypted connections which do not meet the
+    /// security requirements of Secure Connections Only mode will be disconnected.
+    strict SetLeSecurityMode(struct {
+        le_security_mode sys.LeSecurityMode;
+    });
+
+    /// Assigns the pairing delegate that will respond to authentication challenges using the given
+    /// I/O capabilities. Calling this method cancels any on-going pairing procedure started
+    /// using a previous delegate. Pairing requests will be rejected if no PairingDelegate has been
+    /// assigned.
+    flexible SetPairingDelegate(resource struct {
+        input sys.InputCapability;
+        output sys.OutputCapability;
+        delegate client_end:sys.PairingDelegate;
+    });
+
+    /// Set a BondingDelegate protocol that will be notified of new and removed bonds that need to
+    /// be persisted. If a delegate is already set, the new `delegate` will be closed with
+    /// ALREADY_BOUND
+    flexible SetBondingDelegate(resource struct {
+        delegate server_end:BondingDelegate;
+    });
+};

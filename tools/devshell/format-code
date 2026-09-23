@@ -1,0 +1,373 @@
+#!/bin/bash
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Source tree
+### runs source formatters on modified files
+
+## Usage: fx format-code
+##           [--dry-run] [--verbose] [--emit] [--all]
+##           [--files=FILES,[FILES ...]]
+##           [--target=GN_TARGET]
+##           [--git] [--changed-lines] [-- PATTERN]
+##
+##   --dry-run Stops the program short of running the formatters
+##   --all     Formats all code in the git repo under the current working
+##             directory.
+##   --emit    Emits the files on stdout as opposed to writing them to disk.
+##   --args    Formats the configured build's |args.gn|
+##   --files   Allows the user to specify files.  Files are comma separated.
+##             Does not support globs. To format all files in a directory, use
+##             `cd <dir> && fx format-code --all`.
+##   --target  Allows the user to specify a gn target. If the template for the
+##             given target is defined in a .gni file, the files to format may
+##             be forwarded to another target, and specifying the target may not
+##             work.  The workaround is to pass the target to which the files
+##             are forwarded, instead.  Specifically, as of January 2023, you
+##             can only use this with rustc binary and library targets by
+##             appending ".actual" to them.
+##   --git     The default; it uses `git diff` against the newest parent
+##             commit in the upstream branch (or against HEAD if no such commit
+##             is found).  Files that are locally modified, staged or touched by
+##             any commits introduced on the local branch are formatted.
+##   --changed-lines
+##             Format changed lines only. Only supported on a subset of languages
+##             (currently, just C++). Unsupported languages will continue to have
+##             the entire file formatted. "Changes" are relative to the git
+##             commit that would be used by "--git".
+##   --parallel
+##             Formats all files in the background rather than waiting on each one
+##             before starting the next.
+##             WARNING: with this flag enabled, output from multiple formatters
+##             may be interleaved, and format-code will exit with status 0 even
+##             if some formatters failed.
+##   --verbose Print all formatting commands prior to execution.
+##    -- PATTERN
+##             For --all or --git, passes along -- PATTERN to `git ls-files`
+##             to filter what files are affected. For example, to format all
+##             rust source files use `fx format-code --all -- "*.rs"`
+##
+## Supported Languages: C, C++, cml, dml, Dart, FIDL, GN, Go, Python, Rust, JSON
+
+set -e
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+
+function usage() {
+  fx-command-help
+}
+
+function zap-commas() {
+  printf %s "$1" | tr ',' '\n'
+}
+
+function get-diff-base() {
+  local upstream=$(git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null)
+  if [[ -z "${upstream}" ]]; then
+    # Make sure upstream is always an ancestor commit.
+    if git merge-base --is-ancestor origin/main HEAD; then
+      upstream="origin/main"
+    elif git merge-base --is-ancestor JIRI_HEAD HEAD; then
+      if git merge-base --is-ancestor JIRI_HEAD origin/main; then
+        # You may have some merged CLs in your checkout between JIRI_HEAD and origin/main
+        upstream=$(git merge-base HEAD origin/main)
+      else
+        upstream="JIRI_HEAD"
+      fi
+    else
+      upstream="HEAD"
+    fi
+  fi
+  local local_commit=$(git rev-list HEAD ^${upstream} --  2>/dev/null | tail -1)
+  if [[ -z "${local_commit}" ]]; then
+    printf "HEAD"
+  else
+    git rev-parse "${local_commit}"^
+  fi
+}
+
+# Execute a command, printing it first if VERBOSE is set.
+function print-and-execute() {
+  if [[ -n "${VERBOSE}" ]]; then
+    echo "$@"
+  fi
+  "$@"
+}
+
+# Format the given C++ file.
+function format-cc-file() {
+  if [[ -n ${CHANGED_LINES} ]]; then
+    # Only update changed lines.
+    local changed_line_commands=$(git-print-changed-lines "$1" "--lines=%dF:%dL ")
+    if [[ -n ${changed_line_commands} ]]; then
+        print-and-execute ${CLANG_CMD} ${changed_line_commands} "$1"
+    fi
+  else
+    # Update entire files.
+    print-and-execute ${CLANG_CMD} "$1"
+  fi
+  # Unconditionally update header guards.
+  if [[ $1 =~ .*\.h ]]; then
+    print-and-execute ${FIX_HEADER_GUARDS_CMD} "$1"
+  fi
+}
+
+# Run the given format command on a single file, warning if "CHANGED_LINES" is set.
+function format-full-file() {
+  local command="$1"
+  local file="$2"
+  if [ -n "${CHANGED_LINES}" ]; then
+    echo "Warning: cannot format only modified lines; formatting full file ${file}" >&2
+  fi
+  print-and-execute ${command} "${file}"
+}
+
+# Format the given file.
+function format-file() {
+  filename="$(basename "$1")"
+  case "${filename}" in
+    *.c | *.cc | *.cpp | *.h | *.hh | *.hpp | *.proto | *.ts)
+      format-cc-file "$1" ;;
+    *.config) format-full-file "${JSON_FMT_CMD}" "$1" ;;
+    *.json) format-full-file "${JSON_FMT_CMD}" "$1" ;;
+    # TODO(https://fxbug.dev/514804491): temporarily disabled due to upstream bugs.
+    # *.golden.dts) ;; # Do not format golden files.
+    # *.dts | *.dts.S | *.dtsi | *.dtsi.S) format-full-file "${DTSFMT_CMD}" "$1" ;;
+  esac
+}
+
+# Removes leading //, resolves to absolute path, and resolves globs.  The first
+# argument is a path prefix, and the remaining arguments are relative to that
+# path prefix.
+#
+# When calling this function, it is usually a good idea to set IFS to something
+# that is not likely to be contained in a filename being canonicalized (e.g.,
+# IFS=$'\n')
+function canonicalize() {
+  local root_dir="$1"
+  shift
+  for fileglob in "${@}"; do
+    # // means it comes from gn, [^/]* means it is relative
+    if [[ "${fileglob}" = //* || "${fileglob}" = [^/]* ]]; then
+      local dir="${root_dir}"/
+    else
+      local dir=""
+    fi
+    for file in "${dir}""${fileglob#"//"}"; do
+      printf "${file}\n"
+    done
+  done
+}
+
+ARGS_GN=
+DRY_RUN=
+VERBOSE=
+CHANGED_LINES=
+PARALLEL=
+FILES_SPECIFIED=
+EMIT=
+
+fx-config-read
+
+GET_FILES=get_git_files
+while [ $# -gt 0 ]; do
+  ARG="$1"
+  case "$1" in
+    --args) ARGS_GN="1" ;;
+    --parallel) PARALLEL="1" ;;
+    --verbose) VERBOSE="1" ;;
+    --dry-run) DRY_RUN="1" ;;
+    --changed-lines) CHANGED_LINES="1" ;;
+    --emit) EMIT="--emit" ;;
+    --all)
+      GET_FILES=get_all_files
+      ;;
+    --git)
+      GET_FILES=get_git_files
+      ;;
+    --files=*)
+      FILES_SPECIFIED="1"
+      GET_FILES=:
+      OLDIFS=$IFS && IFS=$'\n' \
+      && FILES=( \
+        $(canonicalize "${PWD}" $(zap-commas "${ARG#--files=}")) \
+      ) \
+      && IFS=$OLDIFS
+      ;;
+    --target=*)
+      GET_FILES=:
+      OLDIFS=$IFS && IFS=$'\n' \
+      && FILES=( \
+        $(canonicalize "${FUCHSIA_DIR}" \
+          $(fx-gn desc "${FUCHSIA_BUILD_DIR}" "${ARG#--target=}" sources)) \
+      ) \
+      && IFS=$OLDIFS
+      ;;
+    --) break ;;
+    *) usage && printf "Unknown flag %s\n" "${ARG}" && exit 1 ;;
+  esac
+  shift
+done
+
+GIT_FILTER=(
+  "$@"
+  ":(top,exclude)third_party/bazel_vendor"
+  ":(top,exclude)third_party/golibs/vendor"
+  ":(top,exclude)third_party/rust_crates"
+  ":(top,exclude)src/devices/tools/fidlgen_banjo/tests"
+  ":(top,exclude)src/devices/tools/fidlgen_banjo/src/backends/templates/rust"
+  ":(top,exclude)build/bazel/fuchsia_idk/validation_data"
+  ":(top,exclude)build/sdk/generate_prebuild_idk/validation_data"
+  ":(exclude)*/goldens/*"
+)
+
+get_git_files() {
+  OLDIFS=$IFS && IFS=$'\n' \
+    && FILES=( \
+    $(canonicalize $(git rev-parse --show-toplevel) \
+      $(git diff --name-only $(get-diff-base) "${GIT_FILTER[@]}")) \
+    ) \
+    && IFS=$OLDIFS
+}
+
+get_all_files() {
+  OLDIFS=$IFS && IFS=$'\n' && FILES=( \
+    $(canonicalize "${PWD}" $(git ls-files "${GIT_FILTER[@]}")) \
+  ) \
+  && IFS=$OLDIFS
+}
+
+# Print lines changed in the given file.
+#
+# "Changes" are calculated relative to `git-diff-base`.
+git-print-changed-lines() {
+  # Have git run `/usr/bin/diff` on the input file.
+  #
+  # We in turn ask `diff` to print for each new or modified line the format
+  # string in `$2`. Details about the format string can be found in the man
+  # page for diff, under `--new-group-format`.
+  git difftool -y \
+    -x "diff --new-group-format='$2' --line-format=''" \
+    $(get-diff-base) -- "$1"
+}
+
+$GET_FILES
+
+if [[ $ARGS_GN == "1" ]]; then
+  FILES+=( "${FUCHSIA_BUILD_DIR}/args.gn" )
+fi
+
+if [[ -n "${VERBOSE}" ]]; then
+  printf "Files to be formatted:\n%s\n" "${FILES[@]}"
+fi
+
+readonly PY_TOOL="${FUCHSIA_DIR}/scripts/fuchsia-vendored-python"
+readonly CLANG_CMD="${PREBUILT_CLANG_DIR}/bin/clang-format -style=file -fallback-style=Google -sort-includes -i"
+readonly JSON_FMT_CMD="${PY_TOOL} ${FUCHSIA_DIR}/scripts/style/json-fmt.py --no-sort-keys --ignore-errors --quiet"
+# readonly DTSFMT_CMD="fx-command-run dtsfmt"
+readonly FIX_HEADER_GUARDS_CMD="${PY_TOOL} ${FUCHSIA_DIR}/scripts/style/check-header-guards.py --fix"
+
+# Mapping from tool name to a list of extensions for files to which the tool
+# applies. Used to determine which tools to compile just-in-time based on the
+# files that are being formatted.
+#
+# Not all supported Bash versions support associative arrays (a.k.a. hash
+# tables), so instead use an array of specially-formatted strings, with keys and
+# values separated by an equals sign and repeated values separated by spaces.
+compiled_formatter_extensions=(
+  "cmc=.cml .dml"
+  "doc-checker=.md"
+  "fidl-format=.fidl"
+  "formatjson5=.json5 .persist .triage"
+  "gidl-format=.gidl"
+)
+
+# If a required formatter does not exist, but can be built, build it.
+tool_targets=()
+for entry in "${compiled_formatter_extensions[@]}"; do
+  tool="${entry%%=*}"
+  extensions="${entry##*=}"
+  needed=false
+  for file in "${FILES[@]}"; do
+    for ext in ${extensions}; do
+      if [[ ${file} = *${ext} ]]; then
+        needed=true
+      fi
+    done
+  done
+
+  if $needed; then
+    tool_path="$( fx-command-run list-build-artifacts --expect-one --name "${tool}" tools )"
+    if [[ ! -x "${FUCHSIA_BUILD_DIR}/${tool_path}" ]]; then
+      fx-info "${tool} not built; building now..."
+      tool_label="$( fx-command-run list-build-artifacts --show-label --expect-one --name "${tool}" tools )"
+      tool_targets+=("$tool_label")
+    fi
+  fi
+done
+
+if [[ ${#tool_targets[@]} -gt 0 ]]; then
+  fx-command-run build "${tool_targets[@]}"
+fi
+
+[[ -n "${DRY_RUN}" ]] && exit
+
+# Format files.
+shac_files=()
+for file in "${FILES[@]}"; do
+  # Git reports deleted files, which we don't want to try to format
+  if [[ ! -f "${file}" ]]; then
+    # If files were specified on the command line rather than retrieved via Git,
+    # report missing files as errors.
+    if [[ -n "${FILES_SPECIFIED}" ]]; then
+      fx-error "no such file: ${file}"
+    fi
+    continue
+  fi
+  shac_files+=("$file")
+
+  if [[ -n "$PARALLEL" ]]; then
+    format-file "${file}" &
+  else
+    format-file "${file}"
+  fi
+done
+
+# shac is git-aware and determines which shac.star files to run using `git
+# ls-files`. However, if the current working directory's git repo doesn't
+# contain a shac.star file, then shac will fail. In that case we should fall
+# back to using the shac.star file from fuchsia.git.
+shac_workdir="$FUCHSIA_DIR"
+if [[ "$(git rev-parse --is-inside-work-tree 2> /dev/null)" == "true" ]] && \
+    [ -f "$(git rev-parse --show-toplevel)/shac.star" ]; then
+  shac_workdir="$(pwd)"
+fi
+
+# Resolve Jiri packages directory for worktrees, allowing sandboxed shac to
+# access prebuilt tools.
+if [[ -z "${JIRI_PACKAGES_DIR}" ]]; then
+  if git_common_dir=$(git -C "${FUCHSIA_DIR}" rev-parse --git-common-dir 2>/dev/null) && [[ -d "${git_common_dir}" ]]; then
+    parent_root=$(cd "${git_common_dir}/.." 2>/dev/null && pwd)
+    packages_dir="${parent_root}/.jiri_root/packages"
+    if [[ -d "${packages_dir}" ]]; then
+      export JIRI_PACKAGES_DIR="${packages_dir}"
+    fi
+  fi
+fi
+
+# TODO(https://fxbug.dev/42162946): Move all formatters into SHAC to ensure parity between
+# the formatters enforced by the infrastructure and those enforced locally.
+print-and-execute "${PREBUILT_SHAC}" fmt \
+  ${EMIT} \
+  --quiet \
+  -C "${shac_workdir}" \
+  --var fuchsia_build_dir="${FUCHSIA_BUILD_DIR#"$FUCHSIA_DIR/"}" \
+  "${shac_files[@]}"
+
+[[ -n "$PARALLEL" ]] && wait
+
+# The last thing this script does is often the [[ -n "${hgcmd}" ]], which will
+# often return a non-zero value.  So, we force the script to return 0 and rely
+# on "set -e" to catch real errors.
+exit 0

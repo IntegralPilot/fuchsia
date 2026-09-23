@@ -1,0 +1,204 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include <lib/async-loop/cpp/loop.h>
+#include <lib/async-loop/default.h>
+#include <lib/async/cpp/task.h>
+#include <lib/async/cpp/time.h>
+#include <lib/trace-provider/provider.h>
+#include <lib/trace/event.h>
+#include <lib/trace/observer.h>
+#include <lib/zx/time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <zircon/status.h>
+
+#include <iostream>
+#include <memory>
+
+#include "src/lib/fxl/command_line.h"
+#include "src/lib/fxl/strings/string_number_conversions.h"
+
+static constexpr int kDefaultCount = 1;
+static constexpr int kDefaultDelaySeconds = 0;
+static constexpr int kDefaultDurationSeconds = 10;
+static constexpr int kWaitStartTimeoutSeconds = 60;
+
+static const char* prog_name;
+
+static void PrintHelp(FILE* f) {
+  fprintf(f, "Usage: %s [options]\n", prog_name);
+  fprintf(f, "Options:\n");
+  fprintf(f, "  --help             Duh ...\n");
+  fprintf(f, "  --count=COUNT      Specify number of records per iteration\n");
+  fprintf(f, "                     The default is %d.\n", kDefaultCount);
+  fprintf(f, "  --delay=SECONDS    Delay SECONDS before starting\n");
+  fprintf(f, "                     The default is %d.\n", kDefaultDelaySeconds);
+  fprintf(f, "  --duration=SECONDS Specify time to run, in seconds\n");
+  fprintf(f, "                     The default is %d.\n", kDefaultDurationSeconds);
+}
+
+static void RunStressTestIteration(int count) {
+  // Simulate some kind of workload.
+  std::cout << "Doing work!" << std::endl;
+
+  static const char kSomethingCategory[] = "stress:something";
+  static const char kWithZeroArgs[] = "with-zero-args";
+  static const char kWithOneArg[] = "with-one-arg";
+  static const char kWithTwoArgs[] = "with-two-args";
+
+  for (int i = 0; i < count; ++i) {
+    // Add some variety.
+    const char* event_name = nullptr;
+    switch (i % 3) {
+      case 0:
+        event_name = kWithZeroArgs;
+        TRACE_DURATION_BEGIN(kSomethingCategory, event_name);
+        break;
+      case 1:
+        event_name = kWithOneArg;
+        TRACE_DURATION_BEGIN(kSomethingCategory, event_name, "k1", 1);
+        break;
+      case 2:
+        event_name = kWithTwoArgs;
+        TRACE_DURATION_BEGIN(kSomethingCategory, event_name, "k1", 1, "k2", 2.0);
+        break;
+      default:
+        __UNREACHABLE;
+    }
+    zx::nanosleep(zx::deadline_after(zx::usec(1)));
+    TRACE_DURATION_END(kSomethingCategory, event_name);
+  }
+}
+
+static bool WaitForTracingStarted(zx::duration timeout) {
+  // This implementation is more complex than it needs to be.
+  // We don't really need to use an async loop here.
+  // It is written this way as part of the purpose of this program is to
+  // provide examples of tracing usage.
+  trace::TraceObserver trace_observer;
+  async::Loop loop(&kAsyncLoopConfigAttachToCurrentThread);
+
+  bool started = false;
+  auto on_trace_state_changed = [&loop, &started]() {
+    if (trace_state() == TRACE_STARTED) {
+      started = true;
+    }
+    // Any state change is relevant to us. If we're not started then we must
+    // have transitioned from STOPPED to STARTED to at least STOPPING.
+    loop.Quit();
+  };
+
+  trace_observer.Start(loop.dispatcher(), std::move(on_trace_state_changed));
+  if (trace_state() == TRACE_STARTED) {
+    return true;
+  }
+
+  async::TaskClosure timeout_task([&loop] {
+    std::cerr << "Timed out waiting for tracing to start" << std::endl;
+    loop.Quit();
+  });
+  timeout_task.PostDelayed(loop.dispatcher(), timeout);
+  loop.Run();
+
+  return started;
+}
+
+int main(int argc, char** argv) {
+  prog_name = argv[0];
+  auto cl = fxl::CommandLineFromArgcArgv(argc, argv);
+
+  if (cl.HasOption("help", nullptr)) {
+    PrintHelp(stdout);
+    return EXIT_SUCCESS;
+  }
+
+  int count = kDefaultCount;
+  int delay = kDefaultDelaySeconds;
+  int duration = kDefaultDurationSeconds;
+  std::string arg;
+
+  if (cl.GetOptionValue("count", &arg)) {
+    if (!fxl::StringToNumberWithError<int>(arg, &count) || count < 0) {
+      std::cerr << "Invalid count: " << arg << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
+  if (cl.GetOptionValue("delay", &arg)) {
+    if (!fxl::StringToNumberWithError<int>(arg, &delay) || delay < 0) {
+      std::cerr << "Invalid delay: " << arg << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
+  if (cl.GetOptionValue("duration", &arg)) {
+    if (!fxl::StringToNumberWithError<int>(arg, &duration) || duration < 0) {
+      std::cerr << "Invalid duration: " << arg << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+
+  // Use a separate loop for the provider.
+  // This is in anticipation of double-buffering support.
+  async::Loop provider_loop(&kAsyncLoopConfigNoAttachToCurrentThread);
+  provider_loop.StartThread("TraceProvider");
+  std::unique_ptr<trace::TraceProviderWithFdio> provider;
+  bool already_started;
+  if (!trace::TraceProviderWithFdio::CreateSynchronously(provider_loop.dispatcher(), "trace_stress",
+                                                         &provider, &already_started)) {
+    std::cerr << "Trace provider registration failed" << std::endl;
+    return EXIT_FAILURE;
+  }
+  if (already_started) {
+    std::cout << "Tracing already started, waiting for our Start request" << std::endl;
+    if (WaitForTracingStarted(zx::sec(kWaitStartTimeoutSeconds))) {
+      std::cout << "Start request received" << std::endl;
+    } else {
+      std::cerr << "Error waiting for tracing to start, timed out";
+    }
+  }
+
+  if (delay > 0) {
+    std::cout << "Trace stressor delaying " << delay << " seconds ..." << std::endl;
+    zx::nanosleep(zx::deadline_after(zx::sec(delay)));
+  }
+
+  async::Loop loop(&kAsyncLoopConfigAttachToCurrentThread);
+  zx::time start_time = async::Now(loop.dispatcher());
+  zx::time quit_time = start_time + zx::sec(duration);
+
+  std::cout << "Trace stressor doing work for " << duration << " seconds ..." << std::endl;
+
+  int iteration = 0;
+  async::TaskClosure task([&loop, &task, &iteration, count, quit_time] {
+    TRACE_DURATION("stress:example", "Doing Work!", "iteration", ++iteration);
+
+    RunStressTestIteration(count);
+
+    zx::nanosleep(zx::deadline_after(zx::msec(500)));
+
+    // Stop if quitting.
+    zx::time now = async::Now(loop.dispatcher());
+    if (now > quit_time) {
+      loop.Quit();
+      return;
+    }
+
+    // Schedule more work in a little bit.
+    task.PostForTime(loop.dispatcher(), now + zx::msec(200));
+  });
+  task.PostForTime(loop.dispatcher(), start_time);
+
+  loop.Run();
+
+  std::cout << "Trace stressor finished" << std::endl;
+
+  // Cleanly shutdown the provider thread.
+  provider_loop.Quit();
+  provider_loop.JoinThreads();
+
+  return EXIT_SUCCESS;
+}

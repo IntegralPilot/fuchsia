@@ -1,0 +1,183 @@
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bind/bind.gni")
+import("//build/cipd.gni")
+import("//build/components.gni")
+import("//build/dist/resource.gni")
+import("//build/drivers.gni")
+import("//build/testing/cc_test_executable.gni")
+import("//build_overrides/pigweed.gni")
+import("$dir_pigweed/third_party/emboss/build_defs.gni")
+
+fuchsia_driver_dml("intel-dml") {
+  dml = "meta/intel.dml"
+  driver_name = "intel"
+}
+
+driver_bind_rules("bt_hci_intel_bind") {
+  dml_label = ":intel-dml"
+  bind_output = "intel.bindbc"
+  tests = "meta/bind_tests.json"
+  deps = [
+    "//src/devices/bind/fuchsia.bluetooth",
+    "//src/devices/bind/fuchsia.usb",
+  ]
+}
+
+config("undefined_behavior_misaligned_memory") {
+  cflags = [ "-fno-sanitize=alignment" ]
+}
+
+source_set("common") {
+  configs += [
+    "//build/config:all_source",
+    "//build/config/fuchsia:enable_zircon_asserts",
+  ]
+
+  # TODO(https://fxbug.dev/42136089): delete the below and fix compiler warnings
+  configs += [ "//build/config:Wno-conversion" ]
+
+  sources = [
+    "device.cc",
+    "device.h",
+    "firmware_loader.cc",
+    "firmware_loader.h",
+    "hci_event_handler.cc",
+    "logging.h",
+    "vendor_hci.cc",
+    "vendor_hci.h",
+  ]
+
+  deps = [
+    ":bt_hci_intel_bind",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/driver/compat/cpp",
+    "//sdk/lib/driver/component/cpp",
+    "//src/devices/lib/driver:driver_runtime",
+    "//zircon/system/ulib/fbl",
+    "//zircon/system/ulib/sync",
+    "//zircon/system/ulib/sync:sync-cpp",
+    "//zircon/system/ulib/zx",
+  ]
+
+  public_deps = [
+    ":emboss",
+    "//sdk/banjo/fuchsia.hardware.usb:fuchsia.hardware.usb_banjo_cpp",
+    "//sdk/fidl/fuchsia.hardware.bluetooth:fuchsia.hardware.bluetooth_cpp",
+  ]
+}
+
+fuchsia_cc_driver("fuchsia_driver") {
+  output_name = "bt-hci-intel"
+  deps = [ ":common" ]
+}
+
+fuchsia_driver_component("driver") {
+  component_name = "bt-hci-intel"
+  dml_label = ":intel-dml"
+  deps = [
+    ":bt_hci_intel_bind",
+    ":fuchsia_driver",
+  ]
+  info = "meta/driver-info.json"
+}
+
+if (internal_access) {
+  resource("btintel-firmware") {
+    sources = [
+      "//prebuilt/connectivity/bluetooth/firmware/intel/ibt-0041-0041.sfi",
+      "//prebuilt/connectivity/bluetooth/firmware/intel/ibt-11-5.sfi",
+      "//prebuilt/connectivity/bluetooth/firmware/intel/ibt-12-16.sfi",
+      "//prebuilt/connectivity/bluetooth/firmware/intel/ibt-17-2.sfi",
+      "//prebuilt/connectivity/bluetooth/firmware/intel/ibt-18-2.sfi",
+      "//prebuilt/connectivity/bluetooth/firmware/intel/ibt-hw-37.8.10-fw-22.50.19.14.f.bseq",
+      "//prebuilt/connectivity/bluetooth/firmware/intel/ibt-hw-37.8.bseq",
+    ]
+    outputs = [ "lib/firmware/{{source_file_part}}" ]
+  }
+}
+
+fuchsia_driver_package("intel") {
+  driver_components = [ ":driver" ]
+
+  deps = []
+  if (internal_access) {
+    deps += [ ":btintel-firmware($shlib_toolchain)" ]
+  }
+}
+
+cc_test_executable("tests_executable") {
+  testonly = true
+
+  output_name = "bt-hci-intel-tests"
+
+  sources = [
+    "bt_hci_intel_unittest.cc",
+    "vendor_hci_unittest.cc",
+  ]
+
+  deps = [
+    ":common",
+    "//sdk/lib/component/outgoing/cpp",
+    "//sdk/lib/driver/compat/cpp",
+    "//sdk/lib/driver/runtime:driver_runtime_cpp",
+    "//sdk/lib/driver/testing/cpp",
+    "//sdk/lib/driver/testing/cpp:scoped_global_logger",
+    "//sdk/lib/fdio",
+    "//src/devices/testing/mock-ddk",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/loop_fixture",
+    "//src/storage/lib/vfs/cpp",
+    "//third_party/googletest:gtest",
+    "//zircon/system/ulib/fzl",
+    "//zircon/system/ulib/zircon-internal",
+  ]
+
+  public_deps = [
+    "$dir_pw_assert",
+    "$dir_pw_bluetooth:emboss_hci_group",
+    "$dir_pw_chrono:system_clock",
+    "$dir_pw_intrusive_ptr",
+    "$dir_pw_log",
+    "$dir_pw_random",
+    "$dir_pw_span",
+    "$dir_pw_string",
+    "$dir_pw_third_party/fuchsia:fit",
+  ]
+
+  # Suppress UBsan's complains on the __PACKED structure.
+  configs += [ ":undefined_behavior_misaligned_memory" ]
+}
+
+config("emboss_include_path") {
+  include_dirs = [ "$target_gen_dir" ]
+  visibility = [ ":*" ]
+}
+
+emboss_cc_library("emboss") {
+  public_configs = [ ":emboss_include_path" ]
+  source = "packets.emb"
+  imports = [ "$dir_pw_bluetooth/public/pw_bluetooth/hci_common.emb" ]
+  import_dirs = [ "$dir_pw_bluetooth/public" ]
+  public_deps = [ "$dir_pw_bluetooth:emboss_hci_common" ]
+}
+
+fuchsia_unittest_package("bt-hci-intel-tests") {
+  deps = [ ":tests_executable" ]
+  test_specs = {
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":bt-hci-intel-tests",
+    ":bt_hci_intel_bind_test",
+  ]
+}

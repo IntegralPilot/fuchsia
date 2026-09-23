@@ -1,0 +1,186 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "network.h"
+
+#include "gmock/gmock.h"
+#include "mdns.h"
+#include "mock_boot_service.h"
+
+namespace gigaboot {
+namespace {
+
+class NetworkTest : public ::testing::Test {
+ public:
+  NetworkTest()
+      : image_device_({"path-A", "path-B", "path-C", "image"}),
+        net_device_({"path-A", "path-B", "path-C"},
+                    {
+                        .CurrentAddress = {0x52, 0x54, 0x00, 0x63, 0x5e, 0x7a},
+                        .MediaPresent = true,
+                    }) {
+    stub_service_.AddDevice(&image_device_);
+    stub_service_.AddDevice(&net_device_);
+  }
+
+  MockStubService& stub_service() { return stub_service_; }
+  Device& image_device() { return image_device_; }
+  ManagedNetworkDevice& net_device() { return net_device_; }
+
+ private:
+  MockStubService stub_service_;
+  Device image_device_;
+  ManagedNetworkDevice net_device_;
+};
+
+struct BadIntfTestCase {
+  std::string_view name;
+  void (*mutate_net_device)(ManagedNetworkDevice&) = [](auto&) {};
+};
+
+class NetworkFindIntfFailureTest : public NetworkTest,
+                                   public testing::WithParamInterface<BadIntfTestCase> {};
+
+TEST_P(NetworkFindIntfFailureTest, NetIntfCreationTest) {
+  auto cleanup = SetupEfiGlobalState(stub_service(), image_device());
+
+  const BadIntfTestCase& test_case = GetParam();
+  test_case.mutate_net_device(net_device());
+
+  ASSERT_TRUE(EthernetAgent::Create().is_error());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    NetworkFindIntfFailureTests, NetworkFindIntfFailureTest,
+    testing::ValuesIn<NetworkFindIntfFailureTest::ParamType>({
+        {"get_mode_failure",
+         [](ManagedNetworkDevice& d) {
+           d.GetManagedNetworkProtocol()->GetModeData = [](auto*, auto*, auto*)
+                                                            EFIAPI { return EFI_UNSUPPORTED; };
+         }},
+        {"configure_stop_failure",
+         [](ManagedNetworkDevice& d) {
+           d.GetManagedNetworkProtocol()->Configure = [](auto*, auto*)
+                                                          EFIAPI { return EFI_UNSUPPORTED; };
+         }},
+        {"no_media_present",
+         [](ManagedNetworkDevice& d) { d.SetModeData({.MediaPresent = false}); }},
+        {"configure_enable_failure",
+         [](ManagedNetworkDevice& d) {
+           d.GetManagedNetworkProtocol()->Configure = [](auto*, auto* data) EFIAPI {
+             return data == nullptr ? EFI_SUCCESS : EFI_UNSUPPORTED;
+           };
+         }},
+    }),
+    [](testing::TestParamInfo<NetworkFindIntfFailureTest::ParamType> const& info) {
+      return std::string(info.param.name.begin(), info.param.name.end());
+    });
+
+TEST_F(NetworkTest, CreateAgentAndTx) {
+  auto cleanup = SetupEfiGlobalState(stub_service(), image_device());
+  auto res = EthernetAgent::Create();
+  ASSERT_TRUE(res.is_ok());
+  EthernetAgent agent = std::move(res.value());
+
+  MacAddr dest = {0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA};
+  uint8_t payload[] = {0x11, 0x22, 0x33, 0x44, 0x55};
+  efi_handle callback = reinterpret_cast<efi_handle>(0xDEADBEEF);
+  efi_managed_network_sync_completion_token token;
+
+  ASSERT_TRUE(agent
+                  .SendV6LocalFrame(dest, std::span<const uint8_t>(payload, std::size(payload)),
+                                    callback, &token)
+                  .is_ok());
+
+  // This is a fragile, quick and dirty check to make sure that
+  // _something_ gets transmitted and that
+  // 1) it has a valid, expected ethernet header
+  // 2) it has the payload contents that we tried to transmit
+  //
+  // This is very much not what a real transmitted packet would look like
+  // except for the ethernet header.
+  std::vector<uint8_t> expected;
+  MacAddr source = agent.Addr();
+  expected.insert(expected.end(), dest.cbegin(), dest.cend());
+  expected.insert(expected.end(), source.cbegin(), source.cend());
+  expected.push_back(0x86);
+  expected.push_back(0xDD);
+  expected.insert(expected.end(), std::cbegin(payload), std::cend(payload));
+
+  ASSERT_EQ(expected, net_device().GetFakeProtocol().GetMostRecentTx());
+}
+
+TEST_F(NetworkTest, CreateAgentNoConfigure) {
+  auto cleanup = SetupEfiGlobalState(stub_service(), image_device());
+  net_device().GetManagedNetworkProtocol()->Configure = [](auto*, auto*)
+                                                            EFIAPI { return EFI_UNSUPPORTED; };
+  net_device().GetFakeProtocol().SetConfigData({.EnableUnicastReceive = true});
+
+  auto res = EthernetAgent::Create();
+  ASSERT_TRUE(res.is_ok());
+}
+
+TEST_F(NetworkTest, MdnsBroadcastTest) {
+  // It is outside the scope of fastboot's mDNS broadcast to write a
+  // fully functional DNS parser and validator to test against.
+  // Instead, we just do a byte-by-byte comparison against a known good broadcast packet
+  // generated by the previous implementation.
+  // These are the literal bytes of the entire encapsulated mDNS broadcast.
+  // Don't try to fix it up if it ever needs changing: the checksum, length fields,
+  // name compression, and other aspects make it infeasible to adjust by hand.
+  // Instead, verify correctness of the new packet against a DNS client,
+  // capture the packet's bytes using Wireshark, and replace the contents of
+  // `expected_periodic_frame` with the bytes of the new packet.
+  const std::vector<uint8_t> expected_periodic_frame = {
+      0x33, 0x33, 0x00, 0x00, 0x00, 0xfb, 0x52, 0x54, 0x00, 0x63, 0x5e, 0x7a, 0x86, 0xdd, 0x60,
+      0x00, 0x00, 0x00, 0x00, 0x94, 0x11, 0xff, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x50, 0x54, 0x00, 0xff, 0xfe, 0x63, 0x5e, 0x7a, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb, 0x14, 0xe9, 0x14, 0xe9, 0x00, 0x94,
+      0xa5, 0xbc, 0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x09,
+      0x5f, 0x66, 0x61, 0x73, 0x74, 0x62, 0x6f, 0x6f, 0x74, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05,
+      0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c, 0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00,
+      0x19, 0x16, 0x66, 0x75, 0x63, 0x68, 0x73, 0x69, 0x61, 0x2d, 0x35, 0x32, 0x35, 0x34, 0x2d,
+      0x30, 0x30, 0x36, 0x33, 0x2d, 0x35, 0x65, 0x37, 0x61, 0xc0, 0x0c, 0xc0, 0x2c, 0x00, 0x21,
+      0x80, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x15, 0xb2, 0x16,
+      0x66, 0x75, 0x63, 0x68, 0x73, 0x69, 0x61, 0x2d, 0x35, 0x32, 0x35, 0x34, 0x2d, 0x30, 0x30,
+      0x36, 0x33, 0x2d, 0x35, 0x65, 0x37, 0x61, 0xc0, 0x1b, 0xc0, 0x57, 0x00, 0x1c, 0x80, 0x01,
+      0x00, 0x00, 0x00, 0x78, 0x00, 0x10, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50,
+      0x54, 0x00, 0xff, 0xfe, 0x63, 0x5e, 0x7a};
+
+  auto cleanup = SetupEfiGlobalState(stub_service(), image_device());
+  auto res = EthernetAgent::Create();
+  ASSERT_TRUE(res.is_ok());
+  EthernetAgent eth_agent = std::move(res.value());
+  const std::vector<uint8_t>& packet = net_device().GetFakeProtocol().GetMostRecentTx();
+  {
+    // On destruction, the mDNS agent makes a best effort attempt to send a shutdown
+    // packet with all time-to-live fields set to 0.
+    // Make a new scope so that we can capture that shutdown packet.
+    MdnsAgent mdns_agent(eth_agent, gEfiSystemTable);
+    ASSERT_TRUE(mdns_agent.Poll().is_ok());
+    EXPECT_EQ(expected_periodic_frame, packet);
+  }
+
+  // Same deal as with `expected_periodic_frame`: make changes, verify the new packet
+  // against a known good DNS client, and copy the raw packet bytes.
+  const std::vector<uint8_t> expected_shutdown_frame = {
+      0x33, 0x33, 0x00, 0x00, 0x00, 0xfb, 0x52, 0x54, 0x00, 0x63, 0x5e, 0x7a, 0x86, 0xdd, 0x60,
+      0x00, 0x00, 0x00, 0x00, 0x94, 0x11, 0xff, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x50, 0x54, 0x00, 0xff, 0xfe, 0x63, 0x5e, 0x7a, 0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfb, 0x14, 0xe9, 0x14, 0xe9, 0x00, 0x94,
+      0x1e, 0xad, 0x00, 0x00, 0x84, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x09,
+      0x5f, 0x66, 0x61, 0x73, 0x74, 0x62, 0x6f, 0x6f, 0x74, 0x04, 0x5f, 0x74, 0x63, 0x70, 0x05,
+      0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x00, 0x00, 0x0c, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x19, 0x16, 0x66, 0x75, 0x63, 0x68, 0x73, 0x69, 0x61, 0x2d, 0x35, 0x32, 0x35, 0x34, 0x2d,
+      0x30, 0x30, 0x36, 0x33, 0x2d, 0x35, 0x65, 0x37, 0x61, 0xc0, 0x0c, 0xc0, 0x2c, 0x00, 0x21,
+      0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x00, 0x15, 0xb2, 0x16,
+      0x66, 0x75, 0x63, 0x68, 0x73, 0x69, 0x61, 0x2d, 0x35, 0x32, 0x35, 0x34, 0x2d, 0x30, 0x30,
+      0x36, 0x33, 0x2d, 0x35, 0x65, 0x37, 0x61, 0xc0, 0x1b, 0xc0, 0x57, 0x00, 0x1c, 0x80, 0x01,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50,
+      0x54, 0x00, 0xff, 0xfe, 0x63, 0x5e, 0x7a};
+  EXPECT_EQ(expected_shutdown_frame, packet);
+}
+
+}  // namespace
+}  // namespace gigaboot

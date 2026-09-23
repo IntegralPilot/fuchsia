@@ -1,0 +1,205 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/fidl/fidl.gni")
+
+# List of contexts where dangerous identifiers can be used
+uses = [
+  "constants",
+  "enums",
+  "event.names",
+  "method.event.arguments",
+  "method.names",
+  "method.request.arguments",
+  "method.response.arguments",
+  "protocol.names",
+  "service.names",
+  "service.member.types",
+  "service.member.names",
+  "struct.names",
+  "struct.types",
+  "table.fields",
+  "table.names",
+  "union.names",
+  "union.types",
+  "using",
+]
+
+# List of identifiers styles to test
+styles = [
+  "lower",
+  "upper",
+  "camel",
+]
+
+# How to shard identifiers
+shards = [
+  "1",
+  "2",
+  "3",
+  "4",
+]
+
+# Prefix for generated FIDL libraries
+fidl_library_prefix = "fidl.test.dangerous"
+
+# Generate the list of tests. Each test is a scope containing:
+#  use: the use name
+#  style: the style name
+#  fidl_library: the fidl library name
+#  fidl_target: the target for the FIDL library
+#  hlcpp_target: the target for the HLCPP test binary
+#  rust_target: the target for the Rust test binary
+dangerous_tests = []
+foreach(use, uses) {
+  foreach(style, styles) {
+    foreach(shard, shards) {
+      dangerous_tests += [
+        {
+          use = use
+          style = style
+          shard = shard
+          fidl_library = "${fidl_library_prefix}.${use}.${style}${shard}"
+          fidl_target = fidl_library
+          hlcpp_target = "hlcpp_${use}_${style}_${shard}"
+
+          # Deny list of libraries we can compile in Rust.
+          # [BindingsDenyList] on struct members doesn't work in Rust.
+          if (use != "struct.names" && use != "struct.types") {
+            rust_target = true
+          }
+        },
+      ]
+    }
+  }
+}
+
+# Generate FIDL files
+template("generate_dangerous_fidl") {
+  assert(defined(invoker.use))
+  assert(defined(invoker.style))
+  assert(defined(invoker.fidl_library))
+  assert(defined(invoker.output))
+
+  output = rebase_path(invoker.output, root_build_dir)
+
+  action(target_name) {
+    script = "generate/generate.py"
+    sources = [
+      "generate/common.py",
+      "generate/identifiers.py",
+      "generate/styles.py",
+      "generate/uses.py",
+    ]
+    outputs = [ invoker.output ]
+    args = [
+      "--use=${invoker.use}",
+      "--style=${invoker.style}",
+      "--shards=" + string_join(",", shards),
+      "--shard=${invoker.shard}",
+      "--fidl-library=${invoker.fidl_library}",
+      "--out=${output}",
+    ]
+  }
+}
+
+# Build the FIDL library
+template("dangerous_fidl") {
+  generate_target_name = "${target_name}_generate"
+  generate_target_dep = ":${generate_target_name}(${default_toolchain})"
+  generated_file_dir = get_label_info(generate_target_dep, "target_gen_dir")
+  generated_file = "${generated_file_dir}/${invoker.fidl_library}.test.fidl"
+
+  # Only perform the fidl source generation once, in the default toolchain
+  if (current_toolchain == default_toolchain) {
+    generate_dangerous_fidl(generate_target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "use",
+                               "style",
+                               "shard",
+                               "fidl_library",
+                             ])
+      output = generated_file
+    }
+  } else {
+    not_needed(invoker,
+               [
+                 "shard",
+                 "style",
+                 "use",
+               ])
+  }
+
+  # But the fidl() template needs to be invoked in all toolchains in order to
+  # generate the correct bindings.
+  fidl(target_name) {
+    name = invoker.fidl_library
+    sources = [ generated_file ]
+    non_fidl_deps = [ generate_target_dep ]
+    enable_hlcpp = true
+    disable_rustdoc = true
+  }
+}
+
+# Define all FIDL targets
+fidl_targets = []
+foreach(test, dangerous_tests) {
+  dangerous_fidl(test.fidl_target) {
+    forward_variables_from(test,
+                           [
+                             "use",
+                             "style",
+                             "shard",
+                             "fidl_library",
+                           ])
+  }
+  fidl_targets += [ ":${test.fidl_target}($fidl_toolchain)" ]
+}
+
+if (toolchain_variant.base == default_toolchain) {
+  # This section needs to be executed for variants of the default_toolchain,
+  # such as asan
+
+  # Define all HLCPP targets
+  _hlcpp_targets = []
+  foreach(test, dangerous_tests) {
+    executable(test.hlcpp_target) {
+      output_dir = target_out_dir
+      sources = [ "main.cc" ]
+      header_path = string_replace(test.fidl_library, ".", "/") + "/cpp/fidl.h"
+      cflags_cc = [
+        "-include",
+        header_path,
+      ]
+      deps = [ ":${test.fidl_target}_hlcpp" ]
+    }
+    _hlcpp_targets += [ ":${test.hlcpp_target}" ]
+  }
+
+  # But these groups only need to exist in the non-variant, base toolchain.
+  if (current_toolchain == default_toolchain) {
+    group("hlcpp_targets") {
+      deps = _hlcpp_targets
+    }
+
+    # Define all Rust target deps
+    group("rust_targets") {
+      deps = []
+      foreach(test, dangerous_tests) {
+        if (defined(test.rust_target)) {
+          deps += [ ":${test.fidl_target}_rust" ]
+        }
+      }
+    }
+
+    group("tests") {
+      testonly = true
+      deps = fidl_targets + [
+               ":hlcpp_targets",
+               ":rust_targets",
+             ]
+    }
+  }
+}

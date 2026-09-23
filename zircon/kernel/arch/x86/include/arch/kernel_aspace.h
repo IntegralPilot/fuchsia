@@ -1,0 +1,30 @@
+// Copyright 2020 The Fuchsia Authors
+//
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT
+
+#ifndef ZIRCON_KERNEL_ARCH_X86_INCLUDE_ARCH_KERNEL_ASPACE_H_
+#define ZIRCON_KERNEL_ARCH_X86_INCLUDE_ARCH_KERNEL_ASPACE_H_
+
+// NOTE: This is an independent header so it can be #include'd
+// by a userland test program as well as the kernel source.
+
+// Virtual address where the kernel address space begins.
+// Below this is the user address space.
+#define KERNEL_ASPACE_BASE 0xffffff8000000000UL  // -512GB
+#define KERNEL_ASPACE_SIZE 0x0000008000000000UL
+
+// Virtual address where the user-accessible address space begins.
+// Below this is wholly inaccessible.
+#define USER_ASPACE_BASE 0x0000000000200000UL  // 2MB
+
+// We set the top of user address space to be (1 << 47) - 4k.
+// See //docs/concepts/kernel/sysret_problem.md for why we subtract 4k here.
+#define USER_ASPACE_SIZE ((1ULL << 47) - 4096 - USER_ASPACE_BASE)
+
+// Size of the restricted mode address space in unified address spaces.
+// We set the top of the restricted aspace to exactly halfway through the PML4.
+#define USER_RESTRICTED_ASPACE_SIZE ((1ULL << 46) - USER_ASPACE_BASE)
+
+#endif  // ZIRCON_KERNEL_ARCH_X86_INCLUDE_ARCH_KERNEL_ASPACE_H_

@@ -1,0 +1,305 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.ui.pointer;
+
+using fuchsia.input;
+using fuchsia.input.report as device;
+using zx;
+
+const MOUSE_MAX_EVENT uint32 = 128;
+
+/// The default maximum number of unacknowledged events allowed in flight for
+/// [`MouseSourceV2`].
+///
+/// Reflects approximately 0.625 seconds (625ms) of buffered events for a typical
+/// 240Hz sensor sampling rate.
+///
+/// The server (Scenic) will throttle event delivery when unacknowledged events
+/// in flight reach this limit. Clients should send acknowledgments periodically
+/// (e.g. before reaching the limit, such as within 20 remaining credits) to
+/// avoid being throttled.
+@available(added=NEXT)
+const MOUSE_SOURCE_V2_MAX_UNACKNOWLEDGED_EVENTS uint32 = 150;
+
+/// A method for a client to receive mouse pointer events.
+///
+/// The position of a pointer event is defined in the context of a viewport,
+/// situated in the view. The dimensions of the view and viewport, and their
+/// spatial relationship (defined with a transform matrix), are supplied
+/// synchronously in a |ViewParameter| table. A view may retrieve a pointer's
+/// position in its local coordinate system by applying the viewport-to-view
+/// transform matrix.
+///
+/// The viewport is embedded in an independent and stable coordinate system,
+/// suitable for interpreting pointer events in a scale-independent manner;
+/// mouse movement will be observed at a constant scale, even under effects such
+/// as magnification or panning. However, other effects, such as enlargening the
+/// view's clip bounds, may trigger a change in the viewport extents.
+closed protocol MouseSource {
+    /// A method for a client to receive mouse pointer events.
+    ///
+    /// This call is formulated as a "hanging get" pattern: the client asks for
+    /// a set of recent events, and receives them via the callback. This
+    /// pull-based approach ensures that clients consume events at their own
+    /// pace; events don't clog up the channel in an unbounded manner.
+    ///
+    /// Flow control. The caller is allowed at most one in-flight |Watch| call
+    /// at a time; it is a logical error to have concurrent calls to |Watch|.
+    /// Non-compliance results in channel closure.
+    ///
+    /// Client pacing. The server will dispatch events to the caller on a FIFO,
+    /// lossless, best-effort basis, but the caller must allocate enough time to
+    /// keep up with new events.
+    ///
+    /// Event times. The timestamps on each event in the event vector are *not*
+    /// guaranteed monotonic; events from different devices may be injected into
+    /// Scenic at different times. Generally, events from a single device are
+    /// expected to have monotonically increasing timestamps.
+    ///
+    /// View parameters. Occasionally, changes in view or viewport require
+    /// notifying the client. If a |MouseEvent| carries |ViewParameters|, these
+    /// parameters apply to successive |MousePointerSample|s until the next
+    /// |ViewParameters|.
+    strict Watch() -> (MouseSourceWatchResponse);
+};
+
+/// A push-based reader protocol for a client to receive mouse pointer events.
+///
+/// Streaming begins automatically on connection. Scenic dispatches mouse
+/// events in hover fragments, starting with `ENTERED` and ending with `EXITED`
+/// when the cursor leaves a view.
+///
+/// Flow control and acknowledgment rules:
+/// - The server will not push more than
+///   `MOUSE_SOURCE_V2_MAX_UNACKNOWLEDGED_EVENTS` (or a product-configured
+///   maximum) events without receiving an acknowledgment from the client.
+///   The server (Scenic) will throttle event delivery when unacknowledged
+///   events in flight reach this limit.
+/// - Clients should send acknowledgments periodically (e.g. before reaching
+///   the limit, such as within 20 remaining credits) to avoid being throttled.
+/// - No head-of-line blocking: Because channels and credit limits are
+///   independent per-view, a slow client that fails to acknowledge `EXITED`
+///   events only blocks its own channel. Scenic can immediately start pushing
+///   events to the newly hovered client on its own channel.
+///
+/// The position of a pointer event is defined in the context of a viewport,
+/// situated in the view, identical to [`MouseSource`].
+@available(added=NEXT)
+open protocol MouseSourceV2 {
+    /// Pushes mouse pointer events from the server to the client.
+    ///
+    /// Streaming begins automatically on connection. The server will not push
+    /// more than `MOUSE_SOURCE_V2_MAX_UNACKNOWLEDGED_EVENTS` (or a
+    /// product-configured maximum) events without receiving an acknowledgment.
+    /// The server will throttle event delivery when unacknowledged events in
+    /// flight reach this limit.
+    strict -> OnMouseEvents(resource struct {
+        events vector<MouseEvent>:MOUSE_MAX_EVENT;
+        /// The stamp associated with the last event in this batch.
+        /// Must be strictly increasing.
+        last_event_stamp uint64;
+    });
+
+    /// Acknowledges receipt of events up to `last_acknowledged_event_stamp`.
+    ///
+    /// This grants the server "credits" to send more events. All events sent
+    /// with a `last_event_stamp` less than or equal to
+    /// `last_acknowledged_event_stamp` are considered acknowledged.
+    ///
+    /// The server (Scenic) will throttle event delivery when unacknowledged
+    /// events in flight reach `MOUSE_SOURCE_V2_MAX_UNACKNOWLEDGED_EVENTS` (or a
+    /// product-configured maximum). Clients should send acknowledgments
+    /// periodically (e.g. before reaching the limit, such as within 20
+    /// remaining credits) to avoid being throttled.
+    ///
+    /// `last_acknowledged_event_stamp` must be strictly increasing.
+    /// Non-compliance results in channel closure.
+    strict AcknowledgeEvents(struct {
+        last_acknowledged_event_stamp uint64;
+    });
+};
+
+@available(replaced=HEAD)
+type MouseSourceWatchResponse = struct {
+    events vector<MouseEvent>:MOUSE_MAX_EVENT;
+};
+
+@available(added=HEAD)
+type MouseSourceWatchResponse = resource struct {
+    events vector<MouseEvent>:MOUSE_MAX_EVENT;
+};
+
+/// The self-sufficient, self-consistent collection of pointer-related data,
+/// sent from server to client.
+@available(replaced=HEAD)
+type MouseEvent = table {
+    /// The time this event was observed.
+    /// Required.
+    1: timestamp zx.Time;
+
+    /// The parameters of the associated view and viewport, sufficient to
+    /// correctly interpret the position, orientation, magnitude, and
+    /// inter-event distance of pointer events dispatched to a view.
+    /// - It is issued on connection and on change.
+    2: view_parameters ViewParameters;
+
+    /// A description of the mouse device, sufficient to correctly interpret
+    /// the capabilities and usage intent of the device.
+    /// - It is issued once per device.
+    3: device_info MouseDeviceInfo;
+
+    /// A description of each sampled data point in a mouse event stream.
+    ///
+    /// Issuance policy. There are two dispatch modes, "hover" and "latched".
+    /// Hover mode is default, and the stream is dispatched in fragments to the
+    /// visible client that each mouse event hovers above. Latched mode directs
+    /// the stream to a single client (regardless of view boundary) until
+    /// unlatched. Latched mode is typically toggled when the user presses the
+    /// primary mouse button, but is ultimately a product-specific policy.
+    4: pointer_sample MousePointerSample;
+
+    /// The signal for view entry/exit in hover mode.
+    /// - It is issued on hover entry into a view, and hover exit from a view.
+    5: stream_info MouseEventStreamInfo;
+
+    /// An identifier to correlate this event's send/receive occurrence across
+    /// component boundaries or abstraction layers.
+    6: trace_flow_id uint64;
+};
+
+@available(added=HEAD)
+type MouseEvent = resource table {
+    /// The time this event was observed.
+    /// Required.
+    1: timestamp zx.Time;
+
+    /// The parameters of the associated view and viewport, sufficient to
+    /// correctly interpret the position, orientation, magnitude, and
+    /// inter-event distance of pointer events dispatched to a view.
+    /// - It is issued on connection and on change.
+    2: view_parameters ViewParameters;
+
+    /// A description of the mouse device, sufficient to correctly interpret
+    /// the capabilities and usage intent of the device.
+    /// - It is issued once per device.
+    3: device_info MouseDeviceInfo;
+
+    /// A description of each sampled data point in a mouse event stream.
+    ///
+    /// Issuance policy. There are two dispatch modes, "hover" and "latched".
+    /// Hover mode is default, and the stream is dispatched in fragments to the
+    /// visible client that each mouse event hovers above. Latched mode directs
+    /// the stream to a single client (regardless of view boundary) until
+    /// unlatched. Latched mode is typically toggled when the user presses the
+    /// primary mouse button, but is ultimately a product-specific policy.
+    4: pointer_sample MousePointerSample;
+
+    /// The signal for view entry/exit in hover mode.
+    /// - It is issued on hover entry into a view, and hover exit from a view.
+    5: stream_info MouseEventStreamInfo;
+
+    /// An identifier to correlate this event's send/receive occurrence across
+    /// component boundaries or abstraction layers.
+    6: trace_flow_id uint64;
+
+    /// Optional wake lease for power baton passing.
+    7: wake_lease zx.Handle:EVENTPAIR;
+};
+
+/// The valid values of relative motion for a mouse device.
+/// - The ranges are placed in (x, y) order.
+@available(replaced=32)
+alias RelativeMotionRange = array<device.Axis, 2>;
+@available(added=32)
+alias RelativeMotionRange = array<fuchsia.input.Axis, 2>;
+
+/// Information about a device that issues a mouse event stream.
+type MouseDeviceInfo = table {
+    /// An identifier for the mouse device that issues a mouse event stream.
+    /// Required.
+    1: id uint32;
+
+    /// Range of relative movement values issued by the device.
+    5: relative_motion_range RelativeMotionRange;
+
+    /// Range of vertical scroll values issued by the device.
+    2: scroll_v_range device.Axis;
+
+    /// Range of horizontal scroll values issued by the device.
+    3: scroll_h_range device.Axis;
+
+    /// Button identifiers issued by the device, in priority order.
+    4: buttons vector<uint8>:device.MOUSE_MAX_NUM_BUTTONS;
+};
+
+/// The relative motion performed by a mouse device.
+/// - The valid range is defined in [`MouseDeviceInfo.RelativeMotionRange`].
+/// - The values are placed in (x, y) order.
+alias RelativeMotion = array<float32, 2>;
+
+/// A description of each sampled data point in a mouse event stream.
+///
+/// `MousePointerSample` may bundle multiple state changes into one event.
+/// For example, if user scrolls mouse wheel and presses the left buttton
+/// down at the same time, client may receive scroll and button state changes
+/// together in 1 event, or receive button change and scroll change in
+/// separate events.
+type MousePointerSample = table {
+    /// An identifier for the mouse device that issues a mouse event stream.
+    /// Required.
+    1: device_id uint32;
+
+    /// The position of this event, in the viewport's coordinate system.
+    /// Required.
+    2: position_in_viewport Point2;
+
+    /// The relative movement performed, independent of the viewport's
+    /// coordinate system.
+    6: relative_motion RelativeMotion;
+
+    /// Relative vertical scrolling displacement by detent.
+    3: scroll_v int64;
+
+    /// Relative horizontal scrolling displacement by detent.
+    4: scroll_h int64;
+
+    /// Recommended vertical scrolling displacement by physical pixel, it is
+    /// computed with accelerator, detent / mm to pixel ratio, etc.
+    7: scroll_v_physical_pixel float64;
+
+    /// Recommended horizontal scrolling displacement by physical pixel, it
+    /// is computed with accelerator, detent / mm to pixel ratio, etc.
+    8: scroll_h_physical_pixel float64;
+
+    /// Indicated if the scroll event is from a precision scroll device (HI_RES
+    /// mouse or touchpad). Clients may want to play interpolation animations
+    /// on non precision scroll device for smooth scrolling.
+    9: is_precision_scroll bool;
+
+    /// Identifiers of currently pressed buttons.
+    5: pressed_buttons vector<uint8>:device.MOUSE_MAX_NUM_BUTTONS;
+};
+
+/// The status of a mouse event stream, sent from server to client.
+///
+/// Invariant: a client's mouse events are bracketed by
+/// [`MouseViewStatus.ENTERED`] and [`MouseViewStatus.EXITED`].
+///
+type MouseEventStreamInfo = struct {
+    /// An identifier for the mouse device that issues a mouse event stream.
+    device_id uint32;
+
+    /// The mouse event stream's enter/exit status, sent from server to client.
+    status MouseViewStatus;
+};
+
+/// A description of mouse event stream's relationship to this view.
+@strict_audit(bug="https://fxbug.dev/467128273", state="PENDING_REVIEW")
+type MouseViewStatus = strict enum {
+    /// The stream is directed towards this view.
+    ENTERED = 1;
+
+    /// The stream is directed away from this view.
+    EXITED = 2;
+};

@@ -1,0 +1,313 @@
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
+#include <unistd.h>
+
+#include <string>
+#include <string_view>
+
+#include <fbl/unique_fd.h>
+
+#include "src/storage/fs_test/fs_test_fixture.h"
+
+namespace fs_test {
+namespace {
+
+using UnlinkTest = FilesystemTest;
+
+// Make some files, then unlink them.
+TEST_P(UnlinkTest, Simple) {
+  const std::string paths[] = {GetPath("abc"), GetPath("def"), GetPath("ghi"), GetPath("jkl"),
+                               GetPath("mnopqrstuvxyz")};
+  for (const std::string& path : paths) {
+    fbl::unique_fd fd(open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+    ASSERT_TRUE(fd);
+  }
+
+  for (const std::string& path : paths) {
+    ASSERT_EQ(unlink(path.c_str()), 0);
+  }
+}
+
+constexpr std::string_view kStringData[] = {
+    "Hello, world",
+    "Foo bar baz blat",
+    "This is yet another sample string",
+};
+
+void SimpleReadTest(int fd, size_t data_index) {
+  ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
+  char buf[1024];
+  memset(buf, 0, sizeof(buf));
+  auto len = static_cast<ssize_t>(kStringData[data_index].size());
+  ASSERT_EQ(read(fd, buf, len), static_cast<ssize_t>(len));
+  ASSERT_EQ(memcmp(kStringData[data_index].data(), buf, len), 0);
+}
+
+void SimpleWriteTest(int fd, size_t data_index) {
+  ASSERT_EQ(ftruncate(fd, 0), 0);
+  ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
+  auto len = static_cast<ssize_t>(kStringData[data_index].size());
+  ASSERT_EQ(write(fd, kStringData[data_index].data(), len), static_cast<ssize_t>(len));
+  SimpleReadTest(fd, data_index);
+}
+
+TEST_P(UnlinkTest, UseAfterwards) {
+  const std::string path = GetPath("foobar");
+  fbl::unique_fd fd(open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+  ASSERT_TRUE(fd);
+
+  ASSERT_NO_FATAL_FAILURE(SimpleWriteTest(fd.get(), 1));
+
+  // When we unlink path, fd is still open.
+  ASSERT_EQ(unlink(path.c_str()), 0);
+  ASSERT_NO_FATAL_FAILURE(
+      SimpleReadTest(fd.get(), 1));  // It should contain the same data as before
+  ASSERT_NO_FATAL_FAILURE(SimpleWriteTest(fd.get(), 2));  // It should still be writable
+  ASSERT_EQ(close(fd.release()), 0);                      // This actually releases the file
+
+  // Now, opening the file should fail without O_CREAT
+  ASSERT_EQ(open(path.c_str(), O_RDWR, 0644), -1);
+}
+
+TEST_P(UnlinkTest, UseAfterRenameOver) {
+  const std::string path = GetPath("foobar");
+  fbl::unique_fd fd(open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+  ASSERT_TRUE(fd);
+
+  ASSERT_NO_FATAL_FAILURE(SimpleWriteTest(fd.get(), 1));
+
+  // When we rename over path, fd is still open.
+  const std::string barfoo = GetPath("barfoo");
+  fbl::unique_fd fd2(open(barfoo.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+  ASSERT_EQ(rename(barfoo.c_str(), path.c_str()), 0);
+
+  ASSERT_NO_FATAL_FAILURE(
+      SimpleReadTest(fd.get(), 1));  // It should contain the same data as before
+  ASSERT_NO_FATAL_FAILURE(SimpleWriteTest(fd.get(), 2));  // It should still be writable
+}
+
+TEST_P(UnlinkTest, OpenElsewhere) {
+  const std::string path = GetPath("foobar");
+  fbl::unique_fd fd1(open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+  ASSERT_TRUE(fd1);
+  fbl::unique_fd fd2(open(path.c_str(), O_RDWR, 0644));
+  ASSERT_TRUE(fd2);
+
+  ASSERT_NO_FATAL_FAILURE(SimpleWriteTest(fd1.get(), 0));
+  ASSERT_EQ(close(fd1.release()), 0);
+
+  // When we unlink path, fd2 is still open.
+  ASSERT_EQ(unlink(path.c_str()), 0);
+  ASSERT_NO_FATAL_FAILURE(
+      SimpleReadTest(fd2.get(), 0));  // It should contain the same data as before
+  ASSERT_NO_FATAL_FAILURE(SimpleWriteTest(fd2.get(), 1));  // It should still be writable
+  ASSERT_EQ(close(fd2.release()), 0);                      // This actually releases the file
+
+  // Now, opening the file should fail without O_CREAT
+  ASSERT_EQ(open(path.c_str(), O_RDWR, 0644), -1);
+}
+
+TEST_P(UnlinkTest, OpenElsewhereLongName) {
+  // Test a filename that's not 8.3
+  const std::string path = GetPath("really_really_long_file_name");
+  fbl::unique_fd fd1(open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+  ASSERT_TRUE(fd1);
+  fbl::unique_fd fd2(open(path.c_str(), O_RDWR, 0644));
+  ASSERT_TRUE(fd2);
+
+  ASSERT_NO_FATAL_FAILURE(SimpleWriteTest(fd1.get(), 0));
+  ASSERT_EQ(close(fd1.release()), 0);
+
+  // When we unlink path, fd2 is still open.
+  ASSERT_EQ(unlink(path.c_str()), 0);
+  ASSERT_NO_FATAL_FAILURE(
+      SimpleReadTest(fd2.get(), 0));  // It should contain the same data as before
+  ASSERT_NO_FATAL_FAILURE(SimpleWriteTest(fd2.get(), 1));  // It should still be writable
+  ASSERT_EQ(close(fd2.release()), 0);                      // This actually releases the file
+
+  // Now, opening the file should fail without O_CREAT
+  ASSERT_EQ(open(path.c_str(), O_RDWR, 0644), -1);
+}
+
+TEST_P(UnlinkTest, SpaceReturned) {
+  if (fs().GetTraits().in_memory) {
+    GTEST_SKIP() << "In-memory filesystems do not track space usage";
+  }
+
+  const std::string path1 = GetPath("file1");
+  fbl::unique_fd fd1(open(path1.c_str(), O_RDWR | O_CREAT, 0644));
+  ASSERT_TRUE(fd1);
+  constexpr int kBufSize = 1024 * 1024;
+  auto buf = std::make_unique<uint8_t[]>(kBufSize);
+  ASSERT_EQ(write(fd1.get(), buf.get(), kBufSize), kBufSize);
+
+  const std::string path2 = GetPath("file2");
+  fbl::unique_fd fd2(open(path2.c_str(), O_RDWR | O_CREAT, 0644));
+  ASSERT_TRUE(fd2);
+  ASSERT_EQ(write(fd2.get(), buf.get(), kBufSize), kBufSize);
+
+  struct statfs statfs_buf;
+  ASSERT_EQ(statfs(GetPath("").c_str(), &statfs_buf), 0);
+
+  auto free_space = [](const struct statfs& s) { return s.f_bavail * s.f_bsize; };
+
+  const auto initial_free_space = free_space(statfs_buf);
+
+  fd1.reset();
+  ASSERT_EQ(unlink(path1.c_str()), 0);
+  ASSERT_EQ(unlink(path2.c_str()), 0);
+
+  ASSERT_EQ(statfs(GetPath("").c_str(), &statfs_buf), 0);
+
+  // Some filesystems use space for metadata, so allow for that.
+  const int kMetadataSize = 128 * 1024;
+
+  const auto free_space_after_deleting_one_file = free_space(statfs_buf);
+  EXPECT_GE(free_space_after_deleting_one_file, initial_free_space + kBufSize - kMetadataSize);
+
+  fd2.reset();
+
+  // After closing the second file, we should get the space back soon afterwards
+  // (but not necessarily immediately).
+  for (;;) {
+    ASSERT_EQ(statfs(GetPath("").c_str(), &statfs_buf), 0);
+    if (free_space(statfs_buf) >= free_space_after_deleting_one_file + kBufSize - kMetadataSize) {
+      break;
+    }
+    sleep(1);
+  }
+}
+
+TEST_P(UnlinkTest, Remove) {
+  // Test the trivial cases of removing files and directories
+  const std::string filename = GetPath("file");
+  fbl::unique_fd fd(open(filename.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+  ASSERT_TRUE(fd);
+  ASSERT_EQ(remove(filename.c_str()), 0);
+  ASSERT_EQ(remove(filename.c_str()), -1);
+  ASSERT_EQ(errno, ENOENT);
+  ASSERT_EQ(close(fd.release()), 0);
+
+  const std::string dirname = GetPath("dir");
+  ASSERT_EQ(mkdir(dirname.c_str(), 0666), 0);
+  ASSERT_EQ(remove(dirname.c_str()), 0);
+  ASSERT_EQ(remove(dirname.c_str()), -1);
+  ASSERT_EQ(errno, ENOENT);
+
+  // Test that we cannot remove non-empty directories, and that
+  // we see the expected error code too.
+  ASSERT_EQ(mkdir(dirname.c_str(), 0666), 0);
+  ASSERT_EQ(mkdir((dirname + "/subdir").c_str(), 0666), 0);
+  ASSERT_EQ(remove(dirname.c_str()), -1);
+  ASSERT_EQ(errno, ENOTEMPTY);
+  ASSERT_EQ(remove((dirname + "/subdir").c_str()), 0);
+  ASSERT_EQ(remove(dirname.c_str()), 0);
+  ASSERT_EQ(remove(dirname.c_str()), -1);
+  ASSERT_EQ(errno, ENOENT);
+}
+
+TEST_P(UnlinkTest, PurgedAfterRemount) {
+  const std::string filename = GetPath("file");
+  fbl::unique_fd fd(open(filename.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+  ASSERT_TRUE(fd);
+  constexpr size_t kBufSize = 1024 * 1024;
+  auto buf = std::make_unique<uint8_t[]>(kBufSize);
+  EXPECT_EQ(write(fd.get(), buf.get(), kBufSize), static_cast<ssize_t>(kBufSize));
+
+  struct statfs statfs_buf;
+  ASSERT_EQ(statfs(GetPath("").c_str(), &statfs_buf), 0);
+
+  auto free_space = [](const struct statfs& s) {
+    return static_cast<uint64_t>(s.f_bavail) * s.f_bsize;
+  };
+
+  uint64_t before = free_space(statfs_buf);
+
+  fd.reset(open(filename.c_str(), O_RDONLY));
+  EXPECT_TRUE(fd);
+
+  // Keep a reference using mmap rather than via a file descriptor.
+  void* addr = nullptr;
+  const Filesystem::Traits& traits = fs().GetTraits();
+
+  if (traits.supports_mmap) {
+    addr = mmap(nullptr, kBufSize, PROT_READ, MAP_SHARED, fd.get(), 0);
+    EXPECT_NE(addr, MAP_FAILED) << strerror(errno);
+  }
+
+  EXPECT_EQ(unlink(filename.c_str()), 0);
+  fd.reset();
+
+  // Keep the reference and remount.
+  if (!traits.in_memory) {
+    EXPECT_EQ(fs().Unmount().status_value(), ZX_OK);
+    EXPECT_EQ(fs().Mount().status_value(), ZX_OK);
+  }
+
+  if (traits.supports_mmap) {
+    EXPECT_EQ(munmap(addr, kBufSize), 0) << strerror(errno);
+  }
+
+  // The file should not exist.
+  EXPECT_EQ(open(filename.c_str(), O_RDONLY), -1);
+
+  // It can take a short while for the space to be recovered.
+  if (!traits.in_memory) {
+    int attempts;
+    for (attempts = 0; attempts < 10; ++attempts) {
+      struct statfs statfs_buf;
+      ASSERT_EQ(statfs(GetPath("").c_str(), &statfs_buf), 0);
+
+      if (free_space(statfs_buf) > before + kBufSize / 2)
+        break;
+
+      usleep(500000);
+    }
+
+    EXPECT_LT(attempts, 10);
+  }
+}
+
+using UnlinkSparseTest = FilesystemTest;
+
+TEST_P(UnlinkSparseTest, UnlinkLargeSparseFileAfterClose) {
+  const std::string foo = GetPath("foo");
+  fbl::unique_fd fd(open(foo.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644));
+  ASSERT_TRUE(fd);
+  // The offset here is deliberately chosen so that it would involve Minfs's double indirect blocks,
+  // but also fits within memfs.
+  ASSERT_EQ(pwrite(fd.get(), "hello", 5, 0x20000000 - 5), 5);
+  ASSERT_EQ(fsync(fd.get()), 0);  // Deliberate sync so that close is likely to unload the vnode.
+  ASSERT_EQ(close(fd.release()), 0);
+  ASSERT_EQ(unlink(foo.c_str()), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(/*no prefix*/, UnlinkTest, testing::ValuesIn(AllTestFilesystems()),
+                         testing::PrintToStringParamName());
+
+// These tests will only work on a file system that supports sparse files.
+INSTANTIATE_TEST_SUITE_P(
+    /*no prefix*/, UnlinkSparseTest,
+    testing::ValuesIn(MapAndFilterAllTestFilesystems(
+        [](const TestFilesystemOptions& options) -> std::optional<TestFilesystemOptions> {
+          if (options.filesystem->GetTraits().supports_sparse_files) {
+            return options;
+          } else {
+            return std::nullopt;
+          }
+        })),
+    testing::PrintToStringParamName());
+
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(UnlinkSparseTest);
+
+}  // namespace
+}  // namespace fs_test

@@ -1,0 +1,11 @@
+# Integrator Development Kit (IDK) Documentation
+
+These are some of the tools included in the IDK. See [fuchsia.dev](https://fuchsia.dev) for
+complete information on how to use the IDK to create a development environment.
+
+* Minimal [Compilation notes for C/C++](compilation.md).
+* Starting the [Debugger](debugger.md).
+* [Working with devices](devices.md).
+* [Logging](logging.md).
+* [Packaging components](packages.md).
+* [Using SSH](ssh.md)

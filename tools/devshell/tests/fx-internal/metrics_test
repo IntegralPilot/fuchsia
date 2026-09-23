@@ -1,0 +1,720 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test expected behavior of metrics collection
+
+# Source vars.sh so that we can point to jq and include it as a runtime dependency.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../../lib/vars.sh || exit $?
+
+BT_FILE_DEPS=(
+  "prebuilt/third_party/jq/${HOST_PLATFORM}/bin/jq"
+  "tools/devshell/jq.fx"
+  "scripts/fx"
+  "tools/devshell/metrics"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/platform.sh"
+  "tools/devshell/lib/metrics.sh"
+  "tools/devshell/lib/style.sh"
+)
+
+BT_MOCKED_TOOLS=(
+  # commands defined in tools/devshell/lib/metrics.sh constants:
+  "tools/devshell/emu"
+  "tools/devshell/set"
+  "tools/devshell/shell"
+  "tools/devshell/fidlcat"
+  "tools/devshell/run-host-tests"
+  "tools/devshell/build"
+  "tools/devshell/test"
+
+  # this is a fake command that is a substring of a valid command
+  "tools/devshell/fidl"
+)
+
+declare fx mycurl metrics_log
+
+BT_SET_UP() {
+  local mock_py_path="prebuilt/third_party/python3/${HOST_PLATFORM}/bin/python3"
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx_with_metrics)"
+  mycurl="$(btf::make_mock_binary curl)"
+  btf::add_binary_to_path "${mycurl}"
+  btf::make_mock ${BT_TEMP_DIR}/${mock_py_path}
+  echo "1234567890000000" > "${BT_TEMP_DIR}/${mock_py_path}.mock_stdout"
+  metrics_log="${BT_TEMP_DIR}/metrics_log"
+  metrics_done="${BT_TEMP_DIR}/metrics_done"
+  metrics_fifo="${BT_TEMP_DIR}/metrics_fifo"
+  metrics_notice="${BT_TEMP_DIR}/metrics_notice"
+  metrics_config_internal="${BT_TEMP_DIR}/Fuchsia/metrics/analytics-status-internal"
+  metrics_config_external="${BT_TEMP_DIR}/Fuchsia/metrics/analytics-status"
+  metrics_config_fx="${BT_TEMP_DIR}/.fx/config/metrics"
+  BT_ASSERT_FILE_DOES_NOT_EXIST "${metrics_config_fx}"
+
+  mkdir -p ${BT_TEMP_DIR}/.fx/config
+  source "${BT_TEMP_DIR}/tools/devshell/lib/vars.sh"
+  source "${BT_TEMP_DIR}/tools/devshell/lib/metrics.sh"
+  metrics-write-config 1 TESTUUID "${metrics_log}"
+  metrics-read-config
+  mkfifo ${metrics_done}
+  mkfifo ${metrics_fifo}
+  mkdir -p ${BT_TEMP_DIR}/Fuchsia/metrics
+  export XDG_DATA_HOME="${BT_TEMP_DIR}"
+}
+
+# Special version of metrics_init that allows waiting for the analytics/metrics
+# Note: this can not be called from BT_SET_UP because somehow the TEST_xxx
+# function is executed in a subshell of BT_SET_UP function, and closing a file
+# descriptor in a subshell does not affect its parent. If metrics_init calls
+# were moved from each TEST_xxx function into BT_SET_UP, metrics_wait will wait
+# forever.
+metrics_init() {
+  (_metrics-service <"${metrics_fifo}"; : >"${metrics_done}") &
+  exec 10>&-
+  exec 10>"${metrics_fifo}"
+}
+
+metrics_wait(){
+  exec 10>&-
+  read <"${metrics_done}"
+}
+
+verify_execution_event() {
+  local cmd="$1"
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"name\":\"invoke\""
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"subcommand\":\"${cmd}\""
+}
+
+TEST_metrics_no_arguments_tracking() {
+  local cmd="build"
+  local arg="something"
+  metrics_init
+  # Execute track-* command in subshell since they will close stdout and stderr
+  # which will confuse our bash test framework
+  (track-command-execution "${cmd}" "$arg")
+  (track-command-finished "200" "0" "${cmd}" "$arg")
+  metrics_wait
+  verify_execution_event "${cmd}"
+  # the "build" command does not track arguments:
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"args\":\"\""
+}
+
+TEST_metrics_track_specific_arguments() {
+  local cmd="shell"
+  local subcmd="uname"
+  local arg="$subcmd blah"
+  metrics_init
+  (track-command-execution "${cmd}" "$arg")
+  (track-command-finished "200" "0" "${cmd}" "$arg")
+  metrics_wait
+  verify_execution_event ${cmd}
+  # The "shell" command tracks one subcommand, let's verify:
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"args\":\"${subcmd}\""
+}
+
+TEST_metrics_track_unknown_arguments() {
+  local cmd="shell"
+  local subcmd="\$mandragora"
+  local replacement_text="\$unknown_subcommand"
+  local arg="$subcmd blah"
+  metrics_init
+  (track-command-execution "${cmd}" "$arg")
+  (track-command-finished "200" "0" "${cmd}" "$arg")
+  metrics_wait
+  verify_execution_event ${cmd}
+  # The "shell" command tracks one subcommand, let's verify:
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"args\":\"${replacement_text}\""
+}
+
+TEST_metrics_custom_track() {
+  local cmd="test"
+  local action="myaction"
+  local label="mylabel"
+
+  metrics_init
+  (track-command-execution "${cmd}" "$arg")
+  (track-subcommand-custom-event "${cmd}" "${action}" "${label}")
+  (track-command-finished "200" "0" "${cmd}" "$arg")
+  metrics_wait
+  verify_execution_event ${cmd}
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"name\":\"custom\""
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"action\":\"${action}\""
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"label\":\"${label}\""
+}
+
+TEST_metrics_no_custom_track() {
+  local cmd="build"
+  local action="myaction"
+  local label="mylabel"
+
+  metrics_init
+  (track-command-execution "${cmd}" "$arg")
+  (track-subcommand-custom-event "${cmd}" "${action}" "${label}")
+  (track-command-finished "200" "0" "${cmd}" "$arg")
+  metrics_wait
+  verify_execution_event ${cmd}
+  BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${metrics_log}" "\"name\":\"custom\""
+}
+
+# Tests for internal analytics
+# We start with defining a few helper functions, and then there
+# will be a series of tests named in the form TEST_metrics_state_xyzw
+# where the values of x, y, z and w have the following meanings
+# x=N: .fx/config/metrics does not exist
+# x=0: METRICS_ENABLED=0 in .fx/config/metrics
+# x=1: METRICS_ENABLED=1 in .fx/config/metrics
+#
+# y=N: analytics-status does not exist
+# y=0: analytics-status has content 0
+# y=1: analytics-status has content 1
+#
+# z=N: analytics-status-internal does not exist
+# z=0: analytics-status-internal has content 0
+# z=1: analytics-status-internal has content 1
+# z=2: analytics-status-internal has content 2
+#
+# w=0: user is external
+# w=1: user is internal
+#
+# There are in total 3x3x4x2=72 possible different states. Fortunately,
+# many of the states can be merged together.
+
+set_up_environment() {
+  rm -f "${metrics_notice}"
+  rm -f "${metrics_log}"
+
+  local fx_metrics_config=$1
+  local analytics_status=$2
+  local analytics_status_internal=$3
+  local is_internal=$4
+
+  case "${fx_metrics_config}" in
+    N)
+      rm -f "${metrics_config_fx}"
+      if [[ "${is_internal}" == "1" && "${analytics_status_internal}" != "0" && "${analytics_status_internal}" != "N" ]]; then
+        metrics-write-config-internal TESTUUID "${metrics_log}"
+      fi
+      ;;
+    0)
+      metrics-write-config-internal TESTUUID "${metrics_log}"
+      echo "METRICS_ENABLED=0" >> "${metrics_config_fx}"
+      ;;
+    1)
+      metrics-write-config 1 TESTUUID "${metrics_log}"
+      ;;
+  esac
+
+  case "${analytics_status}" in
+    N)
+      rm -f "${metrics_config_external}"
+      ;;
+    0)
+      echo 0 >"${metrics_config_external}"
+      ;;
+    1)
+      echo 1 >"${metrics_config_external}"
+      ;;
+  esac
+
+  case "${analytics_status_internal}" in
+    N)
+      rm -f "${metrics_config_internal}"
+      ;;
+    0)
+      echo 0 >"${metrics_config_internal}"
+      ;;
+    1)
+      echo 1 >"${metrics_config_internal}"
+      ;;
+    2)
+      echo 2 >"${metrics_config_internal}"
+      ;;
+  esac
+
+  case "${is_internal}" in
+    0)
+      HOSTNAME="local"
+      ;;
+    1)
+      HOSTNAME="test.corp.google.com"
+      ;;
+  esac
+}
+
+expect_show_external_notice() {
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_notice}" "Please opt in or out"
+  BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${metrics_notice}" "Googler"
+}
+
+expect_not_show_notice() {
+  BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${metrics_notice}" "Please opt in or out"
+  BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${metrics_notice}" "Googler"
+}
+
+expect_show_internal_notice() {
+  BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${metrics_notice}" "Please opt in or out"
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_notice}" "Googler"
+}
+
+expect_not_send_analytics() {
+  BT_EXPECT_FILE_DOES_NOT_EXIST "${metrics_log}"
+}
+
+expect_send_basic_analytics() {
+  local cmd=$1
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"name\":\"invoke\""
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"subcommand\":\"${cmd}\""
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"args\":\"\""
+}
+
+expect_send_enhanced_analytics() {
+  local cmd=$1
+  local args="$(metrics-sanitize-string $2)"
+
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"name\":\"invoke\""
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"subcommand\":\"${cmd}\""
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"args\":\"${args}\""
+}
+
+
+# For non-Googlers, experience should not be affected
+## New user
+TEST_metrics_state_Nxx0() {
+  local cmd="build"
+  local arg="something"
+
+  local fx_metrics_config="N"
+  local is_internal="0"
+
+  for analytics_status in "N" "0" "1"
+  do
+    for analytics_status_internal in "N" "0" "1" "2"
+    do
+      set_up_environment "${fx_metrics_config}" "${analytics_status}" "${analytics_status_internal}" "${is_internal}"
+
+      metrics-read-and-validate 2>"${metrics_notice}"
+      expect_show_external_notice
+
+      metrics_init
+      (track-command-execution "${cmd}" "${arg}")
+      metrics_wait
+      expect_not_send_analytics
+    done
+  done
+}
+
+## Existing user, fx analytics disabled
+TEST_metrics_state_0xx0() {
+  local cmd="build"
+  local arg="something"
+
+  local fx_metrics_config="0"
+  local is_internal="0"
+
+  for analytics_status in "N" "0" "1"
+  do
+    for analytics_status_internal in "N" "0" "1" "2"
+    do
+      set_up_environment "${fx_metrics_config}" "${analytics_status}" "${analytics_status_internal}" "${is_internal}"
+
+      metrics-read-and-validate 2>"${metrics_notice}"
+      expect_not_show_notice
+
+      metrics_init
+      (track-command-execution "${cmd}" "${arg}")
+      metrics_wait
+      expect_not_send_analytics
+    done
+  done
+}
+
+## Existing user, fx analytics enabled
+TEST_metrics_state_1xx0() {
+  local cmd="build"
+  local arg="something"
+
+  local fx_metrics_config="1"
+  local is_internal="0"
+
+  for analytics_status in "N" "0" "1"
+  do
+    for analytics_status_internal in "N" "0" "1" "2"
+    do
+      set_up_environment "${fx_metrics_config}" "${analytics_status}" "${analytics_status_internal}" "${is_internal}"
+
+      metrics-read-and-validate 2>"${metrics_notice}"
+      expect_not_show_notice
+
+      metrics_init
+      (track-command-execution "${cmd}" "${arg}")
+      metrics_wait
+      expect_send_basic_analytics "${cmd}"
+    done
+  done
+}
+
+# For Googler who has made a choice on enhanced analytics, the
+# analytics-status-internal config should decide the analytics status.
+
+## Analytics disabled
+TEST_metrics_state_xx01() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  local analytics_status_internal="0"
+  local is_internal="1"
+
+  for fx_metrics_config in "N" "0" "1"
+  do
+    for analytics_status in "N" "0" "1"
+    do
+      set_up_environment "${fx_metrics_config}" "${analytics_status}" "${analytics_status_internal}" "${is_internal}"
+
+      metrics-read-and-validate 2>"${metrics_notice}"
+      expect_not_show_notice
+
+      metrics_init
+      (track-command-execution "${cmd}" "${arg}")
+      metrics_wait
+      expect_not_send_analytics
+    done
+  done
+}
+
+## Basic analytics enabled
+TEST_metrics_state_xx11() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  local analytics_status_internal="1"
+  local is_internal="1"
+
+  for fx_metrics_config in "N" "0" "1"
+  do
+    for analytics_status in "N" "0" "1"
+    do
+      set_up_environment "${fx_metrics_config}" "${analytics_status}" "${analytics_status_internal}" "${is_internal}"
+
+      metrics-read-and-validate 2>"${metrics_notice}"
+      expect_not_show_notice
+
+      metrics_init
+      (track-command-execution "${cmd}" "${arg}")
+      metrics_wait
+      expect_send_basic_analytics "${cmd}"
+    done
+  done
+}
+
+## Enhanced analytics enabled
+TEST_metrics_state_xx21() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  local analytics_status_internal="2"
+  local is_internal="1"
+
+  for fx_metrics_config in "N" "0" "1"
+  do
+    for analytics_status in "N" "0" "1"
+    do
+      set_up_environment "${fx_metrics_config}" "${analytics_status}" "${analytics_status_internal}" "${is_internal}"
+
+      metrics-read-and-validate 2>"${metrics_notice}"
+      expect_not_show_notice
+
+      metrics-read-config
+      metrics_init
+      (track-command-execution "${cmd}" "${arg}")
+      metrics_wait
+      expect_send_enhanced_analytics "${cmd}" "${arg}"
+    done
+  done
+}
+
+# For Googlers who haven't made a choice yet (xxN1)
+
+##  New user
+TEST_metrics_state_NNN1() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  set_up_environment "N" "N" "N" "1"
+
+  metrics-read-and-validate 2>"${metrics_notice}"
+  expect_show_internal_notice
+
+  metrics-read-config
+  metrics_init
+  (track-command-execution "${cmd}" "${arg}")
+  metrics_wait
+  expect_not_send_analytics
+}
+
+
+## Existing fx user (enabled fx analytics), have not used other tools
+TEST_metrics_state_1NN1() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  set_up_environment "1" "N" "N" "1"
+
+  metrics-read-and-validate 2>"${metrics_notice}"
+  expect_show_internal_notice
+
+  metrics-read-config
+  metrics_init
+  (track-command-execution "${cmd}" "${arg}")
+  metrics_wait
+  expect_send_basic_analytics "${cmd}"
+}
+
+## Existing fx user (disabled fx analytics), have not used other tools
+TEST_metrics_state_0NN1() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  set_up_environment "0" "N" "N" "1"
+
+  metrics-read-and-validate 2>"${metrics_notice}"
+  expect_show_internal_notice
+
+  metrics-read-config
+  metrics_init
+  (track-command-execution "${cmd}" "${arg}")
+  metrics_wait
+  expect_not_send_analytics
+}
+
+## Disabled analytics in other tools
+TEST_metrics_state_x0N1() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  local analytics_status="0"
+  local analytics_status_internal="N"
+  local is_internal="1"
+
+  for fx_metrics_config in "N" "0" "1"
+  do
+    set_up_environment "${fx_metrics_config}" "${analytics_status}" "${analytics_status_internal}" "${is_internal}"
+
+    metrics-read-and-validate 2>"${metrics_notice}"
+    expect_not_show_notice
+
+    metrics-read-config
+    metrics_init
+    (track-command-execution "${cmd}" "${arg}")
+    metrics_wait
+    expect_not_send_analytics
+
+    BT_EXPECT_FILE_EXISTS "${metrics_config_internal}"
+    BT_EXPECT_FILE_CONTAINS "${metrics_config_internal}" "0"
+  done
+}
+
+## New fx user, enabled analytics in other tools
+TEST_metrics_state_N1N1() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  set_up_environment "N" "1" "N" "1"
+
+  metrics-read-and-validate 2>"${metrics_notice}"
+  expect_show_internal_notice
+
+  metrics-read-config
+  metrics_init
+  (track-command-execution "${cmd}" "${arg}")
+  metrics_wait
+  expect_not_send_analytics
+}
+
+
+## Existing fx user (enabled fx analytics), enabled analytics in other tools
+TEST_metrics_state_11N1() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  set_up_environment "1" "1" "N" "1"
+
+  metrics-read-and-validate 2>"${metrics_notice}"
+  expect_show_internal_notice
+
+  metrics-read-config
+  metrics_init
+  (track-command-execution "${cmd}" "${arg}")
+  metrics_wait
+  expect_send_basic_analytics "${cmd}"
+}
+
+## Existing fx user (disabled fx analytics), have not used other tools
+TEST_metrics_state_01N1() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  local cmd="build"
+  local arg="something"
+
+  set_up_environment "0" "1" "N" "1"
+
+  metrics-read-and-validate 2>"${metrics_notice}"
+  expect_show_internal_notice
+
+  metrics-read-config
+  metrics_init
+  (track-command-execution "${cmd}" "${arg}")
+  metrics_wait
+  expect_not_send_analytics
+}
+
+TEST_metrics_init_agent_hides_notice() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  set_up_environment "N" "N" "N" "1"
+  ANTIGRAVITY_AGENT=1 metrics-init "build" "something" 2>"${metrics_notice}"
+  expect_not_show_notice
+}
+TEST_track_test_event() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  set_up_environment "1" "1" "N" "1"
+  metrics-read-config
+  metrics_init
+
+  local start_time="1000000"
+  local end_time="2000000"
+  local exit_status="0"
+  local was_aborted="0"
+  local stats_json='{"t":1000000,"a":0,"ab":null,"top":[],"sum":{}}'
+  local dummy_build_dir="${BT_TEMP_DIR}/build_dir"
+  mkdir -p "${dummy_build_dir}"
+  cat > "${dummy_build_dir}/args.json" <<EOF
+{
+  "build_info_product": "test_product",
+  "build_info_board": "test_board",
+  "main_pb_label": "//products:bundle"
+}
+EOF
+
+  (track-test-event "${start_time}" "${end_time}" "${exit_status}" "${was_aborted}" "${stats_json}" "${dummy_build_dir}")
+  metrics_wait
+
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"name":"test"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"start_time_micros":1000000'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"end_time_micros":2000000'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"exit_status":"0"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"was_aborted":"0"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"product":"test_product"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"board":"test_board"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"test_selection":'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"stats_json1":'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"stats_json2":""'
+}
+
+TEST_track_test_event_selection_extraction_and_stripping() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  set_up_environment "1" "1" "N" "1"
+  metrics-read-config
+  metrics_init
+
+  local stats_json='{"t":1000000,"a":0,"sel":"--package foo --and --component bar"}'
+  (track-test-event "1000000" "2000000" "0" "0" "${stats_json}" "${BT_TEMP_DIR}")
+  metrics_wait
+
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"name":"test"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"test_selection":"--package foo --and --component bar"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"stats_json1":"{\\"t\\":1000000,\\"a\\":0}"'
+  BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${metrics_log}" '\\"sel\\"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"stats_json2":""'
+}
+
+TEST_track_test_event_non_internal() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  set_up_environment "0" "1" "N" "1"
+  metrics-read-config
+  metrics_init
+
+  (track-test-event "1000000" "2000000" "0" "0" "{}" "${BT_TEMP_DIR}")
+  metrics_wait
+
+  expect_not_send_analytics
+}
+
+TEST_track_test_event_aborted() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  set_up_environment "1" "1" "N" "1"
+  metrics-read-config
+  metrics_init
+
+  (track-test-event "1000000" "2000000" "130" "1" '{"t":1000000,"a":1}' "${BT_TEMP_DIR}")
+  metrics_wait
+
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"name":"test"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"exit_status":"130"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"was_aborted":"1"'
+}
+
+TEST_track_test_event_chunking() {
+  if [[ "${HOST_OS}" == "mac" ]]; then
+    return
+  fi
+  set_up_environment "1" "1" "N" "1"
+  metrics-read-config
+  metrics_init
+
+  # Construct a 1200 char string: 1000 'A's followed by 200 'B's
+  local chunk1=$(printf 'A%.0s' {1..1000})
+  local chunk2=$(printf 'B%.0s' {1..200})
+  local long_json="${chunk1}${chunk2}"
+
+  (track-test-event "1000000" "2000000" "0" "0" "${long_json}" "${BT_TEMP_DIR}")
+  metrics_wait
+
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" '"name":"test"'
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"stats_json1\":\"${chunk1}\""
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${metrics_log}" "\"stats_json2\":\"${chunk2}\""
+}
+
+BT_RUN_TESTS "$@"

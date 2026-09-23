@@ -1,0 +1,116 @@
+#!/bin/bash
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test expected behavior of fx serve
+
+# Source platform.sh so that we can point to jq and include it as a runtime dependency.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/../../lib/platform.sh" || exit $?
+
+BT_FILE_DEPS=(
+  "prebuilt/third_party/jq/${HOST_PLATFORM}/bin/jq"
+  "scripts/fx"
+  "tools/devshell/jq.fx"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/platform.sh"
+  "tools/devshell/lib/updates.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/serve"
+)
+
+BT_MOCKED_TOOLS=(
+  "tools/devshell/build"
+)
+
+declare fx ffx
+
+BT_SET_UP() {
+  unset FUCHSIA_NODENAME
+  unset FUCHSIA_DEVICE_ADDR
+  source "${BT_TEMP_DIR}/tools/devshell/lib/vars.sh"
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+  fx-config-read
+  ffx="$(btf::make_installed_hosttools_mock ffx)"
+
+  local repo_dir="${BT_TEMP_DIR}/out/default/amber-files"
+  mkdir -p "${repo_dir}/keys" "${repo_dir}/repository"
+  touch "${repo_dir}/keys/snapshot.json"
+  touch "${repo_dir}/keys/targets.json"
+  touch "${repo_dir}/keys/timestamp.json"
+  touch "${repo_dir}/repository/1.root.json"
+  touch "${repo_dir}/repository/root.json"
+}
+
+get_server_start_state_file() {
+  local f
+  for f in "${ffx}".mock_state*; do
+    if [[ -f "$f" ]]; then
+      if btf::does-mock-args-contain "$f" "repository" "server" "start"; then
+        echo "$f"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+# Verifies that `fx -t my-device serve` passes `--target my-device` to `ffx repository server start`.
+TEST_serve_with_target_flag() {
+  BT_EXPECT ${fx} -t my-device serve
+  local state_file
+  state_file="$(get_server_start_state_file)"
+  BT_ASSERT_FILE_EXISTS "${state_file}"
+  BT_EXPECT btf::does-mock-args-contain "${state_file}" "--target" "my-device" "repository" "server" "start"
+}
+
+# Verifies that `FUCHSIA_NODENAME=my-device fx serve` passes `--target my-device` to `ffx repository server start`.
+TEST_serve_with_nodename_env() {
+  export FUCHSIA_NODENAME="my-device"
+  BT_EXPECT ${fx} serve
+  local state_file
+  state_file="$(get_server_start_state_file)"
+  BT_ASSERT_FILE_EXISTS "${state_file}"
+  BT_EXPECT btf::does-mock-args-contain "${state_file}" "--target" "my-device" "repository" "server" "start"
+}
+
+# Verifies that `fx serve` without FUCHSIA_NODENAME does not pass `--target`.
+TEST_serve_without_target() {
+  unset FUCHSIA_NODENAME
+  BT_EXPECT ${fx} serve
+  local state_file
+  state_file="$(get_server_start_state_file)"
+  BT_ASSERT_FILE_EXISTS "${state_file}"
+  BT_EXPECT btf::does-mock-args-not-contain "${state_file}" "--target"
+  BT_EXPECT btf::does-mock-args-contain "${state_file}" "repository" "server" "start"
+}
+
+# Verifies that `fx -t my-device serve --no-device` omits `--target` when `--no-device` is specified.
+TEST_serve_with_target_and_no_device() {
+  BT_EXPECT ${fx} -t my-device serve --no-device
+  local state_file
+  state_file="$(get_server_start_state_file)"
+  BT_ASSERT_FILE_EXISTS "${state_file}"
+  BT_EXPECT btf::does-mock-args-not-contain "${state_file}" "--target"
+  BT_EXPECT btf::does-mock-args-contain "${state_file}" "repository" "server" "start"
+  BT_EXPECT btf::does-mock-args-contain "${state_file}" "--no-device"
+}
+
+# Verifies that `fx -t my-device serve` overrides the device file if one exists.
+TEST_serve_with_target_overrides_device_file() {
+  echo "default-device" > "${BT_TEMP_DIR}/out/default.device"
+  export FUCHSIA_NODENAME_IS_FROM_FILE="true"
+  export FUCHSIA_NODENAME="default-device"
+  BT_EXPECT ${fx} -t my-device serve
+  local state_file
+  state_file="$(get_server_start_state_file)"
+  BT_ASSERT_FILE_EXISTS "${state_file}"
+  BT_EXPECT btf::does-mock-args-contain "${state_file}" "--target" "my-device" "repository" "server" "start"
+}
+
+BT_RUN_TESTS "$@"

@@ -1,0 +1,109 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("lacewing_fidl_wrapper.gni")
+
+# Please do not use this template outside of CTF.
+#
+# This is similar to fuchsia_test_package. The latter requires that each test
+# component be defined in the same BUILD.gn file as this target, which is not
+# possible for CTF tests.
+template("fuchsia_package_with_test") {
+  if (target_cpu != host_cpu) {
+    not_needed(invoker, "*")
+    group(target_name) {
+      testonly = true
+    }
+  } else {
+    assert(defined(invoker.test_component), "test_component should be defined")
+    assert(defined(invoker.test_component_name),
+           "test_component_name should be defined")
+
+    test_component_name = invoker.test_component_name
+    main_target_name = target_name
+    package_name = main_target_name
+
+    fuchsia_package("${target_name}_package") {
+      testonly = true
+      package_name = package_name
+      subpackages = invoker.subpackages
+      if (defined(invoker.deps)) {
+        deps = invoker.deps
+        deps += [ invoker.test_component ]
+      } else {
+        deps = [ invoker.test_component ]
+      }
+      if (!defined(invoker.metadata)) {
+        metadata = {
+        }
+      }
+      metadata.test_components_barrier = [ invoker.test_component ]
+    }
+
+    # If fidl_coverage is defined true for a test, we'll wrap it in a Lacewing
+    # test that invokes it and snoops its FIDL. If not, just run the test.
+    do_fidl_coverage = defined(invoker.fidl_coverage) && invoker.fidl_coverage
+
+    device_test_target_name = "${target_name}_device_test"
+
+    _package_url =
+        "fuchsia-pkg://fuchsia.com/$package_name#meta/$test_component_name"
+
+    if (do_fidl_coverage) {
+      host_test_target_name = "${target_name}_host_fidl_test"
+      lacewing_fidl_wrapper(host_test_target_name) {
+        device_test_target_name = "$device_test_target_name($default_toolchain)"
+        device_test_url = _package_url
+        package_deps = [ ":${main_target_name}_package" ]
+        forward_variables_from(invoker,
+                               [
+                                 "device_test_realm",
+                                 "test_specs",
+                               ])
+      }
+      group(target_name) {
+        testonly = true
+        deps = [
+          ":$host_test_target_name($host_toolchain)",
+          ":${main_target_name}_package",
+        ]
+      }
+      group(device_test_target_name) {
+        testonly = true
+        forward_variables_from(invoker,
+                               [
+                                 "deps",
+                                 "public_deps",
+                                 "data_deps",
+                               ])
+      }
+    } else {
+      not_needed(invoker, [ "device_test_realm" ])
+      test_spec(device_test_target_name) {
+        if (defined(invoker.test_specs)) {
+          forward_variables_from(invoker.test_specs, "*")
+        }
+        target = get_label_info(":$target_name", "label_with_toolchain")
+        package_label = get_label_info(":$package_name", "label_with_toolchain")
+        package_url = _package_url
+        _package_out_dir =
+            get_label_info(":${main_target_name}_package", "target_out_dir")
+        _package_name = get_label_info(":${main_target_name}_package", "name")
+        package_manifests = [ rebase_path(
+                "${_package_out_dir}/${_package_name}/package_manifest.json",
+                root_build_dir) ]
+        component_label =
+            get_label_info(invoker.test_component, "label_with_toolchain")
+      }
+      group(target_name) {
+        testonly = true
+        deps = [
+          ":$device_test_target_name",
+          ":${main_target_name}_package",
+        ]
+      }
+    }
+  }
+}

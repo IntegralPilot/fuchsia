@@ -1,0 +1,88 @@
+#!/bin/bash
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Build
+### Download toolchain from CAS and print instructions
+
+## usage: fx fetch-toolchain <CAS_DIGEST>
+##
+## Downloads the toolchain specified by <CAS_DIGEST> to $FUCHSIA_DIR/local/toolchain/<CAS_DIGEST>.
+## Prints instructions for how to use it with `fx set` or in `args.gn`.
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+source "$SCRIPT_DIR/../lib/vars.sh" || exit $?
+
+fx-config-read
+
+set -e
+
+function usage() {
+    echo "Usage: fx fetch-toolchain <CAS_DIGEST>"
+    echo "       fx fetch-toolchain --canary"
+    echo ""
+    echo "Options:"
+    echo "  --canary        Automatically retrieve the latest canary CAS digest."
+    echo ""
+    echo "Downloads the toolchain specified by <CAS_DIGEST> to \$FUCHSIA_DIR/local/toolchain/<CAS_DIGEST>."
+    echo "Prints instructions for how to use it with \`fx set\` or in \`args.gn\`."
+    echo ""
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
+    echo "ERROR: Too few arguments. At least one argument is required."
+    exit 1
+fi
+
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+DIGEST=""
+
+if [[ "$1" == "--canary" ]]; then
+    if ! bb auth-info >/dev/null 2>&1; then
+        echo "ERROR: Not authenticated to buildbucket."
+        echo "Please run 'bb auth-login' and try again."
+        exit 1
+    fi
+
+    readonly BUILDER="fuchsia/global.ci/clang_toolchain.ci.core.x64-debug-tot-build_only"
+    readonly JQ_QUERY='first(.input.properties.["$recipe_engine/scheduler"].triggers[].buildbucket.properties.["$fuchsia/checkout"].clang_toolchain.cas_digest)'
+
+    echo "Resolving latest canary digest..."
+    DIGEST=$(bb ls -fields input -n 1 -json "${BUILDER}" | jq -r "${JQ_QUERY}")
+
+    if [[ -z "$DIGEST" || "$DIGEST" == "null" ]]; then
+        echo "ERROR: Failed to resolve canary digest."
+        exit 1
+    fi
+    echo "Resolved canary digest: ${DIGEST}"
+else
+    DIGEST="$1"
+fi
+
+TARGET_DIR="${FUCHSIA_DIR}/local/toolchain/${DIGEST}"
+
+if [[ -d "${TARGET_DIR}" ]] && [[ -n "$(ls -A "${TARGET_DIR}" 2>/dev/null)" ]]; then
+    echo "Toolchain already exists at ${TARGET_DIR}. Skipping download."
+else
+    echo "Creating directory ${TARGET_DIR}"
+    mkdir -p "${TARGET_DIR}"
+
+    echo "Downloading toolchain from CAS..."
+    "${FUCHSIA_DIR}/prebuilt/tools/cas/cas" download -cas-instance chromium-swarm -digest "${DIGEST}" -dir "${TARGET_DIR}"
+fi
+
+echo ""
+echo "Toolchain downloaded to ${TARGET_DIR}"
+echo ""
+echo "To use this toolchain with fx set:"
+echo "  fx set <board>.<product> --args=clang_prefix=\"\${FUCHSIA_DIR}/local/toolchain/${DIGEST}/bin\""
+echo ""
+echo "To use this toolchain in args.gn (e.g., out/default/args.gn):"
+echo "  clang_prefix = \"//local/toolchain/${DIGEST}/bin\""
+echo ""

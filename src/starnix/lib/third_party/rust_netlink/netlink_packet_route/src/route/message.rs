@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: MIT
+
+use super::super::AddressFamily;
+use super::attribute::RTA_ENCAP_TYPE;
+use super::error::RouteError;
+use super::{RouteAttribute, RouteHeader, RouteLwEnCapType, RouteMessageBuffer, RouteType};
+use crate::RouteNetlinkMessageParseMode;
+use netlink_packet_utils::nla::{HasNlas, NlaParseMode};
+use netlink_packet_utils::traits::{Emitable, Parseable, ParseableParametrized};
+
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[non_exhaustive]
+pub struct RouteMessage {
+    pub header: RouteHeader,
+    pub attributes: Vec<RouteAttribute>,
+}
+
+impl Emitable for RouteMessage {
+    fn buffer_len(&self) -> usize {
+        self.header.buffer_len() + self.attributes.as_slice().buffer_len()
+    }
+
+    fn emit(&self, buffer: &mut [u8]) {
+        self.header.emit(buffer);
+        self.attributes.as_slice().emit(&mut buffer[self.header.buffer_len()..]);
+    }
+}
+
+impl<'a, T: AsRef<[u8]> + 'a>
+    ParseableParametrized<RouteMessageBuffer<&'a T>, RouteNetlinkMessageParseMode>
+    for RouteMessage
+{
+    type Error = RouteError;
+    fn parse_with_param(
+        buf: &RouteMessageBuffer<&'a T>,
+        mode: RouteNetlinkMessageParseMode,
+    ) -> Result<Self, RouteError> {
+        // unwrap: RouteHeader can't fail.
+        let header = RouteHeader::parse(buf).unwrap();
+        let address_family = header.address_family;
+        let route_type = header.kind;
+        Ok(RouteMessage {
+            header,
+            attributes: Vec::<RouteAttribute>::parse_with_param(
+                buf,
+                (mode.into(), address_family, route_type),
+            )?,
+        })
+    }
+}
+
+impl<'a, T: AsRef<[u8]> + 'a>
+    ParseableParametrized<RouteMessageBuffer<&'a T>, (NlaParseMode, AddressFamily, RouteType)>
+    for Vec<RouteAttribute>
+{
+    type Error = RouteError;
+    fn parse_with_param(
+        buf: &RouteMessageBuffer<&'a T>,
+        (mode, address_family, route_type): (NlaParseMode, AddressFamily, RouteType),
+    ) -> Result<Self, RouteError> {
+        let mut encap_type = RouteLwEnCapType::None;
+        // The RTA_ENCAP_TYPE is provided __after__ RTA_ENCAP, we should find
+        // RTA_ENCAP_TYPE first.
+        for nla_buf in buf.attributes() {
+            let nla = match nla_buf {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if nla.kind() == RTA_ENCAP_TYPE {
+                if let Ok(RouteAttribute::EncapType(v)) =
+                    RouteAttribute::parse_with_param(&nla, (address_family, route_type, encap_type))
+                {
+                    encap_type = v;
+                    break;
+                }
+            }
+        }
+        buf.parse_attributes(mode, |b| {
+            RouteAttribute::parse_with_param(b, (address_family, route_type, encap_type))
+        })
+    }
+}

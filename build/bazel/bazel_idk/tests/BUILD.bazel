@@ -1,0 +1,1187 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+"""Tests of IDK atom and molecule macros."""
+
+load("@fuchsia_build_info//:args.bzl", "target_cpu")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_import", "cc_library")
+load("//build/bazel/platforms:constraints.bzl", "HOST_OS_CONSTRAINTS")
+load("//build/bazel/rules/idk:idk_atom.bzl", "idk_noop_atom")
+load(
+    "//build/bazel/rules/idk:idk_cc_prebuilt_library.bzl",
+    "idk_cc_shared_library",
+    "idk_cc_shared_library_zx",
+    "idk_cc_static_library",
+    "idk_cc_static_library_zx",
+)
+load(
+    "//build/bazel/rules/idk:idk_cc_source_library.bzl",
+    "idk_cc_source_library",
+    "idk_cc_source_library_zx",
+)
+load("//build/bazel/rules/idk:idk_data.bzl", "idk_data")
+load(
+    "//build/bazel/rules/idk:idk_molecule.bzl",
+    "idk_all_api_level_and_cpu_combinations_molecule",
+    "idk_molecule",
+)
+load(
+    "//build/bazel/rules/idk:idk_transitions.bzl",
+    "build_in_all_idk_api_level_and_cpu_combinations",
+)
+load("//build/bazel/rules/testing:defs.bzl", "verify_file_path")
+load("//build/bazel/rules/tests:rules.bzl", "build_for_host")
+load(":analysis_tests.bzl", "analysis_test_suite")
+load(
+    ":rules.bzl",
+    "create_test_atom_info",
+    "get_debug_file",
+    "get_link_lib_file",
+    "get_stripped_file",
+    "get_stripped_ifs_file",
+    "verify_atom_info",
+)
+
+package(default_applicable_licenses = ["//:license"])
+
+idk_data(
+    name = "test_data_atom",
+    testonly = True,
+    api_area = "Developer",
+    category = "partner",
+    file = "include/lib/test_lib/test_header.h",
+    idk_name = "test_data_public_name",
+    type = "config",
+)
+
+create_test_atom_info(
+    name = "test_data_atom_golden_info",
+    testonly = True,
+    additional_prebuild_info = {
+        "data": '["data/config/test_data_public_name/config.json"]',
+        "name": '"test_data_public_name"',
+        "type": '"config"',
+    },
+    api_area = "Developer",
+    api_contents_map = {},
+    api_file_path = None,
+    atom_build_deps = [],
+    atom_files_map_generated_files = {},
+    atom_files_map_source_files = {
+        "data/config/test_data_public_name/config.json": "//build/bazel/bazel_idk/tests:include/lib/test_lib/test_header.h",
+    },
+    atoms_depset_as_list = [],
+    category = "partner",
+    id = "sdk://data/test_data_public_name",
+    idk_name = "test_data_public_name",
+    is_stable = True,
+    label = "//build/bazel/bazel_idk/tests:test_data_atom_idk",
+    meta_dest = "data/config/test_data_public_name/meta.json",
+    type = "data",
+    deps = [],
+)
+
+verify_atom_info(
+    name = "verify_test_data_atom_info",
+    testonly = True,
+    atom = ":test_data_atom_idk",
+    expected_atom_info = ":test_data_atom_golden_info",
+)
+
+# TODO(https://fxbug.dev/417305295): Add test coverage for `implementation_deps`
+# (and `fuchsia_implementation_deps`) for all three cc library types such that
+# the resulting atom info is validated.
+
+# The headers used by some_library.cc are made available as follows for Fuchsia builds:
+# * dependency.h: via `hdrs` in the `fuchsia_deps` ":test_source_set_dependency"
+#   * This file includes another_header.h, which is available via
+#     `hdrs_for_internal_use` in the deps ":test_source_set_dependency".
+# * test_header.h: via `hdrs`
+# dependency.h is also available via `hdrs` in the `deps`
+# ":test_source_set_dependency2".
+# Non-Fuchsia builds also have a `non_fuchsia_deps` on ":test_source_set_dependency".
+idk_cc_source_library(
+    name = "test-source-library",
+    testonly = True,
+    srcs = [
+        "internal/helper.cc",
+        "some_library.cc",
+    ],
+    hdrs = ["include/lib/test_lib/test_header.h"],
+    api_area = "Developer",
+    api_file_path = "different_file_name.api",
+    category = "partner",
+    fuchsia_deps = [
+        # This target defines `RequiredFunction()`. The test executable would
+        # fail to link if this dependency is not included in the `cc_library()`.
+        ":test_source_set_dependency",
+    ],
+    idk_name = "test_source_set",
+    non_fuchsia_deps = [
+        ":test_source_set_dependency",
+
+        # Necessary for the host configuration to access <zircon/availability.h>.
+        "//src/zircon/lib/zircon",
+    ],
+    stable = True,
+    deps = [
+        ":test_noop_atom",
+
+        # Cover deps strings that omit the package path, omit the target name,
+        # and provide the full label. The first case is covered in `fuchsia_deps`.
+        "//build/bazel/bazel_idk/tests",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2",
+    ],
+)
+
+# The order of items in `deps` in the actual output does not match buildifier's order.
+# buildifier: leave-alone
+create_test_atom_info(
+    name = "test_source_library_golden_info",
+    testonly = True,
+    additional_prebuild_info = {
+        "include_dir": '"pkg/test_source_set/include"',
+        "file_base": '"pkg/test_source_set"',
+        "sources": '["pkg/test_source_set/internal/helper.cc","pkg/test_source_set/some_library.cc"]',
+        "headers": '["pkg/test_source_set/include/lib/test_lib/test_header.h"]',
+    },
+    api_area = "Developer",
+    api_contents_map = {
+        "pkg/test_source_set/include/lib/test_lib/test_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/test_header.h",
+    },
+    api_file_path = "//build/bazel/bazel_idk/tests:different_file_name.api",
+    atom_build_deps = [
+        "//build/bazel/bazel_idk/tests:test-source-library.verify_no_duplicate_files",
+        "//build/bazel/bazel_idk/tests:test-source-library.verify_pragma_once",
+        "//build/bazel/bazel_idk/tests:test-source-library_idk_verify_api",
+    ],
+    atom_files_map_generated_files = {},
+    atom_files_map_source_files = {
+        "pkg/test_source_set/include/lib/test_lib/test_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/test_header.h",
+        "pkg/test_source_set/internal/helper.cc": "//build/bazel/bazel_idk/tests:internal/helper.cc",
+        "pkg/test_source_set/some_library.cc": "//build/bazel/bazel_idk/tests:some_library.cc",
+    },
+    atoms_depset_as_list = [
+        "//build/bazel/bazel_idk/tests:test_source_set_subdependency_idk",
+        "//build/bazel/bazel_idk/tests:test_noop_atom_idk",
+        "//build/bazel/bazel_idk/tests:tests_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency_idk",
+    ],
+    category = "partner",
+    id = "sdk://pkg/test_source_set",
+    idk_name = "test_source_set",
+    is_stable = True,
+    label = "//build/bazel/bazel_idk/tests:test-source-library_idk",
+    meta_dest = "pkg/test_source_set/meta.json",
+    type = "cc_source_library",
+    deps = [
+        "//build/bazel/bazel_idk/tests:test_noop_atom_idk",
+        "//build/bazel/bazel_idk/tests:tests_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency_idk",
+    ],
+)
+
+verify_atom_info(
+    name = "verify_test_source_library_atom_info",
+    testonly = True,
+    atom = ":test-source-library_idk",
+    expected_atom_info = ":test_source_library_golden_info",
+)
+
+# The headers used by some_library.cc are made available as follows for Fuchsia builds:
+# * dependency.h: via `hdrs` in the `fuchsia_deps` ":test_source_set_dependency"
+#   * This file includes another_header.h, which is available via
+#     `hdrs_for_internal_use` in the deps ":test_source_set_dependency".
+# * test_header.h: via `hdrs`
+# dependency.h is also available via `hdrs` in the `deps`
+# ":test_source_set_dependency2". This is required for non-Fuchsia builds.
+idk_cc_shared_library(
+    name = "test-shared-library",
+    testonly = True,
+    srcs = [
+        "internal/helper.cc",
+        "some_library.cc",
+    ],
+    hdrs = ["include/lib/test_lib/test_header.h"],
+    api_area = "Developer",
+    api_file_path = "different_file_name_shared_library.api",
+    category = "partner",
+    fuchsia_deps = [
+        # This target defines `RequiredFunction()`. This library would
+        # fail to link if this dependency is not included in the `cc_library()`.
+        ":test_source_set_dependency",
+    ],
+    idk_name = "test_shared_library",
+    output_name = "my_test_shared_library",
+    deps = [
+        # Cover deps strings that omit the package path, omit the target name,
+        # and provide the full label. The first case is covered in `fuchsia_deps`.
+        "//build/bazel/bazel_idk/tests",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2",
+    ],
+)
+
+# The order of items in `deps` in the actual output does not match buildifier's order.
+# buildifier: leave-alone
+create_test_atom_info(
+    name = "test_shared_library_golden_info",
+    testonly = True,
+    additional_prebuild_info = {
+        "format": '"shared"',
+        "include_dir": '"pkg/test_shared_library/include"',
+        "headers": '["pkg/test_shared_library/include/lib/test_lib/test_header.h"]',
+        "file_base": '"pkg/test_shared_library"',
+        "binaries": (
+            '{"api_level":"PLATFORM",' +
+            '"arch":"x64",' +
+            '"debug_lib":"arch/x64/debug/libmy_test_shared_library.so",' +
+            '"dist_lib":"arch/x64/dist/libmy_test_shared_library.so",' +
+            '"dist_path":"lib/libmy_test_shared_library.so",' +
+            '"ifs":"pkg/test_shared_library/libmy_test_shared_library.ifs",' +
+            '"link_lib":"arch/x64/lib/libmy_test_shared_library.so"}'
+        ),
+    },
+    api_area = "Developer",
+    api_contents_map = {
+        "pkg/test_shared_library/include/lib/test_lib/test_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/test_header.h",
+    },
+    api_file_path = "//build/bazel/bazel_idk/tests:different_file_name_shared_library.api",
+    atom_build_deps = [
+        "//build/bazel/bazel_idk/tests:test-shared-library.verify_no_duplicate_files",
+        "//build/bazel/bazel_idk/tests:test-shared-library.verify_pragma_once",
+        "//build/bazel/bazel_idk/tests:test-shared-library.verify_public_symbols",
+        "//build/bazel/bazel_idk/tests:test-shared-library_idk_verify_api",
+    ],
+    atom_files_map_generated_files = {
+        "arch/x64/lib/libmy_test_shared_library.so": ":test_shared_library_link_lib_file",
+        "pkg/test_shared_library/libmy_test_shared_library.ifs": ":test_shared_library_ifs_file",
+        "arch/x64/debug/libmy_test_shared_library.so": ":test_shared_library_debug_file",
+        "arch/x64/dist/libmy_test_shared_library.so": ":test_shared_library_stripped_file",
+    },
+    atom_files_map_source_files = {
+        "pkg/test_shared_library/include/lib/test_lib/test_header.h": "include/lib/test_lib/test_header.h",
+    },
+    atoms_depset_as_list = [
+        "//build/bazel/bazel_idk/tests:test_source_set_subdependency_idk",
+        "//build/bazel/bazel_idk/tests:tests_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency_idk",
+    ],
+    category = "partner",
+    id = "sdk://pkg/test_shared_library",
+    idk_name = "test_shared_library",
+    is_stable = True,
+    label = "//build/bazel/bazel_idk/tests:test-shared-library_idk",
+    meta_dest = "pkg/test_shared_library/meta.json",
+    type = "cc_prebuilt_library",
+    deps = [
+        "//build/bazel/bazel_idk/tests:tests_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency_idk",
+    ],
+)
+
+verify_atom_info(
+    name = "verify_test_shared_library_atom_info",
+    testonly = True,
+    atom = ":test-shared-library_idk",
+    expected_atom_info = ":test_shared_library_golden_info",
+)
+
+verify_file_path(
+    name = "verify_test_shared_library_file_path",
+    testonly = True,
+    # The actual `cc_library` target is not a shared object.
+    expected_file_path = "build/bazel/bazel_idk/tests/libtest-shared-library_impl.a",
+    # ":test-shared-library" is the `cc_import()`, which exposes `CcInfo` but
+    # not `files` in `DefaultInfo`, so we must use the "..._impl" target instead.
+    target = ":test-shared-library_impl",
+)
+
+verify_file_path(
+    name = "verify_exported_test_shared_library_file_path",
+    testonly = True,
+    expected_file_path = "build/bazel/bazel_idk/tests/libmy_test_shared_library.so",
+    target = ":test-shared-library_export",
+)
+
+get_debug_file(
+    name = "test_shared_library_debug_file",
+    testonly = True,
+    prebuilt_library = ":test-shared-library_link_stubs",
+)
+
+verify_file_path(
+    name = "verify_test_shared_library_debug_file_path",
+    testonly = True,
+    expected_file_path = "build/bazel/bazel_idk/tests/libmy_test_shared_library.so",
+    target = ":test_shared_library_debug_file",
+)
+
+get_stripped_file(
+    name = "test_shared_library_stripped_file",
+    testonly = True,
+    prebuilt_library = ":test-shared-library_link_stubs",
+)
+
+verify_file_path(
+    name = "verify_test_shared_library_stripped_file_path",
+    testonly = True,
+    # TODO(https://fxbug.dev/443982549): Change to the stripped binary once it is available.
+    expected_file_path = "build/bazel/bazel_idk/tests/libmy_test_shared_library.so",
+    target = ":test_shared_library_stripped_file",
+)
+
+get_link_lib_file(
+    name = "test_shared_library_link_lib_file",
+    testonly = True,
+    prebuilt_library = ":test-shared-library_link_stubs",
+)
+
+verify_file_path(
+    name = "verify_test_shared_library_link_lib_file_path",
+    testonly = True,
+    expected_file_path = "build/bazel/bazel_idk/tests/link_stub/libmy_test_shared_library.so",
+    target = ":test_shared_library_link_lib_file",
+)
+
+get_stripped_ifs_file(
+    name = "test_shared_library_ifs_file",
+    testonly = True,
+    prebuilt_library = ":test-shared-library_link_stubs",
+)
+
+verify_file_path(
+    name = "verify_test_shared_library_ifs_file_path",
+    testonly = True,
+    expected_file_path = "build/bazel/bazel_idk/tests/libmy_test_shared_library.ifs",
+    target = ":test_shared_library_ifs_file",
+)
+
+# The headers used by some_library.cc are made available as follows for Fuchsia builds:
+# * dependency.h: via `hdrs` in the `fuchsia_deps` ":test_source_set_dependency"
+#   * This file includes another_header.h, which is available via
+#     `hdrs_for_internal_use` in the deps ":test_source_set_dependency".
+# * test_header.h: via `hdrs`
+# dependency.h is also available via `hdrs` in the `deps`
+# ":test_source_set_dependency2". This is required for non-Fuchsia builds.
+idk_cc_static_library(
+    name = "test-static-library",
+    testonly = True,
+    srcs = [
+        "internal/helper.cc",
+        "some_library.cc",
+    ],
+    hdrs = ["include/lib/test_lib/test_header.h"],
+    api_area = "Developer",
+    api_file_path = "different_file_name_static_library.api",
+    category = "partner",
+    fuchsia_deps = [
+        # This target defines `RequiredFunction()`. The test executable would
+        # fail to link if this dependency is not included in the `cc_library()`.
+        ":test_source_set_dependency",
+    ],
+    idk_name = "test_static_library",
+    deps = [
+        # Cover deps strings that omit the package path, omit the target name,
+        # and provide the full label. The first case is covered in `fuchsia_deps`.
+        "//build/bazel/bazel_idk/tests",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2",
+
+        # Necessary for the host configuration to access <zircon/availability.h>.
+        # Include in the common deps to demonstrate that the deps is always
+        # valid and because this template does not support `non_fuchsia_deps`.
+        "//src/zircon/lib/zircon",
+    ],
+)
+
+# The order of items in `deps` in the actual output does not match buildifier's order.
+# buildifier: leave-alone
+create_test_atom_info(
+    name = "test_static_library_golden_info",
+    testonly = True,
+    additional_prebuild_info = {
+        "format": '"static"',
+        "include_dir": '"pkg/test_static_library/include"',
+        "headers": '["pkg/test_static_library/include/lib/test_lib/test_header.h"]',
+        "file_base": '"pkg/test_static_library"',
+        "binaries": (
+            '{"api_level":"PLATFORM",' +
+            '"arch":"x64",' +
+            '"link_lib":"arch/x64/lib/libtest-static-library.a"}'
+        ),
+    },
+    api_area = "Developer",
+    api_contents_map = {
+        "pkg/test_static_library/include/lib/test_lib/test_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/test_header.h",
+    },
+    api_file_path = "//build/bazel/bazel_idk/tests:different_file_name_static_library.api",
+    atom_build_deps = [
+        "//build/bazel/bazel_idk/tests:test-static-library.verify_no_duplicate_files",
+        "//build/bazel/bazel_idk/tests:test-static-library.verify_pragma_once",
+        "//build/bazel/bazel_idk/tests:test-static-library_idk_verify_api",
+    ],
+    atom_files_map_generated_files = {
+        "arch/x64/lib/libtest-static-library.a": ":test-static-library.export/test-static-library",
+    },
+    atom_files_map_source_files = {
+        "pkg/test_static_library/include/lib/test_lib/test_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/test_header.h",
+    },
+    atoms_depset_as_list = [
+        "//build/bazel/bazel_idk/tests:test_source_set_subdependency_idk",
+        "//build/bazel/bazel_idk/tests:tests_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2_idk",
+        "//src/zircon/lib/zircon:zircon_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency_idk",
+    ],
+    category = "partner",
+    id = "sdk://pkg/test_static_library",
+    idk_name = "test_static_library",
+    is_stable = True,
+    label = "//build/bazel/bazel_idk/tests:test-static-library_idk",
+    meta_dest = "pkg/test_static_library/meta.json",
+    type = "cc_prebuilt_library",
+    deps = [
+        "//build/bazel/bazel_idk/tests:tests_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency2_idk",
+        "//src/zircon/lib/zircon:zircon_idk",
+        "//build/bazel/bazel_idk/tests:test_source_set_dependency_idk",
+    ],
+)
+
+verify_atom_info(
+    name = "verify_test_static_library_atom_info",
+    testonly = True,
+    atom = ":test-static-library_idk",
+    expected_atom_info = ":test_static_library_golden_info",
+)
+
+verify_file_path(
+    name = "verify_test_static_library_file_path",
+    testonly = True,
+    expected_file_path = "build/bazel/bazel_idk/tests/libtest-static-library.a",
+    target = ":test-static-library",
+)
+
+verify_file_path(
+    name = "verify_exported_test_static_library_file_path",
+    testonly = True,
+    expected_file_path = "build/bazel/bazel_idk/tests/test-static-library.export/libtest-static-library.a",
+    target = ":test-static-library.export/test-static-library",
+)
+
+get_link_lib_file(
+    name = "test_static_library_link_lib_file",
+    testonly = True,
+    prebuilt_library = ":test-static-library_static_library_info",
+)
+
+verify_file_path(
+    name = "verify_test_static_library_link_lib_file_path",
+    testonly = True,
+    expected_file_path = "build/bazel/bazel_idk/tests/test-static-library.export/libtest-static-library.a",
+    target = ":test_static_library_link_lib_file",
+)
+
+# Tests use of `select()` with header and source files.
+# Also tests that `hdrs_for_internal_use` appear in the API file as appropriate.
+# buildifier: leave-alone - Preserve attribute ordering for illustrative purposes.
+idk_cc_source_library(
+    name = "platform_dependent_source_library",
+    testonly = True,
+
+    # Source files.
+    srcs = ["platform_dependent_library.cc"] + select({
+        "@platforms//os:fuchsia": ["fuchsia_only_source.cc"],
+        "//conditions:default": ["non_fuchsia_source.cc"],
+    }),
+
+    # Header files.
+    hdrs = [
+        "include/lib/test_lib/platform_dependent_header.h",
+        "include/lib/test_lib/test_header.h",
+    ] + select({
+        "@platforms//os:fuchsia": ["include/lib/test_lib/fuchsia_only_header.h"],
+        "//conditions:default": [],
+    }),
+
+    # Header files for internal use.
+    hdrs_for_internal_use = ["include/lib/test_lib/internal/internal_header_appears_in_api_file.h"] + select({
+        "@platforms//os:fuchsia": ["include/lib/test_lib/internal/fuchsia_only_internal_header_appears_in_api_file.h"],
+        "//conditions:default": ["include/lib/test_lib/internal/non_fuchsia_internal_header_does_not_appear_in_api_file.h"],
+    }),
+
+    # IDK-related attributes.
+    api_area = "Developer",
+    category = "partner",
+    idk_name = "platform_dependent_source_library",
+    stable = True,
+)
+
+create_test_atom_info(
+    name = "platform_dependent_source_library_golden_info",
+    testonly = True,
+    additional_prebuild_info = {
+        "include_dir": '"pkg/platform_dependent_source_library/include"',
+        "file_base": '"pkg/platform_dependent_source_library"',
+        "sources": '["pkg/platform_dependent_source_library/platform_dependent_library.cc","pkg/platform_dependent_source_library/fuchsia_only_source.cc"]',
+        "headers": '["pkg/platform_dependent_source_library/include/lib/test_lib/platform_dependent_header.h","pkg/platform_dependent_source_library/include/lib/test_lib/test_header.h","pkg/platform_dependent_source_library/include/lib/test_lib/fuchsia_only_header.h","pkg/platform_dependent_source_library/include/lib/test_lib/internal/internal_header_appears_in_api_file.h","pkg/platform_dependent_source_library/include/lib/test_lib/internal/fuchsia_only_internal_header_appears_in_api_file.h"]',
+    },
+    api_area = "Developer",
+    api_contents_map = {
+        "pkg/platform_dependent_source_library/include/lib/test_lib/platform_dependent_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/platform_dependent_header.h",
+        "pkg/platform_dependent_source_library/include/lib/test_lib/test_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/test_header.h",
+        "pkg/platform_dependent_source_library/include/lib/test_lib/fuchsia_only_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/fuchsia_only_header.h",
+        "pkg/platform_dependent_source_library/include/lib/test_lib/internal/internal_header_appears_in_api_file.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/internal/internal_header_appears_in_api_file.h",
+        "pkg/platform_dependent_source_library/include/lib/test_lib/internal/fuchsia_only_internal_header_appears_in_api_file.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/internal/fuchsia_only_internal_header_appears_in_api_file.h",
+    },
+    api_file_path = "//build/bazel/bazel_idk/tests:platform_dependent_source_library.api",
+    atom_build_deps = [
+        "//build/bazel/bazel_idk/tests:platform_dependent_source_library.verify_no_duplicate_files",
+        "//build/bazel/bazel_idk/tests:platform_dependent_source_library.verify_pragma_once",
+        "//build/bazel/bazel_idk/tests:platform_dependent_source_library_idk_verify_api",
+    ],
+    atom_files_map_generated_files = {},
+    atom_files_map_source_files = {
+        "pkg/platform_dependent_source_library/include/lib/test_lib/platform_dependent_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/platform_dependent_header.h",
+        "pkg/platform_dependent_source_library/include/lib/test_lib/test_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/test_header.h",
+        "pkg/platform_dependent_source_library/include/lib/test_lib/fuchsia_only_header.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/fuchsia_only_header.h",
+        "pkg/platform_dependent_source_library/include/lib/test_lib/internal/internal_header_appears_in_api_file.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/internal/internal_header_appears_in_api_file.h",
+        "pkg/platform_dependent_source_library/include/lib/test_lib/internal/fuchsia_only_internal_header_appears_in_api_file.h": "//build/bazel/bazel_idk/tests:include/lib/test_lib/internal/fuchsia_only_internal_header_appears_in_api_file.h",
+        "pkg/platform_dependent_source_library/platform_dependent_library.cc": "//build/bazel/bazel_idk/tests:platform_dependent_library.cc",
+        "pkg/platform_dependent_source_library/fuchsia_only_source.cc": "//build/bazel/bazel_idk/tests:fuchsia_only_source.cc",
+    },
+    atoms_depset_as_list = [],
+    category = "partner",
+    id = "sdk://pkg/platform_dependent_source_library",
+    idk_name = "platform_dependent_source_library",
+    is_stable = True,
+    label = "//build/bazel/bazel_idk/tests:platform_dependent_source_library_idk",
+    meta_dest = "pkg/platform_dependent_source_library/meta.json",
+    type = "cc_source_library",
+    deps = [],
+)
+
+verify_atom_info(
+    name = "verify_platform_dependent_source_library_atom_info",
+    testonly = True,
+    atom = ":platform_dependent_source_library_idk",
+    expected_atom_info = ":platform_dependent_source_library_golden_info",
+)
+
+idk_cc_source_library(
+    name = "test_source_set_dependency",
+    testonly = True,
+    srcs = ["dependency.cc"],
+    hdrs = ["different_include_dir/dependency.h"],
+    api_area = "Developer",
+
+    # Test overriding the path to the API file.
+    api_file_path = "dependency_1.api",
+    category = "partner",
+    hdrs_for_internal_use = ["different_include_dir/another_header.h"],
+    idk_name = "source_dependency_1",
+    include_base = "different_include_dir",
+    stable = True,
+    deps = [
+        # Used to ensure transitive dependencies are included.
+        ":test_source_set_subdependency",
+    ],
+)
+
+idk_cc_source_library(
+    name = "test_source_set_dependency2",
+    testonly = True,
+    hdrs = ["different_include_dir/dependency.h"],
+    api_area = "Developer",
+
+    # Test specifying an absolute path to the API file.
+    # The value is the same as the default path, but we are unable to detect
+    # this for reasons explained in the implementation. Do not do this in real
+    # instances.
+    api_file_path = "//build/bazel/bazel_idk/tests:source_dependency_2.api",
+    category = "partner",
+    hdrs_for_internal_use = ["different_include_dir/another_header.h"],
+    idk_name = "source_dependency_2",
+    include_base = "different_include_dir",
+    stable = True,
+)
+
+idk_cc_source_library(
+    name = "test_source_set_subdependency",
+    testonly = True,
+    hdrs = ["different_include_dir/dependency.h"],
+    api_area = "Developer",
+    category = "partner",
+    hdrs_for_internal_use = ["different_include_dir/another_header.h"],
+    idk_name = "source_subdependency",
+    include_base = "different_include_dir",
+    stable = True,
+)
+
+idk_cc_source_library_zx(
+    name = "test_source_set_zx",
+    testonly = True,
+    srcs = [
+        "internal/helper.cc",
+        "some_library.cc",
+        "zx_source.cc",
+    ],
+    hdrs = ["include/lib/test_lib/test_header.h"],
+    api_area = "Developer",
+    category = "partner",
+    # Test appending "_ALL_SOURCE" to an existing list of defines.
+    defines = ["SOME_DEFINE"],
+    fuchsia_deps = [
+        # Test conversion of `foo:foo.headers` to `foo:foo` for atom IDK deps in `fuchsia_deps`.
+        ":test_source_set_dependency_zx.headers",
+    ],
+    idk_name = "test_source_set_zx",
+    implementation_deps = [
+        # This target needs the full dependency to link (in the non-Fuchsia and
+        # Zircon toolchain cases).
+        # This also tests handling of duplicate dependencies when the headers targets are converted.
+        ":test_source_set_dependency_zx",
+
+        # Test conversion of `foo:foo.as-needed` to `foo:foo` for atom IDK deps in `implementation_deps`.
+        ":test_source_set_dependency2_zx.as-needed",
+    ],
+    non_fuchsia_deps = [
+        ":test_source_set_dependency_zx",
+
+        # Necessary for the host configuration to access <zircon/availability.h>.
+        "//src/zircon/lib/zircon",
+    ],
+    stable = True,
+    deps = [
+        # Test conversion of `foo:headers` to `foo:foo` for atom IDK deps in `deps`.
+        ":headers",
+    ],
+)
+
+idk_cc_shared_library_zx(
+    name = "test_shared_library_zx",
+    testonly = True,
+    srcs = [
+        "internal/helper.cc",
+        "some_library.cc",
+        "zx_source.cc",
+    ],
+    hdrs = ["include/lib/test_lib/test_header.h"],
+    api_area = "Developer",
+    category = "partner",
+    # `defines` is intentionally not set to test adding "_ALL_SOURCE" to no list.
+    fuchsia_deps = [
+        # Test conversion of `foo:foo.headers` to `foo:foo` for atom IDK deps in `fuchsia_deps`.
+        # The full target defines `RequiredFunction()`. This library would
+        # fail to link if this dependency is not included in the `cc_library()`,
+        # which is the case for the non-Fuchsia and Zircon toolchain cases.
+        ":test_source_set_dependency_zx.headers",
+    ],
+    idk_name = "test_shared_library_zx",
+    implementation_deps = [
+        # Test conversion of `foo:foo.as-needed` to `foo:foo` in `implementation_deps`.
+        ":test_source_set_dependency2_zx.as-needed",
+    ],
+    deps = [
+        # Test conversion of `foo:headers` to `foo:foo` for atom IDK deps in `deps`.
+        ":headers",
+    ],
+)
+
+idk_cc_static_library_zx(
+    name = "test_static_library_zx",
+    testonly = True,
+    srcs = [
+        "internal/helper.cc",
+        "some_library.cc",
+        "zx_source.cc",
+    ],
+    hdrs = ["include/lib/test_lib/test_header.h"],
+    api_area = "Developer",
+    category = "partner",
+    fuchsia_deps = [
+        # Test conversion of `foo:foo.headers` to `foo:foo` for atom IDK deps in `fuchsia_deps`.
+        # The full target defines `RequiredFunction()`. The test executable would
+        # fail to link if this dependency is not included in the `cc_library()`,
+        # which is the case for the non-Fuchsia and Zircon toolchain cases.
+        ":test_source_set_dependency_zx.headers",
+    ],
+    idk_name = "test_static_library_zx",
+    implementation_deps = [
+        # Test conversion of `foo:foo.as-needed` to `foo:foo` in `implementation_deps`.
+        ":test_source_set_dependency2_zx.as-needed",
+    ],
+    deps = [
+        # Test conversion of `foo:headers` to `foo:foo` for atom IDK deps in `deps`.
+        ":headers",
+
+        # Necessary for the host configuration to access <zircon/availability.h>.
+        # Include in the common deps to demonstrate that the deps is always
+        # valid and because this template does not support `non_fuchsia_deps`.
+        "//src/zircon/lib/zircon",
+    ],
+)
+
+idk_cc_source_library_zx(
+    name = "test_source_set_dependency_zx",
+    testonly = True,
+    srcs = ["dependency.cc"],
+    hdrs = ["include/dependency.h"],
+    api_area = "Developer",
+    category = "partner",
+    hdrs_for_internal_use = ["include/another_header.h"],
+    idk_name = "test_source_set_dependency_zx",
+    stable = True,
+)
+
+idk_cc_source_library_zx(
+    name = "test_source_set_dependency2_zx",
+    testonly = True,
+    hdrs = ["include/dependency.h"],
+    api_area = "Developer",
+    category = "partner",
+    hdrs_for_internal_use = ["include/another_header.h"],
+    idk_name = "test_source_set_dependency2_zx",
+    stable = True,
+)
+
+# A target whose name matches the last component of the package path. It is used
+# to test deps on labels that omit the target name. Not to be confused with a
+# collection of tests. For that, see ":build_only_tests".
+idk_cc_source_library_zx(
+    name = "tests",
+    testonly = True,
+    hdrs = ["include/dependency.h"],
+    api_area = "Developer",
+    category = "partner",
+    hdrs_for_internal_use = ["include/another_header.h"],
+    idk_name = "tests_dependency",
+    stable = True,
+
+    # Prevent mistaken use of this target as a group of tests.
+    visibility = ["//visibility:private"],
+)
+
+idk_noop_atom(
+    name = "test_noop_atom_idk",
+    testonly = True,
+    api_area = "Developer",
+    category = "partner",
+    id = "sdk://test_noop_atom",
+    idk_name = "test_noop_atom",
+    stable = True,
+    target_compatible_with = ["@platforms//os:fuchsia"],
+)
+
+# There must be a real target corresponding to the noop atom. Due to where
+# this noop atom is used, it must use one of a limited number of rules.
+cc_library(
+    name = "test_noop_atom",
+    testonly = True,
+)
+
+idk_molecule(
+    name = "test_submolecule_idk",
+    testonly = True,
+    allowed_in_configurations = "fuchsia",
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [
+        ":platform_dependent_source_library_idk",
+        ":test-shared-library_idk",
+        ":test-source-library_idk",
+        ":test-static-library_idk",
+        ":test_shared_library_zx_idk",
+        ":test_source_set_zx_idk",
+        ":test_static_library_zx_idk",
+        ":tests_idk",
+    ],
+)
+
+# Contains atoms that can be built in any Fuchsia build configuration.
+idk_molecule(
+    name = "test_molecule_idk",
+    testonly = True,
+    allowed_in_configurations = "fuchsia",
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [
+        ":test_submolecule_idk",
+    ],
+)
+
+# Contains atoms that can only be built in the main "PLATFORM" build.
+idk_molecule(
+    name = "main_platform_build_test_molecule_idk",
+    testonly = True,
+    allowed_in_configurations = "once",
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [
+        ":test_data_atom_idk",
+
+        # Test FIDL using real libraries because there are no test libraries
+        # like there are for C++ libraries.
+        # Tests compatibility testing with different expectations per API level.
+        # As of F30+, this library has elements added at 28, 29, and NEXT.
+        "//sdk/fidl/fuchsia.feedback:fuchsia.feedback_idk",
+        # This tests direct FIDL library dependencies.
+        "//sdk/fidl/fuchsia.images2:fuchsia.images2_idk",
+        "//zircon/vdso/zx:zx_idk",
+    ],
+)
+
+# These executables test that all dependencies are linked in.
+# They also test that the `include_base` is exported correctly.
+# Note that these are in-tree tests and do not guarantee that the IDK contents
+# are correct.
+
+cc_binary(
+    name = "test_executable_using_cc_shared_library",
+    testonly = True,
+    srcs = ["test_executable.cc"],
+    deps = [":test-shared-library"],
+)
+
+cc_binary(
+    name = "test_executable_using_cc_source_library",
+    testonly = True,
+    srcs = ["test_executable.cc"],
+    deps = [":test-source-library"],
+)
+
+cc_binary(
+    name = "test_executable_using_cc_static_library",
+    testonly = True,
+    srcs = ["test_executable.cc"],
+    deps = [":test-static-library"],
+)
+
+cc_binary(
+    name = "test_executable_using_platform_dependent_source_library",
+    testonly = True,
+    srcs = ["test_executable.cc"],
+    deps = [":platform_dependent_source_library"],
+)
+
+cc_binary(
+    name = "test_executable_using_cc_shared_library_zx",
+    testonly = True,
+    srcs = ["test_executable.cc"],
+    deps = [":test_shared_library_zx"],
+)
+
+cc_binary(
+    name = "test_executable_using_cc_source_library_zx",
+    testonly = True,
+    srcs = ["test_executable.cc"],
+    deps = [":test_source_set_zx"],
+)
+
+cc_binary(
+    name = "test_executable_using_cc_static_library_zx",
+    testonly = True,
+    srcs = ["test_executable.cc"],
+    deps = [":test_static_library_zx"],
+)
+
+cc_import(
+    name = "imported-test-static-library",
+    testonly = True,
+    hdrs = ["include/lib/test_lib/test_header.h"],
+    # Bazel 8 does not automatically make the include path relative to the
+    # source root - see https://fxbug.dev/478970857 so we must do so manually.
+    # TODO(https://fxbug.dev/478896548): Make this `"include"` when updating to Bazel 9.
+    includes = ["build/bazel/bazel_idk/tests/include"],
+    static_library = ":test-static-library.export/test-static-library",
+)
+
+cc_binary(
+    name = "test_executable_using_imported_cc_static_library",
+    testonly = True,
+    srcs = ["test_executable.cc"],
+    deps = [":imported-test-static-library"],
+)
+
+cc_binary(
+    name = "test_executable_using_fidl_cc",
+    testonly = True,
+    srcs = ["fidl_test.cc"],
+    deps = [
+        "//examples/fidl/fuchsia.examples:fuchsia.examples_cpp",
+        "//sdk/fidl/fuchsia.images2:fuchsia.images2_cpp_hlcpp_conversion",
+        "//sdk/fidl/fuchsia.math:fuchsia.math_cpp",
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_cpp",
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_hlcpp",
+    ] + select(
+        {
+            "@platforms//os:fuchsia": ["//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_cpp_testing"],
+            "//conditions:default": [],
+        },
+    ),
+)
+
+# The `cc_library()` targets underlying each of the `idk_cc_source_library()` targets.
+filegroup(
+    name = "all_underlying_source_libraries",
+    testonly = True,
+    srcs = [
+        ":platform_dependent_source_library",
+        ":test_source_set_dependency",
+        ":tests",
+    ] + select({
+        # TODO(https://fxbug.dev/505380228): Merge these targets into the main
+        # list once sysroots are available for all CPU architectures.
+        "//build/bazel/platforms:is_fuchsia_" + target_cpu: [
+            ":test-source-library",
+            ":test_source_set_zx",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+filegroup(
+    name = "all_test_executables",
+    testonly = True,
+    srcs = [
+        # In the order they are defined above.
+        ":test_executable_using_cc_shared_library",
+        ":test_executable_using_cc_source_library",
+        ":test_executable_using_cc_static_library",
+        ":test_executable_using_platform_dependent_source_library",
+        ":test_executable_using_cc_shared_library_zx",
+        ":test_executable_using_cc_source_library_zx",
+        ":test_executable_using_cc_static_library_zx",
+        ":test_executable_using_imported_cc_static_library",
+        ":test_executable_using_fidl_cc",
+    ],
+)
+
+filegroup(
+    name = "build_only_tests",
+    testonly = True,
+    srcs = [
+        # Depends on the IDK atom targets.
+        ":test_molecule_idk",
+        ":main_platform_build_test_molecule_idk",
+
+        # Depend directly on the underlying source libraries since they are not
+        # dependencies of the atoms.
+        ":all_underlying_source_libraries",
+
+        # Linking executables verifies that all deps are properly specified and
+        # that FIDL bindings were generated correctly.
+        ":all_test_executables",
+
+        # Verify that the file paths of prebuilt libraries are correct.
+        ":verify_test_shared_library_file_path",
+        ":verify_exported_test_shared_library_file_path",
+        ":verify_test_shared_library_debug_file_path",
+        ":verify_test_shared_library_stripped_file_path",
+        ":verify_test_shared_library_link_lib_file_path",
+        ":verify_test_shared_library_ifs_file_path",
+        ":verify_test_static_library_file_path",
+        ":verify_exported_test_static_library_file_path",
+        ":verify_test_static_library_link_lib_file_path",
+
+        # Verify that the info about atoms that goes into the IDK is correct.
+        ":verify_test_data_atom_info",
+        ":verify_test_shared_library_atom_info",
+        ":verify_test_source_library_atom_info",
+        ":verify_test_static_library_atom_info",
+        ":verify_platform_dependent_source_library_atom_info",
+
+        # Exercise various FIDL library cases.
+        # FIDL libraries with the same library name in the same package.
+        "//examples/fidl/fuchsia.examples.docs",
+        "//examples/fidl/fuchsia.examples.docs:versioning",
+        # Bindings for a library with dependencies.
+        # It also depends on "zx", which is handled uniquely and does not support HLCPP.
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_cpp",
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_cpp_testing",
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_cpp_hlcpp_conversion",
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_hlcpp",
+        # A library with indirect dependencies.
+        # It is also a library not in a category.
+        "//sdk/fidl/fuchsia.hardware.display.engine",
+        # TODO(https://fxbug.dev/454977301): Uncomment once FIDL for drivers is supported.
+        # "//sdk/fidl/fuchsia.hardware.display.engine:fuchsia.hardware.display.engine_cpp",
+        # fdomain uses `excluded_checks` and `experimental_flags`.
+        "//sdk/fidl/fuchsia.fdomain:fuchsia.fdomain_cpp",
+        "//sdk/fidl/fuchsia.fdomain:fuchsia.fdomain_rust",
+        "//sdk/fidl/fuchsia.fdomain:fuchsia.fdomain_rust_fdomain",
+        # TODO(https://fxbug.dev/546092413): Uncomment both once Rust next bindings are implemented.
+        # "//sdk/fidl/fuchsia.fdomain:fuchsia.fdomain_rust_next",
+        # "//sdk/fidl/fuchsia.fdomain:fuchsia.fdomain_rust_fdomain_next",
+        # Tests linting exemptions and a source file with the same base name as the target name.
+        "//sdk/fidl/zbi",
+        # This library is not in the IDK or a dependency of any other target in this list.
+        # This dependency can be used to verify that aspects find FIDL libraries
+        # via bindings targets. For example, by depending on this target in
+        # `//build/fidl:all_fidl_ir_json_files`.
+        "//sdk/fidl/fuchsia.camera2.debug:fuchsia.camera2.debug_cpp",
+        # A library with `contains_drivers = True`.
+        "//sdk/fidl/fuchsia.wlan.fullmac:fuchsia.wlan.fullmac_cpp",
+        "//sdk/fidl/fuchsia.wlan.fullmac:fuchsia.wlan.fullmac_rust",
+        "//sdk/fidl/fuchsia.wlan.fullmac:fuchsia.wlan.fullmac_rust_fdomain",
+        # TODO(https://fxbug.dev/546092413): Uncomment both once Rust next bindings are implemented.
+        # "//sdk/fidl/fuchsia.wlan.fullmac:fuchsia.wlan.fullmac_rust_next",
+        # "//sdk/fidl/fuchsia.wlan.fullmac:fuchsia.wlan.fullmac_rust_fdomain_next",
+
+        # Build some of the targets on the host toolchain.
+        ":build_only_tests_in_host_configuration",
+    ],
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    visibility = [
+        "//build/bazel/rules/tests:__pkg__",
+        # TODO(https://fxbug.dev/496603528): Remove once a better target is used for "all_fidl_ir_json_files".
+        "//build/fidl:__pkg__",
+    ],
+)
+
+filegroup(
+    name = "targets_to_build_in_host_configurations",
+    testonly = True,
+    srcs = [
+        # Verify that a target using `select()` statements for `hdrs`,
+        # `hdrs_for_internal_use`, and `srcs` can be built on the host toolchain.
+        ":test_executable_using_platform_dependent_source_library",
+
+        # Test linking on the host toolchain where possible.
+        ":test_executable_using_cc_source_library",
+        ":test_executable_using_cc_source_library_zx",
+        ":test_executable_using_fidl_cc",
+
+        # These libraries have Fuchsia-only dependencies and thus cannot be
+        # linked into the executable on the host toolchain.
+        ":test-static-library",
+        ":test_static_library_zx",
+        # The shared library targets fail to link without symbols from their
+        # Fuchsia-only dependencies.
+        # Note: The `cc_import()` targets only build the shared libraries when
+        # building from GN via `bazel_build_action()`.
+
+        # Exercise FIDL bindings.
+        # Bindings for a library with dependencies.
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_cpp",
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_cpp_hlcpp_conversion",
+        "//sdk/fidl/fuchsia.sysmem2:fuchsia.sysmem2_hlcpp",
+    ],
+    target_compatible_with = HOST_OS_CONSTRAINTS,
+    visibility = ["//build/bazel/rules/tests:__pkg__"],
+)
+
+build_for_host(
+    name = "build_only_tests_in_host_configuration",
+    testonly = True,
+    stamp = "build_only_tests_in_host_configuration.stamp",
+    # This target transitions to the host config ("exec") to build the test targets.
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [":targets_to_build_in_host_configurations"],
+)
+
+# A filegroup of IDK atom targets to build for each CPU and API level combination.
+# Grouping the targets means that the transition will only run once per
+# combination and allows `select()` statements to run in the context of the
+# combination.
+idk_molecule(
+    name = "atoms_to_build_for_each_cpu_and_api_level_combination_idk",
+    testonly = True,
+    allowed_in_configurations = "fuchsia",
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    deps = [
+        # TODO(https://fxbug.dev/505380228): Remove these targets once
+        # ":test_molecule_idk" is moved to this main list.
+        ":platform_dependent_source_library_idk",
+        ":test-source-library_idk",
+        ":test_source_set_zx_idk",
+        ":tests_idk",
+    ] + select({
+        # TODO(https://fxbug.dev/505380228): Merge these targets into the main
+        # list once sysroots are available for all CPU architectures.
+        "//build/bazel/platforms:is_fuchsia_" + target_cpu: [
+            # Both of these must be built for each API level to ensure that the
+            # golden IFS files are populated when creating new API levels.
+            ":test-shared-library_idk",
+            ":test_shared_library_zx_idk",
+
+            # Depends on the IDK atom targets.
+            ":test_molecule_idk",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+idk_all_api_level_and_cpu_combinations_molecule(
+    name = "all_api_level_and_cpu_combinations_molecule_idk",
+    testonly = True,
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    # Do not add to this list. Add to
+    # ":atoms_to_build_for_each_cpu_and_api_level_combination_idk" instead.
+    deps = [":atoms_to_build_for_each_cpu_and_api_level_combination_idk"],
+)
+
+# A filegroup of non-atom targets to build for each CPU and API level combination.
+# Grouping the targets means that the transition will only run once per
+# combination and allows `select()` statements to run in the context of the
+# combination.
+filegroup(
+    name = "targets_to_build_for_each_cpu_and_api_level_combination",
+    testonly = True,
+    srcs = [
+        # Depend directly on the underlying source libraries since they are not
+        # dependencies of the atoms.
+        ":all_underlying_source_libraries",
+
+        # Exercise FIDL.
+        # TODO(https://fxbug.dev/443762519): Remove these once FIDL bindings are
+        # being used in API level configurations.
+        "//examples/fidl/fuchsia.examples.docs",
+        "//examples/fidl/fuchsia.examples.docs:versioning",
+        # This tests indirect FIDL library dependencies.
+        "//sdk/fidl/fuchsia.hardware.display.engine",
+        # A FIDL library in a category.
+        # Note that the "..._idk" IDK atom targets are not built in combinations.
+        "//sdk/fidl/fuchsia.feedback",
+    ] + select({
+        # TODO(https://fxbug.dev/505380228): Merge these targets into the main
+        # list once sysroots are available for all CPU architectures.
+        "//build/bazel/platforms:is_fuchsia_" + target_cpu: [
+            # Linking executables verifies that all deps are properly specified
+            # and that FIDL bindings were generated correctly.
+            ":all_test_executables",
+        ],
+        "//conditions:default": [],
+    }),
+    target_compatible_with = ["@platforms//os:fuchsia"],
+)
+
+build_in_all_idk_api_level_and_cpu_combinations(
+    name = "all_api_level_and_cpu_combinations_non_idk_targets",
+    testonly = True,
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    # Do not add to this list. Add to
+    # ":targets_to_build_for_each_cpu_and_api_level_combination" instead.
+    deps = [":targets_to_build_for_each_cpu_and_api_level_combination"],
+)
+
+filegroup(
+    name = "api_level_and_cpu_combinations_build_only_tests",
+    testonly = True,
+    # Do not add to this list. Add to the dependencies instead.
+    srcs = [
+        ":all_api_level_and_cpu_combinations_molecule_idk",
+        ":all_api_level_and_cpu_combinations_non_idk_targets",
+    ],
+    target_compatible_with = ["@platforms//os:fuchsia"],
+    visibility = ["//build/bazel/rules/tests:__pkg__"],
+)
+
+# Although this will output errors when built with `bazel build`, it will not
+# fail the build. It must be run with `bazel test` in order for test failures to
+# cause Bazel to fail.
+analysis_test_suite(
+    name = "analysis_tests",
+    visibility = ["//build/bazel/rules/tests:__pkg__"],
+)

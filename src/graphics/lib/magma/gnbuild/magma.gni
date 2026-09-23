@@ -1,0 +1,196 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/cpp/extract_imported_symbols.gni")
+import("//build/cpp/verify_imported_symbols.gni")
+import("//build/dist/resource.gni")
+import("//build/testing/environments.gni")
+
+declare_args() {
+  # Enable this to include fuchsia tracing capability
+  magma_enable_tracing = true
+
+  # The path to OpenVX headers
+  magma_openvx_include = ""
+
+  # The path to an OpenVX implementation
+  magma_openvx_package = ""
+}
+
+# Target environments with an Intel GPU.
+magma_intel_gpu_envs = [
+  nuc7_env,
+  nuc11_env,
+]
+
+# Target environments with an ARM Mali GPU.
+magma_arm_gpu_envs = [
+  astro_env,
+  sherlock_env,
+  vim3_env,
+  nelson_env,
+]
+
+magma_other_gpu_envs = [ sorrel_env ]
+
+# General hardware environments for magma tests to target.
+magma_hardware_envs =
+    magma_intel_gpu_envs + magma_arm_gpu_envs + magma_other_gpu_envs
+
+# Magma hardware environments that also support libvulkan.
+# Intel devices are using lavapipe since Intel ANV was dropped.
+magma_libvulkan_hardware_envs = magma_arm_gpu_envs + magma_other_gpu_envs
+magma_libvulkan_arm_hardware_envs = magma_arm_gpu_envs
+
+template("magma_vulkan_icd") {
+  assert(defined(invoker.output_name), "output_name must be provided")
+  if (is_fuchsia) {
+    assert(defined(invoker.imported_symbols_allowlist),
+           "imported_symbols_allowlist must be provided")
+  } else {
+    testonly = true
+  }
+
+  has_allowlist = defined(invoker.imported_symbols_allowlist)
+
+  shared_library_target_name = "${target_name}__shlib"
+  shared_library(shared_library_target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "imported_symbols_allowlist",
+                             "configs",
+                           ])
+
+    if (defined(invoker.configs)) {
+      configs += invoker.configs
+    }
+    if (!is_debug) {
+      if (is_fuchsia) {
+        # This linker script has Fuchsia specific symbols
+        version_script = "//src/graphics/lib/magma/scripts/libvulkan.version"
+      } else {
+        version_script = ""
+      }
+      if (version_script != "") {
+        if (!defined(invoker.inputs)) {
+          inputs = []
+        }
+        inputs += [ version_script ]
+        if (!defined(invoker.ldflags)) {
+          ldflags = []
+        }
+        ldflags += [ "-Wl,--version-script=" +
+                     rebase_path(version_script, root_build_dir) ]
+      }
+    }
+
+    # Do not build ICDs with instrumented build variants, otherwise
+    # they will become very slow and many parts of the graphics
+    # stack will timeout, resulting in failed and flaky tests!!
+    exclude_toolchain_tags = [ "instrumented" ]
+  }
+
+  if (has_allowlist) {
+    lib_name = "lib${invoker.output_name}.so"
+    extract_imported_symbols_target_name =
+        "${target_name}__extract_imported_symbols"
+    verify_imported_symbols_target_name =
+        "${target_name}__verify_imported_symbols"
+
+    generated_imported_symbols_file =
+        "$target_gen_dir/${invoker.output_name}.imported_symbols.list"
+    extract_imported_symbols(extract_imported_symbols_target_name) {
+      # IMPORTANT: Always use the shared library built in the "base" toolchain
+      # to extract imported symbols. Because when the build is configured to
+      # enable an instrumented build variant (e.g. `asan`), then the compiler
+      # will generate extra symbols in the library that will fail the
+      # verify action below.
+      library_target = ":${shared_library_target_name}($shlib_toolchain_no_default_variant_redirect)"
+      symbols = generated_imported_symbols_file
+    }
+
+    verify_imported_symbols(verify_imported_symbols_target_name) {
+      current = generated_imported_symbols_file
+      allowlist = invoker.imported_symbols_allowlist
+      library_name = lib_name
+      deps = [ ":$extract_imported_symbols_target_name" ]
+    }
+  }
+
+  group(target_name) {
+    public_deps = [ ":${shared_library_target_name}" ]
+
+    if (has_allowlist) {
+      public_deps += [ ":$verify_imported_symbols_target_name" ]
+
+      metadata = {
+        # Ensure that the runtime dependencies of the version of
+        # the library used for verification are not picked up
+        # into final containers (mainifest or bootfs images).
+        distribution_entries_barrier = [ ":${shared_library_target_name}" ]
+        zbi_input_barrier = distribution_entries_barrier
+        runtime_deps_manifest_barrier = distribution_entries_barrier
+      }
+    }
+  }
+}
+
+# Generate an ICD manifest and config packages for a set of ICDs.
+#
+# Parameters
+#
+#   icds (required)
+#     [list of scopes] List of ICDs to generate config files for.
+#
+#     Entries in scope:
+#
+#       lib (required)
+#         [string] Filename of ICD shared library.
+#
+#       manifest (optional)
+#         [string] Path to output manifest to.
+#
+#       manifest_name (optional)
+#         [string] Name of manifest file. One of |manifest| or |manifest_name| must be specified.
+#
+#   resource_target_name (optional):
+#     [label] Name of a "resource" target to output that includes the manifest files.
+#
+#   resource_path (optional):
+#     [label] Directory where the "resource" target should output the manifest file to.
+
+template("icd_config_data") {
+  assert(defined(invoker.icds))
+  manifest_files = []
+  manifest_targets = []
+  foreach(entry, invoker.icds) {
+    if (defined(entry.manifest)) {
+      assert(!defined(entry.manifest_name))
+      manifest_file = entry.manifest
+    } else {
+      manifest_file = "$target_gen_dir/vulkan/icd.d/${entry.manifest_name}"
+    }
+    manifest_target = "${target_name}_${entry.lib}_gen"
+    action(manifest_target) {
+      script = "//src/graphics/lib/magma/scripts/gen_icd_manifest.sh"
+      args = [
+        "${entry.lib}",
+        rebase_path("${manifest_file}", root_build_dir),
+      ]
+      outputs = [ manifest_file ]
+    }
+    manifest_files += [ manifest_file ]
+    manifest_targets += [ ":${manifest_target}" ]
+  }
+  resource_path = "data/icd.d"
+  if (defined(invoker.resource_path)) {
+    resource_path = invoker.resource_path
+  }
+  resource(target_name) {
+    sources = manifest_files
+    outputs = [ "${resource_path}/{{source_file_part}}" ]
+    deps = [ ":${manifest_target}" ]
+  }
+}

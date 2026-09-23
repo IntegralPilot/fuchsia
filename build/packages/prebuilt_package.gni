@@ -1,0 +1,166 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+import("//build/packages/package_metadata.gni")
+import("//src/sys/pkg/bin/package-tool/package-tool.gni")
+
+# Generates package metadata from a prebuilt FAR archive.
+#
+# Parameters
+#
+#   archive (required)
+#     Path to archive containing a package.
+#
+#   package_name (optional)
+#     Name of the package.
+#     Defaults to the target's name.
+#
+#   repository (optional)
+#     The repository host name part of the package URL. Defaults to "fuchsia.com".
+#     See https://fuchsia.dev/fuchsia-src/concepts/packages/package_url#repository
+#     for more details.
+#     Type: string
+#     Default: fuchsia.com
+#
+#   debug_symbols_dir (optional)
+#     The location where debug symbols for the package's ELF binaries will be looked
+#     up. The files must be named '${debug_symbols_dir}/.build-id/xx/yyyyyyyyy.debug'
+#     where xxyyyyyyyyyy is the lowercase build-id value.
+#     Type: string
+#     Default: //prebuilt
+#
+#   deps (optional)
+#   testonly (optional)
+#   visibility (optional)
+#   metadata (optional)
+#     Usual GN meanings.
+#
+template("prebuilt_package") {
+  assert(defined(invoker.archive))
+
+  _package_name = target_name
+  if (defined(invoker.package_name)) {
+    _package_name = invoker.package_name
+  }
+
+  _repository = "fuchsia.com"
+  if (defined(invoker.repository)) {
+    _repository = invoker.repository
+  }
+
+  _main_target_name = target_name
+  _main_target_deps = []
+  if (defined(invoker.deps)) {
+    _main_target_deps += invoker.deps
+  }
+
+  _debug_symbols_dir = "//prebuilt"
+  if (defined(invoker.debug_symbols_dir)) {
+    _debug_symbols_dir = invoker.debug_symbols_dir
+  }
+
+  # First extract the package archive.
+  _package_target_name = "${target_name}.package"
+  _package_out_dir = "$target_out_dir/${_main_target_name}"
+  _package_out_manifest = "${_package_out_dir}/package_manifest.json"
+
+  _debug_symbols_target = "${_main_target_name}.debug_symbols"
+
+  package_tool_package_archive_extract(_package_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "metadata",
+                           ])
+    archive = invoker.archive
+    package_name = _package_name
+    repository = _repository
+    deps = _main_target_deps
+    package_out_dir = _package_out_dir
+
+    if (!defined(visibility)) {
+      visibility = []
+    }
+    visibility += [
+      ":${_debug_symbols_target}",
+      ":${_main_target_name}",
+    ]
+  }
+
+  _package_label =
+      get_label_info(":${_package_target_name}", "label_with_toolchain")
+
+  # Second, generate a debug symbols manifest, and a build-ids manifest
+  # from the content of the package, matching the build-id values from
+  # ELF blobs with the symbols available from _debug_symbols_dir.
+  #
+  # The build-ids manifest lists the build-id values for all ELF files in the
+  # package, while the debug symbols manifest only contains entries for files
+  # whose build-id value was found in the debug_symbols_dir.
+  #
+  # At the moment, many prebuilt packages do not include debug symbols for the
+  # SDK's prebuilt libraries (e.g. libfdio.so or libasync-default.so) that they
+  # include.
+  #
+  _debug_symbols_manifest =
+      "$target_out_dir/${_main_target_name}.debug_symbols.json"
+  _debug_symbols_build_ids =
+      "$target_out_dir/${_main_target_name}.build_ids.txt"
+
+  _rebased_debug_symbols_manifest =
+      rebase_path(_debug_symbols_manifest, root_build_dir)
+
+  action(_main_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    script = "//build/packages/generate_package_debug_symbols_manifest.py"
+    inputs = [
+      _package_out_manifest,
+      "//build/api/debug_symbols.py",
+    ]
+    outputs = [
+      _debug_symbols_manifest,
+      _debug_symbols_build_ids,
+    ]
+    args = [
+      "--package-manifest",
+      rebase_path(_package_out_manifest, root_build_dir),
+      "--package-label",
+      _package_label,
+      "--debug-symbols-dir",
+      rebase_path(_debug_symbols_dir, root_build_dir),
+      "--output-build-ids-txt",
+      rebase_path(_debug_symbols_build_ids, root_build_dir),
+      "--output-debug-manifest",
+      _rebased_debug_symbols_manifest,
+      "--target-cpu",
+      current_cpu,
+    ]
+    public_deps = [ ":${_package_target_name}" ]
+    metadata = {
+      # Used by //:debug_symbols build API module.
+      debug_symbol_manifests = [
+        {
+          label = _package_label
+          manifest = _rebased_debug_symbols_manifest
+        },
+      ]
+    }
+
+    # The content-addressed blob files are accessed as implicit inputs by
+    # this action, but listing them in a depfile would create stale
+    # dependencies for incremental builds that happen after the prebuilt
+    # package is updated to a new revision. Fortunately, tracking the
+    # package manifest as explicit input is enough to guarantee that Ninja
+    # will re-run this action as needed.
+    hermetic_action_ignored_prefixes = [ "${_package_out_dir}/blobs" ]
+
+    if (defined(visibility)) {
+      visibility += [ ":${_main_target_name}" ]
+    }
+  }
+}

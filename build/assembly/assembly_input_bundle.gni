@@ -1,0 +1,1080 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_inputs.gni")
+import("//build/components/fuchsia_package.gni")
+import("//build/group_with_inputs.gni")
+import("//build/python/python_action.gni")
+import("//tools/cmc/build/restricted_features.gni")
+
+# Creates an Assembly Input Bundle from sets of deps.
+#
+# NOTE: This is not yet able to support all categories of inputs that are in an
+#       AIB.  That support will be added in future CLs.  See the parameters
+#       below for the categories that are currently supported.
+#
+# NOTE: This template DOES NOT use GN metadata, all labels for packages must be
+# the actual target that creates the package.
+#
+# Parameters
+#
+#  allowed_in [optional]
+#    [list, strings] Which feature set + build type combinations this AIB is
+#    allowed to be included in. Assembly asserts during product assembly that
+#    the AIB is not included in any feature set + build type combinations
+#    that are not in this list.
+#
+#    Options:
+#    - "everything"
+#    - "standard", "utility", "bootstrap", "embeddable"
+#    - "user", "userdebug", "eng"
+#    - "standard::user", "utility::eng", etc.
+#
+#  scrutiny_required [optional]
+#    [list, strings] Which feature set + build type combinations to expect the
+#    contents of this AIB to be added to. Adding to this list will force the
+#    contents of this AIB to be listed as required in scrutiny goldens.
+#
+#    Options:
+#    - "everything"
+#    - "standard", "utility", "bootstrap", "embeddable"
+#    - "user", "userdebug", "eng"
+#    - "standard::user", "utility::eng", etc.
+#
+#  auto_include_in [optional]
+#    [list, strings] Which feature set + build type combinations to
+#    automatically include this AIB in.
+#
+#    Options:
+#    - "everything"
+#    - "standard", "utility", "bootstrap", "embeddable"
+#    - "user", "userdebug", "eng"
+#    - "standard::user", "utility::eng", etc.
+#
+#  experimental [optional; default=false]
+#    [bool] Whether this AIB is experimental and should be excluded from the
+#    scrutiny goldens. Experimental AIBs must be available in userdebug and
+#    never in user. Experimental AIBs are allowed in any feature set level.
+#    The typical way to mark an AIB as available in userdebug but not user is to
+#    set `experimental = true` and `allowed_in = ["userdebug", "eng"]`.
+#
+#  base_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the base package set.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a package target, it will cause an error
+#    like:
+#      "no dependency provides the input <package_name>/package_manifest.json"
+#
+#  bootfs_or_base_packages
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to include
+#    in the bootfs_or_base package set, which means the package will go in the
+#    base package set if the product has it, or bootfs if not. Products with the
+#    `standard` or `utility` feature set have base packages while `embeddable`
+#    or `bootstrap` do not.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a package target, it will cause an error
+#    like:
+#      "no dependency provides the input <package_name>/package_manifest.json"
+#
+#   drivers [optional]
+#     [list, GN scopes] A list of GN scopes that hold the driver packages to
+#     include in the assembly input bundle. The scope must have a `package_target`
+#     field pointing to the GN target of the fuchsia_package, `driver_components`
+#     field containing a list of relative paths to driver components provided by
+#     the package, e.g. "meta/driver.cm", and a `set` field ("base" or "bootfs").
+#
+#  cache_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the cache package set.
+#
+#  anchored_automatic_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the anchored automatic package set.
+#
+#  anchored_on_demand_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the anchored on-demand package set.
+#
+#  flexible_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets that
+#    assembly may choose to put in base, cache, or elsewhere depending on the
+#    assembly context.
+#
+#  bootfs_packages [optional]
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the bootfs package set.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a package target, it will cause an error
+#    like:
+#      "no dependency provides the input <package_name>/package_manifest.json"
+#
+#  bootfs_files_labels [optional]
+#    [list, GN labels] A list of GN labels of bootfs_files_for_assembly()
+#    targets to include in bootfs_files provided by this AIB.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata. If the target isn't a bootfs_files_for_assembly target, it will
+#    cause an error like:
+#      "no dependency provides the input <package_name>/bootfs_files.json"
+#
+#  config_data_labels [optional]
+#    [list, GN labels] A list of GN labels of config_data_for_assembly() targets
+#    to include in the config_data provided by this AIB.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a config_data_for_assembly() target, it will
+#    cause an error like:
+#      "no dependency provides the input <package_name>/config_data_entry.json"
+#
+#  config_data [optional]
+#    [list, scopes] A list of scopes, defining each config_data associated with
+#    a given package, and the source, label, and destination required to add it
+#    in bootfs using assembly.
+#
+#    Example w/ source-files:
+#    config_data = [
+#      {
+#        package_name = "example_package"
+#        files = [
+#          {
+#            source =
+#                "//src/path_to_config/config1.json"
+#            destination = "config1.json"
+#          },
+#          {
+#            source = "//src/path_to_config/other_stuff.txt"
+#            destination = "other_stuff.txt"
+#          },
+#        ]
+#      },
+#    ]
+#
+#    Example w/ build-output:
+#    config_data = [
+#      {
+#        package_name = "example_package"
+#        label = "//src/package/path:example_package"
+#        files = [
+#          {
+#            source =
+#                "//src/path_to_config/config1.json"
+#            destination = "config1.json"
+#          },
+#          {
+#            source = "//src/path_to_config/other_stuff.txt"
+#            destination = "other_stuff.txt"
+#          },
+#        ]
+#      },
+#    ]
+#
+#  qemu_kernel (optional; default: false)
+#    [path] Path to the qemu kernel.
+#
+#  kernel_cmdline (optional: default: [])
+#    [list of strings] Kernel cmdline arguments.
+#
+#  shell_commands (optional; default: empty)
+#    [list of scopes] A list of scopes that describe the shell commands for each
+#    listed package
+#
+#    Example:
+#    shell_commands = [
+#      {
+#        package = "//third_party/sbase"
+#        components = [ "ls" ]
+#      },
+#    ]
+#
+#  compiled_packages [optional]
+#     [list of GN scopes] List of GN scopes of `CompiledPackageDefinition`s
+#     that describe packages that are to be built dynamically by Assembly, for
+#     example, the `core` package. This is passed directly through to the AIB
+#     config so all paths should be rebased by the caller.
+#
+#     Example:
+#
+#     # Add a core shard
+#     compiled_packages = [
+#       {
+#         name = "core"
+#         packages = [ "//path/to/package" ],
+#         components = [
+#           {
+#             component_name = "core"
+#             shards = [
+#                     "//src/sys/process-resolver/meta/process_resolver.core_shard.cml",
+#             ]
+#           },
+#           ...
+#         component_includes = [ ... ]
+#       },
+#     ]
+#
+#     shards [optional]
+#       [list of GN file paths] List of CML files to merge together when
+#       compiling the component.
+#
+#     cmc_features [optional]
+#       [list of string] List of CMC features to enable for component
+#       compilation.
+#
+#     component_includes [optional]
+#       [list of FileEntry] List of source/destination pairs related to a
+#       compiled package in the compiled_packages list that specifies cml files
+#       that can be included by any cml shards in any platform AIB for the given
+#       package. These files will be included in the Assembly Input Bundle.
+#
+#  bootstrap_shards [optional]
+#    [list of file paths] A list of CML shard files to add to the "bootstrap"
+#    component of the "bootstrap" compiled package. This package is a bootfs
+#    package.
+#
+#  core_shards [optional]
+#    [list of file paths] A list of CML shard files to add to the "core"
+#    component of the "core" compiled package.
+#
+#  root_shards [optional]
+#    [list of file paths] A list of CML shard files to add to the "root"
+#    component of the "root" compiled package. This package is a bootfs package.
+#
+#  toolbox_shards [optional]
+#    [list of file paths] A list of CML shard files to add to the "toolbox"
+#    component of the "toolbox" compiled package. This package is a bootfs
+#    package.
+#
+#  memory_buckets (optional; default: [])
+#    [list of paths] Paths to memory bucket configs that should get merged and
+#    passed to memory monitor.
+#
+#
+#
+#  Outputs
+#    A directory structure and manifest that matches that documented in
+#    //build/python/modules/assembly/assembly_input_bundle.py.
+#
+#   manifest path:
+#   $target_out_dir/$target_name/assembly_config.json
+#
+#
+# GN usual meanings
+#  testonly, visibility
+template("assembly_input_bundle") {
+  bundles_dir = target_out_dir
+  bundle_name = target_name
+  assert(bundle_name != "resources",
+         "The bundle name 'resources' is reserved for internal use")
+
+  labels = {
+    # The AIB itself
+    assembly_input_bundle = "$target_name.bundle"
+
+    bazel_inputs = "${target_name}_bazel_inputs"
+    gn_targets_name = target_name
+
+    bootfs_files_package = "${target_name}.bootfs_files_package"
+    config_data = "${target_name}.config_data_list"
+    config_data_with_verification = "${target_name}.group_with.config_data"
+    kernel_cmdline = "${target_name}.kernel_cmdline"
+    shell_commands_list = "${target_name}.shell_commands.list"
+    compiled_packages = "${target_name}.compiled_packages"
+  }
+
+  files = {
+    # The directory where all the bundle contents are written to
+    assembly_input_bundle_dir = "${bundles_dir}/${bundle_name}"
+
+    # The unpackaged bootfs files that we throw into a package to add to the
+    # AIB.
+    bootfs_files_package = "$target_out_dir/$target_name.bootfs_files_package/package_manifest.json"
+
+    # The "official" outputs file that we create in that directory
+    assembly_input_bundle_config =
+        "${assembly_input_bundle_dir}/assembly_config.json"
+
+    # The files that we create as book-keeping between our tasks.
+    assembly_input_bundle_depfile = "${assembly_input_bundle_dir}.d"
+
+    # The manifest of all files in the AIB, used to create pkgs and archives.
+    assembly_input_bundle_manifest =
+        "${assembly_input_bundle_dir}.fini_manifest"
+
+    _gen_files = "${target_gen_dir}/${target_name}"
+    shell_commands_list = "${_gen_files}/shell_commands.list"
+
+    # The output path for the generated file which collects config_data from
+    # the invoking scope
+    config_data = "${assembly_input_bundle_dir}.config_data_list"
+
+    # The output path for the generated file which collects kernel cmdline
+    # arguments.
+    kernel_cmdline = "${assembly_input_bundle_dir}.kernel_cmdline"
+
+    # The list of user-provided compiled_package_definitions to include in
+    # the AIB config
+    compiled_packages = "${assembly_input_bundle_dir}.compiled_packages"
+  }
+
+  _allowed_on_user = false
+  _allowed_in = []
+  if (defined(invoker.allowed_in)) {
+    _allowed_in += invoker.allowed_in
+  }
+  if (defined(invoker.scrutiny_required)) {
+    _allowed_in += invoker.scrutiny_required
+  }
+  if (defined(invoker.auto_include_in)) {
+    _allowed_in += invoker.auto_include_in
+  }
+  if (_allowed_in == []) {
+    _allowed_on_user = true
+  } else {
+    foreach(allow_rule, _allowed_in) {
+      if (allow_rule == "standard" || allow_rule == "utility" ||
+          allow_rule == "bootstrap" || allow_rule == "embeddable" ||
+          allow_rule == "user" || allow_rule == "everything") {
+        _allowed_on_user = true
+      } else {
+        _allow_rule_parts = []
+        _allow_rule_parts = string_split(allow_rule, "::")
+        if (_allow_rule_parts + [ "user" ] - [ "user" ] != _allow_rule_parts) {
+          _allowed_on_user = true
+        }
+      }
+    }
+  }
+
+  creation_args = []
+  creation_inputs = []
+  creation_deps = []
+  if (defined(invoker.deps)) {
+    creation_deps += invoker.deps
+  }
+
+  if (defined(invoker.testonly) && invoker.testonly) {
+    creation_args += [ "--testonly" ]
+  }
+
+  if (defined(invoker.allowed_in)) {
+    foreach(include, invoker.allowed_in) {
+      creation_args += [
+        "--allowed-in",
+        include,
+      ]
+    }
+  }
+
+  if (defined(invoker.scrutiny_required)) {
+    foreach(include, invoker.scrutiny_required) {
+      creation_args += [
+        "--scrutiny-required",
+        include,
+      ]
+    }
+  }
+
+  if (defined(invoker.auto_include_in)) {
+    foreach(include, invoker.auto_include_in) {
+      creation_args += [
+        "--auto-include-in",
+        include,
+      ]
+    }
+  }
+
+  if (defined(invoker.experimental) && invoker.experimental) {
+    creation_args += [ "--experimental" ]
+  }
+
+  if (defined(invoker.bootfs_files_labels)) {
+    fuchsia_package(labels.bootfs_files_package) {
+      forward_variables_from(invoker, [ "testonly" ])
+      deps = invoker.bootfs_files_labels
+    }
+
+    # Pass the bootfs files package to the assembly tool.
+    creation_args += [
+      "--bootfs-files-package",
+      rebase_path(files.bootfs_files_package, root_build_dir),
+    ]
+    creation_deps += [ ":${labels.bootfs_files_package}" ]
+  }
+
+  # Convert the list of config_data_labels into a set of config_data_entry.json
+  # files that are inputs that define config data entry scopes.
+  if (defined(invoker.config_data_labels)) {
+    _config_data_entries = []
+
+    foreach(entry_label, invoker.config_data_labels) {
+      # Assume this is a GN-label to a config_data_for_assembly()
+      # instantiation, which is similar to packages.
+      _entry_out_dir = get_label_info(entry_label, "target_out_dir")
+      _entry_name = get_label_info(entry_label, "name")
+      _entry_file = "${_entry_out_dir}/${_entry_name}/config_data_entry.json"
+      _config_data_entries += [ _entry_file ]
+
+      creation_args += [
+        "--config-data-list",
+        rebase_path(_entry_file, root_build_dir),
+      ]
+    }
+
+    creation_deps += invoker.config_data_labels
+    creation_inputs += _config_data_entries
+  }
+
+  # Splits config_data inputs from the invoker into:
+  # 1) group_with_inputs deps / sources and
+  # 2) generated_file contents
+  if (defined(invoker.config_data)) {
+    config_data_contents = []
+    _config_data_deps = []
+    _config_data_sources = []
+    foreach(definition, invoker.config_data) {
+      assert(defined(definition.package_name),
+             "config_data definitions must include package_name")
+      assert(defined(definition.files),
+             "config_data definitions must include source")
+
+      if (defined(definition.label)) {
+        _config_data_deps += [ definition.label ]
+      }
+
+      foreach(file, definition.files) {
+        assert(defined(file.source), "file must have source in scope")
+        assert(defined(file.destination), "file must have destination in scope")
+        _config_data_sources += [ file.source ]
+        config_data_contents += [
+          {
+            package_name = definition.package_name
+            source = rebase_path(file.source, root_build_dir)
+            destination = file.destination
+          },
+        ]
+      }
+    }
+    group_with_inputs(labels.config_data_with_verification) {
+      deps = _config_data_deps
+      sources = _config_data_sources
+    }
+
+    generated_file(labels.config_data) {
+      forward_variables_from(invoker, [ "testonly" ])
+      contents = config_data_contents
+      outputs = [ "${files.config_data}" ]
+      output_conversion = "json"
+    }
+
+    creation_deps += [
+      ":${labels.config_data_with_verification}",
+      ":${labels.config_data}",
+    ]
+
+    creation_args += [
+      "--config-data-list",
+      rebase_path(files.config_data, root_build_dir),
+    ]
+    creation_inputs += [ files.config_data ]
+  }
+
+  # Convert each set of package targets into:
+  #  1) a set of manifests paths in a file
+  #  2) add that file as an input and argument to the AIB creation action
+  #  3) add the target labels as dependencies of the AIB creation action
+
+  # This defines a set of package sets that can be looped over by name to find
+  # process.  This use of defined() and the invoker is to tolerate undefined,
+  # optional, parameters to the template, as `invoker[name]` is not supported
+  # with defined
+  package_sets = {
+    base = []
+    if (defined(invoker.base_packages)) {
+      foreach(_target, invoker.base_packages) {
+        base += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+    cache = []
+    if (defined(invoker.cache_packages)) {
+      foreach(_target, invoker.cache_packages) {
+        cache += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+    anchored_automatic = []
+    if (defined(invoker.anchored_automatic_packages)) {
+      foreach(_target, invoker.anchored_automatic_packages) {
+        anchored_automatic += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+    anchored_on_demand = []
+    if (defined(invoker.anchored_on_demand_packages)) {
+      foreach(_target, invoker.anchored_on_demand_packages) {
+        anchored_on_demand += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+    flexible = []
+    if (defined(invoker.flexible_packages)) {
+      foreach(_target, invoker.flexible_packages) {
+        flexible += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+    system = []
+    if (defined(invoker.system_packages)) {
+      foreach(_target, invoker.system_packages) {
+        system += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+    bootfs = []
+    if (defined(invoker.bootfs_packages)) {
+      foreach(_target, invoker.bootfs_packages) {
+        bootfs += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+    bootfs_or_base = []
+    if (defined(invoker.bootfs_or_base_packages)) {
+      foreach(_target, invoker.bootfs_or_base_packages) {
+        bootfs_or_base += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+    on_demand = []
+    if (defined(invoker.on_demand)) {
+      foreach(_target, invoker.on_demand) {
+        on_demand += [
+          {
+            package_target = _target
+          },
+        ]
+      }
+    }
+
+    drivers = []
+    if (defined(invoker.drivers)) {
+      drivers = invoker.drivers
+    }
+  }
+
+  # Loop over the above sets of packages
+  foreach(set_name,
+          [
+            "base",
+            "cache",
+            "anchored-automatic",
+            "anchored-on-demand",
+            "flexible",
+            "system",
+            "bootfs",
+            "bootfs-or-base",
+            "on-demand",
+            "drivers",
+          ]) {
+    _package_target_details = []
+    _package_target_details = package_sets[string_replace(set_name, "-", "_")]
+    _package_targets = []
+    _manifest_entries = []
+
+    # Skip empty package sets
+    if (_package_target_details != []) {
+      # 1a) Calculate the manifest path for each package target
+      foreach(details, _package_target_details) {
+        assert(
+            defined(details.package_target),
+            "A target must be defined for each package. (this should be unreachable)")
+        _package_targets += [ details.package_target ]
+        _package_out_dir =
+            get_label_info(details.package_target, "target_out_dir")
+        _package_name = get_label_info(details.package_target, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+        _manifest_path_rebased = rebase_path(_manifest_path, root_build_dir)
+
+        if (set_name == "drivers") {
+          assert(defined(details.driver_components),
+                 "driver_components must be specified for driver targets")
+          assert(defined(details.set),
+                 "set must be specified for driver targets")
+
+          _manifest_entries += [
+            {
+              package_target = _manifest_path_rebased
+              driver_components = details.driver_components
+              set = details.set
+            },
+          ]
+        } else {
+          _manifest_entries += [ _manifest_path_rebased ]
+        }
+      }
+
+      _manifest_list = "${target_name}.${set_name}_packages.list"
+      _manifest_list_file = "${target_gen_dir}/${_manifest_list}"
+
+      # 1b) Generate a file containing that list
+      # For base packages this will be a list of package manifests.
+      # For drivers, this will be a list of DriverDetails, containing
+      # the package manifests and component file paths.
+      generated_file(_manifest_list) {
+        forward_variables_from(invoker, [ "testonly" ])
+        deps = _package_targets
+        outputs = [ "${_manifest_list_file}" ]
+        output_conversion = "json"
+        contents = _manifest_entries
+      }
+
+      # 2) add the file as an input and argument to the AIB creation action
+      if (set_name == "drivers") {
+        creation_args += [
+          "--drivers-list",
+          rebase_path(_manifest_list_file, root_build_dir),
+        ]
+      } else {
+        creation_args += [
+          "--${set_name}-pkg-list",
+          rebase_path(_manifest_list_file, root_build_dir),
+        ]
+      }
+      creation_inputs += [ _manifest_list_file ]
+
+      # 3) add the file as a dependency of the AIB creation action (linking the
+      #    actual package deps transitively, to preserve the route by which they
+      #    are added to the AIB:
+      #      AIB
+      #       +-> AIB.base_packages_list
+      #            +-> [ base package deps ]
+      #       +-> AIB.cache_packages_list
+      #            +-> [ cache package deps ]
+      creation_deps += [ ":${_manifest_list}" ]
+    }
+  }
+
+  # Only add the shell command packages list if it's non-empty
+  if (defined(invoker.shell_commands) && invoker.shell_commands != []) {
+    shell_commands_json_contents = []
+
+    foreach(shell_command, invoker.shell_commands) {
+      assert(
+          defined(shell_command.package),
+          "shell_command entries must specify a package name: ${shell_command}")
+      assert(
+          defined(shell_command.components),
+          "shell_command components must be a list of strings pointing to binaries that are components in the package that make up the package: ${shell_command}")
+      _package_name = get_label_info(shell_command.package, "name")
+      _bootfs_package = false
+      if (defined(shell_command.bootfs_package)) {
+        _bootfs_package = shell_command.bootfs_package
+      }
+      shell_commands_json_contents += [
+        {
+          package = _package_name
+          bootfs_package = _bootfs_package
+          components = shell_command.components
+        },
+      ]
+    }
+
+    generated_file(labels.shell_commands_list) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      outputs = [ files.shell_commands_list ]
+      output_conversion = "json"
+      contents = shell_commands_json_contents
+    }
+
+    creation_args += [
+      "--shell-cmds-list",
+      rebase_path(files.shell_commands_list, root_build_dir),
+    ]
+    creation_inputs += [ files.shell_commands_list ]
+    creation_deps += [ ":${labels.shell_commands_list}" ]
+  }
+
+  if (defined(invoker.qemu_kernel)) {
+    creation_args += [
+      "--qemu-kernel",
+      rebase_path(invoker.qemu_kernel, root_build_dir),
+    ]
+  }
+
+  if (defined(invoker.kernel_cmdline)) {
+    generated_file(labels.kernel_cmdline) {
+      forward_variables_from(invoker, [ "testonly" ])
+      outputs = [ files.kernel_cmdline ]
+      output_conversion = "json"
+      contents = invoker.kernel_cmdline
+    }
+
+    creation_args += [
+      "--kernel-cmdline",
+      rebase_path(files.kernel_cmdline, root_build_dir),
+    ]
+    creation_inputs += [ files.kernel_cmdline ]
+    creation_deps += [ ":${labels.kernel_cmdline}" ]
+  }
+
+  # Add the additional shards to the compiled packages list.
+  _all_compiled_packages = []
+  if (defined(invoker.compiled_packages)) {
+    _all_compiled_packages = invoker.compiled_packages
+  }
+
+  _shard_types = [
+    {
+      name = "bootstrap"
+      arg = "bootstrap_shards"
+      bootfs = true
+    },
+    {
+      name = "core"
+      arg = "core_shards"
+      bootfs = false
+    },
+    {
+      name = "root"
+      arg = "root_shards"
+      bootfs = true
+    },
+    {
+      name = "toolbox"
+      arg = "toolbox_shards"
+      bootfs = true
+    },
+  ]
+
+  # Keep track of all the hardcoded shard types from above that we already
+  # merged in. This will ensure that we add any missing types after the merge.
+  _merged_shard_types = []
+
+  # Accumulate a list of all the compiled packages by merging
+  # _all_compiled_packages with the hardcoded shard lists above.
+  _merged_compiled_packages = []
+  foreach(package, _all_compiled_packages) {
+    # Search for a hardcoded shard type that matches this package.
+    _package_found = false
+    foreach(type, _shard_types) {
+      # Merge the compiled_package with the hardcoded shard type.
+      if (!_package_found && defined(invoker[type.arg]) &&
+          invoker[type.arg] != [] && type.name == package.name) {
+        _package_found = true
+
+        # Search for an existing component inside the package to merge the
+        # shards lists.
+        _component_found = false
+        if (defined(package.components)) {
+          foreach(component, package.components) {
+            if (!_component_found && type.name == component.component_name) {
+              _component_found = true
+
+              if (defined(component.shards)) {
+                component.shards += invoker[type.arg]
+              } else {
+                component.shards = invoker[type.arg]
+              }
+            }
+          }
+        } else {
+          package.components = []
+        }
+
+        # The component was not found in the package, so add it.
+        if (!_component_found) {
+          package.components += [
+            {
+              component_name = type.name
+              shards = invoker[type.arg]
+            },
+          ]
+        }
+
+        _merged_shard_types += [ type.name ]
+      }
+    }
+    _merged_compiled_packages += [ package ]
+  }
+
+  # If we walked _all_compiled_packages and didn't find one of the hardcoded
+  # shard types (such as 'core'), we need to add the missing hardcoded shard
+  # types to _merged_compiled_packages.
+  foreach(type, _shard_types) {
+    if (defined(invoker[type.arg]) && invoker[type.arg] != []) {
+      _missing = true
+      foreach(added_type, _merged_shard_types) {
+        if (type.name == added_type) {
+          _missing = false
+        }
+      }
+      if (_missing) {
+        _new_package = {
+        }
+        _new_package = {
+          name = type.name
+          components = [
+            {
+              component_name = type.name
+              shards = invoker[type.arg]
+            },
+          ]
+        }
+        if (type.bootfs) {
+          _new_package.bootfs_package = true
+        }
+        _merged_compiled_packages += [ _new_package ]
+      }
+    }
+  }
+  _all_compiled_packages = []
+  _all_compiled_packages = _merged_compiled_packages
+  not_needed(_merged_shard_types)
+
+  if (_all_compiled_packages != []) {
+    _compiled_packages = []
+    foreach(package, _all_compiled_packages) {
+      _package = {
+      }
+      _package = {
+        forward_variables_from(package,
+                               [
+                                 "name",
+                                 "bootfs_package",
+                               ])
+      }
+
+      # Rebase and create input groups for the contents, component shards, and
+      # component includes for each package in the group.
+      _inputs = []
+      _deps = []
+
+      # Gather the package manifests as input files
+      if (defined(package.packages)) {
+        packages = []
+        foreach(entry, package.packages) {
+          _package_out_dir = get_label_info(entry, "target_out_dir")
+          _package_name = get_label_info(entry, "name")
+          _manifest_path =
+              "${_package_out_dir}/${_package_name}/package_manifest.json"
+          _inputs += [ _manifest_path ]
+          _deps += [ entry ]
+          packages += [ rebase_path(_manifest_path, root_build_dir) ]
+        }
+        _package.packages = packages
+      }
+
+      # Gather the core shards as input files
+      if (defined(package.components)) {
+        components = []
+        foreach(entry, package.components) {
+          _inputs += entry.shards
+          components += [
+            {
+              forward_variables_from(entry, "*", [ "shards" ])
+              shards = rebase_path(entry.shards, root_build_dir)
+            },
+          ]
+          if (defined(entry.cmc_features) && entry.cmc_features != []) {
+            # This component is using potentially gated CMC features. Encode
+            # this in a group dependency that potentially requires addition to a
+            # visibility group.
+            _features_group_name = "${target_name}.compiled_package.${package.name}.${entry.component_name}.cmc_features"
+            _deps += [ ":${_features_group_name}" ]
+            group(_features_group_name) {
+              deps = []
+              foreach(feature, entry.cmc_features) {
+                if (filter_include(cmc_security_owned_restricted_features,
+                                   [ feature ]) != []) {
+                  deps += [ "//tools/cmc/build/restricted_features/security_owned:$feature" ]
+                } else {
+                  deps += [ "//tools/cmc/build/restricted_features:$feature" ]
+                }
+              }
+            }
+          }
+        }
+        _package.components = components
+      }
+
+      # Gather the component includes as input files
+      if (defined(package.component_includes)) {
+        component_includes = []
+        foreach(entry, package.component_includes) {
+          _inputs += [ entry.source ]
+          component_includes += [
+            {
+              source = rebase_path(entry.source, root_build_dir)
+              destination = entry.destination
+            },
+          ]
+        }
+        _package.component_includes = component_includes
+      }
+
+      # Create a group that wraps together all the deps and inputs found above,
+      # to make sure that all input files are either source, or an output that's
+      # accounted for by one of the deps.
+      group_name = "${target_name}.compiled_package.${package.name}.inputs"
+      group_with_inputs(group_name) {
+        deps = _deps
+        inputs = _inputs
+      }
+      creation_deps += [ ":${group_name}" ]
+
+      _compiled_packages += [ _package ]
+    }
+
+    # Write out the whole compiled_package json file, now that all the inputs
+    # in it have been found, and all GN file paths rebased.
+    generated_file(labels.compiled_packages) {
+      forward_variables_from(invoker, [ "testonly" ])
+      outputs = [ "${files.compiled_packages}" ]
+      output_conversion = "json"
+      contents = _compiled_packages
+    }
+
+    creation_args += [
+      "--compiled-packages",
+      rebase_path(files.compiled_packages, root_build_dir),
+    ]
+
+    creation_inputs += [ files.compiled_packages ]
+    creation_deps += [ ":${labels.compiled_packages}" ]
+  }
+
+  if (defined(invoker.memory_buckets)) {
+    foreach(memory_bucket, invoker.memory_buckets) {
+      creation_args += [
+        "--memory-buckets",
+        rebase_path(memory_bucket, root_build_dir),
+      ]
+      creation_inputs += [ memory_bucket ]
+    }
+  }
+
+  # Create the out-of-tree-usable Assembly Input Bundle
+  python_action(labels.assembly_input_bundle) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    binary_label = "//build/assembly/scripts:assembly_input_bundle_tool"
+
+    # The contents of these folders is dynamic, and managed entirely by this
+    # action.  Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    #
+    # These folders would grow in size forever, if it was not cleaned out on
+    # each incremental build.
+    hermetic_action_ignored_prefixes = [
+      "${files.assembly_input_bundle_dir}/blobs",
+      "${files.assembly_input_bundle_dir}/bootfs",
+      "${files.assembly_input_bundle_dir}/compiled_packages",
+      "${files.assembly_input_bundle_dir}/config_data",
+      "${files.assembly_input_bundle_dir}/kernel",
+      "${files.assembly_input_bundle_dir}/packages",
+      "${files.assembly_input_bundle_dir}/subpackages",
+      "${files.assembly_input_bundle_dir}/memory_buckets",
+    ]
+
+    outputs = [ files.assembly_input_bundle_config ]
+    depfile = files.assembly_input_bundle_depfile
+
+    args = [
+      "create",
+      "--outdir",
+      rebase_path(files.assembly_input_bundle_dir, root_build_dir),
+      "--depfile",
+      rebase_path(files.assembly_input_bundle_depfile, root_build_dir),
+    ]
+    args += creation_args
+
+    inputs = creation_inputs
+    deps = creation_deps
+
+    metadata = {
+      # We insert these barriers to prevent the dependencies of the input bundle
+      # from leaking into images "higher up" in the dependency chain.
+      package_barrier = []
+      assembly_package_barrier = []
+      config_package_barrier = []
+      distribution_entries_barrier = []
+      shell_commands_barrier = []
+      assembly_input_archives_barrier = []
+    }
+  }
+
+  # Make generated AIBs available to Bazel builds.
+  bazel_input_directory(labels.bazel_inputs) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    generator = ":${labels.assembly_input_bundle}"
+    output_directory = files.assembly_input_bundle_dir
+    gn_targets_name = labels.gn_targets_name
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = [ ":${labels.bazel_inputs}" ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    public_deps = [ ":${labels.assembly_input_bundle}" ]
+    metadata = {
+      if (!_allowed_on_user) {
+        applicable_licenses_host_barrier = []
+      }
+      assembly_input_bundles = [
+        {
+          name = target_name
+          path = rebase_path(files.assembly_input_bundle_dir, root_build_dir)
+          label =
+              get_label_info(labels.assembly_input_bundle, "label_no_toolchain")
+        },
+      ]
+    }
+  }
+}

@@ -1,0 +1,435 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.paver;
+
+using fuchsia.mem;
+using zx;
+
+/// Describes the version of an asset.
+type Configuration = strict enum {
+    A = 1;
+    B = 2;
+    RECOVERY = 3;
+};
+
+/// Describes assets which may be updated. Each asset has 3 versions, each tied to a particular
+/// configuration.
+type Asset = strict enum {
+    /// Zircon Boot Image (ZBI) containing the kernel image as well as bootfs.
+    KERNEL = 1;
+    /// Metadata used for verified boot purposes.
+    VERIFIED_BOOT_METADATA = 2;
+};
+
+/// Set of states configuration may be in.
+type ConfigurationStatus = strict enum {
+    /// Bootable and health checked.
+    HEALTHY = 1;
+    /// Bootable but not yet marked healthy.
+    PENDING = 2;
+    /// Unbootable.
+    UNBOOTABLE = 3;
+};
+
+/// Reasons why a configuration may be marked unbootable.
+type UnbootableReason = flexible enum {
+    /// No reason known; generally indicates that whatever code wrote the underlying metadata does
+    /// not yet support unbootable reasons.
+    NONE = 0;
+    /// The configuration ran out of boot attempts without being marked `HEALTHY`.
+    NO_MORE_TRIES = 1;
+    /// The OS set the configuration unbootable via `BootManager::SetConfigurationUnbootable`.
+    OS_REQUESTED = 2;
+    /// Kernel verification failed.
+    VERIFICATION_FAILURE = 3;
+};
+
+/// The maximum number of times the firmware will attempt to boot into a `PENDING` configuration.
+///
+/// If the boot attempts are all exhausted without the configuration being updated to `HEALTHY`,
+/// the configuration will switch to `UNBOOTABLE` which will cause the next boot to fall back to
+/// the next usable slot.
+///
+/// `HEALTHY` and `UNBOOTABLE` configurations do not count boot attempts; it is assumed that once a
+/// device is in these states it will remain so until the configuration is manually modified.
+const MAX_PENDING_BOOT_ATTEMPTS uint8 = 7;
+
+type ReadInfo = struct {
+    /// Offset into VMO where read data starts.
+    offset zx.Off;
+    /// Size of read data.
+    size uint64;
+};
+
+type ReadResult = strict union {
+    /// Error encountered while reading data.
+    1: err zx.Status;
+    /// End of file reached.
+    2: eof bool;
+    /// Information about location of successfully read data within pre-registered VMO.
+    3: info ReadInfo;
+};
+
+type WriteFirmwareResult = strict union {
+    /// The result status if a write was attempted.
+    1: status zx.Status;
+
+    /// True if a write was not attempted due to unsupported firmware. This could
+    /// be either unsupported content type or unsupported A/B configuration.
+    ///
+    /// Callers must not treat this as a fatal error, but instead ignore it and
+    /// continue to update the device. This is important to be able to add new
+    /// items to an update package without breaking updates on older devices.
+    2: unsupported bool;
+};
+
+// The maximum string length for the `firmware type` parameter.
+const MAX_FIRMWARE_TYPE_LENGTH uint32 = 256;
+
+@discoverable
+closed protocol Paver {
+    /// Attempts to auto-discover the data sink where assets and volumes will get paved to.
+    /// On devices with GPT, the partition must have a valid FVM partition in order for
+    /// auto-discovery to find it. If multiple devices are found suitable, error is returned.
+    ///
+    /// `data_sink` will be closed on error, with an epitaph provided on failure reason.
+    strict FindDataSink(resource struct {
+        data_sink server_end:DataSink;
+    });
+
+    /// Like `FindDataSink`, but the returned block device will be dynamic, supporting partition
+    /// table manipulation.
+    ///
+    /// `data_sink` will be closed on error, with an epitaph provided on failure reason.
+    strict FindPartitionTableManager(resource struct {
+        data_sink server_end:DynamicDataSink;
+    });
+
+    /// Attempts to auto-discover the boot manager.
+    ///
+    /// `boot_manager` will be closed on error, with an epitaph provided on failure reason.
+    /// ZX_ERR_NOT_SUPPORTED indicates lack of support and configuration A is always booted from.
+    strict FindBootManager(resource struct {
+        boot_manager server_end:BootManager;
+    });
+
+    /// Find Sysconfig service.
+    strict FindSysconfig(resource struct {
+        sysconfig server_end:Sysconfig;
+    });
+};
+
+/// Protocol for reading and writing boot partitions.
+///
+/// A note on DataSink.Flush() (and BootManager.Flush() coming after):
+///
+/// Some platforms may implement the Flush() fidl interface of DataSink/BootManager. For these
+/// platforms, the update of some system images and A/B configuration is not persisted to storage
+/// immediately and only buffered internally when the write fidl interfaces return. The data is
+/// guaranteed to be persisted only after the Flush() interfaces are called.
+///
+/// If not implemented, Flush() is no-op and system images and A/B configuration will be persisted
+/// to storage immediately after the write fidl interfaces return.
+///
+/// For all platforms, it is guaranteed that if DataSink.Flush() is implemented, BootManager.Flush()
+/// is implemented as well. Therefore, in the context of system update, both of the following update
+/// sequences are safe in the sense that, new A/B configuration will not be persisted to storage
+/// before new system images.
+/// DataSink.Write[...]() --> DataSink.Flush() --> BootManager.Set[...]() --> BootManager.Flush()
+/// DataSink.Write[...]() --> BootManager.Set[...]() --> DataSink.Flush() --> BootManager.Flush()
+closed protocol DataSink {
+    /// Reads the partition corresponding to `configuration` and `asset` into a vmo and returns it.
+    /// The size field of the returned `Buffer` will be the size of just the asset, if it can be
+    /// determined. Otherwise, it will be the size of the entire partition.
+    /// The size and stream size of the vmo in the returned `Buffer` will always be the size of the
+    /// entire partition.
+    strict ReadAsset(struct {
+        configuration Configuration;
+        asset Asset;
+    }) -> (resource struct {
+        asset fuchsia.mem.Buffer;
+    }) error zx.Status;
+
+    /// Writes partition corresponding to `configuration` and `asset` with data from `payload`.
+    /// `payload` may need to be resized to the partition size, so the provided vmo must have
+    /// been created with `ZX_VMO_RESIZABLE` or must be a child VMO that was created with
+    /// `ZX_VMO_CHILD_RESIZABLE`. Will zero out rest of the partition if `payload` is smaller
+    /// than the size of the partition being written.
+    ///
+    ///
+    /// Returns `ZX_ERR_INVALID_ARGS` if `configuration` specifies active configuration.
+    strict WriteAsset(resource struct {
+        configuration Configuration;
+        asset Asset;
+        payload fuchsia.mem.Buffer;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Writes firmware data from `payload`.
+    ///
+    /// `configuration` represents the A/B/R configuration. For platforms that do not support
+    /// firmware A/B/R, the parameter will be ignored by the underlying device-specific logic .
+    ///
+    /// `type` is a device-specific string identifying the payload contents,
+    /// used to select the proper paving logic. For example, a device with
+    /// multiple bootloader stages might send them as separate calls to
+    /// `WriteFirmware()`, differentiated by `type`. An empty string
+    /// indicates the default type.
+    ///
+    /// `payload` may need to be resized to the partition size, so the provided
+    /// vmo must have been created with `ZX_VMO_RESIZABLE` or must be a child
+    /// VMO that was created with `ZX_VMO_CHILD_RESIZABLE`.
+    strict WriteFirmware(resource struct {
+        configuration Configuration;
+        type string:MAX_FIRMWARE_TYPE_LENGTH;
+        payload fuchsia.mem.Buffer;
+    }) -> (struct {
+        result WriteFirmwareResult;
+    });
+
+    /// Read firmware corresponding to `configuration` and `type`.
+    ///
+    /// Parameter `configuration` and `type` are the same as WriteFirmware.
+    ///
+    /// If ReadFirmware returns error, caller should assume that firmware image does not exist
+    /// or is in a bad state, or firmware read is not defined for the product.
+    strict ReadFirmware(resource struct {
+        configuration Configuration;
+        type string:MAX_FIRMWARE_TYPE_LENGTH;
+    }) -> (resource struct {
+        firmware fuchsia.mem.Buffer;
+    }) error zx.Status;
+
+    /// Write a raw volume image to the device. The image will be passed as it is to the device
+    /// partitioner backend to write. Therefore the format and write logic for the image is up to
+    /// the product to define. It differs from the legacy WriteVolume(), which was specifically
+    /// for writing the FVM sparse image, in that the paver will not perform any FVM related
+    /// parsing or other operation of the image. Thus it is not dependent on the volume driver
+    /// version and less susceptible to an outdated paver.
+    ///
+    /// Returns ZX_ERR_NOT_SUPPORTED if the backend does not support opaque volume blobs.
+    strict WriteOpaqueVolume(resource struct {
+        payload fuchsia.mem.Buffer;
+    }) -> () error zx.Status;
+
+    /// Writes an image in the Android Sparse format.  Identical in behaviour to
+    /// `WriteOpaqueVolume`, except the contents of `payload` are parsed as a sparse image and
+    /// unpacked before being written to disk.
+    strict WriteSparseVolume(resource struct {
+        payload fuchsia.mem.Buffer;
+    }) -> () error zx.Status;
+
+    /// Flush all previously buffered writes to persistent storage.
+    strict Flush() -> (struct {
+        status zx.Status;
+    });
+};
+
+/// Specialized DataSink with dynamic partition tables.
+closed protocol DynamicDataSink {
+    compose DataSink;
+
+    /// Initializes partitions on given block device.
+    ///
+    /// Currently only supported on devices which don't support fastboot (which is the preferred
+    /// mechanism for device setup).
+    ///
+    /// *WARNING*: This API will wipe the existing partitions and data loss may occur.  Non-Fuchsia
+    /// partitions *may* be preserved, although this is behaviour is board-specific.
+    strict InitializePartitionTables() -> (struct {
+        status zx.Status;
+    });
+
+    /// Wipes all entries from the partition table of the specified block device.
+    /// Currently only supported on devices with a GPT.
+    ///
+    /// *WARNING*: This API may destructively remove non-fuchsia maintained partitions from
+    /// the block device.
+    @available(deprecated=HEAD)
+    strict WipePartitionTables() -> (struct {
+        status zx.Status;
+    });
+};
+
+/// Protocol for managing boot configurations.
+///
+/// All functions will first check the A/B/R metadata and reset it to the default state if it's
+/// invalid.
+///
+/// Operations which change the configuration are applied transactionally and will not be persisted
+/// to storage until Flush() is called, at which point they will *all* be applied (or none at all).
+/// If any of the operations fail (which is generally unexpected), the current set of changes may be
+/// discarded.
+///
+/// The connection will be immediately closed with an epitaph of `ZX_ERR_NOT_SUPPORTED` if A/B/R is
+/// not supported.
+closed protocol BootManager {
+    /// Queries the configuration the system is currently running.
+    ///
+    /// Returns `ZX_ERR_NOT_SUPPORTED` if the `zvb.current_slot` boot argument cannot be read
+    /// or is an unexpected value.
+    strict QueryCurrentConfiguration() -> (struct {
+        configuration Configuration;
+    }) error zx.Status;
+
+    /// Queries the configuration which will be used as the default boot choice on a normal cold
+    /// boot, which may differ from the currently running configuration. `Configuration::RECOVERY`
+    /// should never be active.
+    ///
+    /// Returns `ZX_ERR_NOT_SUPPORTED` if `Configuration.RECOVERY` is active.
+    strict QueryActiveConfiguration() -> (struct {
+        configuration Configuration;
+    }) error zx.Status;
+
+    /// Queries the configuration that was last explicitly marked as active by
+    /// SetConfigurationActive(). The result is not affected by the current status of the slot.
+    ///
+    /// A newly updated slot is typically marked as active immediately. Therefore this interface
+    /// can be used as a way to identify the newest slot.
+    ///
+    /// Returns `ZX_ERR_IO` if fail to load abr metadata. Returns `ZX_ERR_INTERNAL` if invalid
+    /// slot index is returned by libabr routine.
+    strict QueryConfigurationLastSetActive() -> (struct {
+        configuration Configuration;
+    }) error zx.Status;
+
+    /// Queries status of `configuration`.
+    ///
+    /// Returns `ZX_ERR_INVALID_ARGS` if `Configuration.RECOVERY` is passed in via `configuration`.
+    // We may want to migrate users over to `QueryConfigurationStatusAndBootAttempts` at some point
+    // and delete this, but it's not hard to support both.
+    strict QueryConfigurationStatus(struct {
+        configuration Configuration;
+    }) -> (struct {
+        status ConfigurationStatus;
+    }) error zx.Status;
+
+    /// Queries status of `configuration`.
+    ///
+    /// The returned table contains:
+    ///
+    /// * `status`: the current `ConfigurationStatus`
+    ///
+    /// * `boot_attempts`: if `status` is `ConfigurationStatus::PENDING`, this will be the number of
+    ///   times this configuration has attempted to boot, including the current attempt. For any
+    ///   other `status` this value will not be provided.
+    ///
+    ///   If provided, this value will be in the range `[0, MAX_PENDING_BOOT_ATTEMPTS]`. 0 indicates
+    ///   the configuration was just set active and has not attempted any boots yet, and
+    ///   `MAX_PENDING_BOOT_ATTEMPTS` indicates that all attempts have been used.
+    ///
+    /// * `unbootable_reason`: if `status` is `ConfigurationStatus::UNBOOTABLE`, this will be the
+    ///   reported reason for why the configuration is unbootable. For any other `status` this value
+    ///   will not be provided.
+    ///
+    /// Returns `ZX_ERR_INVALID_ARGS` if `Configuration.RECOVERY` is passed in via `configuration`.
+    strict QueryConfigurationStatusAndBootAttempts(struct {
+        configuration Configuration;
+    }) -> (table {
+        1: status ConfigurationStatus;
+        2: boot_attempts uint8;
+        3: unbootable_reason UnbootableReason;
+    }) error zx.Status;
+
+    /// Updates persistent metadata identifying which configuration should be selected as 'primary'
+    /// for booting purposes. Should only be called after `KERNEL` as well as optional
+    /// `VERIFIED_BOOT_METADATA` assets for specified `configuration` were written successfully.
+    ///
+    /// Also resets the boot attempts count for the given `Configuration`.
+    ///
+    /// Returns `ZX_ERR_INVALID_ARGS` if `Configuration.RECOVERY` is passed in via `configuration`.
+    strict SetConfigurationActive(struct {
+        configuration Configuration;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Updates persistent metadata identifying whether `configuration` is bootable.
+    /// Should only be called in the following situations:
+    /// * Before `KERNEL` as well as optional `VERIFIED_BOOT_METADATA` assets for specified
+    ///   `configuration` are written.
+    /// * After successfully booting from a new configuration and marking it healthy. This method
+    ///   would be then called on the old configuration.
+    /// * After "successfully" booting from a new configuration, but encountering an unrecoverable
+    ///   error during health check. This method would be then called on the new configuration.
+    ///
+    /// If the configuration is unbootable, no action is taken.
+    ///
+    /// Returns `ZX_ERR_INVALID_ARGS` if `Configuration.RECOVERY` is passed in via `configuration`.
+    strict SetConfigurationUnbootable(struct {
+        configuration Configuration;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Updates persistent metadata to mark a [`fuchsia.paver/Configuration`]
+    /// as successful.
+    ///
+    /// This function is typically used by the OS update system after having
+    /// confirmed that the configuration works as intended and the "rollback to
+    /// previous slot" logic is not needed anymore.
+    ///
+    /// Compatibility between the newly successful configuration and the other
+    /// configuration is unknown. Even if the other configuration was
+    /// successful at one point, it may no longer be. This function adds a
+    /// success mark to the given configuration but also removes any success
+    /// mark on the other.
+    ///
+    /// If `configuration` is unbootable or is
+    /// [`fuchsia.paver/Configuration.RECOVERY`], `response` will be
+    /// `ZX_ERR_INVALID_ARGS`.
+    ///
+    /// + request `configuration` the `Configuration` to mark as healthy. Must
+    ///   not be `RECOVERY`.
+    /// - response `status` a zx_status value indicating success or failure.
+    strict SetConfigurationHealthy(struct {
+        configuration Configuration;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Force device to boot to recovery in the next reboot/power cycle. This will only be
+    /// triggered once and will be reset after the reboot. State of A/B configuration slot will not
+    /// be affected.
+    strict SetOneShotRecovery() -> () error zx.Status;
+
+    /// Flush all previously buffered writes to persistent storage.
+    strict Flush() -> (struct {
+        status zx.Status;
+    });
+};
+
+/// Protocol that provides access to sysconfig-data sub-partition in sysconfig partition.
+/// The main user of the protocol are pkg-solver and system update-checker, which need to
+/// read/write sysconfig-data channel.
+closed protocol Sysconfig {
+    /// Read from the sub-partition
+    strict Read() -> (resource struct {
+        data fuchsia.mem.Buffer;
+    }) error zx.Status;
+
+    /// Writes to the sub-partition
+    strict Write(resource struct {
+        payload fuchsia.mem.Buffer;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Get sub-partition size.
+    strict GetPartitionSize() -> (struct {
+        size uint64;
+    }) error zx.Status;
+
+    /// Flush all previously buffered data to persistent storage.
+    strict Flush() -> (struct {
+        status zx.Status;
+    });
+
+    /// Wipe all data in the sub-partition (write 0 to all bytes).
+    strict Wipe() -> (struct {
+        status zx.Status;
+    });
+};

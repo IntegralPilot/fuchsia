@@ -1,0 +1,503 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang.gni")
+import("//build/config/fuchsia/target_api_level.gni")
+import("//build/dist/distribution_manifest_generated_file.gni")
+import("//build/host.gni")
+import("//build/packages/package_metadata.gni")
+import("//build/python/python_action.gni")
+import("//build/rust/config.gni")
+
+# Which tool(s) to use in this process are conditional based on this being a
+# sub-build or normal build.  Sub-builds use prebuilt binaries, whereas the
+# normal build depends on the actual build targets.  For each of the tools
+# used by the `fuchsia_package()` template, we need to calculate the label,
+# path, etc.
+#
+# This logic is taken from `compiled_action()`, and is similar to the logic
+# there, although slightly simplified because we know we will not be opt'ing
+# out of the use of prebuilt tools.
+foreach(tool_info,
+        # This is a list of all input tools
+        [
+          {
+            name = "package-tool"
+            label = "//src/sys/pkg/bin/package-tool(${host_toolchain})"
+          },
+          {
+            name = "configc"
+            label = "//tools/configc(${host_toolchain})"
+          },
+        ]) {
+  tool_desc = {
+  }
+  tool_output_name = get_label_info(tool_info.label, "name")
+  tool_output_dir = get_label_info(tool_info.label, "root_out_dir")
+  host_executable = "$tool_output_dir/$tool_output_name"
+
+  if (host_tools_base_path_override != "") {
+    # Use a prebuilt version of the host tool. Assume the tool is already
+    # built so do not add any dependency to the target.
+    host_executable_rebased = host_tools_base_path_override + "/" +
+                              rebase_path(host_executable, root_build_dir)
+    host_executable =
+        "//" + rebase_path(host_executable_rebased, "//", root_build_dir)
+
+    tool_desc = {
+      name = tool_info.name
+      input = host_executable
+      rebased = host_executable_rebased
+    }
+  } else {
+    # Use the compilation dep for the tool
+    tool_desc = {
+      name = tool_info.name
+      dep = tool_info.label
+      input = host_executable
+      rebased = rebase_path(host_executable, root_build_dir)
+    }
+  }
+
+  # Setup useful variables for each of these tools.  Because we don't have the
+  # ability in GN to reference scope variables by name in L-value contexts, we
+  # need to do this odd bit of logic.
+
+  if (tool_info.name == "package-tool") {
+    # Setup a variable for the description of the package-tool
+    _tools_package_tool = tool_desc
+  } else if (tool_info.name == "configc") {
+    # Setup a variable for the description of the configc tool
+    _tools_configc = tool_desc
+  }
+}
+
+# Defines a Fuchsia package.
+# See: https://fuchsia.dev/fuchsia-src/development/components/build
+#
+# Fuchsia packages are a collection of any number of files (or resources), each
+# with a unique path that is relative to the package's root.
+# Package targets collect resources via their dependencies. These dependencies
+# are typically either:
+#
+#   * `fuchsia_component()` targets, which provide their component manifest and
+#     other files that the component needs (such as an executable)
+#   * other `fuchsia_package()` targets, declared as `subpackages`
+#
+# Packages can be defined as a collection of pairs each representing a file in
+# the package. Each pair consists of the path in the package that is assigned
+# to the file, and a path relative to the build system's output directory where
+# the contents of the file will be sourced from.
+# This mapping is generated at build time, and is known as the package
+# manifest.
+#
+# To view the package manifest, For instance assume you have defined
+# a package at `path/to/project:my_package` and built it:
+# ```
+# $ fx build path/to/project:my_package
+# ```
+# You can then find the path to the generated manifest:
+# ```
+# $ fx gn outputs out/default path/to/project:my_package_manifest
+# ```
+#
+# The package name is defined by the target name.
+# Some rules apply to package names.
+# See: https://fuchsia.dev/fuchsia-src/concepts/packages/package_url#package-name
+#
+# It's recommended for a package to depend on one or more `fuchsia_component()`
+# targets, and zero or more `subpackages` and/or `renameable_subpackages`.
+#
+# Examples:
+# ```
+# fuchsia_package("my-package") {
+#   deps = [
+#     ":main_component",
+#   ]
+#   subpackages = [
+#     ":second_package",
+#   ]
+# }
+# ```
+#
+# ```
+# fuchsia_package("my-package") {
+#   deps = [
+#     ":main_component",
+#   ]
+#   renameable_subpackages = [
+#     {
+#       package = ":second_package"
+#     },
+#     {
+#       name = "renamed-subpackage"
+#       package = ":third_package"
+#     }
+#   ]
+# }
+# ```
+#
+# ```
+# fuchsia_package("my-package") {
+#   deps = [
+#     ":first_component",
+#     ":second_component",
+#   ]
+# }
+# ```
+#
+# Parameters
+#
+#   package_name (optional)
+#     The name of the package.
+#     Type: string
+#     Default: target_name
+#
+#   disable_elf_binaries_checks (optional)
+#     Set to true to disable ELF binaries verification checks. Useful
+#     if your package includes non-Fuchsia ELF binaries, or if some
+#     of them are unstripped.
+#     Type: boolean
+#     Default: false
+#
+#   validate_structured_config (optional)
+#     If true, check that component manifests which declare config schemas have been
+#     packaged with the resources needed to resolve them at runtime. Only useful for
+#     those packages which fully generate their configuration during the build. If a
+#     component has configuration provided by assembly tooling, that happens after the
+#     package is built and this should be set to false to prevent spurious errors.
+#     Type: boolean
+#     Default: true
+#
+#   is_system_package (optional)
+#     Used internally to implement fuchsia_system_package(), do not use!
+#     If this is true, this is a fuchsia_system_package(), and it is allowed
+#     to be included in //build/input:system_image.
+#     Type: boolean
+#
+#   is_driver_package (optional)
+#     Used internally to implement fuchsia_driver_package(), do not use!
+#     If defined, this is a fuchsia_driver_package(). The only behavior
+#     difference is a fuchsia_driver_package can be added as a dependency
+#     to the boot image, and its contents will appear in the boot image.
+#     This flag will be removed eventually as fuchsia_driver_packages
+#     are included in the build in the correct way.
+#     Type: boolean
+#
+#   repository (optional)
+#     The repository host name part of the package URL. Defaults to "fuchsia.com".
+#     See https://fuchsia.dev/fuchsia-src/concepts/packages/package_url#repository
+#     for more details.
+#     Type: string
+#     Default: fuchsia.com
+#
+#   subpackages (optional)
+#     A list of `fuchsia_package` targets. Each target is converted into the
+#     equivalent of a `renameable_targets` entry with its `package` property set
+#     to the target, and no `name` override. All included `package` entries will
+#     be added as `deps` of the generated meta file, and do not need to be
+#     listed as additional `deps` of the `fuchsia_package` target.
+#     Subpackage names must be unique (relative to the containing package), but
+#     both `renameable_subpackages` and `subpackages` may be included,
+#     additively.
+#     Type: list of targets
+#
+#   renameable_subpackages (optional)
+#     A list of subpackages defined by scoped variables `package` and an
+#     optional `name`. If `name` is omitted, the subpackage target's package
+#     name is used by default. The generated package will include a
+#     `subpackages` meta file that declares dependencies on the listed packages,
+#     using the current package hash of each package. All included `package`
+#     entries will be added as `deps` of the generated meta file, and do not
+#     need to be listed as additional `deps` of the `fuchsia_package` target.
+#     Subpackage names must be unique (relative to the containing package), but
+#     both `renameable_subpackages` and `subpackages` may be included,
+#     additively.
+#     Type: list of scopes
+#
+#   data_deps
+#   deps
+#   testonly
+#   visibility
+template("fuchsia_package") {
+  if (current_toolchain == target_toolchain) {
+    main_target = target_name
+
+    package_name = target_name
+    if (defined(invoker.package_name)) {
+      package_name = invoker.package_name
+    }
+
+    repository = "fuchsia.com"
+    if (defined(invoker.repository)) {
+      repository = invoker.repository
+    }
+
+    verify_elf = !(defined(invoker.disable_elf_binaries_checks) &&
+                   invoker.disable_elf_binaries_checks)
+
+    _validate_structured_config = true
+    if (defined(invoker.validate_structured_config)) {
+      _validate_structured_config = invoker.validate_structured_config
+    }
+
+    _labels = {
+      dist_manifest = "${target_name}.dist"
+      build_target = "${target_name}.pkg"
+    }
+
+    _files = {
+      dist_manifest = "${target_out_dir}/${target_name}.dist"
+      fini_manifest = "${target_out_dir}/${target_name}.manifest"
+
+      # LINT.IfChange
+      package_out_dir = "${target_out_dir}/$target_name"
+      package_manifest = "${package_out_dir}/package_manifest.json"
+
+      # LINT.ThenChange(//build/packages/exported_fuchsia_package_archive.gni)
+
+      blobs_json = "${package_out_dir}/blobs.json"
+      blobs_manifest = "${package_out_dir}/blobs.manifest"
+    }
+
+    # Generate the "meta/package" file
+    meta_package_target = "${target_name}.meta_package"
+    generate_meta_package(meta_package_target) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                             ])
+      visibility = [ ":*" ]
+      package_name = package_name
+    }
+
+    # Generate the subpackages manifest
+    if (defined(invoker.subpackages) ||
+        defined(invoker.renameable_subpackages) ||
+        defined(invoker.test_pkg__subpackages) ||
+        defined(invoker.test_pkg__renameable_subpackages)) {
+      subpackages_list = []
+
+      if (defined(invoker.renameable_subpackages)) {
+        subpackages_list = invoker.renameable_subpackages
+      }
+      if (defined(invoker.test_pkg__renameable_subpackages)) {
+        subpackages_list = invoker.test_pkg__renameable_subpackages
+      }
+
+      if (defined(invoker.subpackages)) {
+        foreach(subpackage, invoker.subpackages) {
+          subpackages_list += [
+            {
+              package = subpackage
+            },
+          ]
+        }
+      }
+      if (defined(invoker.test_pkg__subpackages)) {
+        foreach(subpackage, invoker.test_pkg__subpackages) {
+          subpackages_list += [
+            {
+              package = subpackage
+            },
+          ]
+        }
+      }
+
+      # Generate the "meta/fuchsia.pkg/subpackages" file
+      meta_subpackages_target = "${target_name}.meta_subpackages"
+      generate_meta_subpackages(meta_subpackages_target) {
+        forward_variables_from(invoker, [ "testonly" ])
+        visibility = [ ":*" ]
+        subpackages = subpackages_list
+      }
+      meta_subpackages_outputs =
+          get_target_outputs(":${meta_subpackages_target}")
+      meta_subpackages_file = meta_subpackages_outputs[0]
+    }
+
+    # Get a JSON manifest of all runtime objects.
+    # Gather metadata about runtime objects.
+    distribution_manifest_generated_file("${_labels.dist_manifest}") {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "deps",
+                               "testonly",
+                             ])
+
+      visibility = [ ":${_labels.build_target}" ]
+
+      # Include the meta/package file in the set of resources to include in the
+      # package
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += [ ":$meta_package_target" ]
+
+      outputs = [ _files.dist_manifest ]
+    }
+
+    metadata_target_name = "${target_name}.metadata"
+    define_package_metadata(metadata_target_name) {
+      package_name = package_name
+      snapshot_entry = "$package_name/0=" +
+                       rebase_path("${_files.blobs_json}", root_build_dir)
+      blob_manifest = _files.blobs_manifest
+      package_output_manifest = _files.package_manifest
+    }
+
+    # Call the wrapper script that builds the package
+    python_action("${_labels.build_target}") {
+      mnemonic = "PACKAGE"
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "data_deps",
+                               "testonly",
+                               "visibility",
+                             ])
+      binary_label =
+          "//build/components:package_creation_wrapper($host_toolchain)"
+
+      # These are the base deps/inputs/outputs/args for all package creation
+      # calls
+      deps = [
+        ":${_labels.dist_manifest}",
+        ":${metadata_target_name}",
+      ]
+      if (defined(_tools_package_tool.dep)) {
+        deps += [ _tools_package_tool.dep ]
+      }
+
+      # The invoker deps are added here (as well as to the dist manifest above)
+      # so that barriers specified in invoker.metadata will work correctly.
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+      inputs = [
+        # GN metadata on package entries
+        _files.dist_manifest,
+
+        # package tool binary
+        _tools_package_tool.input,
+      ]
+      depfile = "${target_out_dir}/${target_name}.d"
+      outputs = [
+        _files.package_manifest,
+        "${_files.package_out_dir}/meta.far",
+        "${_files.package_out_dir}/blobs.json",
+        "${_files.package_out_dir}/blobs.manifest",
+
+        # Intermediate outputs written
+        _files.fini_manifest,
+        "${_files.package_out_dir}/meta.far.d",
+      ]
+      args = [
+        "--distribution-manifest",
+        rebase_path(_files.dist_manifest, root_build_dir),
+        "--fini-manifest",
+        rebase_path(_files.fini_manifest, root_build_dir),
+        "--package-tool",
+        _tools_package_tool.rebased,
+        "--output-dir",
+        rebase_path(_files.package_out_dir, root_build_dir),
+        "--repository",
+        repository,
+        "--api-level",
+        "${current_build_target_api_level}",
+        "--depfile",
+        rebase_path(depfile, root_build_dir),
+      ]
+
+      if (defined(meta_subpackages_target)) {
+        deps += [ ":${meta_subpackages_target}" ]
+        inputs += [ meta_subpackages_file ]
+        args += [
+          "--subpackages-manifest",
+          rebase_path(meta_subpackages_file, root_build_dir),
+        ]
+      }
+
+      if (verify_elf) {
+        args += [
+          "--verify-elf-binaries",
+          "--toolchain-lib-dir=${rebased_clang_dir}/lib",
+          "--toolchain-lib-dir=${rebased_rustc_prefix}/lib",
+        ]
+      }
+
+      if (_validate_structured_config) {
+        if (defined(_tools_configc.dep)) {
+          deps += [ _tools_configc.dep ]
+        }
+        inputs += [ _tools_configc.input ]
+        args += [
+          "--validate-structured-config",
+          _tools_configc.rebased,
+        ]
+      }
+
+      metadata = {
+        if (defined(invoker.metadata)) {
+          forward_variables_from(invoker.metadata, "*")
+        }
+
+        # Only report this package's metadata (and not say, any subpackage's
+        # metadata)
+        package_barrier = [ ":${metadata_target_name}" ]
+
+        # Installing a Fuchsia package into another one should not also install
+        # its content to the root install location, which is why this metadata
+        # key is set to an empty list.
+        distribution_entries_barrier = []
+
+        component_id_index_barrier = []
+
+        test_component_manifest_barrier = []
+        if (!defined(test_components_barrier)) {
+          # don't produce entries for non-test packages.
+          test_components_barrier = []
+        }
+        test_component_manifest_program_barrier = []
+        expect_includes_barrier = []
+      }
+
+      # Ensure that even if the top-level package restricts its visibility,
+      # this action is visible to the main target group.
+      if (defined(visibility)) {
+        visibility += [ ":${main_target}" ]
+      } else {
+        not_needed([ "main_target" ])
+      }
+    }
+
+    group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      public_deps = [ ":${_labels.build_target}" ]
+      if (defined(invoker.package_deps)) {
+        deps = invoker.package_deps
+      }
+    }
+  } else {
+    # Fuchsia packages should only be built with target_toolchain. However, it
+    # is possible for package targets to be expanded in other toolchains (host,
+    # variant, etc.). In these cases, make fuchsia_package expand to nothing.
+    group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+    }
+
+    # Suppress unused variable warnings.
+    not_needed(invoker, "*")
+  }
+}

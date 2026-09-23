@@ -1,0 +1,231 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Use this template to ensure that a shared_library() instance is
+# always installed into a Fuchsia package.
+#
+# By default, the creation of a Fuchsia package ignores shared_library()
+# instances that are not actual ELF runtime dependencies of one of the
+# linkable binaries (e.g. executables or loadable modules) in the package.
+#
+# Use this template guarantee that a given shared_library() instance will
+# always be installed into any fuchsia_package() that depends on it.
+#
+# This is seldom needed, typically when a non-linkable GN target needs to depend
+# on a shared_library() instance directly. Let's consider the example of a
+# component that contains a prebuilt ELF binary, which depends on libfdio.so
+# defined by the //sdk/lib/fdio target. To achieve this, one would use something
+# like the following:
+#
+#     packaged_shared_library("my_fdio") {
+#       library = "//sdk/lib/fdio"
+#     }
+#
+#     fuchsia_component("my_component") {
+#       deps = [
+#         ":my_prebuilt_binary",
+#         ":my_fdio",
+#       ]
+#       ...
+#     }
+#
+# Arguments:
+#   library: (required)
+#     [GN label] A GN label, without toolchain, pointing to a shared_library()
+#     instance.
+#
+#   exclude_toolchain_tags: (optional)
+#     [strings] An optional list of toolchain or variants tags that must be
+#     excluded from build variant redirection. This is useful, for example,
+#     if the final library cannot be built in specific variants (e.g. asan).
+#
+#     Note that if 'library' points to a shared_library() that also defines
+#     exclude_toolchain_tags, the value here should contain at least the same
+#     tags, otherwise package creation will fail.
+#
+#   output_dir, output_name, output_extension, install_name, testonly (optional)
+#     [string] or [boolean]: These must match the target library's definition, if
+#     it happens to set these arguments. This will ensure that variant selectors
+#     based on the target's output name and testonly flag work correctly.
+#
+template("packaged_shared_library") {
+  assert(defined(invoker.library),
+         "'library' must be defined when calling this template!")
+  _library_label = get_label_info(invoker.library, "label_no_toolchain")
+  assert(
+      _library_label != get_label_info(_library_label, "label_with_toolchain"),
+      "'library' label must not contain a toolchain when calling this template: $_library_label")
+
+  # Keep this in sync with variant_target() in //build/config/BUILDCONFIG.gn
+  #
+  _exclude_toolchain_tags = []
+  if (defined(invoker.exclude_toolchain_tags)) {
+    _exclude_toolchain_tags += invoker.exclude_toolchain_tags
+  }
+  if (defined(toolchain_variant.exclude_variant_tags)) {
+    _exclude_toolchain_tags += toolchain_variant.exclude_variant_tags
+  }
+
+  # Compute library output name, keep this in sync with shared_library()
+  if (defined(invoker.output_name)) {
+    _output_name = invoker.output_name
+  } else {
+    _output_name = get_label_info(_library_label, "name")
+  }
+  _prefixless = string_replace("###$_output_name", "###lib", "")
+  if (_prefixless != "###$_output_name") {
+    _output_name = _prefixless
+  }
+  if (defined(invoker.output_extension)) {
+    _output_extension = invoker.output_extension
+  } else {
+    if (current_os == "win") {
+      _output_extension = "dll"
+    } else {
+      _output_extension = "so"
+    }
+  }
+  _output_name = "lib${_output_name}"
+  if (_output_extension != "") {
+    _output_name += "." + _output_extension
+  }
+
+  _install_name = _output_name
+  if (defined(invoker.install_name)) {
+    _install_name = invoker.install_name
+  }
+
+  if (defined(invoker.output_dir)) {
+    _output_dir = invoker.output_dir
+  } else {
+    _output_dir = target_out_dir
+  }
+
+  forward_variables_from(invoker, [ "testonly" ])
+  if (!defined(testonly)) {
+    testonly = false
+  }
+
+  # LINT.IfChange(variant_selection)
+
+  _select = {
+    host = is_host
+    kernel = is_kernel
+    testonly = testonly
+    target_type = [ "shared_library" ]
+    output_name = [ _output_name ]
+    label = [ _library_label ]
+    name = [ get_label_info(_library_label, "name") ]
+    dir = [ get_label_info(_library_label, "dir") ]
+    exclude_toolchain_tags = _exclude_toolchain_tags
+  }
+
+  not_needed([ "_select" ])
+
+  _variant = false
+  _variant_libprefix = ""
+  if (select_variant_canonical != []) {
+    _selected = false
+
+    foreach(_selector, select_variant_canonical) {
+      if (_variant == false) {
+        _selected = true
+        if (_selected && defined(_selector.host)) {
+          _selected = _selector.host == _select.host
+        }
+
+        if (_selected && defined(_selector.kernel)) {
+          _selected = _selector.kernel == _select.kernel
+        }
+
+        if (_selected && defined(_selector.testonly)) {
+          _selected = _selector.testonly == _select.testonly
+        }
+
+        if (_selected && _selector.target_type != []) {
+          _selected = _selector.target_type + _select.target_type -
+                      _select.target_type != _selector.target_type
+        }
+
+        if (_selected && _selector.output_name != []) {
+          _selected = _selector.output_name + _select.output_name -
+                      _select.output_name != _selector.output_name
+        }
+
+        if (_selected && _selector.label != []) {
+          _selected =
+              _selector.label + _select.label - _select.label != _selector.label
+        }
+
+        if (_selected && _selector.name != []) {
+          _selected =
+              _selector.name + _select.name - _select.name != _selector.name
+        }
+
+        if (_selected && _selector.dir != []) {
+          _selected = _selector.dir + _select.dir - _select.dir != _selector.dir
+        }
+
+        if (_selected && _select.exclude_toolchain_tags != []) {
+          _selected = _select.exclude_toolchain_tags + _selector.variant_tags -
+                      _selector.variant_tags == _select.exclude_toolchain_tags
+        }
+
+        if (_selected && _selector.variant != false) {
+          _variant = "-${_selector.variant}"
+
+          # Compute variant-specific libprefix, keep this in sync with the
+          # definition of toolchain_variant.libprefix in
+          # //build/config/BUILDCONFIG.gn
+          if (_selector.variant_tags + [ "instrumented" ] -
+              [ "instrumented" ] != _selector.variant_tags) {
+            _variant_libprefix =
+                string_replace(_selector.variant, "-fuzzer", "") + "/"
+          }
+        }
+      }
+    }
+  }
+
+  if (_variant == false) {
+    _library_toolchain = shlib_toolchain
+  } else {
+    _library_toolchain = "${toolchain_variant.base}${_variant}-shared"
+  }
+
+  # LINT.ThenChange(//build/config/BUILDCONFIG.gn:variant_selection)
+
+  _final_target = "${_library_label}(${_library_toolchain})"
+
+  if (defined(invoker.output_dir)) {
+    _output_dir = invoker.output_dir
+  } else if (_library_toolchain == default_toolchain) {
+    _output_dir =
+        get_label_info("${_library_label}($shlib_toolchain)", "root_out_dir")
+  } else {
+    _output_dir = get_label_info(_final_target, "root_out_dir")
+  }
+
+  group(target_name) {
+    testonly = testonly
+    public_deps = [ _final_target ]
+
+    metadata = {
+      # Used by the distribution_manifest template. Note that this should match
+      # the same entry generated by the final shared_library() target, except
+      # that the 'elf_runtime_dir' field is added.
+      distribution_entries = [
+        {
+          destination = "lib/${_variant_libprefix}${_install_name}"
+          source = rebase_path("${_output_dir}/${_output_name}", root_build_dir)
+          label = get_label_info(target_name, "label_with_toolchain")
+          elf_runtime_dir = "lib/${_variant_libprefix}"
+        },
+      ]
+      # NOTE: Do not use distribution_entries_barrier here to ensure
+      # that the final library's dependencies will be properly included
+      # in the package as well.
+    }
+  }
+}

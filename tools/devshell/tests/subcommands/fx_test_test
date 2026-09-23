@@ -1,0 +1,128 @@
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test expected behavior of fx test
+
+BT_FILE_DEPS=(
+  "scripts/fx"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/host_symbolizer.sh"
+  "tools/devshell/lib/metrics.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/platform.sh"
+  "tools/devshell/test"
+  "tools/devshell/host-tool"
+)
+
+BT_MOCKED_TOOLS=(
+  "tools/devshell/host-tool"
+)
+
+declare fx host_tool_state
+
+BT_SET_UP() {
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx 1)"
+
+  host_tool_state="${BT_TEMP_DIR}/host_tool_calls"
+  rm -f "${host_tool_state}"
+
+  local mock_host_tool="${BT_TEMP_DIR}/tools/devshell/host-tool"
+  cat > "${mock_host_tool}.mock_side_effects" <<'MOCK_EOF'
+    echo "$*" >> "${BT_TEMP_DIR}/host_tool_calls"
+
+    if [[ "$1" == "--print" ]]; then
+      echo "/bin/true"
+      exit 0
+    fi
+
+    if [[ "$1" == "test" ]]; then
+      if [[ -f "${BT_TEMP_DIR}/mock_abort_code" ]]; then
+        code=$(cat "${BT_TEMP_DIR}/mock_abort_code")
+        exit "${code}"
+      fi
+
+      for arg in "$@"; do
+        if [[ "$arg" == "stats-analytics" ]]; then
+          echo '{"t":1000000,"a":0,"ab":null,"top":[],"sum":{}}'
+          exit 0
+        fi
+      done
+
+      save_ptr=""
+      has_log=true
+      prev=""
+      for a in "$@"; do
+        if [[ "$prev" == "--save-log-path-to-file" ]]; then
+          save_ptr="$a"
+        elif [[ "$a" =~ ^--save-log-path-to-file= ]]; then
+          save_ptr="${a#--save-log-path-to-file=}"
+        elif [[ "$a" == "--no-log" || "$a" == "--json" || "$a" == "--logpath=-" || ( "$a" == "-" && "$prev" == "--logpath" ) ]]; then
+          has_log=false
+        fi
+        prev="$a"
+      done
+
+      if [[ -n "$save_ptr" && "$has_log" == true ]]; then
+        mock_log="${BT_TEMP_DIR}/mock_test.log.json.gz"
+        touch "$mock_log"
+        echo "$mock_log" > "$save_ptr"
+      fi
+      exit 0
+    fi
+MOCK_EOF
+}
+
+# Verify all user arguments ($@) are passed intact to host-tool test
+TEST_user_args_passed_intact() {
+  BT_EXPECT ${fx} test --test-filter my_filter pkg_name -- --custom_test_arg
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(< "${host_tool_state}")" "--test-filter my_filter pkg_name -- --custom_test_arg"
+}
+
+# Verify --save-log-path-to-file is passed and cleaned up
+TEST_save_log_path_to_file_passed() {
+  BT_EXPECT ${fx} test my_test
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(< "${host_tool_state}")" "--save-log-path-to-file "
+
+  local ptr_file
+  ptr_file=$(sed -n 's/.*--save-log-path-to-file \([^ ]*\).*/\1/p' "${host_tool_state}" | head -n 1)
+  [[ "${ptr_file}" =~ ^.*\.fxtest_logpath\.[A-Za-z0-9]+$ ]]
+  BT_EXPECT_GOOD_STATUS $?
+  # Pointer file should be cleaned up after execution
+  [[ ! -f "${ptr_file}" ]]
+  BT_EXPECT_GOOD_STATUS $?
+}
+
+# Verify user custom flags are passed intact without interference
+TEST_custom_flags_passed_intact() {
+  local custom_path="${BT_TEMP_DIR}/custom.log.gz"
+  BT_EXPECT ${fx} test --logpath "${custom_path}" --no-log my_test
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(< "${host_tool_state}")" "--logpath ${custom_path} --no-log my_test"
+}
+
+# Verify fast path for non-test commands (help, info, dry, prev)
+TEST_fast_path_non_test() {
+  for flag in "--help" "-h" "--info" "--dry" "-pr" "--prev"; do
+    rm -f "${host_tool_state}"
+    BT_EXPECT ${fx} test ${flag}
+    [[ "$(< "${host_tool_state}")" != *"--print symbolizer"* ]]
+    BT_EXPECT_GOOD_STATUS $?
+    [[ "$(< "${host_tool_state}")" != *"--save-log-path-to-file"* ]]
+    BT_EXPECT_GOOD_STATUS $?
+  done
+}
+
+# Verify exit code propagation on simulated abort (exit 130)
+TEST_aborted_exit_code_propagation() {
+  echo 130 > "${BT_TEMP_DIR}/mock_abort_code"
+  BT_EXPECT_FAIL ${fx} test my_test
+  rm -f "${BT_TEMP_DIR}/mock_abort_code"
+}
+
+BT_RUN_TESTS "$@"

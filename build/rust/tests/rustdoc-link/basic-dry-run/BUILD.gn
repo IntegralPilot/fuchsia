@@ -1,0 +1,88 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This test exercises the --dry-run flag of rustdoc-link, which is consumed
+# by infra to build the rustdoc index.
+
+import("//build/python/python_host_test.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/testing/host_test_data.gni")
+
+group("basic-dry-run") {
+  testonly = true
+  deps = [ ":host_test($host_toolchain)" ]
+}
+
+rustc_library("foo") {
+  edition = "2024"
+  source_root = "crates/foo/src/lib.rs"
+  sources = [ "crates/foo/src/lib.rs" ]
+  define_rustdoc_test_override = true
+}
+
+if (is_host) {
+  rustc_library("bar") {
+    edition = "2024"
+    source_root = "crates/bar/src/lib.rs"
+    sources = [ "crates/bar/src/lib.rs" ]
+    define_rustdoc_test_override = true
+  }
+
+  _rust_target_mapping = "$target_gen_dir/rust_target_mapping.json"
+  generated_file("gen_rust_target_mapping") {
+    outputs = [ _rust_target_mapping ]
+    output_conversion = "json"
+    testonly = true
+    data_keys = [ "rust_target_mapping" ]
+    walk_keys = [ "rust_test_barrier" ]
+    deps = [
+      ":bar($host_toolchain)",
+      ":foo($default_toolchain)",
+    ]
+  }
+
+  _rustdoc_link_output = "${target_gen_dir}/output_base/actions.json"
+  action("rustdoc-link") {
+    testonly = true
+    public_deps = [
+      ":bar.rustdoc($host_toolchain)",
+      ":foo.rustdoc($default_toolchain)",
+      ":gen_rust_target_mapping",
+    ]
+    hermetic_deps = false
+
+    script = "//tools/devshell/contrib/lib/rust/rustdoc-link.py"
+    inputs = [ "${rustc_prefix}/bin/rustdoc" ]
+    outputs = [ _rustdoc_link_output ]
+    args = [
+      "--quiet",
+      "--no-build",
+      "--rustdoc-executable",
+      "${rebased_rustc_prefix}/bin/rustdoc",
+      "--output-base",  # Set output base to avoid writing to global argfiles.
+      rebase_path("${target_gen_dir}/output_base", root_build_dir),
+      "--dry-run",
+      "--rust-target-mapping",
+      rebase_path("$_rust_target_mapping", root_build_dir),
+      "--fuchsia-dir",  # typically provided by devshell
+      rebase_path("//", root_build_dir),
+      "--build-dir",  # typically provided by devshell
+      rebase_path(root_build_dir, root_build_dir),
+    ]
+  }
+
+  _copy_rustdoc_actions = "$target_gen_dir/rustdoc_actions.copy.json"
+  host_test_data("copy-rustdoc-actions") {
+    testonly = true
+    sources = [ _rustdoc_link_output ]
+    outputs = [ _copy_rustdoc_actions ]
+    deps = [ ":rustdoc-link" ]
+  }
+
+  python_host_test("host_test") {
+    main_source = "host_test.py"
+    deps = [ ":copy-rustdoc-actions" ]
+    extra_args = [ rebase_path("$_copy_rustdoc_actions", root_build_dir) ]
+  }
+}

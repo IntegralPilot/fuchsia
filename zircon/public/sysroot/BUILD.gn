@@ -1,0 +1,351 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//sdk/lib/c/libc_toolchain.gni")
+import("//sdk/lib/c/sysroot_entries.gni")
+import("//src/zircon/lib/zircon/sysroot_entries.gni")
+
+assert(current_toolchain != shlib_toolchain,
+       "deps in //zircon/public/sysroot should use \$variant_base_toolchain")
+
+# This file is used to build the sysroot directories used to build C++,
+# Rust and Go binaries with the Fuchsia build system.
+#
+# A "sysroot" is a directory that should provide system headers, libraries
+# and support files for a given target system. In the case of Fuchsia,
+# its layout will look like:
+#
+#   * `include/`
+#     - Files here are found via `#include <...>`.
+#
+#   * `lib/`
+#     - `Scrt1.o` is found here by the compiler driver for an executable linked
+#        without `-nostartfiles`.  This has nontrivial build steps that must
+#        be done before linking any such executable.
+#     - `lib*.so` files here are found at link time via `-l...` (including
+#       implicitly by the compiler driver) and equivalent linker mechanisms
+#       such as deplibs (which is used by some toolchain-supplied prebuilt
+#       runtime libraries).  These files may be needed either explicitly or
+#       implicitly to link shared_library() and loadable_module() targets as
+#       well as executable() targets.  These files are all either tiny
+#       generated_file() text files or ELF linking stubs made by very quick
+#       ifs_shared_library() build steps.
+#
+# Note that in Fuchsia the sysroot **does not** contain the runtime files for
+# shared libraries.  The sysroot only supplies compile-time and link-time
+# files.  However, there are implied runtime file dependencies for any shared
+# libraries used by executable() or loadable_module() targets; and for the
+# PT_INTERP file of any dynamically-linked executable even if it uses no shared
+# libraries per se.  None of these runtime files is needed at compile time, nor
+# at link time.  But they must go into the Fuchsia package's filesystem image
+# along with that executable, by being in data_deps and propagating metadata.
+# The :data target handles this.
+#
+# Each sysroot is toolchain-specific to allow variants to affect its link-time
+# artifacts (currently only `Scrt1.o` might differ, except by $current_cpu).
+#
+# Each sysroot directory is created as follows:
+#
+#   * //build/config/fuchsia:source_deps is in deps blocking build/rebuild of
+#     target that does compilation.  Its deps suffice to compile and/or link
+#     anything but an executable:
+#
+#     - :include keeps `include/` populated (and cleaned of stale files for
+#      headers removed in an incremental build) using a Python script.  It gets
+#      copies of all header files (the same files in every sysroot).
+#
+#     - :lib delivers each `lib/lib*.so` file in either of two ways:
+#        1. Some `lib*.so` files are tiny linker script files with fixed
+#           contents.  These are created via generated_file() targets, once at
+#           `gn gen` time.  Until those contents are changed in GN, repeated
+#           regenerations won't cause relinks by dirtying link inputs.
+#        2. ELF linking stubs are created by ifs_shared_library() targets.
+#           There is one `llvm-ifs` build step for each file across all
+#           toolchains for each $current_cpu, which is copied (hard-linked)
+#           into each sysroot.  Changes to `.ifs` files that don't change the
+#           ELF contents won't cause relinks by dirtying link inputs.
+#
+#   * //build/config/fuchsia:link_deps is in deps blocking build/rebuild of any
+#     linking target.  Its deps are needed before an executable can be linked
+#     (without `-nostartfiles`).  This ideally would be in :executable_deps
+#     instead, but the RBE link wrapper requires the startfiles to be present
+#     for all link steps, not just for executables (which could ever use them,
+#     while other kinds of link steps never do).
+#
+#     - :startfiles delivers the `lib/Scrt1.o` file via libc's build rules.
+#       It's a copy (hard link) of the actual build location, and relinks
+#       will be triggered only when it gets recompiled from source.
+#
+# Note that these targets never directly contribute any link inputs to the
+# GN/Ninja build graph, nor any configs or suchlike that would affect any
+# compilation or link step's command line.  They just constitute order-only
+# deps to ensure that their respective sysroot files are fully up to date.
+# Triggering recompiles for changed header files in the sysroot depends
+# entirely on the depfile from the compiler.  Triggering relinks for changed
+# link inputs in the sysroot depends entirely on the depfile from the linker.
+#
+# By the same token, the order-only deps mean that a compilation step that uses
+# `-nostdinc` or otherwise never reads a sysroot header file will _wait_ for
+# the sysroot headers to be brought up to date, but won't be recompiled
+# unnecessarily.  A linking step that uses `-nostdlib` and/or `-nostartfiles`
+# or otherwise never reads a sysroot link input will _wait_ for some sysroot
+# link inputs to be brought up to date, but it won't be relinked unnecessarily.
+#
+# The Rust compiler uses the `lib/` files in much the same way that the C/C++
+# compiler does, and they both use the same linker.  Rust-based builds may also
+# invoke the C/C++ compiler and thereby use the `include/` files as it does.
+#
+# The Go compiler is somewhat more finnicky about its link inputs.  But the
+# linker scripts in this sysroot are empty except for comments, which Go
+# doesn't mind.  The other link inputs are ELF files.  The Go compiler may or
+# may not use `lib/Scrt1.o` and won't use `include/` files, but it can use the
+# ELF linking stubs found in `lib/lib*.so` files.
+
+# Collect the scope definitions that list all sysroot headers.
+sysroot_entries = sysroot_uninstrumented_libc_entries +
+                  sysroot_instrumented_libc_entries + sysroot_vdso_entries
+
+# Generate the "$target_gen_dir/include" directory by parsing the
+# sysroot_entries list of scopes.
+#
+# For historical reasons, only the scopes with an `sdk` key are considered
+# here. Each value associated with an `sdk` key is a scope itself, with the
+# following schema:
+#
+# If `include_dir` is present then:
+#
+#   include_dir (optional)
+#     [GN path] A GN path to a subdirectory containing zero or more headers
+#     to copy to the sysroot's include directory. This can also be a
+#     path relative to the Ninja build directory.
+#
+#   headers (optional)
+#     [list of paths] Required if `include_dir` is specified, ignored otherwise.
+#     A list of header sub-paths, relative to `include_dir`, that must be
+#     copied to the sysroot directory.
+#
+#   no_export (optional)
+#     [boolean] Ignored if `include_dir` is not used. A flag that is set to
+#     indicate that the set of headers described in the current entry should
+#     not be exported to the SDK sysroot (though they will still be copied
+#     to the platform's sysroot). This is useful for <zircon/device/*.h>
+#     headers, as well as `testonly-cdecls.inc`.
+#
+# Otherwise, if `include_dir` is _not_ present:
+#
+#   source (optional)
+#     [path] A path, relative to the current root build directory, where
+#     to find the source file to be copied into the sysroot, where destination
+#     is specified by one of the ` link`, `debug` or `dist` keys described
+#     below. Ignored if `include_dir` is present.
+#
+#   debug (optional)
+#   dist (optional)
+#   link (optional)
+#     [path] A path relative to the sysroot directory, that specifies where
+#     the `source` file needs to be copied into the SDK. Only one of these
+#     keys can be used per entry. For the platform SDK, onle `dist` and `link`
+#     are used. The SDK sysroot will use all three though.
+#
+#   deps (optional)
+#     [list of labels] A list of labels to dependencies for this entry,
+#     this should correspond to the GN target that built the `source`
+#     file, once the sysroot generation is moved to the Fuchsia build.
+#
+
+# The flat list of files relative to include/ is collected here.  For each
+# file, a generated_file() target generates an `#include "../..."` header that
+# acts as a "redirector".  The labels of all these targets are collected too,
+# along with any labels from `sdk.deps`.
+sysroot_include_files = []
+sysroot_include_deps = []
+foreach(entry, sysroot_entries) {
+  if (defined(entry.sdk)) {
+    foreach(sdk, [ entry.sdk ]) {  # Singleton loop to get a temporary scope.
+      if (defined(sdk.headers)) {
+        if (defined(sdk.deps)) {
+          # Add the deps of any sdk scope that adds headers to get generation
+          # steps--but not others, which will reach binaries and influence the
+          # link.  This loses the association of which headers had which deps
+          # when looking at the deps graph with `gn desc` or `gn path` and so
+          # on.  However, it avoids a bunch of duplicated lists and many more
+          # multiple paths to reach the same deps from :include.
+          sysroot_include_deps += sdk.deps
+        }
+        foreach(dir, [ sdk.include_dir ]) {  # Singleton for scope.
+          # The sdk.include_dir item is a strange beast: it's either a // path
+          # or it's a path relative to $root_build_dir.  The rebase_path()
+          # operation treats the input path as relative to the last argument
+          # if it's relative, so rebasing it to the same directory is a no-op;
+          # but it relativizes an absolute (//) path.
+          dir = rebase_path(dir, root_build_dir, root_build_dir)
+          foreach(file, sdk.headers) {
+            file_target = "include." + string_replace(file, "/", "-")
+            sysroot_include_files += [ file ]
+            sysroot_include_deps += [ ":$file_target" ]
+            generated_file(file_target) {
+              visibility = [ ":*" ]
+              output_conversion = "list lines"
+              outputs = [ "$target_gen_dir/include/$file" ]
+
+              # The `#include "..."` path is always tried first relative to
+              # the containing file itself.  So compute the precise path
+              # relative from this proxy header to the real file in the source
+              # (which $dir represents relative to $root_build_dir).
+              # This is not only smaller and more rare to change than a copy,
+              # but the compiler's error messages will report the real source
+              # location in the original file that can be edited.
+              _relative_path = rebase_path("$dir/$file",
+                                           get_path_info(outputs[0], "dir"),
+                                           root_build_dir)
+              contents =
+                  [ "#include \"${_relative_path}\"  // IWYU pragma: export" ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# This doesn't have anything to do at runtime except whatever
+# header-generation steps are reached by some sdk.deps lists.  Its deps must
+# also reach all the generated_file() targets just to keep them alive so the
+# files are actually generated by `gn gen`.
+group("include") {
+  visibility = [ "//build/config/fuchsia:source_deps" ]
+
+  deps = sysroot_include_deps
+
+  metadata = {
+    # Populate build_api("generated_sources") to ensure all the headers are
+    # present for analysis.
+    generated_sources = rebase_path(sysroot_include_files,
+                                    root_build_dir,
+                                    "$target_gen_dir/include")
+  }
+}
+
+# Generate the shared library linking stubs in "$target_gen_dir/lib".  This
+# is everything a shared_library() target might need, but not the startfiles.
+
+link_stub_dirs = [
+  "//sdk/lib/c",
+  "//src/zircon/lib/zircon",
+]
+
+copy("lib") {
+  visibility = [
+    ":startfiles",
+    "//build/config/fuchsia:source_deps",
+  ]
+
+  sources = []
+  deps = []
+  foreach(link_stub_dir, link_stub_dirs) {
+    stub_out_dir = get_label_info(link_stub_dir, "target_out_dir")
+    stub_name = get_path_info(link_stub_dir, "name")
+    sources += [ "$stub_out_dir/lib${stub_name}.so" ]
+    deps += [ "$link_stub_dir:$stub_name.stub" ]
+  }
+  outputs = [ "$target_gen_dir/lib/{{source_file_part}}" ]
+
+  foreach(stub, sysroot_stub_libs) {
+    deps += [ ":$stub" ]
+  }
+}
+
+foreach(stub, sysroot_stub_libs) {
+  generated_file(stub) {
+    visibility = [ ":*" ]
+    outputs = [ "$target_gen_dir/lib/$stub" ]
+    output_conversion = "list lines"
+    contents = [
+      "/* Empty $stub placeholder because it's already implicit in -lc. */",
+    ]
+  }
+}
+
+# Generate a JSON list of file names relative to target_gen_dir.
+# No others should exist.
+sysroot_files = rebase_path(sysroot_include_files,
+                            target_gen_dir,
+                            "$target_gen_dir/include") +
+                rebase_path([ "Scrt1.o" ] + sysroot_stub_libs,
+                            target_gen_dir,
+                            "$target_gen_dir/lib")
+foreach(name, get_path_info(link_stub_dirs, "name")) {
+  sysroot_files += [ "lib/lib$name.so" ]
+}
+
+# The JSON file itself is the only file in target_gen_dir not in sysroot_files.
+# It's listed as well so it doesn't get removed by the cleanup script.
+generated_file("sysroot-files.json") {
+  visibility = [ ":*" ]
+  outputs = [ "$target_gen_dir/$target_name" ]
+  output_conversion = "json"
+  contents = sysroot_files + rebase_path(outputs, target_gen_dir)
+}
+
+# The libc/startup target writes into our $target_gen_dir/lib directly.  This
+# does the cleanup checking for all of $target_gen_dir, meaning its deps must
+# reach :include and :lib too.  This target is reached only via link_deps and
+# those will also be reached by source_deps in the same target anyway, it
+# doesn't cause any more serialization.
+action("startfiles") {
+  script = "cleanup.py"
+
+  # The script reads the JSON file and runs again when it changes.
+  deps = [ ":sysroot-files.json" ]
+  sources = get_target_outputs(deps[0])
+
+  # The script also runs again when any of the files has changed as a secondary
+  # check just to verify that the deps are really in place to get them there
+  # and another chance to scan for extra files.  It's still possible that some
+  # new file has been created in the directory though neither the list of
+  # expected files nor any of expected those files themselves has changed, and
+  # the script won't be run when it does have files to clean up.  But that
+  # can't really be avoided without using directory timestamps, which tend to
+  # be problematic.
+  inputs = rebase_path(sysroot_files, ".", target_gen_dir)
+
+  # This gets all the header files up to date before checking for stale files.
+  # This is just the deps list of :include, but the generated_file() targets
+  # must be direct deps to use their outputs as inputs.
+  deps += sysroot_include_deps
+
+  # This gets all the linking stubs (and indirectly, the stub linker scripts)
+  # that are in inputs.
+  deps += [ ":lib" ]
+
+  # These are in deps of :lib, but they must be in direct deps to be in inputs.
+  foreach(stub, sysroot_stub_libs) {
+    deps += [ ":$stub" ]
+  }
+
+  # This has "$sysroot/lib/Scrt1.o" as a direct output.
+  deps += [ "//sdk/lib/c/startup:startfiles" ]
+
+  # The script takes the directory, the JSON file, and the stamp file.  All the
+  # other inputs are just to get it to check for stray files more often.
+  outputs = [ "$target_gen_dir/cleanup.stamp" ]
+  args = rebase_path([ target_gen_dir ] + sources + outputs, root_build_dir)
+}
+
+# //build/config:terminal_link_deps is in deps of every executable() and
+# loadable_module(). It has data_deps here to ensure any runtime file
+# dependencies for shared libraries linked in from the sysroot get packaged up.
+group("data") {
+  data_deps = [ "//sdk/lib/c:libc" ]
+}
+
+# A special dependency that ensures that the uninstrumented C library is
+# available in the system package as /lib/ld.so.1. For more details read
+# //sdk/lib/c/libc_toolchain.gni
+#
+# In practice, should only be used to build the system package, and some
+# prebuilt driver packages.
+group("system_libc_deps") {
+  public_deps = [ system_libc_target ]
+}

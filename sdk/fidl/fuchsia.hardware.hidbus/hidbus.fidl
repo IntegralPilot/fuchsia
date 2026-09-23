@@ -1,0 +1,153 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.hidbus;
+
+using zx;
+
+alias ReportId = uint8;
+
+const MAX_DESC_LEN uint16 = 8192;
+const MAX_REPORT_LEN uint16 = 8192;
+const MAX_REPORT_DATA uint16 = 8192;
+
+type ReportType = strict enum : uint8 {
+    INPUT = 1;
+    OUTPUT = 2;
+    FEATURE = 3;
+};
+
+/// HID 1.11 Chapter 7.1 Class Descriptor Types
+type HidDescriptorType = strict enum : uint8 {
+    HID = 0x21;
+    REPORT = 0x22;
+    PHYSICAL = 0x23;
+};
+
+/// HID 1.11 Chapter 4.2 Subclass
+type HidProtocol = strict enum : uint8 {
+    BOOT = 0;
+    REPORT = 1;
+};
+
+/// HID 1.11 Chapter 4.3 Protocols
+type HidBootProtocol = strict enum : uint8 {
+    NONE = 0;
+    KBD = 1;
+    POINTER = 2;
+    OTHER = 3;
+};
+
+/// The HID protocol doesn't specify any character strings. This const value
+/// limits the length of names passed along from low-level protocols such as
+/// USB and Bluetooth.
+///
+/// Chosen to be larger than the size limits for USB string descriptors
+/// (Universal Serial Bus Specification v2.0, 9.6.7 String) and Bluetooth Device
+/// Name (Bluetooth Specification v5.2, Vol 4, Part E, Section 6.23).
+const MAX_NAME_LENGTH uint32 = 256;
+
+/// Contains both information shared among HID protocols and specific to HID
+/// devices, and information passed along by the low-level transport.
+type HidInfo = table {
+    1: dev_num uint8;
+    // boot_protocol is NONE if device is not boot protocol.
+    2: boot_protocol HidBootProtocol;
+
+    3: vendor_id uint32;
+    4: product_id uint32;
+    5: version uint32;
+
+    /// polling rate if applicable in usec
+    6: polling_rate zx.Duration;
+
+    /// Human-readable name of the manufacturer. Optional.
+    7: manufacturer_name string:MAX_NAME_LENGTH;
+
+    /// Human-readable name of the product. Optional.
+    8: product_name string:MAX_NAME_LENGTH;
+
+    /// Serial number of the device. Optional.
+    9: serial_number string:MAX_NAME_LENGTH;
+};
+
+type Report = resource table {
+    1: buf vector<uint8>:MAX_REPORT_DATA;
+    2: timestamp zx.Time;
+    3: wake_lease zx.Handle:EVENTPAIR;
+};
+
+closed protocol Hidbus {
+    /// Obtain information about the hidbus device and supported features.
+    /// Safe to call at any time.
+    strict Query() -> (struct {
+        info HidInfo;
+    }) error zx.Status;
+
+    /// Start the hidbus device. The device may begin queueing hid reports via
+    /// OnReportReceived before this function returns. The hidbus device will
+    /// keep track of the number of times Start has been called and will only
+    /// be stopped when Stop has been called for each Start that has been
+    /// called. Theoretically, Start should not be called again by the same
+    /// client unless it has called Stop.
+    strict Start() -> () error zx.Status;
+    /// Stop the hidbus device.
+    strict Stop() -> ();
+
+    /// Queues a report received by the hidbus device.
+    /// Timestamp should be whenever the report was created. Ideally it should
+    /// come from the driver's IRQ callback. If the driver doesn't have
+    /// something like that it should fill this with `zx_clock_get_monotonic()`
+    strict -> OnReportReceived(Report);
+
+    /// Methods matching HID spec 1.11 Chapter 7 Requests
+    /// 7.1.1 Get_Descriptor
+    strict GetDescriptor(struct {
+        desc_type HidDescriptorType;
+    }) -> (struct {
+        data vector<uint8>:MAX_DESC_LEN;
+    }) error zx.Status;
+    /// 7.1.2 Set_Descriptor (optional)
+    strict SetDescriptor(struct {
+        desc_type HidDescriptorType;
+        data vector<uint8>:MAX_DESC_LEN;
+    }) -> () error zx.Status;
+    /// 7.2.1 Get_Report
+    strict GetReport(struct {
+        rpt_type ReportType;
+        rpt_id ReportId;
+        len uint64;
+    }) -> (struct {
+        data vector<uint8>:MAX_REPORT_LEN;
+    }) error zx.Status;
+    /// 7.2.2 Set_Report
+    strict SetReport(struct {
+        rpt_type ReportType;
+        rpt_id ReportId;
+        data vector<uint8>:MAX_REPORT_LEN;
+    }) -> () error zx.Status;
+    /// 7.2.3 Get_Idle
+    strict GetIdle(struct {
+        rpt_id ReportId;
+    }) -> (struct {
+        duration zx.Duration;
+    }) error zx.Status;
+    /// 7.2.4 Set_Idle
+    strict SetIdle(struct {
+        rpt_id ReportId;
+        duration zx.Duration;
+    }) -> () error zx.Status;
+    /// 7.2.5 Get_Protocol
+    strict GetProtocol() -> (struct {
+        protocol HidProtocol;
+    }) error zx.Status;
+    /// 7.2.6 Set_Protocol
+    strict SetProtocol(struct {
+        protocol HidProtocol;
+    }) -> () error zx.Status;
+};
+
+service Service {
+    device client_end:Hidbus;
+};

@@ -1,0 +1,589 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/licenses/generated_licenses_spdx.gni")
+
+# A set of GN templates to expose Ninja-generated output files as inputs
+# to bazel_action() targets. The latter run a `bazel build` command in
+# the Bazel workspace setup by the platform build, which cannot access
+# the Ninja output directory directly.
+#
+# A bazel_input_xxx() target defines a mapping from Ninja-generated outputs
+# as Bazel filegroups) targets. For historical reasons two distinct
+# mechanisms exist:
+#
+# For full documentation, see the dedicated section in //build/bazel/README.md
+#
+# Use bazel_input_file() and/or bazel_input_directory() to expose output files
+# or even directories.
+#
+# These templates populate the special @gn_targets// external repository
+# with filegroup() targets named "@gn_targets//{gn_dir}:{gn_name}
+# where {gn_dir} and {gn_name} reflect the directory and name of the
+# bazel_input_xxx() target.
+#
+# For example, consider an action //src/lib:gen_foo that generates some
+# outputs that needs to be exposed to the Bazel graph. This would look like:
+#
+#     # //src/lib/BUILD.gn
+#     action("gen_foo") {       # generating action
+#       outputs = [ ... ]
+#     }
+#
+#     bazel_input_file("foo_outputs") {  # expose outputs to Bazel
+#       generator = ":gen_foo"
+#     }
+#
+#  Here the "foo_outputs" targets doesn't generate anything, it just records
+#  information about the output files and what generates them.
+#
+#  Next, one can define a Bazel target that accesses the output files directly
+#  using the @gn_targets//<gn_label> notation, where <gn_label> matches
+#  the GN label of the bazel_input_file() target above, as in:
+#
+#     # //src/bar/BUILD.bazel
+#     process_file(
+#        name = "process_foo",
+#        # The input target name is `gn_targets_name` if specified and the name
+#        # of the `generator` target otherwise.
+#        input = "@gn_targets//src/lib:gen_foo",
+#        output = "foo_processed_by_bazel",
+#     )
+#
+#  Invoking Bazel from GN can be done with a bazel_action() target, which must
+#  list "foo_outputs" as part of its dependencies. For example:
+#
+#     # //src/bar/BUILD.gn
+#     bazel_action("process_foo_with_bazel") {
+#        command = "build"
+#        deps = [ "//src/lib:foo_outputs "]
+#        copy_outputs = {
+#           bazel = "{{BAZEL_TARGET_OUT_DIR}}/foo_processed_by_bazel"
+#           ninja = "foo_final"
+#        }
+#     }
+#
+#  Then trying to `fx build //src/bar:process_foo_with_bazel` will do the following:
+#
+#     - Ensure the outputs of //src/lib:gen_foo are up-to-date.
+#     - Update the content of the @gn_targets repository _before_ launching Bazel.
+#     - Invoke Bazel with something equivalent to `fx bazel build //src/bar:process_foo`
+#     - Copy the Bazel build artifact into its final location $BUILD_DIR/obj/src/bar/foo_final
+#     - Generate Ninja depfile dependencies from the Bazel build graph to ensure that if
+#       anything changes in the Bazel build graph, Ninja will properly re-invoke Bazel
+#       if needed.
+#
+
+# Used internally by bazel_input_file() and bazel_input_directory()
+template("_bazel_input_entry") {
+  _main_target_name = target_name
+
+  if (invoker.entry_type == "file") {
+    _output_files = rebase_path(invoker.outputs, root_build_dir)
+  } else if (invoker.entry_type == "directory") {
+    _output_dir = rebase_path(invoker.output_directory, root_build_dir)
+  } else {
+    assert(false, "Unknown _bazel_input_entry type: ${invoker.entry_type}")
+  }
+
+  # The Bazel package is the generator's GN directory, with an optional
+  # 'toolchain_<name>' prefix if it does not belong to the default toolchain.
+  # For example:
+  #
+  #   generator = "//src/lib/foo"
+  #      bazel_package = "src/lib/foo"
+  #      bazel_name    = "foo"
+  #      final_label   = "@gn_targets//src/lib/foo:foo"
+  #
+  #   generator = "//zircon/tools/zbi(//build/toolchain:host_x64)
+  #      bazel_package = "toolchain_host_x64/zircon/tools/zbi"
+  #      bazel_name    = "zbi"
+  #      final_label   = "@gn_targets//toolchain_host_x64/zircon/tools/zbi:zbi"
+  #
+  _bazel_package = get_label_info(invoker.generator, "dir")
+  _bazel_package = string_replace(_bazel_package, "//", "")
+  if (current_toolchain != default_toolchain) {
+    _toolchain_name = get_label_info(current_toolchain, "name")
+    _bazel_package = "toolchain_${_toolchain_name}/${_bazel_package}"
+  }
+
+  if (defined(invoker.gn_targets_name)) {
+    _bazel_name = invoker.gn_targets_name
+  } else {
+    _bazel_name = get_label_info(invoker.generator, "name")
+  }
+
+  _licenses_spdx_target = "${target_name}.licenses_spdx"
+
+  # IMPORTANT: This must end in `.spdx.json` for license classification to work
+  # correctly!
+  _licenses_spdx_file = "$target_out_dir/${target_name}.licenses.spdx.json"
+
+  # Generate the SPDX file for the generated outputs.
+  generated_licenses_spdx(_licenses_spdx_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    target = invoker.generator
+    output = _licenses_spdx_file
+    spdx_root_package_name = "Fuchsia"
+    debug_hints = true
+
+    include_host_tools = defined(invoker.include_host_tools_licenses) &&
+                         invoker.include_host_tools_licenses
+
+    ignore_collection_errors =
+        defined(invoker.ignore_license_collection_errors) &&
+        invoker.ignore_license_collection_errors
+
+    visibility = [ ":${_main_target_name}" ]
+  }
+
+  group(_main_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "applicable_licenses",
+                           ])
+
+    deps = [
+      ":${_licenses_spdx_target}",
+      invoker.generator,
+    ]
+
+    metadata = {
+      # Used by generate_gn_targets_repository_manifest() template, which
+      # is part of the new scheme to expose Ninja outputs as Bazel inputs.
+      gn_targets_repository_entries = [
+        {
+          # LINT.IfChange(gn_targets_repository_manifest)
+          generator_label =
+              get_label_info(invoker.generator, "label_with_toolchain")
+          bazel_package = _bazel_package
+          bazel_name = _bazel_name
+          if (invoker.entry_type == "file") {
+            output_files = _output_files
+          } else if (invoker.entry_type == "directory") {
+            output_directory = _output_dir
+          }
+          license_spdx_file = rebase_path(_licenses_spdx_file, root_build_dir)
+
+          # LINT.ThenChange(//build/bazel/scripts/workspace_utils.py:gn_targets_repository_manifest)
+        },
+      ]
+      gn_targets_repository_entries_barrier = []
+      bazel_inputs_barrier = []
+    }
+  }
+}
+
+# Expose a set of GN target output files to Bazel.
+#
+# Calling this template does not build anything, but the resulting
+# target should be in the dependencies of any bazel_action() target
+# that needs to access these files from the Bazel graph.
+#
+# They will be exposed through a single filegroup() defined as
+# @gn_targets//{target_dir}:{generator_name} in the Bazel graph,
+# where {target_dir} matches the directory of the current target,
+# and {generator_name} is the name of the generator target (
+# which could be defined in a different directory).
+#
+# For example:
+#
+#    ```
+#    # From //src/lib/BUILD.gn
+#    bazel_input_file("foo.bazel_inputs") {
+#      generator = ":foo"
+#    }
+#    ```
+#
+# Will expose the outputs of the `//src/lib:foo` target in the Bazel
+# filegroup named `@gn_targets/src/lib:foo`.
+#
+# It is possible to change the name of the Bazel filegroup by setting
+# the `gn_targets_name` argument. For example:
+#
+#    ```
+#    bazel_input_file("foo.bazel_inputs") {
+#      generator = ":foo"
+#      gn_targets_name = "foo_files"
+#    }
+#    ```
+#
+#    Will create a filegroup() named `@gn_targets//src/lib:foo_files`
+#    instead.
+#
+#    Note: only the filegroup name can be change, not its package which is
+#    hard-coded to @gn_targets//{target_dir}.
+#
+# If no 'outputs' argument is provided, *and* the generator and target
+# are defined in the same BUILD.gn file and toolchain, then
+# get_target_outputs(generator) will be used to expose all outputs
+# from the generator target.
+#
+# If the generator and target are in different BUILD.gn file, or
+# different toolchain contexts, the 'outputs' argument is required.
+#
+# When an 'outputs' argument is specified, it doesn't need to list all
+# outputs from the generator, only those that need to be exposed.
+#
+# It is an error to expose a directory through 'outputs', as Bazel
+# will complain when trying to access its content later. Use
+# bazel_input_directory() to handle this use case.
+#
+# Arguments:
+#   generator: GN label of target that generates the output files.
+#      This can also be the label of a group() that depends on multiple
+#      generating targets. In this case, the 'outputs' argument will be
+#      required to list the output files from said dependencies to be
+#      exposed.
+#
+#   outputs: Optional. List of output files for this target that will be exposed
+#      to Bazel. This argument is required if this target and the generator are
+#      defined in different directories or toolchains.
+#
+#   gn_targets_name: Optional. Name of Bazel filegroup() used to expose the
+#      output files. If not provided, this will use the name of the generator
+#      target.
+#
+#   include_host_tools_licenses: (optional)
+#     Set this to true to include the licenses of host tool dependencies in
+#     this target's SPDX file.
+#     Type: boolean
+#     Default: false
+#
+#   ignore_license_collection_errors: (optional)
+#     Set this to true to ignore errors when collecting license requirements
+#     from dependencies.
+#     Type: boolean
+#     Default: false
+#
+#   testonly, visibility: Usual GN meaning.
+#
+template("bazel_input_file") {
+  assert(defined(invoker.generator),
+         "bazel_input_file() requires a generator argument!")
+
+  # Auto-compute 'outputs' value if not provided, and the right conditions are
+  # checked.
+  if (!defined(invoker.outputs)) {
+    _target_dir = get_label_info(":$target_name", "dir")
+    _generator_dir = get_label_info(invoker.generator, "dir")
+    assert(
+        _target_dir == _generator_dir,
+        "bazel_input_file() requires an 'outputs' argument if target and generator are from different directories (${_target_dir} != ${_generator_dir}")
+
+    _target_toolchain = get_label_info(":$target_name", "toolchain")
+    _generator_toolchain = get_label_info(invoker.generator, "toolchain")
+    assert(
+        _target_toolchain == _generator_toolchain,
+        "bazel_input_file() requires an 'outputs' argument if target and generator are from different toolchains (${_target_toolchain} != ${_generator_toolchain}")
+    invoker.outputs = get_target_outputs(invoker.generator)
+  }
+
+  _bazel_input_entry(target_name) {
+    entry_type = "file"
+    forward_variables_from(invoker, "*")
+  }
+}
+
+# Expose a GN target output directory to Bazel.
+#
+# This is similar to bazel_input_file() but allows exposing an output
+# directory, for the rare case where a GN target generates one.
+#
+# Note that only a single directory can be specified per instance.
+# The directory will be exposed as a Bazel filegroup() with the
+# name `@gn_targets//{gn_dir}:{gn_target}`. The filegroup's
+# sources will be grabbed with a `glob()` statement and will thus
+# contain all files and directories contained in it.
+#
+# Arguments:
+#   generator: GN label of target that generates the output files.
+#
+#   output_directory: GN path to output directory populated by the generator.
+#      This argument can be omitted if all conditions apply:
+#         - The target and the generator are defined in the same BUILD.gn file.
+#         - The target and the generator are defined in the same GN toolchain context.
+#         - The generator only produces a single output (from GN's point of view).
+#
+#   gn_targets_name: Optional. Name of Bazel filegroup() used to expose the
+#      output files. If not provided, this will use the name of the generator
+#      target.
+#
+#   include_host_tools_licenses: (optional)
+#     Set this to true to include the licenses of host tool dependencies in
+#     this target's SPDX file.
+#     Type: boolean
+#     Default: false
+#
+#   ignore_license_collection_errors: (optional)
+#     Set this to true to ignore errors when collecting license requirements
+#     from dependencies.
+#     Type: boolean
+#     Default: false
+#
+#   testonly, visibility: Usual GN meaning.
+#
+template("bazel_input_directory") {
+  assert(defined(invoker.generator),
+         "bazel_input_directory() requires a generator argument!")
+
+  if (!defined(invoker.output_directory)) {
+    assert(defined(invoker.generator),
+           "bazel_input_directory() requires a 'generator' argument")
+    _target_dir = get_label_info(":$target_name", "dir")
+    _generator_dir = get_label_info(invoker.generator, "dir")
+    assert(
+        _target_dir == _generator_dir,
+        "bazel_input_file() requires an 'outputs' argument if target and generator are from different directories (${_target_dir} != ${_generator_dir}")
+
+    _target_toolchain = get_label_info(":$target_name", "toolchain")
+    _generator_toolchain = get_label_info(invoker.generator, "toolchain")
+    assert(
+        _target_toolchain == _generator_toolchain,
+        "bazel_input_file() requires an 'outputs' argument if target and generator are from different toolchains (${_target_toolchain} != ${_generator_toolchain}")
+
+    _outputs = get_target_outputs(invoker.generator)
+    assert(
+        _outputs != [] && _outputs == [ _outputs[0] ],
+        "bazel_input_directory() requires an 'output_directory' argument if the generator produces more than one output: ${_outputs}")
+    invoker.output_directory = _outputs[0]
+  }
+  assert(defined(invoker.output_directory),
+         "Missing output_directory argument.")
+  assert("${invoker.output_directory}" == invoker.output_directory,
+         "output_directory argument must be a path string.")
+  _bazel_input_entry(target_name) {
+    entry_type = "directory"
+    forward_variables_from(invoker, "*")
+  }
+}
+
+# Generate a manifest file describing the content of the Bazel inputs
+# repository that will be used by the Bazel workspace to read Ninja outputs
+# as sources / prebuilts.
+#
+# Args:
+#   output:
+#     Path to generated manifest file.
+#
+#   inputs_deps:
+#     A list of targets, all transitive dependencies which are bazel_input_xxx()
+#     target will generate one entry in the manifest.
+#
+template("generate_bazel_inputs_manifest") {
+  # Generate a single manifest file that collects all bazel_input_xxx()
+  # resources. Each metadata entry is a scope that describes a single
+  # Bazel filegroup() target that will appear at the top of the
+  # auto-generated workspace.
+  #
+  # There are two types of entries:
+  #
+  # ## REGULAR ENTRIES
+  #
+  #   These entries expose an explicit list of files, they look like:
+  #
+  #     name: (required)
+  #        Bazel filegroup name.
+  #        Type: string
+  #
+  #     destinations: (required)
+  #        List of input files, relative to the top of the generated workspace.
+  #        Each one will appear in the `srcs` list of the corresponding
+  #        filegroup.
+  #
+  #     sources: (required)
+  #        List of source files for the filegroup. Must have the same
+  #        size as the `destinations` list.
+  #        Type: list of paths relative to the root_build_dir
+  #
+  #     gn_label:
+  #        GN label of target that defines this entry.
+  #        Type: GN label string
+  #
+  #   They should generate Bazel targets that look like:
+  #
+  #     filegroup(
+  #        name = "<name>",
+  #        srcs = [
+  #            <destination_1>,
+  #            <destination_2>,
+  #            ...
+  #        ],
+  #     )
+  #
+  #   Where <destination_N> is the N-th entry in `destinations`, and will be
+  #   the path to a symlink (in the repository) to the corresponding
+  #   <sources_N> file.
+  #
+  # ## DIRECTORY ENTRIES
+  #
+  #   These entries expose all files under a given output directory as
+  #   a single filegroup() using the glob() function. IMPORTANT: For
+  #   correctness, only use these when it is 100% sure that the content
+  #   of the source directory is re-created properly during incremental
+  #   builds. These look like:
+  #
+  #     name: (required)
+  #        Bazel filegroup name.
+  #        Type: string
+  #
+  #     source_dir: (required)
+  #        A source directory path, relative to the Ninja build output
+  #        directory, which will contain all input files for the Bazel
+  #        filegroup().
+  #
+  #     dest_dir: (required)
+  #        A directory prefix for all input files, relative to the top of
+  #        the generated workspace. This will be a symlink to source_dir,
+  #        and the filegroup() will use a glob(["<dest_dir>/*"]) call to get all
+  #        files in it.
+  #
+  #     gn_label: (optional)
+  #        GN label of target that defines this entry.
+  #        Type: GN label string
+  #
+  #   They should generate Bazel targets that look like:
+  #
+  #     filegroup(
+  #         name = "<name>",
+  #         srcs = glob(["<dest_dir>/**]),
+  #     )
+  #
+  #   Where <dest_dir> is a repository symlink that points to source_dir.
+  #
+  generated_file(target_name) {
+    forward_variables_from(invoker, [ "testonly" ])
+    outputs = [ invoker.output ]
+    data_keys = [ "bazel_inputs" ]
+    walk_keys = [ "bazel_inputs_barrier" ]
+    deps = invoker.inputs_deps
+    output_conversion = "json"
+  }
+}
+
+# Generate a manifest file describing the content of the @gn_targets
+# repository. Only used internally by the Fuchsia platform build.
+# This should not be invoked by regular BUILD.gn files.
+#
+# Arguments:
+#  deps: List of root dependencies to walk from to collect all metadata.
+#  output: Output file path. Defaults to $target_gen_dir/$target_name.json
+#
+template("generate_gn_targets_repository_manifest") {
+  if (defined(invoker.output)) {
+    _output = invoker.output
+  } else {
+    _output = "$target_gen_dir/$target_name.json"
+  }
+
+  # LINT.IfChange(GnTargetsDirectoryManifestEntry)
+  #
+  # There are two types of entries:
+  #
+  # ## REGULAR ENTRIES
+  #
+  #   These entries expose an explicit list of files, as a single file group,
+  #   they look like:
+  #
+  #     bazel_name: (required)
+  #        Bazel filegroup name.
+  #        Type: Bazel target name string
+  #
+  #     bazel_package: (required)
+  #        Bazel package name (without leading // prefix).
+  #        Type: Bazel label string
+  #
+  #     generator_label: (required)
+  #        GN target label that generates the file, must include toolchain.
+  #        Type: GN label string
+  #
+  #     output_files: (required)
+  #        List of Ninja build artifacts, relative to the Ninja build directories.
+  #        These will appear in the 'srcs' attribute of the filegroup.
+  #        Type: list of paths relative to the root_build_dir
+  #
+  #     license_spdx_file: (required)
+  #        Path to an SPDX JSON file describing the license that applies to
+  #        the output files.
+  #
+  #   They should generate Bazel targets in @gn_targets//<bazel_package>/BUILD.bazel
+  #   that look like:
+  #
+  #     # From <generator_label>
+  #     license(
+  #        name = "<bazel_name>.license",
+  #        package_name = "Legacy Ninja Build Outputs",
+  #        license_text = "_files/<license_spdx_file>",
+  #     )
+  #
+  #     filegroup(
+  #        name = "<bazel_name>",
+  #        applicable_licenses = [ "<bazel_name>.license" ],
+  #        srcs = [
+  #            "_files/<output_file_1>",
+  #            "_files/<output_file_2>",
+  #            ...
+  #        ],
+  #     )
+  #
+  #   Where <output_file_N> is the N-th entry in `output_files`, and will be
+  #   the path to a symlink (in the repository) into the special @gn_targets//_files
+  #   package.
+  #
+  # ## DIRECTORY ENTRIES
+  #
+  #   These entries expose all files under a given Ninja output directory as
+  #   a single filegroup() using the glob() function. IMPORTANT: For
+  #   correctness, only use these when it is 100% sure that the content
+  #   of the source directory is re-created properly during incremental
+  #   builds. These look like:
+  #
+  #     bazel_name: (required)
+  #        Bazel filegroup name.
+  #        Type: Bazel target name string
+  #
+  #     bazel_package: (required)
+  #        Bazel package name (without leading // prefix).
+  #        Type: Bazel label string
+  #
+  #     generator_label: (required)
+  #        GN target label that generates the file, must include toolchain.
+  #        Type: GN label string
+  #
+  #     output_directory: (required)
+  #        Path to the directory containing Ninja output files, relative to the Ninja build directories.
+  #        Type: directory path relative to the root_build_dir
+  #
+  #     license_spdx_file: (required)
+  #        Path to an SPDX JSON file describing the license that applies to
+  #        the output files.
+  #
+  #   They should generate Bazel targets in @gn_targets//<bazel_package>/BUILD.bazel
+  #   that look like:
+  #
+  #     # From <generator_label>
+  #     license(
+  #        name = "<bazel_name>.license",
+  #        package_name = "Legacy Ninja Build Outputs",
+  #        license_text = "_files/<license_spdx_file>",
+  #     )
+  #
+  #     filegroup(
+  #         name = "<bazel_name>",
+  #         applicable_licenses = [ "<bazel_name>.license" ],
+  #         srcs = glob(["_files/<output_directory>/**]),
+  #     )
+  #
+  # LINT.ThenChange(//build/bazel/scripts/workspace_utils.py:GnTargetsDirectoryManifestEntry)
+  generated_file(target_name) {
+    forward_variables_from(invoker, [ "testonly" ])
+    outputs = [ _output ]
+    data_keys = [ "gn_targets_repository_entries" ]
+    walk_keys = [ "gn_targets_repository_entries_barrier" ]
+    deps = invoker.deps
+    output_conversion = "json"
+  }
+}

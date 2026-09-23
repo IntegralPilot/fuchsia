@@ -1,0 +1,275 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.netemul.network;
+
+using fuchsia.device;
+using fuchsia.hardware.network;
+using fuchsia.net.virtualization;
+using fuchsia.net;
+using zx;
+
+const MAX_NAME_LENGTH uint32 = 256;
+
+/// Provides emulated latency configuration.
+type LatencyConfig = struct {
+    /// Average latency, in ms.
+    average uint64;
+    /// Latency standard deviation, in ms.
+    std_dev uint64;
+};
+
+// Note: Loss config is a union to be able to provide other models of packet loss.
+/// Provides emulated packet loss configuration.
+type LossConfig = strict union {
+    /// Rate of packet loss expressed as independent drop probability [0-100].
+    1: random_rate uint8;
+};
+
+/// Provides emulated packet reordering configuration.
+type ReorderConfig = struct {
+    /// Size of buffer, in packets, to store and forward with randomized order.
+    store_buff uint32;
+    /// Tick/deadline in ms to empty buffer, regardless of full state.
+    /// 0 will cause buffer to flush only when full (dangerous).
+    tick uint64;
+};
+
+/// Used to configure a network with emulated adversity conditions.
+type NetworkConfig = table {
+    /// Latency configuration.
+    1: latency LatencyConfig;
+    /// Packet loss configuration.
+    2: packet_loss LossConfig;
+    /// Packet reordering configuration.
+    3: reorder ReorderConfig;
+};
+
+/// Manages virtual networks.
+closed protocol NetworkManager {
+    /// Lists emulated networks by name.
+    strict ListNetworks() -> (struct {
+        nets vector<string:MAX_NAME_LENGTH>:MAX;
+    });
+    /// Creates a new network with given name and config.
+    strict CreateNetwork(struct {
+        name string:MAX_NAME_LENGTH;
+        config NetworkConfig;
+    }) -> (resource struct {
+        status zx.Status;
+        net client_end:<Network, optional>;
+    });
+    /// Gets a handle to a network.
+    strict GetNetwork(struct {
+        name string:MAX_NAME_LENGTH;
+    }) -> (resource struct {
+        net client_end:<Network, optional>;
+    });
+};
+
+/// Configuration used to create an endpoint.
+type EndpointConfig = struct {
+    /// Fake ethernet mtu.
+    mtu uint16;
+    /// Fake ethernet mac address, if not provided will be set to randomized local mac,
+    /// using endpoint name as seed.
+    mac box<fuchsia.net.MacAddress>;
+    /// Port class of the endpoint.
+    port_class fuchsia.hardware.network.PortClass;
+    /// Simulate hardware checksum offloading. Transport-layer checksums are
+    /// neither computed nor verified.
+    ///
+    /// Note: this does not simulate the actual hardware offloading logic so
+    /// packets may be sent with invalid checksums. This property should be set
+    /// on both the sender and receiver to avoid dropped packets.
+    checksum_offload bool;
+};
+
+/// Manages virtual endpoints.
+closed protocol EndpointManager {
+    /// Lists endpoints by name.
+    strict ListEndpoints() -> (struct {
+        endp vector<string:MAX_NAME_LENGTH>:MAX;
+    });
+    /// Creates endpoint with given name and config.
+    strict CreateEndpoint(struct {
+        name string:MAX_NAME_LENGTH;
+        config EndpointConfig;
+    }) -> (resource struct {
+        status zx.Status;
+        endpoint client_end:<Endpoint, optional>;
+    });
+    /// Gets a handle to an endpoint.
+    strict GetEndpoint(struct {
+        name string:MAX_NAME_LENGTH;
+    }) -> (resource struct {
+        endpoint client_end:<Endpoint, optional>;
+    });
+};
+
+/// Fake endpoint can be added to a network to snoop or inject packets.
+closed protocol FakeEndpoint {
+    /// Writes a frame to the network.
+    strict Write(struct {
+        data vector<uint8>:MAX;
+    }) -> ();
+    /// Reads a single frame from the network.
+    ///
+    /// Blocks until new data is available to be read. FakeEndpoint will keep a limited amount of
+    /// frames to be read, dropping the oldest ones if the data is not fetched fast enough. The
+    /// number of dropped frames since the last call to `Read` is returned in `dropped_frames`.
+    ///
+    /// Issuing a second `Read` request when the first one is still pending will cause the channel
+    /// to be closed with `ZX_ERR_BAD_STATE`.
+    strict Read() -> (struct {
+        data vector<uint8>:MAX;
+        dropped_frames uint64;
+    });
+};
+
+/// Virtual network.
+closed protocol Network {
+    // Allows guest VMs to interact with the [`Network`].
+    compose fuchsia.net.virtualization.Network;
+
+    /// Gets network configuration.
+    strict GetConfig() -> (struct {
+        config NetworkConfig;
+    });
+    /// Gets network name.
+    strict GetName() -> (struct {
+        name string:MAX_NAME_LENGTH;
+    });
+    /// Updates network configuration.
+    strict SetConfig(struct {
+        config NetworkConfig;
+    }) -> (struct {
+        status zx.Status;
+    });
+    /// Attaches endpoint with given name to network.
+    strict AttachEndpoint(struct {
+        name string:MAX_NAME_LENGTH;
+    }) -> (struct {
+        status zx.Status;
+    });
+    /// Removes endpoint with given name from network.
+    strict RemoveEndpoint(struct {
+        name string:MAX_NAME_LENGTH;
+    }) -> (struct {
+        status zx.Status;
+    });
+    /// Injects a fake endpoint.
+    strict CreateFakeEndpoint(resource struct {
+        ep server_end:FakeEndpoint;
+    });
+    /// Starts capturing packet in this network.
+    ///
+    /// The packet capture will be stored at `/custom_artifacts/{name}.pcapng`.
+    ///
+    /// Returns [`ZX_ERR_ALREADY_EXISTS`] if the capturing is already started
+    /// in this network.
+    strict StartCapture(struct {
+        name string:MAX_NAME_LENGTH;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Stops capturing packets. This function is guaranteed to succeed.
+    ///
+    /// The packet capture will be stored in the file at the path chosen when
+    /// capturing started. The packet capture will stop automatically once the
+    /// network is destroyed regardless of whether this method is called.
+    strict StopCapture() -> ();
+};
+
+/// Simple interface to serve devices over fidl.
+closed protocol DeviceProxy {
+    // TODO(https://fxbug.dev/501161302): Remove or replace once netcfg no
+    // longer needs topo path.
+    /// Serve the Controller protocol for this device.
+    strict ServeController(resource struct {
+        req server_end:fuchsia.device.Controller;
+    });
+
+    /// Serve the device's FIDL protocol.
+    strict ServeDevice(resource struct {
+        req server_end:fuchsia.hardware.network.Device;
+    });
+};
+
+/// Virtual ethernet endpoint.
+closed protocol Endpoint {
+    // Gets endpoint configuration.
+    strict GetConfig() -> (struct {
+        config EndpointConfig;
+    });
+    /// Gets endpoint name.
+    strict GetName() -> (struct {
+        name string:MAX_NAME_LENGTH;
+    });
+    /// Sends link up or down signal
+    strict SetLinkUp(struct {
+        up bool;
+    }) -> ();
+    /// Connects to the underlying device port.
+    strict GetPort(resource struct {
+        port server_end:fuchsia.hardware.network.Port;
+    });
+    /// Gets a proxy to open requests with zircon ethernet device.
+    strict GetProxy(resource struct {
+        proxy server_end:DeviceProxy;
+    });
+};
+
+/// Convenience struct for creating entire network setups.
+type NetworkSetup = struct {
+    /// Network name, must be unique in network context.
+    name string:MAX_NAME_LENGTH;
+    /// NetworkConfig to use when creating network.
+    config NetworkConfig;
+    /// Collection of endpoints to create and attach to network.
+    endpoints vector<EndpointSetup>:MAX;
+};
+
+/// Convenience struct for creating endpoints along with network setup.
+type EndpointSetup = struct {
+    /// Endpoint name, must be unique in network context.
+    name string:MAX_NAME_LENGTH;
+    /// Optional endpoint config, if not provided defaults will be used. Default
+    /// values are: mtu = 1500,  mac = randomized, port_class = Virtual.
+    config box<EndpointConfig>;
+    /// Start endpoint with link status up.
+    link_up bool;
+};
+
+/// Handle returned when using NetworkContext.Setup for quick network configuration.
+/// Networks and endpoints created by Setup are tied to the lifecycle of the SetupHandle's channel.
+closed protocol SetupHandle {};
+
+/// Main entry point to manage virtual networks and endpoints.
+///
+/// Every new connection to NetworkContext provides access to a an isolated
+/// namespace for networks and endpoints. `Clone` is the only means by which a
+/// client can acquire a new connection to the same network context.
+@discoverable
+closed protocol NetworkContext {
+    strict Clone(resource struct {
+        network_context server_end:NetworkContext;
+    });
+    strict GetNetworkManager(resource struct {
+        net_manager server_end:NetworkManager;
+    });
+    strict GetEndpointManager(resource struct {
+        endp_manager server_end:EndpointManager;
+    });
+    /// Creates a collection of networks described by `networks`.
+    /// `status` is `ZX_OK` for success
+    /// `setup_handle` is a resource that references and maintains the lifecycle of
+    ///                the created networks and endpoints.
+    strict Setup(struct {
+        networks vector<NetworkSetup>:MAX;
+    }) -> (resource struct {
+        status zx.Status;
+        setup_handle client_end:<SetupHandle, optional>;
+    });
+};

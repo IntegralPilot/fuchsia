@@ -1,0 +1,188 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.nfc;
+
+using zx;
+
+/// The maximum number of vmos that is registered with the driver for
+/// read/write.
+const MAX_VMOS uint32 = 32;
+
+/// The maximum number of outstanding reads allowed.
+const MAX_NUMBER_OF_OUTSTANDING_READS uint32 = 10;
+
+/// The maximum number of outstanding writes allowed.
+const MAX_NUMBER_OF_OUTSTANDING_WRITES uint32 = 10;
+
+type NfcMode = flexible enum : uint32 {
+    /// Nfc device is in active mode.
+    ACTIVE = 1;
+    /// Nfc device is in passive mode.
+    PASSIVE = 2;
+    /// Powers off the device.
+    POWER_OFF = 3;
+};
+
+alias VmoId = uint32;
+
+/// NFC specific error values
+type Error = flexible enum : uint32 {
+    /// Invalid parameters to fidl
+    INVALID_PARAMS = 1;
+    /// Catch all error that is context specific.
+    UNSPECIFIED = 2;
+    /// Data transfer was too large to be handled by the transport.
+    OUT_OF_RANGE = 3;
+    /// IO device not found.
+    IO_NOT_PRESENT = 4;
+    /// Request was refused, because client is trying to perform an invalid/illegal
+    /// operation.
+    REFUSED = 5;
+    /// NFC is in not in the correct state.
+    INVALID_STATE = 6;
+    /// The VMO ID passed to Write()/UnregisterVmo() was not found.
+    VMO_NOT_FOUND = 7;
+    /// The VMO ID passed to RegisterVmo() is already in use.
+    VMO_ALREADY_EXISTS = 8;
+    /// Too many outstanding `Read` calls.
+    TOO_MANY_OUTSTANDING_READS = 9;
+    /// Vmo already in use by the driver.
+    VMO_ALREADY_IN_USE = 10;
+    /// Too many outstanding `Write` calls.
+    TOO_MANY_OUTSTANDING_WRITES = 11;
+};
+
+type NfcVmo = flexible resource union {
+    1: write_vmo
+            zx.Handle:<VMO, zx.RIGHTS_BASIC | zx.RIGHTS_PROPERTY | zx.RIGHTS_IO | zx.Rights.MAP>;
+    2: read_vmo
+            zx.Handle:<VMO, zx.RIGHTS_BASIC | zx.Rights.GET_PROPERTY | zx.Rights.READ | zx.Rights.MAP>;
+};
+
+type NfcVmoRequest = resource struct {
+    vmo_id uint32;
+    vmo NfcVmo;
+};
+
+/// Asynchronous events sent by the driver when something goes wrong in the HW or
+/// state machine.
+///
+/// `error` is signalled when an internal error like a HW error occurs
+/// which could be used by client to reset the HW and get it back into a good state.
+type NfcEvent = flexible union {
+    1: error Error;
+};
+
+/// Device protocol used to connect to an NFC device.
+///
+/// The data sent by clients to `Write` and returned by `Read` are NCI commands, responses and
+/// and data messages. The detailed format is defined in NFC Controller Interface(NCI)
+/// specification https://nfc-forum.org/our-work/specification-releases/.
+/// The device is only capable of operating if there are pending Read calls with
+/// available VMOs to receive data. Otherwise, data loss might occur.
+@discoverable
+open protocol Device {
+
+    /// Sets Nfc device to `mode`.
+    ///
+    /// Error means that the device may not be in the intended `mode`.
+    flexible SetMode(struct {
+        mode NfcMode;
+    }) -> () error Error;
+
+    /// Initialize or perform any required setup before reading/writing to the
+    /// device.
+    ///
+    /// The API should be called only once after connecting to the protocol.
+    /// Calling it twice will return INVALID_STATE.
+    /// Error means that the specific initialization wasn't carried out.
+    flexible CoreInitialize() -> () error Error;
+
+    /// Performs a factory reset, which will erase any user data and returns the
+    /// device to default settings.
+    ///
+    /// Error means that the factory reset failed.
+    flexible FactoryReset() -> () error Error;
+
+    /// Performs a reset of the device.
+    ///
+    /// `CoreInitialize` should be called after a `Reset`.
+    /// Error means that the HW was not reset properly, client should request
+    /// reset again.
+    flexible Reset() -> () error Error;
+
+    /// Reads NCI responses or data from device into vmo pointed by `vmo_id`.
+    ///
+    /// This call will not return until data is read into the vmo. Clients can have
+    /// multiple calls to `Read` queued up to a maximum of `MAX_NUMBER_OF_OUTSTANDING_READS`.
+    /// Returns the number of bytes read on success.
+    /// Returns:
+    /// `TOO_MANY_OUTSTANDING_READS` when too many `Read` calls are queued.
+    /// `VMO_ALREADY_IN_USE` when the client queues more than 1 `Read` on the same vmo_id.
+    flexible Read(struct {
+        vmo_id VmoId;
+    }) -> (struct {
+        length uint64;
+    }) error Error;
+
+    /// Writes `length` bytes of NCI commands or data in the vmo pointed by `vmo_id` to device.
+    ///
+    /// Success means that the data was written to the HW device. If the payload
+    /// contains a command requiring a response, a subsequent response to Read will
+    /// contain the response. Multiple `Write` calls can be queued up to a maximum of
+    /// MAX_NUMBER_OF_OUTSTANDING_WRITES, but each call should be on a different `vmo_id`.
+    /// Writes are queued and executed in order.
+    /// On Error, the data provided was not written to the HW device.
+    /// Returns:
+    /// `OUT_OF_RANGE` when the data provided was too large.
+    /// `UNSPECIFIED` in specific cases.
+    /// `IO_NOT_PRESENT` when device is unavailable.
+    /// `REFUSED` for example, when performing a write to a read only vmo.
+    /// `TOO_MANY_OUTSTANDING_WRITES` when too many `Write` calls are queued.
+    flexible Write(struct {
+        length uint64;
+        vmo_id VmoId;
+    }) -> () error Error;
+
+    /// Registers multiple vmos `nfc_vmos` each with a `vmo_id` with an internal
+    /// vmo manager.
+    ///
+    /// Success means the provided vmo list is registered successfully
+    /// and Read/Write can be performed.
+    /// Error means that no vmos were registered.
+    /// Returns:
+    /// `VMO_NOT_FOUND` when the provided vmo is not valid or found.
+    /// `VMO_ALREADY_EXISTS` when trying to register an already existing vmo.
+    /// `INVALID_ARGS` if the input parameters are invalid.
+    flexible RegisterVmos(resource struct {
+        nfc_vmos vector<NfcVmoRequest>:MAX_VMOS;
+    }) -> () error Error;
+
+    /// Unregisters multiple vmos `nfc_vmos` each with a `vmo_id`.
+    ///
+    /// Any subsequent read/writes to the vmos will fail until `RegisterVmos` is called
+    /// with that `vmo_id`.
+    /// Error means that no vmos were unregistered, so client should try UnregisterVmos again.
+    flexible UnregisterVmos(resource struct {
+        nfc_vmos vector<VmoId>:MAX_VMOS;
+    }) -> () error Error;
+
+    /// Resets the session ids of all the Secure Elements in the HCI network.
+    ///
+    /// Returns `UNSPECIFIED` when the operation fails.
+    flexible HciNetworkReset() -> () error Error;
+
+    /// `WatchEvents` is a hanging get API which will return only if there is an event to
+    /// report.
+    ///
+    /// The events will be delivered only if there is a hanging watcher.
+    /// The client should attach the watcher again whenever the event is
+    /// delivered, to continue getting events.
+    flexible WatchEvents() -> (NfcEvent);
+};
+
+service Service {
+    device client_end:Device;
+};

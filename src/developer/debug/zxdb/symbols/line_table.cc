@@ -1,0 +1,145 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "src/developer/debug/zxdb/symbols/line_table.h"
+
+#include <span>
+#include <lib/syslog/cpp/macros.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+
+#include "src/developer/debug/shared/largest_less_or_equal.h"
+#include "src/developer/debug/zxdb/symbols/symbol_context.h"
+
+namespace zxdb {
+
+static constexpr uint64_t kMaxAddress = std::numeric_limits<uint64_t>::max();
+
+size_t LineTable::GetNumSequences() const {
+  EnsureSequences();
+  return sequences_.size();
+}
+
+std::span<const LineTable::Row> LineTable::GetSequenceAt(size_t index) const {
+  // Callers will have to call GetNumSequences() above before querying for a specific one, so we
+  // don't have to call EnsureSequence().
+  FX_DCHECK(index < sequences_.size());
+
+  std::span<const Row> rows = GetRows();
+  size_t row_begin = sequences_[index].row_begin;
+  return rows.subspan(row_begin, sequences_[index].row_end - row_begin);
+}
+
+std::span<const LineTable::Row> LineTable::GetRowSequenceForAddress(
+    const SymbolContext& address_context, TargetPointer absolute_address) const {
+  TargetPointer rel_address = address_context.AbsoluteToRelative(absolute_address);
+
+  const Sequence* sequence = GetSequenceForRelativeAddress(rel_address);
+  if (!sequence)
+    return std::span<const Row>();
+
+  std::span<const Row> rows = GetRows();
+  // Include the last row (marked with EndSequence) in the result.
+  return rows.subspan(sequence->row_begin, sequence->row_end - sequence->row_begin + 1);
+}
+
+LineTable::FoundRow LineTable::GetRowForAddress(const SymbolContext& address_context,
+                                                TargetPointer absolute_address,
+                                                SkipMode skip_mode) const {
+  std::span<const Row> seq = GetRowSequenceForAddress(address_context, absolute_address);
+  if (seq.empty())
+    return FoundRow();
+
+  TargetPointer rel_address = address_context.AbsoluteToRelative(absolute_address);
+  // LargestLessOrEqual() will return the first item when it compares equal to an item and that's
+  // a sequence of exact matches. That's the behavior we want here.
+  auto found = debug::LargestLessOrEqual(
+      seq.begin(), seq.end(), rel_address,
+      [](const Row& row, TargetPointer addr) { return row.Address.Address < addr; },
+      [](const Row& row, TargetPointer addr) { return row.Address.Address == addr; });
+
+  // The address should not be before the beginning of this sequence (the only end() case for
+  // LargestLessOrEqual()). Otherwise GetRowSequenceForAddress() shouldn't have returned it.
+  FX_DCHECK(found != seq.end());
+
+  size_t start_search_index = std::distance(seq.begin(), found);
+  size_t symbolizable_index = start_search_index;
+
+  // If the found item has a 0 line entry, then we need to adjust backwards to find a non-zero line
+  // entry for symbolization, and adjust forwards for a non-zero line entry with is_stmt set. This
+  // is effectively also what gdb does, see https://fxbug.dev/436290252.
+  while (seq[symbolizable_index].Line == 0 && symbolizable_index > 0) {
+    symbolizable_index--;
+  }
+
+  size_t next_statement_index = start_search_index;
+  if (skip_mode == kSkipCompilerGenerated) {
+    // Skip compiler-generated rows until we find the next is_stmt row. Don't advance to an "end
+    // sequence" line because that doesn't represent actual code, just the end of the extent of the
+    // sequence. This is going to correspond to where we would place a line-based breakpoint at (or
+    // near) |absolute_address|.
+    while (next_statement_index + 1 < seq.size() &&
+           (seq[next_statement_index].Line == 0 || !seq[next_statement_index].IsStmt) &&
+           !seq[next_statement_index + 1].EndSequence)
+      next_statement_index++;
+  }
+
+  return FoundRow(seq, symbolizable_index, next_statement_index);
+}
+
+const LineTable::Sequence* LineTable::GetSequenceForRelativeAddress(
+    TargetPointer relative_address) const {
+  EnsureSequences();
+  if (sequences_.empty())
+    return nullptr;
+
+  auto found = debug::LargestLessOrEqual(
+      sequences_.begin(), sequences_.end(), relative_address,
+      [](const Sequence& seq, TargetPointer addr) { return seq.addresses.begin() < addr; },
+      [](const Sequence& seq, TargetPointer addr) { return seq.addresses.begin() == addr; });
+  if (found == sequences_.end() || !found->addresses.InRange(relative_address))
+    return nullptr;  // Not in any range.
+
+  return &*found;
+}
+
+void LineTable::EnsureSequences() const {
+  if (!sequences_.empty())
+    return;
+  const auto& rows = GetRows();
+  if (rows.empty())
+    return;
+
+  constexpr size_t kNoSeq = std::numeric_limits<size_t>::max();
+
+  // Beginning row index of current sequence, or kNoSeq if there is no current sequence.
+  size_t cur_seq_begin_row = kNoSeq;
+
+  for (size_t i = 0; i < rows.size(); i++) {
+    if (cur_seq_begin_row == kNoSeq)
+      cur_seq_begin_row = i;
+
+    if (rows[i].EndSequence) {
+      // When the linker strips dead code it will mark the sequence as starting at address 0. Strip
+      // these from the table. As of revision
+      // e618ccbf431f6730edb6d1467a127c3a52fd57f7 in Clang, -1 is used to
+      // indicate that a function was removed. Versions of Clang earlier than
+      // this do not support this behavior.
+      auto seq_addr = rows[cur_seq_begin_row].Address.Address;
+      if (seq_addr && seq_addr != kMaxAddress)
+        sequences_.emplace_back(AddressRange(seq_addr, rows[i].Address.Address), cur_seq_begin_row,
+                                i);
+      cur_seq_begin_row = kNoSeq;
+    }
+  }
+
+  std::sort(sequences_.begin(), sequences_.end(), [](const Sequence& a, const Sequence& b) {
+    return a.addresses.end() < b.addresses.end();
+  });
+}
+
+}  // namespace zxdb

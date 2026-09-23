@@ -1,0 +1,160 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/ninja_implicit_inputs/ninja_implicit_inputs.gni")
+
+# The <zircon/assert.h> header and the associated __zx_panic() function
+# its macros invoke at runtime are a special case in the Fuchsia build:
+#
+# - For Fuchsia toolchains, <zircon/assert.h> is directly provided by
+#   the sysroot (see //sdk/lib/c/sysroot_entries.gni) and the __zx_panic()
+#   function is provided by the C library (which depends on the
+#   'as_libc_source_set' target defined below).
+#
+# - For Zircon toolchains, //sdk/lib/zircon-assert is added to the
+#   default include search path, providing the header
+#   (see //build/config/zircon:default_include_dirs) and the
+#   implementation of __zx_panic() is provided by either
+#   //zircon/kernel/phy/panic.cc, for kernel toolchains,
+#   or by 'as_libc_source_set' defined below for the C library toolchain.
+#
+# - For other toolchains (e.g. host ones), the header is provided
+#   by the 'headers' target below, and the implementation by
+#   the //sdk/lib/zircon-assert:zircon-assert target.
+#
+# GN include checks are not smart enough to recognize these special
+# conditions and will error in several ways if the <zircon/assert.h>
+# header is listed in any of the targets defined below. For example,
+# complaining that a target defined in the Fuchsia toolchain
+# includes <zircon/assert.h> without depending on a target that owns
+# the header, defined in a different toolchain.
+#
+# Due to this, the header is never listed explicitly in the targets
+# below.
+#
+# Finally, //zircon/system/public/zircon/assert.h is currently a symlink
+# to //sdk/lib/zircon-assert/zircon/assert.h. This is required because
+# many (hundreds of) zx_library() targets depend on //zircon/system/public
+# which allows them to find the header there when built on host toolchains.
+#
+# TODO(https://fxbug.dev/433475601): Update all these targets to depend
+# on //sdk/lib/zircon-assert as well to remove the symlink.
+
+if (is_fuchsia) {
+  import("//build/sdk/sdk_noop_atom.gni")
+
+  # The header is provided by the sysroot, and the implementation
+  # by the C library, an empty group is adequate.
+  # LINT.IfChange
+  group("zircon-assert") {
+    public_deps = [ ":headers" ]
+
+    metadata = {
+      # Used by //build/ninja_implicit_inputs:manifest. This is a special
+      # way to tell that both headers belong to the current target.
+      ninja_implicit_cxx_headers = [
+        {
+          gn_label = get_label_info(":$target_name", "label_with_toolchain")
+          files = rebase_path([
+                                "zircon/assert.h",
+                                "//zircon/system/public/zircon/assert.h",
+                              ],
+                              root_build_dir)
+        },
+      ]
+    }
+  }
+
+  # LINT.ThenChange(BUILD.bazel)
+
+  # This is necessary for sdk_source_set() dependents of //sdk/lib/zircon-assert
+  sdk_noop_atom("zircon-assert_sdk") {
+    category = "partner"
+  }
+
+  if (zircon_toolchain != false &&
+      zircon_toolchain.environment == "user.libc") {
+    # This target is only used by //sdk/lib/c:legacy-components to ensure
+    # that the C library provides the __zx_panic() implementation directly
+    # for Fuchsia userland binaries. The <zircon/assert.h> header is provided
+    # by the sysroot directly.
+    source_set("as_libc_source_set") {
+      visibility = [ "//sdk/lib/c:*" ]
+      public = []
+      sources = [ "zx_panic_libc.cc" ]
+
+      # For <zircon/compiler.h>
+      deps = [ "//zircon/system/public" ]
+
+      # This library is linked into libc, which is used by libfuzzer.
+      # Don't instrument it to avoid getting noise in code coverage.
+      # TODO(https://fxbug.dev/42099340): Once a cleaner solution is found, remove this.
+      configs += [ "//build/config/zircon:no_fuzzer" ]
+      include_dirs = [ "." ]
+    }
+  }
+} else if (zircon_toolchain != false) {
+  # The header is provided by //build/config/zircon:default_include_dirs,
+  # the implementation is provided by //zircon/kernel/phys/panic.cc
+  group("zircon-assert") {
+  }
+} else {
+  # Keep this in sync with BUILD.bazel manually.
+  # LINT.IfChange
+
+  # For non-Fuchsia and non-kernel toolchains (e.g. host ones)
+  static_library("zircon-assert") {
+    public_deps = [ ":headers" ]
+    sources = [
+      "zircon/assert.h",
+      "zx_panic_libc.cc",
+    ]
+  }
+
+  # LINT.ThenChange(BUILD.bazel)
+}
+
+source_set("headers") {
+  # As a special case, do not list <zircon/assert.h> in `public`
+  # here as this triggers GN include check errors, as GN isn't
+  # smart enough to understand that the header is provided
+  # implicitly for Fuchsia and Zircon toolchains, but explicitly
+  # for other ones.
+  public = []
+
+  if (!is_fuchsia) {
+    # <zircon/assert.h> includes <zircon/compiler.h>
+    public_deps = [ "//zircon/system/public" ]
+  }
+
+  metadata = {
+    # Used by //build/ninja_implicit_inputs:manifest
+    # This is a special way to declare that both these headers are
+    # implicitly provided by this target.
+    ninja_implicit_cxx_headers = [
+      {
+        gn_label = get_label_info(":$target_name", "label_with_toolchain")
+        files = rebase_path([
+                              "zircon/assert.h",
+                              "//zircon/system/public/zircon/assert.h",
+                            ],
+                            root_build_dir)
+      },
+    ]
+  }
+
+  # This ensures that the current directory is added to the
+  # include_dirs of dependents, allowing them to find the
+  # header when including it.
+  public_configs = [ ":zircon-assert.config" ]
+}
+
+config("zircon-assert.config") {
+  include_dirs = [ "." ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [ "test:tests" ]
+}

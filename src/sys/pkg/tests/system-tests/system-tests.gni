@@ -1,0 +1,739 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/go/go_test.gni")
+
+if (is_host) {
+  # Add this to go_test()'s environments to disable a test in infra
+  disabled_env = {
+    tags = [ "system-tests-disabled" ]  # Tells infra not to run this by default
+    dimensions = host_env.dimensions
+  }
+}
+
+# The service account that allows the test to download build artifacts.
+_environment_service_account =
+    "artifact-readers@fuchsia-infra.iam.gserviceaccount.com"
+
+# A template that configures a System Test Upgrade Suite against a given release
+# builder.
+#
+# Parameters
+#
+#   builds
+#   - Required: An array of build scopes to download and install onto the
+#     device in sequence, in order to simulate multi-step upgrade flows. The
+#     first will be flashed or paved onto the device, then the rest will be
+#     OTAed.
+#
+#     Each scope in $builds contains one of:
+#
+#       release_builder
+#       - Optional: Builder from which the build artifacts will be downloaded and
+#         upgraded to on the device, rather than from the current build. This
+#         has the form of `project/bucket/builder id`, like
+#         `fuchsia/ci/fuchsia-x64-release`.
+#         Conflicts with `release_build_id`.
+#       - Type: string
+#
+#       release_build_id
+#       - Optional: Build ID from which the build artifacts will be downloaded
+#         and upgraded to on the device, rather than from the current
+#         build. This has the form of `1234...`. Conflicts with `release_builder`.
+#       - Type: string
+#
+#   downgrade_release_builder
+#   - Required: Builder from which the downgrade build artifacts will be
+#     downloaded and installed on the device. This has the form of
+#     `project/bucket/builder id`, like `fuchsia/ci/fuchsia-x64-release`.
+#     Conflicts with `downgrade_release_build_id`.
+#   - Type: string
+#
+#   downgrade_release_build_id
+#   - Required: Build ID from which the downgrade build artifacts will be
+#     downloaded and installed on the device. This has the form of `1234...`.
+#     Conflicts with `downgrade_release_builder`.
+#   - Type: string
+#
+#  downgrade_ota_attempts
+#  - Optional: Number of times to try to OTA from the downgrade build to the
+#    upgrade build before failing.
+#  - Type: integer
+#
+#   upgrade_release_builder
+#   - Optional: Builder from which the upgrade build artifacts will be
+#     downloaded and upgraded to on the device, rather than from the current
+#     build. This has the form of `project/bucket/builder id`, like
+#     `fuchsia/ci/fuchsia-x64-release`.
+#     Conflicts with `upgrade_release_build_id`.
+#   - Type: string
+#
+#   upgrade_release_build_id
+#   - Optional: Build ID from which the upgrade build artifacts will be
+#     downloaded and upgraded to on the device, rather than from the current
+#     build. This has the form of `1234...`. Conflicts with `release_builder`.
+#   - Type: string
+#
+#   installer
+#   - Optional: Installer to use to install OTA.
+#   - Type: string
+#
+#   service_account
+#   - Optional: The service account that has permission to download the build
+#     artifacts.
+#   - Type: string
+#
+#   environments
+#   - Required: What environments this test should target.
+#   - Type: see //build/testing/test_spec.gni for more details. Note that
+#     any label and service_account in each environment is ignored.
+#
+#   timeout
+#   - Optional: Err if this test takes longer than this time.
+#   - Type: duration string
+#
+#   pave_timeout
+#   - Optional: Err if paving takes longer than this time.
+#   - Type: duration string
+#
+#   cycle_timeout
+#   - Optional: Err if the test cycle takes longer than this time.
+#   - Type: duration string
+#
+#   cycle_count
+#   - Optional: How many test cycles should the test execute. Defaults to 1
+#     cycle.
+#   - Type: integer string
+#
+#   device_connect_timeout
+#   - Optional: How long to wait between connection attempts.
+#   - Type: duration string
+#
+#   workaround_broken_time_skip
+#   - Optional: whether to sleep 15 seconds and then reconnect after paving
+#     the device to avoid a known bug (https://fxbug.dev/42154590) in netstack when
+#     system time becomes accurate.
+#   - Type: boolean, default false
+#
+#   workaround_downgrade_ota_no_rewrite_rules
+#   - Optional: omaha updater will not set workaround downgrade ota rewrite
+#     rules.
+#   - Type: boolean, default false
+#
+#   require_cup
+#   - Optional: whether or not mock-omaha-server should require that all
+#     incoming requests have CUP enabled.
+#   - Type: boolean, default false
+#
+#   use_flash
+#   - Optional: whether or not to use ffx flash instead of paving when
+#     installing the downgrade build.
+#   - Type: boolean, default false
+#
+#   max_system_image_size
+#   - Optional: the maximum size of the system image. The system image package
+#     will be artificially extended to this size or less.
+#
+#   max_update_images_size
+#   - Optional: the maximum size of the update images. The update images will
+#     be artificially extended to this size or less.
+#   - Type: integer greater than or equal to 0
+#
+#   max_update_package_size
+#   - Optional: the maximum size of the update package. The update package will
+#     be artificially extended to this size or less.
+#   - Type: integer greater than or equal to 0
+#
+#   use_new_update_format
+#   - Optional: use the new update format.
+#   - Type: boolean, default false
+#
+#   bootfs_compression
+#   - Optional: setting to use when compressing bootfs in the zbi
+#   - Type: string
+#
+#   check_abr
+#   - Optional: check that the device booted into the expected ABR slot.
+#   - Type: bool, default true
+#
+#   resolver_mode
+#   - Optional: resolver mode to use
+#   - Type: string, default "constant"
+template("system_test_upgrade_suite") {
+  assert(is_linux, "system_tests are for linux only")
+
+  assert(
+      !(defined(invoker.downgrade_release_builder) &&
+            defined(invoker.downgrade_release_build_id)),
+      "downgrade_release_builder and downgrade_release_build_id are mutually exclusive for $target_name")
+
+  assert(
+      !(defined(invoker.builds) && defined(invoker.downgrade_release_builder)),
+      "builds is mutually exlusive with downgrade_release_builder for $target_name")
+
+  assert(
+      !(defined(invoker.builds) && defined(invoker.downgrade_release_build_id)),
+      "builds is mutually exlusive with downgrade_release_build_id for $target_name")
+
+  assert(
+      !(defined(invoker.builds) && defined(invoker.upgrade_release_builder)),
+      "builds is mutually exlusive with upgrade_release_builder for $target_name")
+
+  assert(
+      !(defined(invoker.builds) && defined(invoker.upgrade_release_build_id)),
+      "builds is mutually exlusive with upgrade_release_build_id for $target_name")
+
+  assert(defined(invoker.environments),
+         "environments must be defined for $target_name")
+
+  _builds = []
+  if (defined(invoker.builds)) {
+    foreach(build, invoker.builds) {
+      assert(
+          defined(build.release_builder) || defined(build.release_build_id),
+          "release_builder or release_build_id must be defined for $target_name")
+      assert(
+          !(defined(invoker.release_builder) &&
+                defined(invoker.release_build_id)),
+          "release_builder and release_build_id are mutually exclusive for $target_name")
+
+      _builds += [ build ]
+    }
+  } else {
+    _build = {
+    }
+
+    if (defined(invoker.downgrade_release_builder)) {
+      _build.release_builder = invoker.downgrade_release_builder
+    }
+
+    if (defined(invoker.downgrade_release_build_id)) {
+      _build.release_build_id = invoker.downgrade_release_build_id
+    }
+
+    if (defined(invoker.upgrade_release_builder)) {
+      _build.release_builder = invoker.upgrade_release_builder
+    }
+
+    if (defined(invoker.upgrade_release_build_id)) {
+      _build.release_build_id = invoker.upgrade_release_build_id
+    }
+
+    _builds += [ _build ]
+  }
+
+  assert(_builds != [], "upgrade builds must be specified")
+
+  _tests =
+      [ "//src/sys/pkg/tests/system-tests/upgrade_test:system_tests_upgrade" ]
+
+  _deps = []
+
+  foreach(test, _tests) {
+    _test_name = get_label_info(test, "name")
+
+    _host_test_target_name = "${target_name}_${_test_name}"
+    _deps += [ ":${_host_test_target_name}" ]
+
+    _args = []
+
+    foreach(build, _builds) {
+      if (defined(build.release_build_id)) {
+        _args += [
+          "--build-id",
+          build.release_build_id,
+        ]
+      }
+
+      if (defined(build.release_builder)) {
+        _args += [
+          "--builder-name",
+          build.release_builder,
+        ]
+      }
+    }
+
+    if (defined(invoker.downgrade_ota_attempts)) {
+      _args += [
+        "-downgrade-ota-attempts",
+        invoker.downgrade_ota_attempts,
+      ]
+    }
+
+    _service_account = _environment_service_account
+    if (defined(invoker.service_account)) {
+      assert(invoker.service_account != "",
+             "'${_host_test_target_name}' cannot have an empty service_account")
+      _service_account = invoker.service_account
+    }
+
+    if (defined(invoker.timeout)) {
+      assert(invoker.timeout != "",
+             "'${_host_test_target_name}' cannot have an empty timeout")
+    }
+
+    if (defined(invoker.pave_timeout)) {
+      assert(invoker.pave_timeout != "",
+             "'${_host_test_target_name}' cannot have an empty pave timeout")
+      _args += [
+        "-pave-timeout",
+        invoker.pave_timeout,
+      ]
+    }
+
+    if (defined(invoker.cycle_timeout)) {
+      assert(invoker.cycle_timeout != "",
+             "'${_host_test_target_name}' cannot have an empty cycle timeout")
+      _args += [
+        "-cycle-timeout",
+        invoker.cycle_timeout,
+      ]
+    }
+
+    if (defined(invoker.cycle_count)) {
+      assert(invoker.cycle_count != "",
+             "'${_host_test_target_name}' cannot have an empty cycle count")
+      _args += [
+        "-cycle-count",
+        invoker.cycle_count,
+      ]
+    }
+
+    if (defined(invoker.installer)) {
+      assert(invoker.installer != "",
+             "'${_host_test_target_name}' cannot have an empty installer")
+      _args += [
+        "-installer",
+        invoker.installer,
+      ]
+    }
+
+    if (defined(invoker.device_connect_timeout)) {
+      assert(
+          invoker.device_connect_timeout != "",
+          "'${_host_test_target_name}' cannot have empty device connect timout")
+      _args += [
+        "-device-connect-timeout",
+        invoker.device_connect_timeout,
+      ]
+    }
+
+    # TODO(74942): remove this workaround
+    if (defined(invoker.workaround_broken_time_skip) &&
+        invoker.workaround_broken_time_skip) {
+      _args += [ "-workaround-broken-time-skip" ]
+    }
+
+    if (defined(invoker.workaround_downgrade_ota_no_rewrite_rules) &&
+        invoker.workaround_downgrade_ota_no_rewrite_rules) {
+      _args += [ "-workaround-downgrade-ota-no-rewrite-rules" ]
+    }
+
+    if (defined(invoker.require_cup) && invoker.require_cup) {
+      _args += [ "-require-cup" ]
+    }
+
+    if (defined(invoker.use_flash) && invoker.use_flash) {
+      _args += [ "-use-flash" ]
+    }
+
+    if (defined(invoker.build_expect_unknown_firmware) &&
+        invoker.build_expect_unknown_firmware) {
+      _args += [ "-build-expect-unknown-firmware" ]
+    }
+
+    if (defined(invoker.max_system_image_size)) {
+      assert(
+          invoker.max_system_image_size != "",
+          "'${_host_test_target_name}' cannot have an empty max_system_image_size")
+      _args += [
+        "-max-system-image-size",
+        invoker.max_system_image_size,
+      ]
+    }
+
+    if (defined(invoker.max_update_images_size)) {
+      assert(
+          invoker.max_update_images_size != "",
+          "'${_host_test_target_name}' cannot have an empty max_update_images_size")
+      _args += [
+        "-max-update-images-size",
+        invoker.max_update_images_size,
+      ]
+    }
+
+    if (defined(invoker.max_update_package_size)) {
+      assert(
+          invoker.max_update_package_size != "",
+          "'${_host_test_target_name}' cannot have an empty max_update_package_size")
+      _args += [
+        "-max-update-package-size",
+        invoker.max_update_package_size,
+      ]
+    }
+
+    if (defined(invoker.bootfs_compression)) {
+      assert(
+          invoker.bootfs_compression != "",
+          "'${_host_test_target_name}' cannot have an empty bootfs_compression")
+      _args += [
+        "-bootfs-compression",
+        invoker.bootfs_compression,
+      ]
+    }
+
+    if (!defined(invoker.check_abr) || invoker.check_abr) {
+      _args += [ "--check-abr=true" ]
+    } else {
+      _args += [ "--check-abr=false" ]
+    }
+
+    if (defined(invoker.resolver_mode)) {
+      _args += [ "--resolver-mode=" + invoker.resolver_mode ]
+    } else {
+      _args += [ "--resolver-mode=constant" ]
+    }
+
+    go_test(_host_test_target_name) {
+      embed = [ "//src/sys/pkg/tests/system-tests/upgrade_test:gopkg" ]
+      args = _args
+      forward_variables_from(invoker, [ "timeout" ])
+
+      if (defined(invoker.environments)) {
+        environments = []
+        foreach(env, invoker.environments) {
+          env.service_account = _service_account
+          environments += [ env ]
+        }
+      }
+    }
+  }
+
+  # Finally, group all the generated test specs into a group to make it easy to
+  # reference.
+  group(target_name) {
+    testonly = true
+    deps = _deps
+  }
+}
+
+# A template that configures a System Test Reboot Suite against a given release
+# builder.
+#
+# Parameters
+#
+#   release_builder
+#   - Optional: Builder from which build artifacts will be downloaded and
+#     installed on the device, instead of from the current build. This has
+#     the form of `project/bucket/builder id`, like
+#     `fuchsia/ci/fuchsia-x64-release`. Conflicts with `release_build_id`.
+#   - Type: string
+#
+#   release_build_id
+#   - Optional: Build ID from which build artifacts will be downloaded and
+#     installed on the device, instead of from the current build. This has
+#     the form of `1234...`. Conflicts with `release_builder`.
+#   - Type: string
+#
+#   service_account
+#   - Optional: The service account that has permission to download the build
+#     artifacts.
+#   - Type: string
+#
+#   environments
+#   - Required: What environments this test should target.
+#   - Type: see //build/testing/test_spec.gni for more details. Note that
+#     any label and service_account in each environment is ignored.
+#
+#   timeout
+#   - Optional: Err if this test takes longer than this time.
+#   - Type: duration string
+#
+#   cycle_timeout
+#   - Optional: Err if the test cycle takes longer than this time.
+#   - Type: duration string
+#
+#   cycle_count
+#   - Optional: How many test cycles should the test execute. Defaults to 1
+#     cycle.
+#   - Type: integer string
+#
+#   device_connect_timeout
+#   - Optional: How long to wait between connection attempts.
+#   - Type: duration string
+#
+#   sleep_after_reboot
+#   - Optional: How long to sleep after we trigger a reboot and connect to the device.
+#   - Type: duration string
+#
+#   check_abr
+#   - Optional: check that the device booted into the expected ABR slot.
+#   - Type: bool, default true
+template("system_test_reboot_suite") {
+  assert(is_linux, "system_test_reboot_suite is for linux only")
+
+  assert(
+      !(defined(invoker.release_builder) && defined(invoker.release_build_id)),
+      "release_builder and release_build_id are mutually exclusive for $target_name")
+
+  assert(defined(invoker.environments),
+         "environments must be defined for $target_name")
+
+  _tests =
+      [ "//src/sys/pkg/tests/system-tests/reboot_test:system_tests_reboot" ]
+
+  _deps = []
+
+  foreach(test, _tests) {
+    _test_name = get_label_info(test, "name")
+
+    _host_test_target_name = "${target_name}_${_test_name}"
+    _deps += [ ":${_host_test_target_name}" ]
+
+    _args = []
+
+    if (defined(invoker.release_builder)) {
+      _args += [
+        "-builder-name",
+        invoker.release_builder,
+      ]
+    }
+
+    if (defined(invoker.release_build_id)) {
+      _args += [
+        "-build-id",
+        invoker.release_build_id,
+      ]
+    }
+
+    _service_account = _environment_service_account
+    if (defined(invoker.service_account)) {
+      assert(invoker.service_account != "",
+             "'${_host_test_target_name}' cannot have an empty service_account")
+      _service_account = invoker.service_account
+    }
+
+    if (defined(invoker.timeout)) {
+      assert(invoker.timeout != "",
+             "'${_host_test_target_name}' cannot have an empty timeout")
+    }
+
+    if (defined(invoker.cycle_timeout)) {
+      assert(invoker.cycle_timeout != "",
+             "'${_host_test_target_name}' cannot have an empty cycle timeout")
+      _args += [
+        "-cycle-timeout",
+        invoker.cycle_timeout,
+      ]
+    }
+
+    if (defined(invoker.cycle_count)) {
+      assert(invoker.cycle_count != "",
+             "'${_host_test_target_name}' cannot have an empty cycle count")
+      _args += [
+        "-cycle-count",
+        invoker.cycle_count,
+      ]
+    }
+
+    if (defined(invoker.device_connect_timeout)) {
+      assert(
+          invoker.device_connect_timeout != "",
+          "'${_host_test_target_name}' cannot have empty device connect timout")
+      _args += [
+        "-device-connect-timeout",
+        invoker.device_connect_timeout,
+      ]
+    }
+
+    if (defined(invoker.sleep_after_reboot)) {
+      assert(invoker.sleep_after_reboot != "",
+             "'${_host_test_target_name}' cannot have empty sleep after reboot")
+      _args += [
+        "-sleep-after-reboot",
+        invoker.sleep_after_reboot,
+      ]
+    }
+
+    if (!defined(invoker.check_abr) || invoker.check_abr) {
+      _args += [ "--check-abr=true" ]
+    } else {
+      _args += [ "--check-abr=false" ]
+    }
+
+    go_test(_host_test_target_name) {
+      embed = [ "//src/sys/pkg/tests/system-tests/reboot_test:gopkg" ]
+      args = _args
+      forward_variables_from(invoker, [ "timeout" ])
+
+      if (defined(invoker.environments)) {
+        environments = []
+        foreach(env, invoker.environments) {
+          env.service_account = _service_account
+          environments += [ env ]
+        }
+      }
+    }
+  }
+
+  # Finally, group all the generated test specs into a group to make it easy to
+  # reference.
+  group(target_name) {
+    testonly = true
+    deps = _deps
+  }
+}
+
+# A template that configures a System Test Recovery Suite against a given
+# release builder.
+#
+# Parameters
+#
+#   release_builder
+#   - Optional: Builder from which build artifacts will be downloaded and
+#     installed on the device, instead of from the current build. This has
+#     the form of `project/bucket/builder id`, like
+#     `fuchsia/ci/fuchsia-x64-release`. Conflicts with `release_build_id`.
+#   - Type: string
+#
+#   release_build_id
+#   - Optional: Build ID from which build artifacts will be downloaded and
+#     installed on the device, instead of from the current build. This has
+#     the form of `1234...`. Conflicts with `release_builder`.
+#   - Type: string
+#
+#   service_account
+#   - Optional: The service account that has permission to download the build
+#     artifacts.
+#   - Type: string
+#
+#   environments
+#   - Required: What environments this test should target.
+#   - Type: see //build/testing/test_spec.gni for more details. Note that
+#     any label and service_account in each environment is ignored.
+#
+#   timeout
+#   - Optional: Err if this test takes longer than this time.
+#   - Type: duration string
+#
+#   cycle_timeout
+#   - Optional: Err if the test cycle takes longer than this time.
+#   - Type: duration string
+#
+#   cycle_count
+#   - Optional: How many test cycles should the test execute. Defaults to 1
+#     cycle.
+#   - Type: integer string
+#
+#   device_connect_timeout
+#   - Optional: How long to wait between connection attempts.
+#   - Type: duration string
+#
+#   check_abr
+#   - Optional: check that the device booted into the expected ABR slot.
+#   - Type: bool, default true
+template("system_test_recovery_suite") {
+  assert(is_linux, "system_test_recovery_suite is for linux only")
+
+  assert(
+      !(defined(invoker.release_builder) && defined(invoker.release_build_id)),
+      "release_builder and release_build_id are mutually exclusive for $target_name")
+
+  assert(defined(invoker.environments),
+         "environments must be defined for $target_name")
+
+  _tests = [ "//src/sys/pkg/tests/system-tests:system_tests_recovery" ]
+
+  _deps = []
+
+  foreach(test, _tests) {
+    _test_name = get_label_info(test, "name")
+
+    _host_test_target_name = "${target_name}_${_test_name}"
+    _deps += [ ":${_host_test_target_name}" ]
+
+    _args = []
+
+    if (defined(invoker.release_builder)) {
+      _args += [
+        "-builder-name",
+        invoker.release_builder,
+      ]
+    }
+
+    if (defined(invoker.release_build_id)) {
+      _args += [
+        "-build-id",
+        invoker.release_build_id,
+      ]
+    }
+
+    _service_account = _environment_service_account
+    if (defined(invoker.service_account)) {
+      assert(invoker.service_account != "",
+             "'${_host_test_target_name}' cannot have an empty service_account")
+      _service_account = invoker.service_account
+    }
+
+    if (defined(invoker.timeout)) {
+      assert(invoker.timeout != "",
+             "'${_host_test_target_name}' cannot have an empty timeout")
+    }
+
+    if (defined(invoker.cycle_timeout)) {
+      assert(invoker.cycle_timeout != "",
+             "'${_host_test_target_name}' cannot have an empty cycle timeout")
+      _args += [
+        "-cycle-timeout",
+        invoker.cycle_timeout,
+      ]
+    }
+
+    if (defined(invoker.cycle_count)) {
+      assert(invoker.cycle_count != "",
+             "'${_host_test_target_name}' cannot have an empty cycle count")
+      _args += [
+        "-cycle-count",
+        invoker.cycle_count,
+      ]
+    }
+
+    if (defined(invoker.device_connect_timeout)) {
+      assert(
+          invoker.device_connect_timeout != "",
+          "'${_host_test_target_name}' cannot have empty device connect timout")
+      _args += [
+        "-device-connect-timeout",
+        invoker.device_connect_timeout,
+      ]
+    }
+
+    if (!defined(invoker.check_abr) || invoker.check_abr) {
+      _args += [ "--check-abr=true" ]
+    } else {
+      _args += [ "--check-abr=false" ]
+    }
+
+    go_test(_host_test_target_name) {
+      embed = [ "//src/sys/pkg/tests/system-tests/recovery_test:gopkg" ]
+      args = _args
+      forward_variables_from(invoker, [ "timeout" ])
+
+      if (defined(invoker.environments)) {
+        environments = []
+        foreach(env, invoker.environments) {
+          env.service_account = _service_account
+          environments += [ env ]
+        }
+      }
+    }
+  }
+
+  # Finally, group all the generated test specs into a group to make it easy to
+  # reference.
+  group(target_name) {
+    testonly = true
+    deps = _deps
+  }
+}

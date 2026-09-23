@@ -1,0 +1,126 @@
+# Copyright 2023 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/testing/boot_tests/kernel_zbi_test.gni")
+import("//build/testing/boot_tests/zbi_test.gni")
+import("//build/zbi/kernel_cmdline.gni")
+
+# Define a ZBI input to set the kernel.shell.script option.
+#
+# This is a shorthand to define a kernel_cmdline() target whose contents
+# are "kernel.shell.script=..." with the "..." being constructed from
+# the parameter.
+#
+# Parameters
+#
+#   * script
+#     - Required: This is a list of strings, each a kernel shell command line.
+#     These are combined by putting `;` between the lines and replacing each
+#     space with `+` as expected for the `kernel.shell.script` boot option.
+#     - Type: list(string)
+#
+#   * deps, visibility, testonly
+#     - Optional: See kernel_cmdline().
+#
+template("kernel_shell_script") {
+  kernel_cmdline(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "visibility",
+                             "testonly",
+                           ])
+
+    args = [ "kernel.shell.script=" +
+             string_replace(string_join(";", invoker.script), " ", "+") ]
+  }
+}
+
+# Define a kernel_zbi_test() that runs a kernel shell script.
+#
+# This is a simple wrapper around kernel_zbi_test() and kernel_shell_script().
+# It defines a $target_name zbi_test() target that uses a $target_name.script
+# kernel_shell_script() target.
+#
+# Parameters
+#
+#   * script
+#     - Required: This is a list of strings, each a kernel shell command line.
+#     These are combined by putting `;` between the lines and replacing each
+#     space with `+` as expected for the `kernel.shell.script` boot option.
+#     - Type: list(string or scope)
+#     When an element is a scope it is:
+#       * cuckoo
+#         - Required: If false, $lines are omitted from the cuckoo version.
+#         If true, $lines are omitted from the non-cuckoo version.
+#         - Type: bool
+#       * lines
+#         - Required: Lines added into the script at this point.
+#         - Type: list(string)
+#
+#   * kernel_images
+#     - Optional: See kernel_zbi_test().  This just has a different default,
+#     since $extra_kernel_test_images shouldn't all be assumed to enable tests.
+#     - Type: list(string)
+#     - Default: `[default_kernel_test_image]`
+#
+# Other parameters are as for kernel_zbi_test().
+#
+template("kernel_shell_script_test") {
+  main_target = target_name
+
+  non_cuckoo_script = []
+  cuckoo_script = []
+  foreach(line, invoker.script) {
+    if (line == "$line") {
+      non_cuckoo_script += [ line ]
+      cuckoo_script += [ line ]
+    } else if (line.cuckoo) {
+      cuckoo_script += line.lines
+    } else {
+      non_cuckoo_script += line.lines
+    }
+  }
+
+  scripts = [
+    {
+      name = "$main_target.script"
+      script = non_cuckoo_script
+    },
+  ]
+  non_cuckoo_script_deps = [ ":$main_target.script" ]
+  if (cuckoo_script == non_cuckoo_script) {
+    cuckoo_script_deps = non_cuckoo_script_deps
+  } else {
+    cuckoo_script_deps = [ ":$main_target.cuckoo.script" ]
+    scripts += [
+      {
+        name = "$main_target.cuckoo.script"
+        script = cuckoo_script
+      },
+    ]
+  }
+
+  foreach(script, scripts) {
+    kernel_shell_script(script.name) {
+      testonly = true
+      forward_variables_from(invoker, [ "visibility" ])
+      if (defined(visibility)) {
+        visibility += [ ":*" ]
+      }
+      script = script.script
+    }
+  }
+
+  kernel_zbi_test(main_target) {
+    kernel_images = [ default_kernel_test_image ]
+    cuckoo_deps = []
+    non_cuckoo_deps = []
+    forward_variables_from(invoker, "*", [ "script" ])
+    cuckoo_deps += cuckoo_script_deps
+    non_cuckoo_deps += non_cuckoo_script_deps
+  }
+}

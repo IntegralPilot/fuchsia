@@ -1,0 +1,179 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import(
+    "//src/lib/testing/expectation/fuchsia_test_component_with_expectations.gni")
+import(
+    "//src/lib/testing/expectation/fuchsia_test_with_expectations_package.gni")
+import("//src/lib/testing/sharding/fuchsia_sharded_test_package.gni")
+
+non_sharded_tests = [
+  {
+    label = "debug"
+  },
+  {
+    label = "interfaces"
+    err_logs = true
+  },
+  {
+    label = "interfaces-admin"
+    err_logs = true
+  },
+  {
+    label = "ndp"
+  },
+  {
+    label = "routes"
+    err_logs = true
+  },
+  {
+    label = "routes-admin"
+    err_logs = true
+    log_less = true
+  },
+  {
+    label = "settings"
+  },
+  {
+    label = "sockets"
+  },
+]
+
+_common_test_package_deps = [
+  # netemul-sandbox is used to create hermetic test realms.
+  "//src/connectivity/network/testing/netemul/service:netemul-sandbox",
+
+  # some tests run the DHCP client along with the hermetic netstack.
+  "//src/connectivity/network/dhcpv4/client/bindings:component",
+
+  # the expectation-comparer is used to support pass/fail/skip expectations.
+  "//src/lib/testing/expectation:expectation_comparer",
+]
+
+_non_log_less_package_deps = [
+  # netstack3 is under test.
+  "//src/connectivity/network/netstack3:component-debug",
+]
+
+_log_less_package_deps = [
+  # :component-debug-less-logs is used instead of :component-debug to avoid
+  # forcing DEBUG logs to be included, which are too verbose and cause some
+  # longer suites to time out.
+  "//src/connectivity/network/netstack3:component-debug-less-logs",
+]
+
+all_non_sharded_test_packages = []
+
+foreach(test, non_sharded_tests) {
+  _err_logs = false
+  if (defined(test.err_logs)) {
+    _err_logs = test.err_logs
+  }
+  _label = test.label
+  _name = "netstack-${_label}-fidl-test"
+  _component_label = "${_name}"
+  _expect = "expectations/${_label}.json5"
+
+  _package_deps = []
+  _package_deps += _common_test_package_deps
+  if (defined(test.log_less) && test.log_less) {
+    _package_deps += _log_less_package_deps
+  } else {
+    _package_deps += _non_log_less_package_deps
+  }
+
+  if (!_err_logs) {
+    _package_label = "${_name}_pkg"
+
+    fuchsia_test_component_with_expectations(_component_label) {
+      component_name = _name
+      expectations = _expect
+      manifest = "meta/${_name}.cml"
+      deps = [ _label ]
+    }
+
+    fuchsia_test_package(_package_label) {
+      package_name = _name
+      test_components = [ ":${_component_label}" ]
+      deps = _package_deps
+    }
+
+    all_non_sharded_test_packages += [ ":${_package_label}" ]
+  } else {
+    fuchsia_test_component(_component_label) {
+      component_name = _name
+      manifest = "meta/${_name}.cml"
+      deps = [ _label ]
+    }
+
+    _no_err_logs_package_name = "${_name}-no-err-logs"
+    fuchsia_test_with_expectations_package(_no_err_logs_package_name) {
+      test_components = [ ":${_component_label}" ]
+      expectations = _expect
+      treatment_of_cases_with_error_logs = "SKIP_CASES_WITH_ERROR_LOGS"
+      deps = _package_deps
+    }
+    _with_err_logs_package_name = "${_name}-with-err-logs"
+    fuchsia_test_with_expectations_package(_with_err_logs_package_name) {
+      test_components = [ ":${_component_label}" ]
+      expectations = _expect
+      treatment_of_cases_with_error_logs = "RUN_ONLY_CASES_WITH_ERROR_LOGS"
+      deps = _package_deps
+      test_specs = {
+        log_settings = {
+          max_severity = "ERROR"
+        }
+      }
+    }
+    all_non_sharded_test_packages += [
+      ":${_no_err_logs_package_name}",
+      ":${_with_err_logs_package_name}",
+    ]
+  }
+}
+
+fuchsia_sharded_test_package("netstack-filter-fidl-tests") {
+  test_components = [
+    {
+      name = "netstack-filter-fidl-test"
+      manifest = "meta/netstack-filter-fidl-test.cml"
+      deps = _common_test_package_deps + _log_less_package_deps + [ "filter" ]
+      expectations = "expectations/filter.json5"
+      num_shards = 15
+
+      # Matches the first two '::'-delimited parts of the test name, or just the
+      # whole name if there are no occurrences of '::'. For example, from
+      # "ingress::drop_incoming_local_ingress_v4::incoming_interface_device_class"
+      # matches "ingress::drop_incoming_local_ingress_v4", and matches all of
+      # "drop_controller_removes_resources".
+      shard_part_regex = "([^::]+(?:::[^::]+)?).*"
+    },
+  ]
+}
+
+fuchsia_sharded_test_package("netstack-neighbor-fidl-tests") {
+  test_components = [
+    {
+      name = "netstack-neighbor-fidl-test"
+      manifest = "meta/netstack-neighbor-fidl-test.cml"
+      deps = _common_test_package_deps + _non_log_less_package_deps +
+             [ "neighbor" ]
+      expectations = "expectations/neighbor.json5"
+      num_shards = 4
+
+      # Matches up to the first ':', which for our purposes is the same as until
+      # the first "::".
+      shard_part_regex = "([^:]+)"
+    },
+  ]
+}
+
+group("tests") {
+  testonly = true
+  deps = all_non_sharded_test_packages + [
+           ":netstack-filter-fidl-tests",
+           ":netstack-neighbor-fidl-tests",
+         ]
+}

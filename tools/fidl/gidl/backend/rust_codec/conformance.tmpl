@@ -1,0 +1,130 @@
+{{/*
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+#![cfg(test)]
+#![allow(unused_imports)]
+#![allow(invalid_from_utf8)]
+#![allow(clippy::approx_constant)]
+
+use {
+    assert_matches::assert_matches,
+    fidl::{AsHandleRef, NullableHandle, HandleDisposition, HandleInfo, HandleOp, ObjectType, Rights},
+    fidl::encoding::{Context, Decode, Decoder, Encoder, WireFormatVersion},
+    fidl_codec::{Value, Error, AsPlatform as _, FromPlatform as _},
+    zx_status::Status,
+    zx_types as zx_types,
+    gidl_util::{
+        HandleDef, HandleSubtype, copy_handle, create_handles, decode_value,
+        get_handle_koid, get_info_handle_valid, repeat, select_handle_infos,
+        select_raw_handle_infos, to_zx_handle_disposition_t,
+    },
+};
+
+fn ns() -> &'static fidl_codec::library::Namespace {
+    static FIDL_JSON: &str = include_str!(env!("CONFORMANCE_JSON_PATH"));
+    static NS: std::sync::OnceLock<fidl_codec::library::Namespace> = std::sync::OnceLock::new();
+    NS.get_or_init(|| {
+        let mut ns = fidl_codec::library::Namespace::new();
+        ns.load(FIDL_JSON).unwrap();
+        ns
+    })
+}
+
+fn convert_handle_infos(infos: Vec<fidl::HandleInfo>) -> Vec<fidl_codec::HandleInfo> {
+    infos.into_iter().map(Into::into).collect()
+}
+
+{{ range .EncodeSuccessCases }}
+#[test]
+fn test_{{ .Name }}_encode() {
+    {{- if .HandleDefs }}
+    let handle_defs = create_handles(&{{ .HandleDefs }});
+    {{- end }}
+    let (bytes, handle_dispositions) = fidl_codec::encode(ns(), "{{.DeclName}}", false, {{ .Value }}).unwrap();
+    assert_eq!(bytes, &{{ .Bytes }});
+    {{- if .HandleDispositions }}
+    assert_eq!(
+        handle_dispositions.into_iter().map(Into::into).map(to_zx_handle_disposition_t).collect::<Vec<_>>(),
+        &{{ .HandleDispositions }}
+    );
+    {{- else if .Handles }}
+    assert_eq!(
+        handle_dispositions.iter().map(|h| h.raw_handle()).collect::<Vec<_>>(),
+        &{{ .Handles }}
+    );
+    {{- else }}
+    assert_eq!(handle_dispositions, &[]);
+    {{- end }}
+}
+{{ end }}
+
+{{ range .DecodeSuccessCases }}
+#[test]
+fn test_{{ .Name }}_decode() {
+    let bytes = &{{ .Bytes }};
+    {{- if .HandleDefs }}
+    let handle_defs = create_handles(&{{ .HandleDefs }});
+    let _handle_koids = handle_defs.iter().map(get_handle_koid).collect::<Vec<_>>();
+    let handle_infos = select_handle_infos(&handle_defs, &{{ .Handles }});
+    {{- else }}
+    let handle_infos = Vec::new();
+    {{- end }}
+    let confirm_value = {{.ConfirmValue}};
+    let value = fidl_codec::decode(ns(), "{{.DeclName}}", bytes, convert_handle_infos(handle_infos)).unwrap();
+    assert_eq!(value, confirm_value);
+    {{- if .UnusedHandles }}
+    let unused_handles = select_raw_handle_infos(&handle_defs, &{{ .UnusedHandles }});
+    assert_eq!(
+        unused_handles.iter().map(get_info_handle_valid).collect::<Vec<_>>(),
+        repeat(Err(Status::BAD_HANDLE), unused_handles.len()),
+    );
+    {{- end }}
+}
+{{ end }}
+
+{{ range .EncodeFailureCases }}
+#[test]
+fn test_{{ .Name }}_encode_failure() {
+    {{- if .HandleDefs }}
+    let handle_defs = create_handles(&{{ .HandleDefs }});
+    {{- end }}
+    match fidl_codec::encode(ns(), "{{.DeclName}}", false, {{ .Value }}) {
+        // TODO: Assert the specific error once the enum variants are more specific
+        Err(err) => assert_matches!(err, Error::EncodeError(_)|Error::RecursionLimitExceeded),
+        Ok(_) => panic!("unexpected successful encoding"),
+    }
+    {{- if .HandleDefs }}
+    assert_eq!(
+        handle_defs.iter().map(get_info_handle_valid).collect::<Vec<_>>(),
+        repeat(Err(Status::BAD_HANDLE), handle_defs.len()),
+    );
+    {{- end }}
+}
+{{ end }}
+
+{{ range .DecodeFailureCases }}
+#[test]
+fn test_{{ .Name }}_decode_failure() {
+    let bytes = &{{ .Bytes }};
+    {{- if .HandleDefs }}
+    let handle_defs = create_handles(&{{ .HandleDefs }});
+    let handle_infos = select_handle_infos(&handle_defs, &{{ .Handles }});
+    {{- else }}
+    let handle_infos = Vec::new();
+    {{- end }}
+    match fidl_codec::decode(ns(), "{{.DeclName}}", bytes, convert_handle_infos(handle_infos)) {
+        // TODO: Assert the specific error once the enum variants are more specific
+        Err(err) => assert_matches!(err, Error::DecodeError(_)|Error::Utf8Error(_)|Error::RecursionLimitExceeded),
+        Ok(_) => panic!("unexpected successful decoding"),
+    }
+    {{- if .HandleDefs }}
+    assert_eq!(
+        handle_defs.iter().map(get_info_handle_valid).collect::<Vec<_>>(),
+        repeat(Err(Status::BAD_HANDLE), handle_defs.len()),
+    );
+    {{- end }}
+}
+{{ end }}

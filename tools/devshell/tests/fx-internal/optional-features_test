@@ -1,0 +1,136 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test expected behavior of optional features library
+
+BT_FILE_DEPS=(
+  "scripts/fx"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/platform.sh"
+)
+
+declare fx
+
+BT_SET_UP() {
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+}
+
+TEST_disable_feature() {
+  local valid_feature="myfeature"
+  cat >> "${BT_TEMP_DIR}/tools/devshell/lib/fx-optional-features.sh" <<EOF
+    list_optional_features() {
+      echo "${valid_feature}"
+    }
+    is_feature_enabled_by_default() {
+      return 0  # enabled by default
+    }
+EOF
+
+  local cmd="mycmd"
+  local cmd_path="${BT_TEMP_DIR}/tools/devshell/${cmd}"
+  mkdir -p "$(dirname "${cmd_path}")"
+  # create a command that runs is_feature_enabled and returns its exit code
+  cat >"${cmd_path}" <<EOF
+#!/bin/bash
+source ${BT_TEMP_DIR}/tools/devshell/lib/fx-optional-features.sh || exit \$\?
+is_feature_enabled "${valid_feature}"
+EOF
+  chmod u+x "${cmd_path}"
+  # check that the command, when executed through fx, works as intended for
+  # an optional feature. It should return 0 (true), since the feature
+  # is not disabled explicitly, hence enabled.
+  BT_EXPECT ${fx} ${cmd}
+  # Same, --enable has no effect
+  BT_EXPECT ${fx} --enable=${valid_feature} ${cmd}
+
+  # Now it should return 1 (false), since the feature is explicitly disabled
+  # in the fx invocation.
+  BT_EXPECT_FAIL ${fx} --disable=${valid_feature} ${cmd}
+}
+
+TEST_enable_feature() {
+  local valid_feature="myfeature"
+  cat >> "${BT_TEMP_DIR}/tools/devshell/lib/fx-optional-features.sh" <<EOF
+    list_optional_features() {
+      echo "${valid_feature}"
+    }
+    is_feature_enabled_by_default() {
+      return 1  # disabled by default
+    }
+EOF
+
+  local cmd="mycmd"
+  local cmd_path="${BT_TEMP_DIR}/tools/devshell/${cmd}"
+  mkdir -p "$(dirname "${cmd_path}")"
+  # create a command that runs is_feature_enabled and returns its exit code
+  cat >"${cmd_path}" <<EOF
+#!/bin/bash
+source ${BT_TEMP_DIR}/tools/devshell/lib/fx-optional-features.sh || exit \$\?
+is_feature_enabled "${valid_feature}"
+EOF
+  chmod u+x "${cmd_path}"
+  # check that the command, when executed through fx, works as intended for
+  # an optional feature.
+  # It should return 1 (false), since the feature is not enabled explicitly, hence disabled.
+  BT_EXPECT_FAIL ${fx} ${cmd}
+  # Same, --disable has no effect
+  BT_EXPECT_FAIL ${fx} --disable=${valid_feature} ${cmd}
+
+  # Should return 0 (true), since the feature is explicitly enabled
+  # in the fx invocation.
+  BT_EXPECT ${fx} --enable=${valid_feature} ${cmd}
+
+}
+
+TEST_features_are_valid() {
+  source "${BT_TEMP_DIR}/tools/devshell/lib/fx-optional-features.sh"
+  for f in $(list_optional_features); do
+    # no spaces
+    if [[ $f =~ " " ]]; then
+      BT_FAIL "Optional feature '${f}' should not contain spaces"
+    fi
+
+    # reverse checking
+    BT_EXPECT is_valid_feature "$f"
+  done
+}
+
+TEST_get_fx_flags_non_default_features() {
+  cat >> "${BT_TEMP_DIR}/tools/devshell/lib/fx-optional-features.sh" <<EOF
+    list_optional_features() {
+      echo "feature1" "feature2"
+    }
+    is_feature_enabled_by_default() {
+      if [[ "\$1" == "feature1" ]]; then return 0; fi  # enabled by default
+      if [[ "\$1" == "feature2" ]]; then return 1; fi  # disabled by default
+    }
+EOF
+
+  local cmd="mycmd"
+  local cmd_path="${BT_TEMP_DIR}/tools/devshell/${cmd}"
+  mkdir -p "$(dirname "${cmd_path}")"
+  # create a command that prints get_fx_flags_non_default_features
+  cat >"${cmd_path}" <<EOF
+#!/bin/bash
+source ${BT_TEMP_DIR}/tools/devshell/lib/fx-optional-features.sh || exit \$\?
+get_fx_flags_non_default_features
+EOF
+  chmod u+x "${cmd_path}"
+
+  BT_EXPECT_EQ "$(${fx} --enable=feature1 ${cmd})" ""  # feature1 is enabled by default
+  BT_EXPECT_EQ "$(${fx} --disable=feature1 ${cmd})" "--disable=feature1"
+
+  BT_EXPECT_EQ "$(${fx} --enable=feature2 ${cmd})" "--enable=feature2"
+  BT_EXPECT_EQ "$(${fx} --disable=feature2 ${cmd})" ""  # feature2 is disabled by default
+
+  BT_EXPECT_EQ "$(${fx} --disable=feature1 --enable=feature2 ${cmd})" "--disable=feature1 --enable=feature2"
+}
+BT_RUN_TESTS "$@"

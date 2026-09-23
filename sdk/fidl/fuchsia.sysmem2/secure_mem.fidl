@@ -1,0 +1,333 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.sysmem2;
+
+/// SecureMem
+///
+/// The client is sysmem.  The server is securemem driver.
+///
+/// TEE - Trusted Execution Environment.
+///
+/// REE - Rich Execution Environment.
+///
+/// Enables sysmem to call the securemem driver to get any secure heaps
+/// configured via the TEE (or via the securemem driver), and set any physical
+/// secure heaps configured via sysmem.
+///
+/// Presently, dynamically-allocated secure heaps are configured via sysmem, as
+/// it starts quite early during boot and can successfully reserve contiguous
+/// physical memory.  Presently, fixed-location secure heaps are configured via
+/// TEE, as the plumbing goes from the bootloader to the TEE.  However, this
+/// protocol intentionally doesn't care which heaps are dynamically-allocated
+/// and which are fixed-location.
+@available(added=HEAD)
+open protocol SecureMem {
+    /// Gets the physical address and length of any secure heap whose physical
+    /// range is configured via the TEE.
+    ///
+    /// Presently, these will be fixed physical addresses and lengths, with the
+    /// location plumbed via the TEE.
+    ///
+    /// This is preferred over ['fuchsia.hardware.sysmem.Sysmem/RegisterHeap']
+    /// when there isn't any special heap-specific per-VMO setup or teardown
+    /// required.
+    ///
+    /// The physical range must be secured/protected by the TEE before the
+    /// securemem driver responds to this request with success.
+    ///
+    /// Sysmem should only call this once.  Returning zero heaps is not a
+    /// failure.
+    ///
+    /// Errors:
+    ///  * PROTOCOL_DEVIATION - called more than once.
+    ///  * UNSPECIFIED - generic internal error (such as in communication
+    ///    with TEE which doesn't generate zx_status_t errors).
+    ///  * other errors are allowed; any other errors should be treated the same
+    ///    as UNSPECIFIED.
+    flexible GetPhysicalSecureHeaps() -> (table {
+        1: heaps vector<SecureHeapAndRanges>:MAX_HEAPS_COUNT;
+    }) error Error;
+
+    /// Gets information about any secure heaps whose physical pages are not
+    /// configured by the TEE, but by sysmem.
+    ///
+    /// Sysmem should only call this once. Returning zero heaps is not a
+    /// failure.
+    ///
+    /// Errors:
+    ///  * PROTOCOL_DEVIATION - called more than once.
+    ///  * UNSPECIFIED - generic internal error (such as in communication
+    ///    with TEE which doesn't generate zx_status_t errors).
+    ///  * other errors are allowed; any other errors should be treated the same
+    ///    as UNSPECIFIED.
+    flexible GetDynamicSecureHeaps() -> (table {
+        1: heaps vector<DynamicSecureHeap>:MAX_HEAPS_COUNT;
+    }) error Error;
+
+    /// This request from sysmem to the securemem driver gets the properties of
+    /// a protected/secure heap.
+    ///
+    /// This only handles heaps with a single contiguous physical extent.
+    ///
+    /// The heap's entire physical range is indicated in case this request needs
+    /// some physical space to auto-detect how many ranges are REE-usable.  Any
+    /// temporary HW protection ranges will be deleted before this request
+    /// completes.
+    ///
+    /// Errors:
+    ///  * UNSPECIFIED - generic internal error (such as in communication
+    ///    with TEE which doesn't generate zx_status_t errors).
+    ///  * other errors are allowed; any other errors should be treated the same
+    ///    as UNSPECIFIED.
+    flexible GetPhysicalSecureHeapProperties(table {
+        1: entire_heap SecureHeapAndRange;
+    }) -> (table {
+        1: properties SecureHeapProperties;
+    }) error Error;
+
+    /// This request from sysmem to the securemem driver conveys a physical
+    /// range to add, for a heap whose physical range(s) are set up via
+    /// sysmem.
+    ///
+    /// Only sysmem can call this because only sysmem is handed the client end
+    /// of a FIDL channel serving this protocol, via RegisterSecureMem().  The
+    /// securemem driver is the server end of this protocol.
+    ///
+    /// The securemem driver must configure all the covered offsets as protected
+    /// before responding to this message with success.
+    ///
+    /// On failure, the securemem driver must ensure the protected range was not
+    /// created.
+    ///
+    /// Sysmem must only call this up to once if dynamic_protection_ranges
+    /// false.
+    ///
+    /// If dynamic_protection_ranges is true, sysmem can call this multiple
+    /// times as long as the current number of ranges never exceeds
+    /// max_protected_range_count.
+    ///
+    /// The caller must not attempt to add a range that matches an
+    /// already-existing range.  Added ranges can overlap each other as long as
+    /// no two ranges match exactly.
+    ///
+    /// Errors:
+    ///   * PROTOCOL_DEVIATION - called more than once when
+    ///     !dynamic_protection_ranges.  Adding a heap that would cause overall
+    ///     heap count to exceed max_protected_range_count. Unexpected heap, or
+    ///     range that doesn't conform to protected_range_granularity. See log.
+    ///   * UNSPECIFIED - generic internal error (such as in communication
+    ///     with TEE which doesn't generate zx_status_t errors).
+    ///   * other errors are possible, such as from communication failures or
+    ///     server propagation of failures.
+    flexible AddSecureHeapPhysicalRange(table {
+        1: heap_range SecureHeapAndRange;
+    }) -> () error Error;
+
+    /// This request from sysmem to the securemem driver conveys a physical
+    /// range to delete, for a heap whose physical range(s) are set up via
+    /// sysmem.
+    ///
+    /// Only sysmem can call this because only sysmem is handed the client end
+    /// of a FIDL channel serving this protocol, via RegisterSecureMem().  The
+    /// securemem driver is the server end of this protocol.
+    ///
+    /// The securemem driver must configure all the covered offsets as not
+    /// protected before responding to this message with success.
+    ///
+    /// On failure, the securemem driver must ensure the protected range was not
+    /// deleted.
+    ///
+    /// Sysmem must not call this if dynamic_protection_ranges false.
+    ///
+    /// If dynamic_protection_ranges is true, sysmem can call this repeatedly,
+    /// on various ranges that exist at the time of the call.
+    ///
+    /// If any portion of the range being deleted is not also covered by another
+    /// protected range, then any ongoing DMA to any part of the entire range
+    /// may be interrupted / may fail, potentially in a way that's disruptive to
+    /// the entire system (bus lockup or similar, depending on device details).
+    /// Therefore, the caller must ensure that no ongoing DMA is occurring to
+    /// any portion of the range being deleted, unless the caller has other
+    /// active ranges covering every block of the range being deleted.  Ongoing
+    /// DMA to/from blocks outside the range being deleted is never impacted by
+    /// the deletion.
+    ///
+    /// Errors:
+    ///   * PROTOCOL_DEVIATION - called when !dynamic_protection_ranges.
+    ///     Unexpected heap, or range that doesn't conform to
+    ///     protected_range_granularity.
+    ///   * UNSPECIFIED - generic internal error (such as in communication
+    ///     with TEE which doesn't generate zx_status_t errors).
+    ///   * NOT_FOUND - the specified range is not found.
+    ///   * other errors are possible, such as from communication failures or
+    ///     server propagation of failures.
+    flexible DeleteSecureHeapPhysicalRange(table {
+        1: heap_range SecureHeapAndRange;
+    }) -> () error Error;
+
+    /// This request from sysmem to the securemem driver conveys a physical
+    /// range to modify and its new base and length, for a heap whose physical
+    /// range(s) are set up via sysmem.
+    ///
+    /// Only sysmem can call this because only sysmem is handed the client end
+    /// of a FIDL channel serving this protocol, via RegisterSecureMem().  The
+    /// securemem driver is the server end of this protocol.
+    ///
+    /// The securemem driver must configure the range to cover only the new
+    /// offsets before responding to this message with success.
+    ///
+    /// On failure, the securemem driver must ensure the range was not changed.
+    ///
+    /// Sysmem must not call this if dynamic_protection_ranges false.  Sysmem
+    /// must not call this if !is_mod_protected_range_available.
+    ///
+    /// If dynamic_protection_ranges is true, sysmem can call this repeatedly,
+    /// on various ranges that exist at the time of the call.
+    ///
+    /// The range must only be modified at one end or the other, but not both.
+    /// If the range is getting shorter, and the un-covered blocks are not
+    /// covered by other active ranges, any ongoing DMA to the entire range
+    /// that's geting shorter may fail in a way that disrupts the entire system
+    /// (bus lockup or similar), so the caller must ensure that no DMA is
+    /// ongoing to any portion of a range that is getting shorter, unless the
+    /// blocks being un-covered by the modification to this range are all
+    /// covered by other active ranges, in which case no disruption to ongoing
+    /// DMA will occur.
+    ///
+    /// If a range is modified to become <= zero length, the range is deleted.
+    ///
+    /// Errors:
+    ///   * PROTOCOL_DEVIATION - called when !dynamic_protection_ranges.
+    ///     Unexpected heap, or old_range or new_range that doesn't conform to
+    ///     protected_range_granularity, or old_range and new_range differ in
+    ///     both begin and end (disallowed).
+    ///   * UNSPECIFIED - generic internal error (such as in communication
+    ///     with TEE which doesn't generate zx_status_t errors).
+    ///   * NOT_FOUND - the specified range is not found.
+    ///   * other errors are possible, such as from communication failures or
+    ///     server propagation of failures.
+    flexible ModifySecureHeapPhysicalRange(table {
+        1: range_modification SecureHeapAndRangeModification;
+    }) -> () error Error;
+
+    /// Zero a sub-range of a currently-existing physical range added via
+    /// AddSecureHeapPhysicalRange().  The sub-range must be fully covered by
+    /// exactly one physical range, and must not overlap with any other
+    /// physical range.
+    ///
+    /// is_covering_range_explicit - When true, the covering range must be one
+    ///     of the ranges explicitly created via AddSecureHeapPhysicalRange(),
+    ///     possibly modified since.  When false, the covering range must not
+    ///     be one of the ranges explicitly created via
+    ///     AddSecureHeapPhysicalRange(), but the covering range must exist as
+    ///     a covering range not created via AddSecureHeapPhysicalRange().  The
+    ///     covering range is typically the entire physical range (or a range
+    ///     which covers even more) of a heap configured by the TEE and whose
+    ///     configuration is conveyed to sysmem via GetPhysicalSecureHeaps().
+    ///
+    /// Ongoing DMA is not disrupted by this request.
+    ///
+    /// Errors:
+    ///   * PROTOCOL_DEVIATION - called when !dynamic_protection_ranges.
+    ///     Unexpected heap.
+    ///   * UNSPECIFIED - generic internal error (such as in communication
+    ///     with TEE which doesn't generate zx_status_t errors).
+    ///   * other errors are possible, such as from communication failures or
+    ///     server propagation of failures.
+    flexible ZeroSubRange(table {
+        1: is_covering_range_explicit bool;
+        2: heap_range SecureHeapAndRange;
+    }) -> () error Error;
+};
+
+@available(added=HEAD)
+type SecureHeapProperties = table {
+    /// The Heap is repeated here for convenience.
+    1: heap Heap;
+
+    /// If true, more than one call to SetPhysicalSecureHeap() for the same
+    /// heap is allowed.  If false, only one SetPhyscialSecureHeap() call is
+    /// allowed, and no calls to DeleteSecureHeapPhysicalRange() or
+    /// ModifySecureHeapPhysicalRange() are allowed.  Even when this is false,
+    /// the SecureMem server (driver) is still responsible for de-protecting
+    /// just before warm reboot if protected ranges would not otherwise be
+    /// cleaned up during a warm reboot.
+    2: dynamic_protection_ranges bool;
+
+    /// The granularity of protection ranges.  If the granularity of start is
+    /// different than granularity of end or length, then this is the max
+    /// granularity value among those values.
+    ///
+    /// This must be a power of 2.  The client must not request ranges that
+    /// specify smaller granularity.
+    ///
+    /// This must be at least zx_system_page_size() even if the HW can do
+    /// smaller granularity.
+    3: protected_range_granularity uint32;
+
+    /// The SecureMem server should not count reserved ranges that the SecureMem
+    /// server uses internally to get from range set A to range set B, if the
+    /// SecureMem server needs to do any emulation of that sort.  Normally such
+    /// emulation by the SecureMem server is unnecessary.  If any ranges are
+    /// reserved by the SecureMem server, those reserved ranges are not
+    /// available for use by the SecureMem client.
+    ///
+    /// If the number of ranges is limited only by available memory, it's ok for
+    /// the SecureMem server to report 0xFFFFFFFFFFFFFFFF for this value.  The
+    /// field must still be set.  As usual, the SecureMem server should ensure
+    /// that SetPhysicalSecureHeapRanges() succeeds or fails atomically (either
+    /// fully updates or rolls back before completing).
+    4: max_protected_range_count uint64;
+
+    /// Iff true, ModifySecureHeapPhysicalRange() is implemented.  Calling
+    /// ModifySecureHeapPhysicalRange() when is_mod_protected_range_available
+    /// is false is prohibited.  Don't attempt to detect availability of
+    /// ModifySecureHeapPhysicalRange() by calling it to see if it fails; it
+    /// may ZX_PANIC().
+    5: is_mod_protected_range_available bool;
+};
+
+@available(added=HEAD)
+const MAX_HEAPS_COUNT uint32 = 32;
+@available(added=HEAD)
+const MAX_RANGES_COUNT uint32 = 128;
+
+@available(added=HEAD)
+type SecureHeapRange = table {
+    /// Must be aligned to at least heap_range_granularity.
+    1: physical_address uint64;
+
+    /// Must be aligned to at least heap_range_granularity.
+    2: size_bytes uint64;
+};
+
+@available(added=HEAD)
+type SecureHeapAndRanges = table {
+    /// This is which secure/protected heap.
+    1: heap Heap;
+
+    /// The list of physical ranges.  This list must be sorted by
+    /// physical_address (lower first), and must not have any overlapping
+    /// ranges.  Ranges that are directly adjacent are allowed (not
+    /// overlapping).
+    2: ranges vector<SecureHeapRange>:MAX_RANGES_COUNT;
+};
+
+@available(added=HEAD)
+type SecureHeapAndRange = table {
+    1: heap Heap;
+    2: range SecureHeapRange;
+};
+
+@available(added=HEAD)
+type SecureHeapAndRangeModification = table {
+    1: heap Heap;
+    2: old_range SecureHeapRange;
+    3: new_range SecureHeapRange;
+};
+
+@available(added=HEAD)
+type DynamicSecureHeap = table {
+    1: heap Heap;
+};

@@ -1,0 +1,165 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/python_interpreter.gni")
+import("//build/python/python_action.gni")
+
+# Defines a Python wheel.
+#
+# Parameters
+#
+#   deps (required)
+#     List of python_library or python_c_extension targets to include in the wheel.
+#
+#   pyproject_toml (required)
+#     Path to the pyproject.toml file for the wheel. Note that the packaging
+#     script generates a setuptools-based setup.py, so the pyproject.toml must
+#     configure setuptools.build_meta as its build backend.
+#
+#   version (optional)
+#     Version of the wheel. Defaults to "0.0.1".
+#
+#   package_name (optional)
+#     Name of the package. Defaults to target_name.
+#
+#   packages (optional)
+#     List of packages (directories) to include in the wheel.
+#
+#   wheel_tags (optional)
+#     Compatibility tags for the wheel adhering to PEP 427
+#     ({python tag}-{abi tag}-{platform tag}). Defaults to "py3-none-any" for
+#     pure Python wheels. For wheels containing C extensions or native shared
+#     libraries, specify the target platform tags (e.g.,
+#     "cp311-cp311-linux_x86_64").
+#
+#   output_name (optional)
+#     Name of the output wheel file. Defaults to
+#     "${_normalized_package_name}-${_normalized_version}-${_wheel_tags}.whl" to
+#     conform to the PEP 427 wheel filename specification.
+#
+#   wheel_name (optional)
+#     Alias for output_name.
+#
+#   output_dir (optional)
+#     Directory where the wheel will be placed. Defaults to
+#     ${target_out_dir}/${target_name}.
+#
+#   testonly
+#   visibility
+template("python_wheel") {
+  assert(defined(invoker.deps), "deps is required")
+  assert(defined(invoker.pyproject_toml), "pyproject_toml is required")
+
+  _version = "0.0.1"
+  if (defined(invoker.version)) {
+    _version = invoker.version
+  }
+
+  _package_name = target_name
+  if (defined(invoker.package_name)) {
+    _package_name = invoker.package_name
+  }
+
+  # PEP 427 specifies distribution name normalization rules where runs of
+  # non-alphanumeric characters (like hyphens) are replaced with a single
+  # underscore. Ensure package_name does not contain whitespace.
+  assert(string_replace(_package_name, " ", "") == _package_name,
+         "package_name must not contain whitespace: '${_package_name}'")
+
+  _wheel_tags = "py3-none-any"
+  if (defined(invoker.wheel_tags)) {
+    _wheel_tags = invoker.wheel_tags
+  }
+
+  # PEP 427 specifies distribution name normalization rules where runs of
+  # non-alphanumeric characters (like hyphens, dots) are replaced with a single
+  # underscore. GN lacks regex support, so we chain string_replace.
+  _normalized_package_name = string_replace(_package_name, "-", "_")
+  _normalized_package_name = string_replace(_normalized_package_name, ".", "_")
+  _normalized_package_name =
+      string_replace(_normalized_package_name, "___", "_")
+  _normalized_package_name = string_replace(_normalized_package_name, "__", "_")
+
+  # Per PEP 427 / PEP 440, version numbers retain periods and only replace
+  # hyphens with underscores.
+  _normalized_version = string_replace(_version, "-", "_")
+  _wheel_name =
+      "${_normalized_package_name}-${_normalized_version}-${_wheel_tags}.whl"
+  if (defined(invoker.wheel_name)) {
+    _wheel_name = invoker.wheel_name
+  } else if (defined(invoker.output_name)) {
+    _wheel_name = invoker.output_name
+  }
+
+  _output_dir = "${target_out_dir}/${target_name}"
+  if (defined(invoker.output_dir)) {
+    _output_dir = invoker.output_dir
+  }
+  _wheel_file = "${_output_dir}/${_wheel_name}"
+
+  _library_infos_target = "${target_name}.library_infos"
+  _library_infos_json = "${target_gen_dir}/${target_name}.library_infos.json"
+  generated_file(_library_infos_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+    public_deps = invoker.deps
+    outputs = [ _library_infos_json ]
+    output_conversion = "json"
+    data_keys = [ "library_info" ]
+    walk_keys = [ "library_info_barrier" ]
+  }
+
+  python_action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    binary_label = "//build/python:package_python_wheel"
+    depfile = "${target_out_dir}/${target_name}.d"
+
+    # Explicitly declare the stamp file and predictable wheel filename in
+    # outputs so they are tracked and downloaded by remote execution/caching
+    # systems (e.g., Siso).
+    _stamp_file = "${target_gen_dir}/${target_name}.wheel.stamp"
+    outputs = [
+      _stamp_file,
+      _wheel_file,
+    ]
+
+    inputs = [
+      _library_infos_json,
+      invoker.pyproject_toml,
+    ]
+
+    deps = [ ":${_library_infos_target}" ] + invoker.deps
+
+    args = [
+      "--target_name",
+      target_name,
+      "--python_interpreter",
+      rebase_path(python_exe_src, root_build_dir),
+      "--gen_dir",
+      rebase_path(target_gen_dir, root_build_dir),
+      "--wheel_file",
+      rebase_path(_wheel_file, root_build_dir),
+      "--stamp_file",
+      rebase_path(_stamp_file, root_build_dir),
+      "--library_infos",
+      rebase_path(_library_infos_json, root_build_dir),
+      "--pyproject_toml",
+      rebase_path(invoker.pyproject_toml, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+      "--version",
+      _version,
+      "--package_name",
+      _package_name,
+    ]
+    if (defined(invoker.packages)) {
+      args += [ "--packages" ] + invoker.packages
+    }
+  }
+}

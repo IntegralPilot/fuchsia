@@ -1,0 +1,326 @@
+#!/bin/bash
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Other
+### serve from a remote workstation
+
+## usage: fx serve-remote [--no-serve] [--tunnel-ports=NNNN,..] HOSTNAME [REMOTE-PATH]
+##
+## HOSTNAME     the hostname of the workstation you want to serve from
+## REMOTE-PATH  defaults to ~/fuchsia. The path on the to FUCHSIA_DIR on the workstation.
+##
+##  --no-serve                    only tunnel, do not start a package server
+##  --no-check-ssh-keys  do not verify that the default SSH
+##                                credentials are the same before serving.
+##  --[no-]persist                enable or disable persistence of repository metadata.
+##                                Disabled by default.
+##  --tunnel-ports=NNN1,NNN2,NNN3 comma-separated list of additional ports to
+##                                tunnel. This is used for e2e tests running on
+##                                remote host that needs to reach the local device.
+##   --repo-port port             port that the repository server will listen on.
+##
+## HOST and DIR are persisted in the file //.fx-remote-config and are reused as
+## defaults in future invocations of any 'fx *-remote' tools.
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/fx-remote.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/verify-default-keys.sh || exit $?
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/updates.sh || exit $?
+fx-config-read
+
+fx-standard-switches "$@"
+set -- "${FX_ARGV[@]}"
+
+serve=true
+check_ssh_keys=true
+verbose=false
+host=""
+dir=""
+serve_persist_arg="--no-persist"
+package_server_port="8083"
+has_tunnel_ports=false
+
+while [[ $# -ne 0 ]]; do
+  case "$1" in
+  --help|-h)
+      fx-command-help
+      exit 0
+      ;;
+  --no-serve)
+    serve=false
+    ;;
+  --no-check-ssh-keys)
+    check_ssh_keys=false
+    ;;
+  --no-persist)
+    ;;
+  --persist)
+    serve_persist_arg="--persist"
+    ;;
+  -v)
+    verbose=true
+    ;;
+  --repo-port)
+    if [[ $# -lt 2 ]]; then
+      fx-error Invalid syntax
+      fx-command-help
+      exit 1
+    fi
+    package_server_port=$2
+    shift
+    ;;
+  --tunnel-ports)
+    if [[ $# -lt 2 ]]; then
+      fx-error Invalid syntax
+      fx-command-help
+      exit 1
+    fi
+    has_tunnel_ports=true
+    # Split comma-separated list of ports to an array.
+    tunnel_ports=(${2//,/ })
+    shift
+    ;;
+  -*)
+    fx-error "Unknown flag: $1"
+    fx-command-help
+    exit 1
+    ;;
+  *)
+    if [[ -z "${host}" ]]; then
+      host="$1"
+    elif [[ -z "${dir}" ]]; then
+      dir="$1"
+    else
+      fx-error "unexpected argument: '$1'"
+      exit 1
+    fi
+    ;;
+  esac
+  shift
+done
+
+if cached=( $(load_remote_info "${host}") ); then
+  host="${cached[0]}"
+  dir="${cached[1]}"
+fi
+
+if [[ -z "${host}" ]]; then
+  fx-error "HOSTNAME must be specified"
+  fx-command-help
+  exit 1
+fi
+
+# Error out if something else is listening on the package server port.
+if is-listening-on-port "${package_server_port}"; then
+  ffx_repo_port=$(ffx-repository-server-running-port "")
+  err=$?
+  if [[ "${err}" -ne 0 ]]; then
+    return "${err}"
+  fi
+
+  if [[ "${ffx_repo_port}" == "${package_server_port}" ]]; then
+    fx-error "The local ffx repository server is running on port ${package_server_port}."
+    fx-error "To use this port, run this on the local device:"
+    fx-error ""
+    fx-error "$ ffx repository server stop"
+    fx-error ""
+    fx-error "Then re-run this command."
+  else
+    fx-error "Another process is listening on ${package_server_port} on the"
+    fx-error "local device. To use this port, shut down that process, then"
+    fx-error "re-run this command."
+  fi
+
+  exit 1
+fi
+
+if "${serve}"; then
+  if [[ -z "${dir}" ]]; then
+    if ssh "${host}" ls \~/fuchsia/.jiri_root/bin/fx > /dev/null; then
+      dir="~/fuchsia"
+    else
+      fx-error "failed to find ~/fuchsia on $host, please specify REMOTE-DIR"
+      fx-command-help
+      exit 1
+    fi
+  else
+    if ! ssh "${host}" ls "${dir}"/.jiri_root/bin/fx; then
+       fx-error "failed to find ${dir} on $host"
+      exit 1
+    fi
+  fi
+fi
+
+save_remote_info "${host}" "${dir}"
+
+fx-export-device-address
+if [[ $? -ne 0 || -z "${FX_DEVICE_ADDR}" ]]; then
+  fx-error "unable to discover device. Is the target up?"
+  exit 1
+fi
+
+if [[ -z "${FX_SSH_PORT}" ]]; then
+  FX_SSH_PORT=22
+fi
+
+echo "Using remote ${host}:${dir}"
+echo "Using target device ${FX_DEVICE_NAME} (${FX_SSH_ADDR}:${FX_SSH_PORT})"
+
+
+# Use a dedicated ControlPath so script can manage a connection seperately from the user's. We
+# intentionally do not use %h/%p in the control path because there can only be one forwarding
+# session at a time (due to the local forward of the package server port).
+ssh_base_args=(
+  -S "${HOME}/.ssh/control-fuchsia-fx-remote"
+  -o "ControlMaster=auto"
+)
+
+ssh_exit() {
+  # Failure to end existing multiplexed SSH connections is acceptable.
+  ssh "${ssh_base_args[@]}" "${host}" -O exit > /dev/null 2>&1 || true
+  wait # for ssh to exit
+}
+
+# If there is already control master then exit it. We can't be sure its to the right host and it
+# also could be stale.
+ssh_exit
+
+# When we exit the script, close the background ssh connection.
+trap_exit() {
+  ssh_exit
+  exit
+}
+trap trap_exit EXIT
+
+ssh_tunnel_args=(
+  -6 # We want ipv6 binds for the port forwards
+  -L "\*:${package_server_port}:localhost:${package_server_port}"       # fx serve
+  -R "8022:${FX_SSH_ADDR}:${FX_SSH_PORT}"                               # fx shell
+  -o ExitOnForwardFailure=yes
+  # Match google default server timeout so in spotty network situations the client doesn't timeout
+  # before server (and leave the server process still holding on to tunneling port).
+  -o ServerAliveInterval=30
+  -o ServerAliveCountMax=20
+)
+
+# This is a rudimentary assumption that the device is reachable at FX_SSH_ADDR
+# iff it is listening on the default SSH port, which is often true, but in no
+# way guaranteed to be true. A better approach here would be to adjust to later
+# perform these forwards inside the device fowrarded link rather than at the
+# host link level.
+if [[ "${FX_SSH_PORT}" == 22 ]]; then
+  ssh_tunnel_args+=(
+    -R "2345:${FX_SSH_ADDR}:2345"             # fx debug
+    -R "8007:${FX_SSH_ADDR}:8007"             # Google-specific
+    -R "8443:${FX_SSH_ADDR}:8443"             # Google-specific
+    -R "9080:${FX_SSH_ADDR}:80"               # SL4F_HTTP_PORT
+  )
+else
+  echo >&2 "Note: tunnelled targets will not receive forwards for SL4F or debug"
+fi
+
+# Add additional ports to tunnel if specified.
+if "${has_tunnel_ports}"; then
+  for port in "${tunnel_ports[@]}"; do
+    ssh_tunnel_args+=(-R "${port}:${FX_SSH_ADDR}:${port}")
+  done
+fi
+
+# Start tunneling session in background. It's started seperately from the command invocations below
+# to allow the script to be consistent on how it is exited for both serve and non-serve cases. It
+# also allows script to explicitly close the control session (to better avoid stale sshd sessions).
+
+# Verify that keys match.
+if "${check_ssh_keys}"; then
+  verify_default_keys "${FUCHSIA_DIR}" "${host}" "${dir}" "${ssh_base_args[@]}" || exit $?
+fi
+
+# XXX: had to stop using -Nf because of b/160269794.
+ssh "${ssh_base_args[@]}" "${ssh_tunnel_args[@]}" "${host}" -nT sleep infinity &
+# Attempt to assert that the backgrounded ssh is alive and kicking, emulating -f as best we can.
+ssh_pid=$!
+# If there's a 2fa prompt, we may need a "human time" number of tries, which is why this is high.
+tries=30
+until ssh -q -O check ${ssh_base_args[@]} "${host}"; do
+  if ! kill -0 ${ssh_pid}; then
+    fx-error "SSH tunnel terminated prematurely"
+    exit 1
+  fi
+  if ! ((tries--)); then
+    fx-error "SSH tunnel appears not to have succeeded"
+    kill -TERM $ssh_pid
+    exit 1
+  fi
+  sleep 1
+done
+
+if "${serve}"; then
+
+    # Check if the remote repository server is running on a different port.
+    remote_server_status=$(
+      ssh "${host}" "${ssh_base_args[@]}" "cd ${dir} && \
+        ./.jiri_root/bin/ffx \
+        --machine json \
+        repository server list"
+    ) || err=$?
+
+    if [[ "${err}" -ne 0 ]]; then
+      fx-error "Unable to get the remote configured repository server address."
+      exit "${err}"
+    fi
+
+    remote_addr=$(echo "${remote_server_status}" | fx-command-run jq -r '.ok.data[].address')
+    if [[ "${err}" -ne 0 ]]; then
+      fx-error "Unable to parse remote repository server status: ${remote_server_status}"
+      exit 1
+    fi
+
+    if [[ ! -z "${remote_addr}" ]]; then
+      if [[ ${remote_addr} =~ .*:([0-9]+) ]]; then
+        remote_port="${BASH_REMATCH[1]}"
+      else
+        fx-error "Unable to parse port from remote ffx repository server address: $remote_addr"
+        exit 1
+      fi
+
+      if [[ "${package_server_port}" != "${remote_port}" ]]; then
+        fx-error "The remote repository server is already on ${remote_addr}."
+        fx-error "If you want to use port ${package_server_port}, run the following on the"
+        fx-error "remote workstation:"
+        fx-error ""
+        fx-error "$ ffx repository server stop"
+        fx-error ""
+        fx-error "Then re-run this command."
+        exit 1
+      fi
+    fi
+
+
+  # Ctrl-C will exit the ssh remote command and this ssh session. Then script exit will trigger
+  # `trap_exit` to close the ssh connection.
+  echo -e "Press Ctrl-C to stop remote serving and tunneling.\n"
+
+  # Set the experimental environment variables to ensure they're passed to `fx
+  # set` and `fx serve`.
+  experimental_vars=$(get_env_vars_non_default_features)
+
+  if "${verbose}"; then
+    serve_verbose_arg=" -v"
+  else
+    serve_verbose_arg=""
+  fi
+  ssh_serve_args=(
+    "-tt" # explicitly force a pty, for HUP'ing on the remote
+    "cd ${dir} && FX_REMOTE_INVOCATION=1 ${experimental_vars} ./.jiri_root/bin/fx set-device '${_FX_REMOTE_WORKFLOW_DEVICE_ADDR}' && FX_REMOTE_INVOCATION=1 ${experimental_vars} ./.jiri_root/bin/fx serve -l \":${package_server_port}\" ${serve_verbose_arg} ${serve_persist_arg}"
+  )
+  ssh "${host}" "${ssh_base_args[@]}" "${ssh_serve_args[@]}"
+else
+  echo "Press Ctrl-C to stop tunneling."
+  # Wait for user Ctrl-C. Then script exit will trigger trap_exit to close the
+  # ssh connection. Use a command on the remote side over ssh with a -tt
+  # parameter to create a pseudo tty on the remote host. That way, the Ctrl-C
+  # hup will go to the remote host which will close the remote ssh connections.
+  ssh "${host}" "${ssh_base_args[@]}" -tt sleep infinity
+fi

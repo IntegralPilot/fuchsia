@@ -1,0 +1,292 @@
+# Copyright 2026 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/current_target_tuple.gni")
+import("//build/rust/build.gni")
+import("//build/rust/rustc_library.gni")
+import("//zircon/kernel/kernel_test_deps.gni")
+import("//zircon/kernel/kernel_tests_enabled.gni")
+
+# Define a Rust module of code going into a kernel crate.
+#
+# This template defines a GN group that registers source files for depfile
+# verification and IDE/Clippy tooling metadata, and aggregates their
+# dependencies.
+#
+# Because all kernel Rust code is compiled into a single unified crate (rooted
+# at `//zircon/kernel/main.rs`), `kernel_rust_mod` targets do not build
+# standalone `.rlib` libraries. Instead, a module defined by `kernel_rust_mod`
+# must be wired up into the Rust module tree using a `#[path = "..."]`
+# attribute:
+#
+#   1. Add the `kernel_rust_mod` label to the consumer's GN `deps` (e.g., in a
+#      parent `kernel_rust_mod` or the kernel executable).
+#
+#   2. In Rust source, register the module using `#[path = "..."]` with the
+#      relative path to the module's entry `.rs` file:
+#
+#      * In `zircon/kernel/main.rs` (for top-level modules):
+#        ```rust
+#        #[path = "lib/cbuf/src/mod.rs"]
+#        pub mod cbuf;
+#        ```
+#
+#      * In a subsystem's `mod.rs` (e.g., `zircon/kernel/vm/mod.rs`):
+#        ```rust
+#        #[path = "../lib/heap/heap.rs"]
+#        pub mod heap;
+#        ```
+#
+#      This makes the library's contents accessible as `crate::<mod_name>` or
+#      `crate::<subsystem>::<mod_name>`.
+#
+#   3. Ensure all `.rs` source files belonging to the module are listed in
+#      `sources` so they are registered in the build graph for depfile
+#      verification and IDE/Clippy support.
+#
+# Parameters
+#
+#   * output_name, source_root
+#     - TODO: Remove once callers are cleaned up.
+#     - Type: string
+#
+#   * sources
+#     - Optional: List of `.rs` files that belong to this module for depfile
+#       verification and tooling.
+#     - Type: list(path)
+#
+#   * inputs
+#     - Optional: Non-source files read by the compiler during compilation.
+#     - Type: list(path)
+#
+#   * data_deps
+#     - Optional: Extra files or ZBI items to go with the kernel.
+#     - Type: list(label)
+#
+#   * deps
+#     - Optional: Dependencies of this module.
+#     - Type: list(label)
+#
+#   * public_deps
+#     - Optional: Public dependencies of this module.
+#     - Type: list(label)
+#
+#   * public_configs
+#     - Optional: Public configs to propagate to dependents.
+#     - Type: list(label)
+#
+#   * test_deps
+#     - Optional: Dependencies only used in unit tests within the module.
+#     - Type: list(label)
+#     - Default: []
+#
+#   * metadata, testonly, visibility
+#     - Optional: Usual GN meanings.
+#
+template("kernel_rust_mod") {
+  not_needed(invoker,
+             [
+               "output_name",
+               "source_root",
+             ])
+
+  test_deps = []
+  if (defined(invoker.test_deps)) {
+    test_deps_target = "kernel_rust_mod.${target_name}.test_deps"
+    test_deps += [ ":$test_deps_target" ]
+    kernel_test_deps(test_deps_target) {
+      visibility = [ ":*" ]
+      public_deps = invoker.test_deps
+    }
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "data_deps",
+                             "public_configs",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = test_deps
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+
+    metadata = {
+      rust_sources = []
+      if (defined(invoker.source_root)) {
+        rust_sources += [ rebase_path(invoker.source_root, root_build_dir) ]
+      }
+      if (defined(invoker.sources)) {
+        rust_sources += rebase_path(invoker.sources, root_build_dir)
+      }
+      if (defined(invoker.inputs)) {
+        rust_sources += rebase_path(invoker.inputs, root_build_dir)
+      }
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+
+      if (kernel_tests_enabled) {
+        _kernel_bin_name = "vmzircon.with-tests"
+      } else {
+        _kernel_bin_name = "vmzircon"
+      }
+      rust_target_mapping = [
+        {
+          disable_rustdoc = true
+          disable_clippy = false
+          clippy_label =
+              get_label_info("//zircon/kernel/bin:${_kernel_bin_name}.clippy",
+                             "label_with_toolchain")
+          actual_label =
+              get_label_info("//zircon/kernel/bin:${_kernel_bin_name}",
+                             "label_with_toolchain")
+          original_label =
+              get_label_info(":$target_name", "label_with_toolchain")
+          target_is_fuchsia = is_fuchsia
+          target = current_target_tuple
+          clippy_output = rebase_path(
+                  "$root_gen_dir/zircon/kernel/bin/${_kernel_bin_name}.clippy",
+                  root_build_dir)
+          src = rust_sources
+        },
+      ]
+    }
+  }
+}
+
+# Collects compiler flags and RSP files for kernel external Rust dependencies.
+#
+# Parameters
+#
+#   * executable_target
+#     - Optional: Output name of the kernel executable to associate with tooling.
+#     - Type: string
+#
+#   * deps
+#     - Required: Dependencies to walk for external Rust crates.
+#     - Type: list(label)
+#
+#   * test_deps
+#     - Optional: Test dependencies.
+#     - Type: list(label)
+#
+#   * public_configs, public_deps, metadata, testonly, visibility
+#     - Optional: Usual GN meanings.
+#
+template("kernel_rust_mod_crate_root") {
+  targets = {
+    main = target_name
+    label = get_label_info(":$main", "label_with_toolchain")
+    prefix = "_kernel_rust_mod_crate_root.$target_name"
+    config = "$prefix.config"
+  }
+
+  gen_rsp_files = [
+    {
+      key = "kernel_rust_externs"
+      barrier = [ "rust_barrier" ]
+    },
+    {
+      key = "rust_aux_searchdir"
+      barrier = []
+    },
+  ]
+
+  test_deps = []
+  if (defined(invoker.test_deps)) {
+    test_deps_target = "kernel_rust_mod.${target_name}.test_deps"
+    test_deps += [ ":$test_deps_target" ]
+
+    kernel_test_deps(test_deps_target) {
+      visibility = [ ":*" ]
+      public_deps = invoker.test_deps
+    }
+  }
+
+  gen_deps = test_deps
+  gen_inputs = []
+  foreach(gen, gen_rsp_files) {
+    gen.target = "${targets.main}.${gen.key}.rsp"
+    gen.label = ":${gen.target}"
+    generated_file(gen.target) {
+      visibility = [ ":*" ]
+      forward_variables_from(invoker, [ "testonly" ])
+      outputs = [ "$target_gen_dir/$target_name" ]
+      output_conversion = "list lines"
+      walk_keys = gen.barrier
+      data_keys = [ gen.key ]
+      deps = invoker.deps
+      metadata = {
+        rust_barrier = []
+      }
+    }
+    gen_deps += [ gen.label ]
+    gen_inputs += get_target_outputs(gen.label)
+  }
+
+  config(targets.config) {
+    visibility = [ ":${targets.main}" ]
+    rustflags = []
+    inputs = gen_inputs
+    foreach(file, gen_inputs) {
+      rustflags += [ "@" + rebase_path(file, root_build_dir) ]
+    }
+    if (rust_rbe_enable) {
+      rustflags += [ "--remote-inputs=" +
+                     string_join(",", rebase_path(inputs, root_build_dir)) ]
+    }
+  }
+
+  group(targets.main) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    public_configs = [ ":${targets.config}" ]
+    public_deps = gen_deps + invoker.deps
+
+    if (defined(invoker.executable_target)) {
+      _kernel_bin_name = invoker.executable_target
+    } else {
+      if (kernel_tests_enabled) {
+        _kernel_bin_name = "vmzircon.with-tests"
+      } else {
+        _kernel_bin_name = "vmzircon"
+      }
+    }
+    metadata = {
+      rust_sources = [ rebase_path("//zircon/kernel/main.rs", root_build_dir) ]
+      rust_target_mapping = [
+        {
+          disable_rustdoc = true
+          disable_clippy = false
+          clippy_label =
+              get_label_info("//zircon/kernel/bin:${_kernel_bin_name}.clippy",
+                             "label_with_toolchain")
+          actual_label =
+              get_label_info("//zircon/kernel/bin:${_kernel_bin_name}",
+                             "label_with_toolchain")
+          original_label =
+              get_label_info(":$target_name", "label_with_toolchain")
+          target_is_fuchsia = is_fuchsia
+          target = current_target_tuple
+          clippy_output = rebase_path(
+                  "$root_gen_dir/zircon/kernel/bin/${_kernel_bin_name}.clippy",
+                  root_build_dir)
+          src = [ rebase_path("//zircon/kernel/main.rs", root_build_dir) ]
+        },
+      ]
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+    }
+  }
+}

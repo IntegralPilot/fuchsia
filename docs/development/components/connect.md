@@ -1,0 +1,893 @@
+# Connect components
+
+This document demonstrates how to connect [components][glossary.component]
+together using capabilities and additional tools for parent components to manage
+their children.
+
+## Concepts
+
+You should understand the following concepts before continuing with this guide:
+
+* The Component Framework assembles the [namespace][glossary.namespace] for a
+  component using [component declarations][glossary.component-declaration] that
+  describe the [capabilities][glossary.capability] the component requires to
+  function. The capabilities the component exposes to others are assembled into
+  an [exposed directory][glossary.exposed-directory].
+* Every component receives a handle to the server end of a
+  [`Directory`][fidl-fuchsia.io.Directory] channel called the
+  [outgoing directory][glossary.outgoing-directory]. The component's program
+  makes discoverable any capabilities that it provides through this directory.
+* At runtime, the [component instance tree][glossary.component-instance-tree]
+  describes parent and child relationships between
+  [component instances][glossary.component-instance]. The component instance
+  tree and the capability routes over that tree are collectively referred to
+  as the [component topology][glossary.component-topology].
+* Parent components declare child components either statically in their
+  [component manifest][glossary.component-manifest] or dynamically using a
+  [component collection][glossary.component-collection]. A collection is a
+  container for dynamic children that may be created and destroyed at runtime
+  using the `fuchsia.component.Realm` framework protocol.
+
+For more details on these concepts, see [Realms][doc-realms] and
+[Capabilities][doc-capabilities].
+
+## Connecting capabilities through routing {#capabilities}
+
+Note: For a complete example using routed capabilities, see
+[`//examples/components/routing`][example-routing].
+
+Components interact with each other through capabilities. Capabilities served by
+a component need to be declared in that component's manifest and, for them to be
+usable by others, routed to parent/child components through `expose` and `offer`
+declarations. Other components that use that capability also need to declare
+their use in their manifests. In order for their programs to use the capability
+at runtime, the used capability must be routed to that component - either
+offered from a parent or exposed by a child.
+
+*Capability routing* refers to the recursive process, performed by the component
+manager, of identifying a serving component by following individual routing
+steps described in manifest files. Capability routing is initiated when:
+
+*   A component's program opens a path in its [namespace][glossary.namespace].
+*   A component's program opens a path in another component's
+    [exposed directory][glossary.exposed-directory].
+*   A developer invokes `ffx component route`.
+*   Starting a component that depends on a Resolver or Runner whose backing
+    resolver or runner capabilities have not been routed.
+
+Routing is performed lazily: while a capability may be *configured* to be
+provided by a parent or child (directly or indirectly through further
+delegation), the target component may not have been resolved yet when the
+routing operation is initiated. Practically, this means that the full route from
+the requesting component to the final serving component may not be known until
+routing is attempted.
+
+### Provide a capability implementation {#provide-capability}
+
+Components that provide a capability must declare the capability in their
+component manifest using a [`capabilities`][cml-capabilities] declaration.
+
+See the following example that declares a FIDL
+[protocol capability][doc-protocol] in the providing component's manifest:
+
+```json5
+{% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/rust/echo_server/meta/echo_server.cml" region_tag="example_snippet" adjust_indentation="auto" highlight="16,17,18,19" %}
+```
+
+At runtime, the server component provides an implementation of the capability by
+serving it in its outgoing directory using the [fuchsia.io][fidl-fuchsia.io]
+protocol. The generated FIDL bindings wrap this handle and enable the provider
+to begin receiving incoming requests:
+
+*   {Rust}
+
+    ```rust
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/rust/echo_server/src/main.rs" region_tag="main_body" adjust_indentation="auto" highlight="1,2,3,4,8,14,15,16,21,22,23,24,25,26,27,28" %}
+
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/rust/echo_server/src/main.rs" region_tag="handler" adjust_indentation="auto" highlight="1,2,3,4,5,6,7" %}
+    ```
+
+*   {C++}
+
+    ```cpp
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/cpp/echo_server/main.cc" region_tag="handler" adjust_indentation="auto" highlight="1,2,3,4,5,6" %}
+
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/cpp/echo_server/main.cc" region_tag="main_body" adjust_indentation="auto" highlight="3,9,10,11,12,13,14,15,16,17" %}
+    ```
+
+### Connect to routed capabilities {#connect-routes}
+
+Client components declare capabilities they may request in their component
+manifest with a [`use`][cml-use] declaration.
+
+See the following example of a client component's manifest that uses the FIDL
+protocol provided by the previous component:
+
+```json5
+{% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/rust/echo_client/meta/echo_client.cml" region_tag="example_snippet" adjust_indentation="auto" highlight="19,20,21,22" %}
+```
+
+At runtime, the client component opens paths populated in its namespace using
+the [fuchsia.io][fidl-fuchsia.io] protocol in order to acquire capabilities
+provided by other components. The Fuchsia component library works with the
+generated FIDL bindings to provide a structured interface for communicating over
+the channel:
+
+*   {Rust}
+
+    ```rust
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/rust/echo_client/src/main.rs" region_tag="main_body" adjust_indentation="auto" highlight="7,8,9,10,11,12,13,14" %}
+    ```
+
+*   {C++}
+
+    ```cpp
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/cpp/echo_client/main.cc" region_tag="main_body" adjust_indentation="auto" highlight="2,3,4,5,7,8,10" %}
+    ```
+
+It is the responsibility of the component's parent to route to it all necessary
+capabilities.
+
+#### Mark some used capabilities as optional {#optional-use}
+
+Not all capabilities used by a component are required for it to operate
+successfully. Sometimes a component can still execute without issue if a
+capability is missing, and its presence will merely enable some additional or
+alternative behavior.
+
+To enable the component framework to understand which capabilities a component
+requires and which capabilities are optional for a component, use the
+`availability` field.
+
+```
+use: [
+    {
+        // It is ok if this protocol is unavailable
+        protocol: "fuchsia.examples.Echo1",
+        availability: "optional",
+    },
+    {
+        // This protocol MUST be provided for the component to function correctly.
+        protocol: "fuchsia.examples.Echo2",
+        availability: "required",
+    },
+]
+```
+
+If a component has a `required` use declaration for a capability (the default)
+but its parent offers the capability as `optional`, then the
+[static capability analyzer][static-analyzer] will generate an error and
+connection attempts at runtime will always fail.
+
+##### Consuming optional capabilities {#consuming-optional-capabilities}
+
+In the case that a component's parent has `offer`ed a capabilitity with
+`availability: "optional"`, the capability may not be usable at runtime.
+
+An entry in the component's [namespace][glossary.namespace] will be present
+whether the capability is available or not. Any attempt to open the path for
+that capability will result in the handle provided to the `Directory.Open()`
+call being closed with a `ZX_ERR_NOT_FOUND` epitaph.
+
+Usage of `libc` methods like `open()` or `stat()` will return `ENOENT`.
+
+### Route capabilities {#route-capability}
+
+Components may only access capabilities routed to them. Capabilities can
+originate from anywhere in the component topology as long as a valid capability
+route exists as a chain of the following declarations from the capability
+provider to any consumers:
+
+*   [`expose`][cml-expose]: Routes a capability up to the component's parent.
+*   [`offer`][cml-offer]: Routes a capability down to one of the component's
+    children.
+
+To connect capability providers with components requesting those capabilities,
+do the following:
+
+1.  Add an `offer` or `expose` declaration to the capability provider component:
+
+    ```json5
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/rust/echo_server/meta/echo_server.cml" region_tag="example_snippet" adjust_indentation="auto" highlight="20,21,22,23,24,25" %}
+    ```
+
+1.  For each intermediate component in the component instance tree, include
+    additional `expose` and `offer` declarations until you reach the consuming
+    component containing a `use` declaration:
+
+    ```json5
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/routing/meta/echo_realm.cml" region_tag="example_snippet" highlight="13,14,15,16,17,18,19,21,22,23,24,25,26,27,28,29,30" %}
+    ```
+
+#### Optional dependencies {#optional-offer}
+
+When a component has an optional dependency on a capability, it is then up to
+that component's parent to decide if the component will receive that capability
+or not. When offering a capability, a component may set the `availability` field
+to either `optional`, `required`, or `same_as_target`. Each value has the
+following semantics:
+
+*   `optional`: The target of the offer must declare its ability to handle the
+    absence of this capability by marking it's `use` declaration as `optional`.
+    If the target cannot do this, (i.e. the target has an availability of
+    `required` for this capability), then routing the capability will cause an
+    error.
+*   `required`: The target must receive this capability. If the offer source is
+    `parent` and the component's parent (the target's grandparent) offered this
+    as an optional capability, then routing the capability will cause an error
+    because the parent cannot guarantee the capability's availability.
+*   `same_as_target`: The availability of this capability is determined by the
+    target's expectations. If the target has an optional dependency on this
+    capability, then this offer will also be optional. If the target has a
+    required dependency on this capability, then this offer will also be
+    required.
+
+```json5
+offer: [
+    {
+        // child-1 MUST receive the protocol 'fuchsia.logger.LogSink'.
+        protocol: "fuchsia.logger.LogSink",
+        to: "#child-1",
+        from: "#child-2",
+        availability: "required",
+    },
+    {
+        // child-1 MUST be able to handle the absence of the protocol
+        // 'fuchsia.tracing.provider.Registry'.
+        protocol: "fuchsia.tracing.provider.Registry",
+        to: "#child-1",
+        from: "parent",
+        availability: "optional",
+    },
+    {
+        // child-1 decides if it must receive the protocol
+        // 'fuchsia.posix.socket.Provider', or if it must be able to support its
+        // absence.
+        protocol: "fuchsia.posix.socket.Provider",
+        to: "#child-1",
+        from: "parent",
+        availability: "same_as_target",
+    },
+]
+```
+
+Like with use declarations, the `availability` field may be omitted, in which
+case it defaults to `required`.
+
+#### Transitionally dependencies {#transitional-offer}
+
+The component framework allows components to soft-transition into using and
+offering both optional and required capabilities. With the transitional
+availability marker, a component using a capability, will not cause Scrutiny
+validation errors whether or not the parent is required, optional, or same as
+target. Note, though this field exists to enable soft-transitions, components
+should ultimately settle on either optional or required.
+
+To use this feature, the child component will mark its availability as
+"transitional":
+
+```json5
+use: [
+    {
+        // It is ok if this protocol is offered as "required" or "optional"
+        protocol: "fuchsia.examples.Echo",
+        availability: "transitional",
+    },
+]
+```
+
+## Managing child components {#children}
+
+Note: For a complete example using child components, see
+[`//examples/components/lifecycle`][example-lifecycle].
+
+Components can interact with each other from anywhere in the component topology
+through capabilities as long as a valid capability route exists between them.
+There are additional methods that enable parent components to interact with
+their direct children.
+
+The following example component declares a single static child named `lifecycle`
+and a collection named `echo` where additional child components may be created
+at runtime:
+
+```json5
+{% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/meta/manager.cml" region_tag="example_snippet" adjust_indentation="auto" %}
+```
+
+Notice that a collection behaves like a static child instance in the parent
+component's manifest — you can give it a name and offer specific capabilities to
+it. All child components in the collection may access the set of capabilities
+offered to it.
+
+### Start child components {#start-child}
+
+The Component Framework provides the [`fuchsia.component.Binder`][fidl-Binder]
+protocol for parent components to explicitly start a child that may not expose
+any other capabilities. Since this capability is provided by the framework,
+child components only need to expose it from their component manifest:
+
+```json5
+{% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/meta/lifecycle.cml" region_tag="example_snippet" adjust_indentation="auto" %}
+```
+
+### Create dynamic children {#create-child}
+
+To create a new child component at runtime, use the
+[`fuchsia.component.Realm`][fidl-Realm] protocol to create the component inside
+of an existing collection. Call the [`CreateChild`][fidl-Realm.CreateChild]
+method with the following parameters:
+
+*   [`CollectionRef`][fidl-decl.CollectionRef]: Describes the collection where
+    the component will be added.
+*   [`Child`][fidl-decl.Child]: Component declaration, including its name and
+    component URL.
+
+*   {Rust}
+
+    ```rust
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/manager.rs" region_tag="imports" adjust_indentation="auto" %}
+
+    // ...
+
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/manager.rs" region_tag="create_child" adjust_indentation="auto" %}
+    ```
+
+*   {C++}
+
+    ```cpp
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/manager.cc" region_tag="imports" adjust_indentation="auto" %}
+
+    // ...
+
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/manager.cc" region_tag="create_child" adjust_indentation="auto" %}
+    ```
+
+### Connect to child capabilities {#connect-child}
+
+Because the parent of a dynamic component is not known at build time, its
+exposed capabilities cannot be named in capability routes expressed in the
+component manifest.
+
+To connect with the capabilities exposed by a dynamic child instance:
+
+1.  Use the [`fuchsia.component.Realm`][fidl-Realm] protocol to open the child's
+    exposed directory. Call the [`OpenExposedDir`][fidl-Realm.OpenExposedDir]
+    method with the child component's name and the collection name:
+
+    *   {Rust}
+
+        ```rust
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/manager.rs" region_tag="imports" adjust_indentation="auto" %}
+
+        // ...
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/manager.rs" region_tag="connect_child" adjust_indentation="auto" %}
+        ```
+
+    *   {C++}
+
+        ```cpp
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/manager.cc" region_tag="imports" adjust_indentation="auto" %}
+
+        // ...
+
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/manager.cc" region_tag="connect_child" adjust_indentation="auto" %}
+        ```
+
+2.  Connect to the child's exposed capabilities using the exposed directory
+    handle as the root:
+
+    *   {Rust}
+
+        ```rust
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/manager.rs" region_tag="echo_send" adjust_indentation="auto" %}
+        ```
+
+    *   {C++}
+
+        ```cpp
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/manager.cc" region_tag="echo_send" adjust_indentation="auto" %}
+        ```
+
+### Destroy dynamic children {#destroy-child}
+
+When the dynamic child is no longer needed, use the
+[`fuchsia.component.Realm`][fidl-Realm] protocol to destroy the component
+instance. Call the [`DestroyChild`][fidl-Realm.DestroyChild] method with a
+[`ChildRef`][fidl-decl.ChildRef] representing the child inside the collection.
+
+*   {Rust}
+
+    ```rust
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/manager.rs" region_tag="imports" adjust_indentation="auto" %}
+
+    // ...
+
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/manager.rs" region_tag="destroy_child" adjust_indentation="auto" %}
+    ```
+
+*   {C++}
+
+    ```cpp
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/manager.cc" region_tag="imports" adjust_indentation="auto" %}
+
+    // ...
+
+    {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/manager.cc" region_tag="destroy_child" adjust_indentation="auto" %}
+    ```
+
+This causes the component to stop if it is currently running. To handle this
+event in your component, see [listen for stop events](#lifecycle-notifications).
+
+## Controlling component lifecycle {#lifecycle}
+
+The Component Framework provides features to modify and interact with various
+parts of the component lifecycle.
+
+For more details on lifecycle concepts, see
+[Component lifecycle][doc-lifecycle].
+
+### Lifecycle notifications {#lifecycle-notifications}
+
+The ELF runner notifies components of lifecycle events using the
+[`fuchsia.process.lifecycle.Lifecycle`][fidl-Lifecycle] protocol.
+
+To listen for stop notifications in your child component:
+
+1.  Subscribe to the [lifecycle event][elf-lifecycle] in your component
+    manifest:
+
+    *   {Rust}
+
+        ```json5
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/meta/lifecycle.cml" region_tag="lifecycle_event" adjust_indentation="auto" highlight="9,10" %}
+        ```
+
+    *   {C++}
+
+        ```json5
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/meta/lifecycle.cml" region_tag="lifecycle_event" adjust_indentation="auto" highlight="9,10" %}
+        ```
+
+1.  Register a lifecycle handler using the startup handle provided by the
+    runner:
+
+    *   {Rust}
+
+        ```rust
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/lifecycle.rs" region_tag="imports" adjust_indentation="auto" %}
+
+        // ...
+
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/rust/src/lifecycle.rs" region_tag="lifecycle_handler" adjust_indentation="auto" %}
+        ```
+
+    *   {C++}
+
+        ```cpp
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/lifecycle.cc" region_tag="imports" adjust_indentation="auto" %}
+
+        // ...
+
+        {% includecode gerrit_repo="fuchsia/fuchsia" gerrit_path="examples/components/lifecycle/cpp/lifecycle.cc" region_tag="lifecycle_handler" adjust_indentation="auto" %}
+        ```
+
+### Start with parent {#eager}
+
+[Component manifests][doc-manifests] let you mark a child as
+[`eager`][cml-children], which causes the component framework to implicitly
+start that child with the parent.
+
+If the eager child fails to start for any reason (such as a missing component),
+component manager exhibits the following behavior:
+
+*   If the parent is not the root component, the parent will start but the
+    component that bound to it will observe a dropped connection (just like any
+    other failed binding).
+*   If the parent is the root component, component manager will crash, with an
+    error message like:
+
+    ```none {:.devsite-disable-click-to-copy}
+    [component_manager] ERROR: protocol `fuchsia.component.CoreBinder` was not available for target `startup`:
+        failed to resolve `fuchsia-pkg://fuchsia.com/your_component#meta/your_component.cm`:
+        package not found: remote resolver responded with PackageNotFound
+        For more, run `ffx component doctor `startup`
+    ```
+
+Components marked as `eager` can cause system crashes when they are not present
+if their ancestors are also marked `eager` up to the root component. This is
+important because many build configurations create system images containing a
+subset of the available components. To avoid this problem, declare these
+components using [**core realm shards**][core-shard] to ensure they can be
+safely excluded from test builds and product images.
+
+An `eager` component should also be in the same [package set][doc-package-set]
+as its parent since the component will be started at the same time as its
+parent. Typically, `eager` components should be in the product's base package
+set.
+
+To determine if your package is in the base package set, run the following
+command:
+
+```posix-terminal
+fx list-packages --verbose {{ '<var label="package name">my-package</var>' }}
+```
+
+This command outputs a list of the package sets where the matching package is
+found. For example, `system-update-checker` is in the `base` and `universe`
+package sets:
+
+```none {:.devsite-disable-click-to-copy}
+$ fx list-packages --verbose system-update-checker
+system-update-checker [base universe]
+```
+
+You can also look at all the packages in the base package set using the `--base`
+option:
+
+```posix-terminal
+fx list-packages --base
+```
+
+### Reboot on terminate {#reboot-on-terminate}
+
+[Component manifests][doc-manifests] let you control the termination policy of
+your component using [`on_terminate`][cml-children]. Components with the
+"reboot-on-terminate" policy set cause the system to gracefully reboot if the
+component terminates for any reason other than successful exit.
+
+Note: This is a special feature intended for use only by system components
+deemed critical to the system's function. Therefore, its use is governed by a
+security policy allowlist.
+
+To enable this feature, do the following:
+
+1.  Mark the child as `on_terminate: "reboot"` in the parent's component manifest:
+
+    ```json5
+    // core.cml
+    {
+        children: [
+            ...
+            {
+                name: "system-update-checker",
+                url: "fuchsia-pkg://fuchsia.com/system-update-checker#meta/system-update-checker.cm",
+                startup: "eager",
+                {{ '<strong>' }}on_terminate: "reboot",{{ '</strong>' }}
+            },
+        ],
+    }
+    ```
+
+1.  Add the component's moniker to component manager's security policy allowlist
+    at
+    [`//src/security/policy/component_manager_policy.json5`][src-security-policy]:
+
+    ```json5
+    // //src/security/policy/component_manager_policy.json5
+    {
+        security_policy: {
+            ...
+            child_policy: {
+                reboot_on_terminate: [
+                    ...
+                    "/core/system-update-checker",
+                ],
+            },
+        },
+    }
+    ```
+
+## Errors {#errors}
+
+### Signaling mechanism
+
+When routing is initiated by a requesting client by performing a
+[`Directory.Open()`][fidl-fuchsia.io.Directory] request on its namespace, or on
+the [exposed directory][glossary.exposed-directory], it passes the server-end
+handle of a zircon object that will provide the capability once routed. Errors
+will result in that handle's object being closed with an epitaph. The epitaph
+payload is always a Zircon status code.
+
+Since routing is lazy and *asynchronous*, this message may arrive at any time
+after the routing operation is initiated.
+
+> NOTE: once routing has *succeeded*, the serving component can *also* close the
+> same object with a status code of their choice. It is impossible for a client
+> to discern if the object was closed by component manager or by the serving
+> component, or another party delegated to thereafter.
+
+The same error signaling mechanism is used for `libc`-like calls like `open()`.
+
+See the section [Troubleshooting](#troubleshooting) for practical examples.
+
+### Error status codes
+
+The following error codes may be sent by component manager to indicate a failed
+routing operation:
+
+*   `ZX_ERR_NOT_FOUND`: the capability was unable to be routed for one of the
+    following reasons:
+    *   An optional capability was not provided in this configuration.
+    *   A configuration error in any one of the components along the route path.
+    *   The serving component is incompatible with this version of Fuchsia.
+    *   A bug in the program of the serving component.
+    *   A bug in any of the [Resolvers][doc-resolvers] or [Runners][doc-runners]
+        involved in completing the routing operation.
+*   `ZX_ERR_ACCESS_DENIED`: the capability was unable to be routed because the
+    requesting component is not allowed to access it. For example:
+    *   A [policy allow-list][src-security-policy] for the capability exists but
+        does not include the requesting component.
+    *   The requesting component asked for rights greater than what was provided
+        to it (ie, asking for read/write on a directory provided as read-only).
+*   `ZX_ERR_TIMED_OUT`: one of the routing steps timed out.
+*   `ZX_ERR_INTERNAL`: component manager itself encountered an unexpected error,
+    indicating a bug in the platform.
+
+`NOT_FOUND`, `ACCESS_DENIED`, and `INTERNAL` errors will reproduce for the same
+capability so long as no software on the platform is updated. A software update,
+even for a single component, can change a capability's route and might affect
+the availability of that capability.
+
+### Principles of routing error semantics
+
+*   *Minimality*: since the error signaling path is shared between component
+    manager and the serving component, component manager leaves the majority of
+    the error space for the serving component to utilize.
+*   *Client perspective*: while routing depends on many individual
+    sub-operations that can each fail for a variety of reasons including errors
+    on the part of other component authors, the error semantics are tailored to
+    the requesting client and the needs of the requesting client. For example,
+    user-error on the part of an intermediate component author will still return
+    `NOT_FOUND` for the requesting client.
+
+## Troubleshooting {#troubleshooting}
+
+This section contains common issues you may encounter trying to `use` and
+connect to capabilities from your component with suggested solutions.
+
+### Capability routing failed {#troubleshoot-use-routing}
+
+Component manager performs [capability routing][doc-capabilities] to find the
+source of a given capability once your component attempts to access the
+capability. Routing can fail if one of the component manifests in the routing
+path is configured incorrectly. For example, an `offer` or `expose` declaration
+is missing from some component in the path, or one of the components in the
+chain could not be resolved.
+
+Do the following to check if a routing failure was the cause of channel closure:
+
+*   Use `ffx component route` to check the routing for your component. This
+    can either be used with the moniker of your component or your component's
+    URL. For example:
+
+    ```bash
+    # check with the moniker
+    ffx component route /core/ffx-laboratory:echo_realm/echo_client
+
+    # check with a partial URL
+    ffx component route echo_client.cm
+    ```
+
+*   Use `ffx component capability` to find all components that use or expose a
+    specific capability. This helps you verify if a capability is available in
+    the component topology.
+
+    ```posix-terminal
+    ffx component capability fuchsia.example.Echo
+    ```
+
+*   Use `ffx component explore` to open an interactive shell inside your
+    component's namespace. You can list the contents of `/svc` (or other
+    routed directories) to see if the capability is actually available in the
+    namespace.
+
+    From the interactive shell, you can check for the capability:
+
+    ```posix-terminal
+    ls /svc
+    ```
+
+*   Check the component logs with `ffx log` for a message beginning with `Failed
+    to route` that explains where the routing chain failed. For example:
+
+    ```none {:.devsite-disable-click-to-copy}
+    [echo_client][][W] protocol `fidl.examples.routing.echo.Echo` was not available for target `/core/ffx-laboratory:echo_realm/echo_client`:
+        `fidl.examples.routing.echo.Echo` was not offered to `/core/ffx-laboratory:echo_realm/echo_client` by parent
+        For more, run `ffx component doctor /core/ffx-laboratory:echo_realm/echo_client`
+    ```
+
+*   Check for an [epitaph on the closed channel](#troubleshooting). The epitaph
+    set for the most common routing failures is `ZX_ERR_NOT_FOUND`:
+
+    ```none {:.devsite-disable-click-to-copy}
+    [echo_client][][I] Connecting to Echo protocol failed with error
+    "A FIDL client's channel to the service fidl.examples.routing.echo.Echo was closed: NOT_FOUND"
+    ```
+
+    See [routing errors](#errors) for more.
+
+For a self-contained example of failed capability routing, see
+[`//examples/components/routing_failed`][example-routing-failed].
+
+### Receiving errors from routing
+
+When capability routing fails, the underlying FIDL channel closes. FIDL protocol
+bindings return an error status if the channel was closed. Consider the
+following example:
+
+*   {Rust}
+
+    ```rust
+    let echo = connect_to_protocol::<EchoMarker>()
+        .context("Failed to connect to echo service")?;
+    let res = echo.echo_string(Some("Hippos rule!")).await;
+    match res {
+        Ok(_) => { info!("Call succeeded!"); }
+        {{ '<strong>' }}Err(fidl::Error::ClientChannelClosed { status, service_name } => { {{ '</strong>' }}
+            {{ '<strong>' }}error!("Channel to service {} was closed with status: {}", service_name, status); {{ '</strong>' }}
+        {{ '<strong>' }}} {{ '</strong>' }}
+        Err(e) => {
+            error!("Unexpected error: {}", e);
+        }
+    };
+    ```
+
+*   {C++}
+
+    ```cpp
+    fuchsia::examples::EchoPtr echo_proxy;
+    auto context = sys::ComponentContext::Create();
+    context->svc()->Connect(echo_proxy.NewRequest());
+
+    {{ '<strong>' }}// Sets an error handler that will be called if an error causes the underlying {{ '</strong>' }}
+    {{ '<strong>' }}// channel to be closed. {{ '</strong>' }}
+    {{ '<strong>' }}echo_proxy.set_error_handler([&loop](zx_status_t status) { {{ '</strong>' }}
+      {{ '<strong>' }}printf("Channel was closed with status: %d\n", status); {{ '</strong>' }}
+      {{ '<strong>' }}// ... {{ '</strong>' }}
+    {{ '<strong>' }}}); {{ '</strong>' }}
+
+    echo_proxy->EchoString("Hippos rule!", [&](std::string response) {
+      // ...
+    });
+    ```
+
+Note: If the protocol method doesn't return a value (such as a one-way method),
+the error status is only set if the channel was closed prior to the method call.
+
+To determine the underlying cause of a channel closure, you can inspect the
+optional [epitaph][doc-epitaphs] set on the channel. To retrieve the epitaph on
+a closed channel, do the following:
+
+*   {Rust}
+
+    ```rust
+    let stream = echo.take_event_stream();
+    match stream.next().await {
+        Some(Err(fidl::Error::ClientChannelClosed { status, .. })) => {
+            info!("Channel was closed with epitaph: {}", status);
+        }
+        Some(m) => {
+            info!("Received message other than epitaph or peer closed: {:?}", m);
+        }
+        None => {
+            info!("Component failed to start or channel was closed by server");
+        }
+    }
+    ```
+
+*   {C++}
+
+    ```cpp
+    echo_proxy.set_error_handler([&loop](zx_status_t status) {
+      // If an Epitaph was present on the channel, its error value will be passed as
+      // the parameter.
+      printf("Channel was closed with epitaph: %d\n", status);
+    });
+    ```
+
+### Component failed to start {#troubleshoot-use-start}
+
+You may encounter an error if capability routing was successful, but an issue
+occurred resolving or starting the component. The form of the error message
+depends on the [component runner][doc-runners]:
+
+*   For the ELF runner, check the component manager logs with `ffx log --filter
+    component_manager`. Look for a message starting with `Failed to start
+    component`. For example:
+
+    ```none {:.devsite-disable-click-to-copy}
+    [component_manager] WARN: Failed to start component
+    `fuchsia-pkg://fuchsia.com/components-routing-failed-example#meta/echo_server_bad.cm`:
+    unable to load component with url "fuchsia-pkg://fuchsia.com/components-routing-failed-example#meta/echo_server_bad.cm":
+    error loading executable: "reading object at \"bin/routing_failed_echo_server_oops\" failed:
+    A FIDL client's channel to the service fuchsia.io.File was closed: PEER_CLOSED"
+    ```
+
+*   For other runners, check the [logs][doc-logs] of the runner component. You
+    can do this by running the following command:
+
+    ```posix-terminal
+    ffx log --tags {{ '<var label="component runner">runner-name</var>' }}
+    ```
+
+To address the issue, verify the following:
+
+*   The [`program`][cml-program] declaration in your component manifest is
+    configured properly. For example, verify that the binary's path is spelled
+    correctly.
+*   The binary itself and all other resource needed to start the component are
+    included in the [package][doc-packages].
+
+For an example of a component that failed to start due to a misconfigured
+component manifest, see
+[`//examples/components/routing_failed`][example-routing-failed].
+
+### Component terminated or closed the channel {#troubleshoot-use-terminated}
+
+If you have verified that routing succeeded and the component started
+successfully, you may be experiencing an issue where the source component closed
+the channel itself. This can happen while the component was running, or can be a
+side effect of the component terminating.
+
+If the component terminated because it crashed, you can look for a crash report
+in `ffx log` that contains the component name in the dump:
+
+```none {:.devsite-disable-click-to-copy}
+[33860.645][klog][klog][I] crashsvc: exception received, processing
+[33860.645][klog][klog][I] <== fatal : process echo_client.cm[21090] thread initial-thread[21092]
+<stack trace follows...>
+```
+
+If the source component closed the channel itself, here are some tips to further
+troubleshoot the cause:
+
+*   Refer to the source component's [logs][doc-logs] for error messages.
+*   Use `ffx debug fidl` to examine the FIDL connection traffic with
+    [`fidlcat`][doc-fidlcat] for errors or unexpected behavior.
+
+[core-shard]: /src/sys/core/README.md
+[cml-capabilities]: https://fuchsia.dev/reference/cml#capabilities
+[cml-children]: https://fuchsia.dev/reference/cml#children
+[cml-expose]: https://fuchsia.dev/reference/cml#expose
+[cml-offer]: https://fuchsia.dev/reference/cml#offer
+[cml-program]: https://fuchsia.dev/reference/cml#program
+[cml-use]: https://fuchsia.dev/reference/cml#use
+[doc-capabilities]: /docs/concepts/components/v2/capabilities/README.md
+[doc-epitaphs]: /docs/reference/fidl/language/wire-format/README.md#epitaph_control_message_ordinal_0xffffffff
+[doc-fidlcat]: /docs/development/monitoring/fidlcat/README.md
+[doc-lifecycle]: /docs/concepts/components/v2/lifecycle.md
+[doc-logs]: /docs/concepts/components/diagnostics/README.md#logs
+[doc-manifests]: /docs/concepts/components/v2/component_manifests.md
+[doc-packages]: /docs/concepts/packages/package.md
+[doc-package-set]: /docs/concepts/packages/package.md#types_of_packages
+[doc-protocol]: /docs/concepts/components/v2/capabilities/protocol.md
+[doc-realms]: /docs/concepts/components/v2/realms.md
+[doc-resolvers]: /docs/concepts/components/v2/capabilities/resolver.md
+[doc-runners]: /docs/concepts/components/v2/capabilities/runner.md
+[elf-lifecycle]: /docs/concepts/components/v2/elf_runner.md#lifecycle
+[example-lifecycle]: /examples/components/lifecycle/
+[example-routing]: /examples/components/routing/
+[example-routing-failed]: /examples/components/routing_failed/
+[fidl-Binder]: https://fuchsia.dev/reference/fidl/fuchsia.component#Binder
+[fidl-decl.Child]: https://fuchsia.dev/reference/fidl/fuchsia.component.decl/#Child
+[fidl-decl.ChildRef]: https://fuchsia.dev/reference/fidl/fuchsia.component.decl/#ChildRef
+[fidl-decl.CollectionRef]: https://fuchsia.dev/reference/fidl/fuchsia.component.decl/#CollectionRef
+[fidl-fuchsia.io]: https://fuchsia.dev/reference/fidl/fuchsia.io
+[fidl-fuchsia.io.Directory]: https://fuchsia.dev/reference/fidl/fuchsia.io#Directory
+[fidl-Lifecycle]: https://fuchsia.dev/reference/fidl/fuchsia.process.lifecycle#Lifecycle
+[fidl-Realm]: https://fuchsia.dev/reference/fidl/fuchsia.component#Realm
+[fidl-Realm.CreateChild]: https://fuchsia.dev/reference/fidl/fuchsia.component#Realm.CreateChild
+[fidl-Realm.DestroyChild]: https://fuchsia.dev/reference/fidl/fuchsia.component#Realm.DestroyChild
+[fidl-Realm.OpenExposedDir]: https://fuchsia.dev/reference/fidl/fuchsia.component#Realm.OpenExposedDir
+[glossary.capability]: /docs/glossary/README.md#capability
+[glossary.component-collection]: /docs/glossary/README.md#component-collection
+[glossary.component-declaration]: /docs/glossary/README.md#component-declaration
+[glossary.component-instance]: /docs/glossary/README.md#component-instance
+[glossary.component-instance-tree]: /docs/glossary/README.md#component-instance-tree
+[glossary.component-manifest]: /docs/glossary/README.md#component-manifest
+[glossary.component-topology]: /docs/glossary/README.md#component-topology
+[glossary.exposed-directory]: /docs/glossary/README.md#exposed-directory
+[glossary.namespace]: /docs/glossary/README.md#namespace
+[glossary.outgoing-directory]: /docs/glossary/README.md#outgoing-directory
+[src-security-policy]: /src/security/policy/component_manager_policy.json5
+[static-analyzer]: /docs/development/components/build.md#troubleshoot-build-analyzer

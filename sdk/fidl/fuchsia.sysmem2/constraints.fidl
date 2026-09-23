@@ -1,0 +1,924 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.sysmem2;
+
+using fuchsia.images2;
+using fuchsia.math;
+
+/// The maximum size of
+/// [`fuchsia.sysmem2/BufferCollectionConstraints.image_format_constraints`].
+@available(added=19)
+const MAX_COUNT_BUFFER_COLLECTION_CONSTRAINTS_IMAGE_FORMAT_CONSTRAINTS uint32 = 64;
+
+/// The maximum size of
+/// [`fuchsia.sysmem2/BufferMemoryConstraints.permitted_heaps`].
+@available(added=19)
+const MAX_COUNT_BUFFER_MEMORY_CONSTRAINTS_PERMITTED_HEAPS uint32 = 64;
+
+/// The maximum size of [`fuchsia.sysmem2/ImageFormatConstraints.color_spaces`].
+const MAX_COUNT_IMAGE_FORMAT_CONSTRAINTS_COLOR_SPACES uint32 = 32;
+
+/// The maximum size of
+/// [`fuchsia.sysmem2/ImageFormatConstraints.pixel_format_and_modifiers`].
+const MAX_COUNT_PIXEL_FORMAT_AND_MODIFIERS uint32 = 64;
+
+@available(added=29)
+const MAX_COUNT_IMAGE_FORMAT_CONSTRAINTS_REQUIRED_MAX_SIZE_LIST uint32 = 64;
+
+/// Constraints on allocated buffers and, optionally, constraints on images
+/// stored in the buffers. These constraints can be specified per-participant.
+/// The sysmem service implements aggregation of constraints from multiple
+/// participants.
+@available(added=19)
+type BufferCollectionConstraints = table {
+    /// The `usage` is a hint to sysmem to potentially help choose a more
+    /// optimal [`fuchsia.images2/PixelFormat`] and/or `pixel_format_modifier`
+    /// when multiple compatible options exist.
+    ///
+    /// When aggregating [`fuchsia.sysmem2/BufferCollectionConstraints`], these
+    /// values bitwise-OR.
+    ///
+    /// At least one `usage` bit must be specified (however, it's permitted for
+    /// a [`fuchsia.sysmem2/BufferCollection.SetConstraints`] request to have
+    /// the request `constraints` field not set, in which case `kNoneUsage` is
+    /// the default, along with no constraints from the participant).
+    ///
+    /// When `kNoneUsage` is specified it must be the only set bit, and no VMOs
+    /// will be sent in response to
+    /// [`fuchsia.sysmem2/BufferCollection.WaitForAllBuffersAllocated`].
+    1: usage BufferUsage;
+
+    /// Per-participant number of buffers that the participant may concurrently
+    /// hold for its exclusive use for more than a transient duration (camp on).
+    /// In this context, a "transient" duration is the time it takes to finish
+    /// running a small amount of non-blocking code that finishes transfering
+    /// away ownership of the buffer. Things like reading from storage, waiting
+    /// on hardware that isn't already known to be done, or doing things like
+    /// frame encode or decode are not considered transient durations, even if
+    /// they might sometimes complete quickly.
+    ///
+    /// For example, a video decoder would specify (at least) the maximum number
+    /// of reference frames + 1 frame currently being decoded into. But not 1
+    /// more for the code that runs async and quickly to deliver a previously
+    /// decoded frame, even though that frame can potentially be owned for a
+    /// transient duration concurrent with decode of the next frame.
+    ///
+    /// A participant must not camp on more buffers than specified here (except
+    /// for a transient duration) else processing may get stuck.
+    ///
+    /// When aggregating BufferCollectionConstraints, these values add.
+    ///
+    /// In testing scenarios, camping on more buffers than this for any
+    /// significant duration (one screen refresh period is "significant" in this
+    /// context) may (ideally will) be flagged as a failure.  In testing
+    /// scenarios, the participant may not be provided with more buffers than
+    /// this concurrently.
+    2: min_buffer_count_for_camping uint32;
+
+    /// Per-participant minimum number of buffers that are needed for slack
+    /// reasons, for better overlap of processing / better performance.
+    ///
+    /// When aggregating `BufferCollectionConstraints`, these values add.
+    ///
+    /// A participant should typically specify 0 or 1 here - typically 0 is
+    /// appropriate if `min_buffer_count_for_camping` is already enough to keep
+    /// the participant busy 100% of the time when the participant is slightly
+    /// behind, while 1 can be appropriate if 1 more buffer than strictly needed
+    /// for min-camping reasons gives enough slack to stay busy 100% of the time
+    /// (when slightly behind, vs. lower % without the extra buffer).
+    ///
+    /// In testing scenarios, this field may be forced to 0, and all
+    /// participants are expected to continue to work without getting stuck. If
+    /// a buffer is needed for forward progress reasons, that buffer should be
+    /// accounted for in `min_buffer_count_for_camping`.
+    3: min_buffer_count_for_dedicated_slack uint32;
+
+    /// Similar to `min_buffer_count_for_dedicated_slack`, except when
+    /// aggregating these values max (instead of add). The value here is not
+    /// shared with any participant's `min_buffer_count_for_dedicated_slack`.
+    ///
+    /// A participant can specify > 0 here if a participant would like to ensure
+    /// there's some slack overall, but doesn't need that slack to be dedicated.
+    ///
+    /// The choice whether to use `min_buffer_count_for_dedicated_slack` or
+    /// `min_buffer_count_for_shared_slack` (or both) will typically be about
+    /// the degree to which the extra slack improves performance.
+    ///
+    /// In testing scenarios, this field may be forced to 0, and all
+    /// participants are expected to continue to work without getting stuck. If
+    /// a buffer is needed for forward progress reasons, that buffer should be
+    /// accounted for in `min_buffer_count_for_camping`.
+    4: min_buffer_count_for_shared_slack uint32;
+
+    /// A particularly-picky participant may unfortunately need to demand a
+    /// tight range of `buffer_count`, or even a specific `buffer_count`. This
+    /// field should remain 0 unless a participant really must set this field to
+    /// constrain the overall `BufferCollectionInfo.buffer_count`. Any such
+    /// participant should still fill out the min_buffer_count_for_* fields as
+    /// appropriate.
+    ///
+    /// If this field is un-set, the logical `min_buffer_count` is 0.
+    5: min_buffer_count uint32;
+
+    /// A particularly-picky participant may unfortunately need to demand a
+    /// tight range of `buffer_count`, or even a specific `buffer_count`. This
+    /// field should remain 0 unless a participant really must set this field to
+    /// constrain the overall `BufferCollectionInfo.buffer_count`. Any such
+    /// participant should still fill out the min_buffer_count_for_* fields.
+    ///
+    /// If this field is un-set, the logical `max_buffer_count` is 0xFFFFFFFF.
+    6: max_buffer_count uint32;
+
+    /// Optional constraints on `BufferCollectionSettings.buffer_settings`.
+    ///
+    /// A participant that intends to set `image_format_constraints` will
+    /// typically specify the minimum buffer size implicitly via
+    /// `image_format_constraints`, and possibly specify only the max buffer
+    /// size via `buffer_memory_constraints`.
+    ///
+    /// If un-set, the client is specifying "don't care" re. any buffer memory
+    /// constraints.
+    7: buffer_memory_constraints BufferMemoryConstraints;
+
+    /// Optional constraints on the image format parameters of an image stored
+    /// in a buffer of the collection. This includes
+    /// [`fuchsia.images2/PixelFormat`] and `pixel_format_modifier` (for tiling
+    /// and the like). These constraints can be specified separately per
+    /// `pixel_format` `pixel_format_modifier` pair. Duplicated `pixel_format`
+    /// `pixel_format_modifier` pairs aren't permitted.
+    ///
+    /// When aggregating, only `pixel_format` `pixel_format_modifier` pairs that
+    /// are specified by all participants with non-zero
+    /// `image_format_constraints` size (and non-null)
+    /// BufferCollectionConstraints) are retained.
+    ///
+    /// A participant can specify `pixel_format`
+    /// [`fuchsia.images2/PixelFormat.DO_NOT_CARE`] and/or
+    /// `pixel_format_modifier`
+    /// [`fuchsia.images2/PixelFormatModifier.DO_NOT_CARE`] to permit any value
+    /// to be selected, but at least one participant must specify a specific
+    /// format for overall allocation to succeed.
+    ///
+    /// In a SetConstraints message, un-set or zero length means no image format
+    /// constraints; a raw buffer can be allocated if no other participants
+    /// specify any `image_format_constraints` entries.
+    8: image_format_constraints
+            vector<ImageFormatConstraints>:MAX_COUNT_BUFFER_COLLECTION_CONSTRAINTS_IMAGE_FORMAT_CONSTRAINTS;
+};
+
+/// A reference to a heap instance.
+///
+/// A given heap instance can have more than one `Heap` which can be used to
+/// refer to the heap instance. Comparing `Heap` tables without knowledge of
+/// these `Heap` aliases is not a reliable way to determine if two `Heap` tables
+/// refer to the same heap (matching means yes, but not matching means maybe).
+/// Allowing heap aliases makes renaming `Heap.type`(s) easier.
+@available(added=19)
+type Heap = table {
+    /// The type of the heap, specified using a bind string defined per the
+    /// schema and mechanism described in comments in the
+    /// fuchsia.sysmem.heap.bind file.
+    ///
+    /// Examples:
+    /// * "fuchsia.sysmem.heap.HEAP_TYPE.SYSTEM_RAM"
+    /// * "fuchsia.goldfish.platform.sysmem.heap.HEAP_TYPE.HOST_VISIBLE"
+    //
+    // The word "heap" is repeated here because "type" is a keyword or reserved
+    // keyword in at least one relevant language (rust), and this naming also
+    // lines up with the bind enum(s) named `HEAP_TYPE` which provide the known
+    // meaningful/valid strings for this field.
+    1: heap_type string:128;
+
+    /// The uint64 id of the heap. This is only required to be unique per (type,
+    /// boot) tuple. In other words, a given heap id is only meaningful within
+    /// the current boot of the machine (not across boots), and only within the
+    /// `Heap.type`.
+    ///
+    /// For `Heap.type`(s) that refer to a singleton heap, a participant
+    /// specifying the singleton heap in
+    /// [`fuchsia.sysmem2.BufferMemoryConstraints.permitted_heaps`] can leave
+    /// this field un-set, or set it to zero. Sysmem will always fill out this
+    /// field for the heap indicated in
+    /// [`fuchsia.sysmem2.BufferMemorySettings.heap`] (for a singleton heap the
+    /// `id` field will be set to 0 by sysmem).
+    2: id uint64;
+};
+
+@available(added=19)
+type BufferMemoryConstraints = table {
+    /// un-set is treated as 1
+    1: min_size_bytes uint64;
+    /// un-set is treated as 0xFFFFFFFFFFFFFFFF.
+    2: max_size_bytes uint64;
+
+    /// When false, physical pages of a buffer VMO can be non-contiguous. When
+    /// true, physical pages of a buffer VMO must be sequentially contiguous. A
+    /// client that doesn't require physically contiguous VMOs must still accept
+    /// physically contiguous VMOs or "physical" VMOs.
+    3: physically_contiguous_required bool;
+
+    /// If true, the participant requires secure memory.
+    ///
+    /// When aggregating `BufferCollectionConstraints`, these values boolean-OR.
+    4: secure_required bool;
+
+    /// When true (or when `BufferMemoryConstraints` is not present), the
+    /// participant is ok with sysmem selecting the CPU domain.
+    ///
+    /// If the CPU domain is selected, participants must ensure the CPU can read
+    /// or write data to the buffer without cache operations outside of the
+    /// participant.
+    ///
+    /// In other words, if a producer participant DMAs data directly to RAM on a
+    /// non-cache-coherent architecture such as arm, the producer must ensure
+    /// the CPU cache is clean wrt. the buffer before the DMA write, and
+    /// invalidate the CPU cache after the DMA write and before indicating that
+    /// the buffer is ready to any other participant. If a consumer participant
+    /// DMAs data directly from RAM on a non-cache-coherent architecture such as
+    /// arm, the consumer must flush the CPU cache wrt the buffer before the DMA
+    /// read.
+    ///
+    /// CPU-only participants that don't do any DMA can just write and read the
+    /// buffers (when they should) without needing to do any CPU cache ops.
+    5: cpu_domain_supported bool;
+
+    /// When true, the participant is ok with sysmem selecting the RAM domain.
+    ///
+    /// If the RAM domain is selected, producer data must be available in RAM
+    /// (with CPU cache state such that the RAM data won't get corrupted by a
+    /// dirty CPU cache line writing incorrect data to RAM), and a consumer
+    /// reading using the CPU must invalidate CPU cache before reading (the
+    /// producer doesn't guarantee zero stale "clean" cache lines).
+    ///
+    /// In other words, if a producer participant uses the CPU to write data on
+    /// a non-cache-coherent architecture such as arm, the producer must flush
+    /// the data to RAM before indicating to another participant that the buffer
+    /// is ready. If a consumer participant uses the CPU to read data on a
+    /// non-cache-coherent architecture such as arm, the participant must
+    /// invalidate (typically flush+invalidate with knowledge that no cache
+    /// lines are dirty) the CPU cache before reading the buffer.
+    ///
+    /// RAM-only participants that don't do any CPU accesses to a buffer can
+    /// just do DMA to/from the buffers (when they should) without needing to
+    /// do any CPU cache ops.
+    6: ram_domain_supported bool;
+
+    /// When true, the participant is ok with sysmem selecting the INACCESSIBLE
+    /// domain.
+    ///
+    /// If the INACCESSIBLE domain is selected, CPU reads and writes of the data
+    /// are prevented. Attempts to read/write the data with the CPU may result
+    /// in UB and/or process termination.
+    ///
+    /// If the INACCESSIBLE domain is selected, participants must only operate
+    /// on the data using DMAs performed by HW, or platform-specific DMA-like
+    /// requests to a secure environment (which will do the needed CPU cache ops
+    /// similar to how a RAM domain participant would operate).
+    ///
+    /// Secure heaps only support INACCESSIBLE domain, and will fail allocation
+    /// if any participant with `BufferUsage` other than `NONE_USAGE` does not
+    /// set inaccessible_domain_supported to true.
+    ///
+    /// When the INACCESSIBLE domain is selected, participants (outside of
+    /// secure/DRM environments) should not attempt to map buffers, and should
+    /// not attempt to perform any CPU cache ops. In this respect, this domain
+    /// is similar to RAM domain with all participants only doing DMA and no
+    /// participant(s) doing CPU accesses.
+    7: inaccessible_domain_supported bool;
+
+    /// Which heaps are acceptable to the participant. Participants that don't
+    /// care which heap memory is allocated on should leave this field un-set. A
+    /// secure heap is only selected if all participants explicitly indicate
+    /// that the secure heap is acceptable via `heap_permitted`, or specify
+    /// `NONE_USAGE`.
+    8: permitted_heaps vector<Heap>:MAX_COUNT_BUFFER_MEMORY_CONSTRAINTS_PERMITTED_HEAPS;
+
+    /// If physically_contiguous_required is false or un-set, this field must
+    /// also be un-set.
+    ///
+    /// When set, this field must be non-zero and must be a power of 2 (only 1
+    /// bit set to 1, rest all 0).
+    ///
+    /// When set, this is the minimum alignment of the base physical address of
+    /// each buffer.
+    @available(added=32)
+    9: min_physical_base_alignment uint64;
+};
+
+/// `INACCESSIBLE` is only for cases where there is no CPU access to the
+/// buffers.
+///
+/// Device-local memory that isn't reachable from the CPU is `CoherencyDomain`
+/// `INACCESSIBLE`, even if it's possible to cause a device (physical or
+/// virtual) to copy the data from the `INACCESSIBLE` buffers to buffers that
+/// are visible to the CPU. In other words, INACCESSIBLE does not imply secure,
+/// but secure implies INACCESSIBLE.
+///
+/// `CPU` means producers must ensure that a consumer can read the produced data
+/// with the CPU without the consumer needing to do additional cache ops not
+/// already performed (as needed) by the producer.
+///
+/// `RAM` means producers must ensure that the produced data is entirely present
+/// in RAM, without any dirty CPU cache lines, and a consumer must invalidate
+/// (or flush and invalidate, typically) the CPU cache before reading data with
+/// the CPU. The `RAM` domain can be faster than the `CPU` domain when all
+/// access is via HW DMA, since in that case no CPU cache ops are required,
+/// since no participant is actually reading/writing using the CPU.
+@available(added=19)
+type CoherencyDomain = flexible enum {
+    CPU = 0;
+    RAM = 1;
+    INACCESSIBLE = 2;
+};
+
+type PixelFormatAndModifier = struct {
+    /// When specified by a participant in a message to sysmem, this can be any
+    /// `PixelFormat` value that's acceptable to the participant. Specifying
+    /// `kInvalid` is not permitted.
+    ///
+    /// The participant can specify [`fuchsia.images2/PixelFormat.DO_NOT_CARE`]
+    /// if the participant needs to specify `ImageFormatConstraints` without
+    /// constraining the `pixel_format`.
+    pixel_format fuchsia.images2.PixelFormat;
+    /// The participant can specify
+    /// [`fuchsia.images2/PixelFormatModifier.DO_NOT_CARE`] if the participant
+    /// needs to specify `ImageFormatConstraints` without constraining the
+    /// `pixel_format_modifier`.
+    pixel_format_modifier fuchsia.images2.PixelFormatModifier;
+};
+
+/// Describes constraints on layout of image data in buffers.
+type ImageFormatConstraints = table {
+    /// The [`fuchsia.images2/PixelFormat`] for which the following constraints
+    /// apply.
+    ///
+    /// The `pixel_format` and `pixel_format_modifier` fields together are
+    /// treated by the server as one additional `pixel_format_and_modifiers`
+    /// entry.
+    ///
+    /// A participant may have more than one
+    /// [`fuchsia.sysmem2/PixelFormatAndModifier`] that's supported.
+    ///
+    /// * If image constraints are the same for different
+    ///   `PixelFormatAndModifier`s, the participant may list additional
+    ///   `PixelFormatAndModifier`s for which the constraints apply in the
+    ///   `pixel_format_and_modifiers` field. This reduces the overall number of
+    ///   `ImageFormatConstraints` that need to be sent, without changing the
+    ///   meaning (vs for example sending a bunch of separate
+    ///   `ImageFormatConstraints` that only differ by the `pixel_format` and
+    ///   `pixel_format_modifier` which overall specify the same list of
+    ///   `PixelFormatAndModifier`s).
+    /// * If image constraints differ for different `PixelFormatAndModifier`s,
+    ///   the participant can convey this using a separate
+    ///   `ImageFormatConstraints` entry in `image_format_constraints` for each
+    ///   set of `PixelFormatAndModifier`s that have different image
+    ///   constraints.
+    /// * It's ok for a participant to have two `image_format_constraints`
+    ///   entries that only differ in their pixel_format_and_modifiers, but this
+    ///   is isn't the most compact way to represent that situation since the
+    ///   two entries could be combined by specifying two
+    ///   `PixelFormatAndModifier`s within a single `ImageFormatConstraints`.
+    ///
+    /// It's not uncommon for the other fields of `ImageFormatConstraints` to
+    /// vary by `pixel_format` or by `pixel_format_modifier` - for example for a
+    /// linear format to support smaller max size than a tiled format.
+    ///
+    /// See also
+    /// [`fuchsia.sysmem2/ImageFormatConstraints.pixel_format_and_modifiers`].
+    ///
+    /// Thie field must be set to a value other than
+    /// [`fuchsia.images2/PixelFormat.INVALID`] unless
+    /// `pixel_format_and_modifiers` is non-empty. In other words, there must be
+    /// at least one `PixelFormatAndModifier` per `ImageFormatConstraints`. If
+    /// `pixel_format_modifier` is set, this field must also be set.
+    ///
+    /// The participant can specify [`fuchsia.images2/PixelFormat.DO_NOT_CARE`]
+    /// if the participant needs to specify `ImageFormatConstraints` without
+    /// constraining the `pixel_format`.
+    1: pixel_format fuchsia.images2.PixelFormat;
+
+    /// The pixel format modifier for which the following constraints apply.
+    ///
+    /// The `pixel_format` and `pixel_format_modifier` fields together are
+    /// treated by the server as one additional `pixel_format_and_modifiers`
+    /// entry.
+    ///
+    /// This is a [`fuchsia.images2/PixelFormatModifier`] that's acceptable to
+    /// the participant in combination with the `pixel_format`.
+    ///
+    /// See also `pixel_format_and_modifiers`.
+    ///
+    /// If `pixel_format` is set but `pixel_format_modifier` is un-set, the
+    /// default depends on other fields:
+    ///
+    /// * If `pixel_format` is [`fuchsia.images2/PixelFormat.DO_NOT_CARE`], the
+    ///   pixel format modifier is implicitly
+    ///   [`fuchsia.images2/PixelFormatModifier.DO_NOT_CARE`].
+    /// * else if `BufferCollectionConstraints.usage` isn't `NONE`, the pixel
+    ///   format modifier is implicitly
+    ///   [`fuchsia.images2/PixelFormatModifier.LINEAR`].
+    /// * else the pixel format modifier is implicitly
+    ///   [`fuchsia.images2/PixelFormatModifier.DO_NOT_CARE`].
+    2: pixel_format_modifier fuchsia.images2.PixelFormatModifier;
+
+    /// The (additional) [`fuchsia.sysmem2/PixelFormatAndModifier`]s for which
+    /// the following constraints apply.
+    ///
+    /// As a non-limiting example, if a participant only wants to set a single
+    /// `PixelFormatAndModifier` for this
+    /// [`fuchsia.sysmem2/ImageFormatConstraints`], the participant can either
+    /// (a) use `pixel_format` and `pixel_format_modifier` fields to specify the
+    /// fields of the one `PixelFormatAndModifier` and leave
+    /// `pixel_format_and_modifiers` un-set, or (b) leave `pixel_format` and
+    /// `pixel_format_modifier` fields un-set and put the one
+    /// `PixelFormatAndModifier` in `pixel_format_and_modifiers`.
+    ///
+    /// If `pixel_format` is set, the server will take pixel_format and
+    /// pixel_format_modifier fields (un-setting them in the process), pack them
+    /// into a `PixelFormatAndModifier`, and move it into this vector as one
+    /// additional entry, with an overall size limit of
+    /// `MAX_COUNT_PIXEL_FORMAT_AND_MODIFIERS + 1`.
+    ///
+    /// After the server moves `pixel_format`, `pixel_format_modifier` into one
+    /// additional entry in this vector, this vector must not be empty. When the
+    /// resulting list has more than 1 item, the entries in this vector are
+    /// equivalent to (shorthand for) listing (size) separate
+    /// `ImageFormatConstraints` entries, one per `pixel_format_and_modifiers`
+    /// entry, each with one `PixelFormatAndModifier`, where all the separate
+    /// `ImageFormatConstraints` entries have the same constraints (compared
+    /// field by field, not including `pixel_format`, `pixel_format_modifier`,
+    /// or `pixel_format_and_modifiers` fields).
+    ///
+    /// In `SetConstraints` message, each entry specifies a
+    /// `PixelFormatAndModifier` which is acceptable to the participant
+    /// (assuming the following constraints fields are also satisfied).
+    ///
+    /// In the response to `WaitForAllBuffersAllocated`, this field will be
+    /// un-set and the one chosen `PixelFormatAndModifier` will be indicated
+    /// using the `pixel_format` and `pixel_format_modifier` fields.
+    ///
+    /// All the `PixelFormatAndModifiers` in a `SetConstraints` message from a
+    /// participant must be unique across all the entries under
+    /// `image_format_constraints`. If
+    /// [`fuchsia.images2/PixelFormat.DO_NOT_CARE`] is used in an entry, there
+    /// must not be any other entry (considering all the entries under
+    /// `image_format_constraints`) with matching `pixel_format_modifier`. If
+    /// [`fuchsia.images2/PixelFormatModifier.DO_NOT_CARE`] is used, there must
+    /// not be any other entry (considering all the entries under
+    /// `image_format_constraints`) with matching `pixel_format`.
+    ///
+    /// A `PixelFormatAndModifier` value with either
+    /// [`fuchsia.images2/PixelFormat.DO_NOT_CARE`] or
+    /// [`fuchsia.images2/PixelFormatModifier.DO_NOT_CARE`] (but not both, for
+    /// purposes of this example) can be combined with a
+    /// `PixelFormatAndModifier` from a separate participant with the other
+    /// field indicating "do not care", resulting in a complete
+    /// `PixelFormatAndModifier` that can succeed allocation. However, at least
+    /// for now, it's not permitted for a single participant to specify two
+    /// separate `PixelFormatAndModifier` values which have "do not care" in
+    /// different fields. This does not prohibit a single
+    /// `PixelFormatAndModifier` with both `PixelFormat.DO_NOT_CARE` and
+    /// `PixelFormatModifier.DO_NOT_CARE` (which is only a single
+    /// `PixelFormatAndModifier` value). If a client really needs to specify
+    /// some constraints relevant to `pixel_format`(s) with
+    /// `pixel_format_modifier` `DO_NOT_CARE`, and other constraints relevant to
+    /// `pixel_format_modifier`(s) with `pixel_format` `DO_NOT_CARE`, the client
+    /// can do so by duplicating the token and using/driving two separate
+    /// participants.
+    ///
+    /// See also `pixel_format` for more comments relevant to multiple
+    /// `PixelFormatAndModifier`s in a single `ImageFormatConstraints`.
+    15: pixel_format_and_modifiers
+            vector<PixelFormatAndModifier>:MAX_COUNT_PIXEL_FORMAT_AND_MODIFIERS;
+
+    /// Empty is an error. Duplicate entries are an error. Arbitrary ordering is
+    /// not an error.
+    ///
+    /// The client can specify a single entry
+    /// [`fuchsia.sysmem2/ColorSpace.DO_NOT_CARE`] if the client doesn't want to
+    /// constrain which `ColorSpace` is chosen. At least one participant must
+    /// specify at least one `ColorSpace` value other than
+    /// `ColorSpace.DO_NOT_CARE`, or allocation will fail.
+    3: color_spaces
+            vector<fuchsia.images2.ColorSpace>:MAX_COUNT_IMAGE_FORMAT_CONSTRAINTS_COLOR_SPACES;
+
+    /// Minimum permitted size in pixels.
+    ///
+    /// For example a video decoder participant may set this field to the
+    /// minimum size that might potentially be specified by a stream. In
+    /// contrast, `required_min_size` would be set to the current size specified
+    /// by the stream. While `min_size` aggregates by taking the max,
+    /// `required_min_size` aggregates by taking the min.
+    ///
+    /// When sending to sysmem, this field can be un-set if the participant is
+    /// prepared to deal with the smallest possible non-zero image layout
+    /// limited only by the constraints implicitly imposed by the `pixel_format`
+    /// and `pixel_format_modifier`. Or this field can be set to the actual
+    /// minimum size the participant can handle.
+    ///
+    /// Producers should set `min_size` and set both width and height to the
+    /// actual non-zero smallest width and height that the producer might
+    /// generate. For example, a video decoder can set the size of a single
+    /// macroblock here.
+    ///
+    /// When receiving from sysmem, this field will always be set, and neither
+    /// width nor height will be 0, because at least one participant must
+    /// specify a non-zero minimum size (where both width and height aren't
+    /// zero).
+    ///
+    /// See also `required_min_size`.
+    4: min_size fuchsia.math.SizeU;
+    /// Maximum size in pixels. For example Scenic may set this field (directly
+    /// or via sub-participants) to the maximum size that can be composited.
+    ///
+    /// Sending to sysmem, un-set is treated as 0xFFFFFFFF, 0xFFFFFFFF.
+    ///
+    /// Receiving from sysmem, this field will always be set. For width and
+    /// height separately, if there is no enforced max, that sub-field will be
+    /// 0xFFFFFFFF.
+    ///
+    /// See also `required_max_size`.
+    5: max_size fuchsia.math.SizeU;
+
+    /// The minimum number of bytes per row, including any padding beyond the
+    /// last image data in a row.
+    ///
+    /// This is sometimes called the "stride in bytes" or the "line to line
+    /// offset". For single-plane formats, this is the number of bytes per row
+    /// of pixels. For multi-plane formats, this is the number of bytes per row
+    /// of samples in plane 0 (for example, the number of bytes per row of luma
+    /// samples in the case of a multi-plane YUV format). For multi-plane
+    /// formats, the bytes per row in planes other than plane 0 is format
+    /// specific, but always a specific relationship to the plane 0 bytes per
+    /// row.
+    ///
+    /// When sending `ImageFormatConstraints` to sysmem, setting this field is
+    /// optional. Not setting this field is recommended unless the participant
+    /// needs to force the `bytes_per_row` to be larger than the minimum value
+    /// implied by `min_size.width`, the "stride bytes per width pixel" of the
+    /// `pixel_format` plus `pixel_format_modifier` (see also
+    /// `ImageFormatStrideBytesPerWidthPixel`), and `bytes_per_row_divisor`.
+    ///
+    /// When this structure is received from sysmem, this field will always be
+    /// set (when the parent structure is present), and will always be at least
+    /// the value implied by `min_size.width`, the "stride bytes per width
+    /// pixel" of the `pixel_format` plus `pixel_format_modifier`, and
+    /// `bytes_per_row_divisor`.
+    ///
+    /// Some producer participants may prefer to simply set
+    /// `ImageFormat.bytes_per_row` to
+    /// `ImageFormatConstraints.min_bytes_per_row` since sysmem is guaranteeing
+    /// that `min_bytes_per_row` is compatible with an image of width
+    /// `min_size.width`. However, producer participants that need to have
+    /// `size.width` > `min_size.width` can get a corresponding
+    /// `min_bytes_per_row` from `ImageFormatMinimumRowBytes` (in C++), or can
+    /// just calculate the `bytes_per_row` directly.
+    6: min_bytes_per_row uint32;
+
+    /// The maximum number of bytes per row, including any padding beyond the
+    /// last image data in a row.
+    ///
+    /// When sent to sysmem, must be >= the value implied by `max_size.width`,
+    /// "stride bytes per width pixel", and `bytes_per_row_divisor`, or
+    /// constraints aggregation will fail. Un-set means the participant doesn't
+    /// need/want to set a strict max.
+    ///
+    /// Sending to sysmem, un-set is treated as 0xFFFFFFFF.
+    ///
+    /// When received from sysmem, this field will always be set. If the max is
+    /// effectively infinite, the value will be 0xFFFFFFFF (not zero).
+    7: max_bytes_per_row uint32;
+
+    /// The maximum number of pixels.
+    ///
+    /// The max image area in pixels is limited indirectly via
+    /// [`fuchsia.sysmem/BufferMemoryConstraints.max_size_bytes`] and the
+    /// resulting [`fuchsia.sysmem/BufferSettings.size_bytes`], and can also be
+    /// enforced directly via this field.
+    ///
+    /// In contrast to the [`fuchsia.sysmem2/ImageFormatConstraints.max_size`]
+    /// field which limits width and height separately, this field limits the
+    /// total number of pixels.
+    ///
+    /// In contrast to
+    /// [`fuchsia.sysmem/BufferMemoryConstraints.max_size_bytes`], this field
+    /// doesn't limit the number of non-pixel padding bytes after each row of
+    /// pixels, and doesn't limit the number of non-pixel bytes in the case of
+    /// tiled `pixel_format_modifier`.
+    ///
+    /// Very narrow or very short image aspect ratios can have worse performance
+    /// per pixel in comparison to more typical aspect ratios. Padding and/or
+    /// memory bandwidth overheads tend to increase for extreme aspect ratios.
+    /// Participants can indicate lack of support for very narrow or very short
+    /// dimensions using ['fuchsia.sysmem/ImageFormatConstraints.min_size`].
+    ///
+    /// Sending to sysmem, un-set is treated as 0xFFFFFFFF.
+    ///
+    /// Receiving from sysmem, this field will always be set, and can be set to
+    /// 0xFFFFFFFF.
+    8: max_width_times_height uint64;
+
+    /// Alignment requirements on the image `size`.
+    ///
+    /// * `size.width % size_alignment.width` must be 0.
+    /// * `size.height % size_alignment.height` must be 0.
+    ///
+    /// Both `size_alignment.width` and `size_alignment.height` must be non-zero
+    /// and a power of 2.
+    ///
+    /// Un-set is treated as 1, 1.
+    9: size_alignment fuchsia.math.SizeU;
+
+    /// Alignment requirements on `display_rect`.
+    ///
+    /// * `display_rect.x % display_rect_alignment.width` must be 0.
+    /// * `display_rect.y % display_rect_alignment.height` must be 0.
+    /// * `display_rect.width % display_rect_alignment.width` must be 0.
+    /// * `display_rect.height % display_rect_alignment.height` must be 0.
+    ///
+    /// Un-set is treated as 1, 1.
+    10: display_rect_alignment fuchsia.math.SizeU;
+
+    /// These fields can be used to ensure the aggregated constraints have
+    /// `min_size` and `max_size` such that both `required_min_size` and
+    /// `required_max_size` (and anything in between that satisfies alignment
+    /// requirements) are permitted values of `ImageFormat.size`.
+    ///
+    /// For example, a producer video decoder doesn't want to constrain the
+    /// allowed `ImageFormat.size`, as a compressed stream can change dimensions
+    /// mid-stream, but the producer video decoder needs to ensure that the
+    /// aggregated constraints allow for at least the current dimensions of
+    /// uncompressed frames at the current position in the stream.
+    ///
+    /// As another example, an initiator that's intending to decode video may
+    /// know what the maximum expected size of frames in the stream(s) can be,
+    /// so by setting `required_max_size`, can ensure that the allocated buffers
+    /// are large enough to support that max `size`. In addition on successful
+    /// allocation the initiator also knows that the consumer participants are
+    /// ok with receiving up to that max `size`.
+    ///
+    /// It's much more common for a producer or initiator to set these fields
+    /// than for a consumer to set these fields.
+    ///
+    /// While `min_size` and `max_size` aggregate by effectively taking the
+    /// intersection, the `required_min_size` and `required_max_size` aggregate
+    /// by effectively taking the union.
+    ///
+    /// The `min_size` is the minimum size that a client is capable of handling.
+    /// If any participant sets `required_min_size` smaller than this,
+    /// allocation will fail.
+    ///
+    /// The `max_size` is the maximum size that a client is capable of handling.
+    /// If any participant sets `required_max_size` larger than this, allocation
+    /// will fail.
+    ///
+    /// This field aggregates by taking the min per component, and
+    /// required_max_size aggregates by taking the max per component. In
+    /// addition the aggregated required_max_size is included in the aggregated
+    /// required_max_size_list.
+    ///
+    /// Un-set is treated as 0xFFFFFFFF, 0xFFFFFFFF.
+    11: required_min_size fuchsia.math.SizeU;
+    /// This field is deprecated. The replacement is required_max_size_list.
+    ///
+    /// See also `required_min_size` and `required_max_size_list`. Un-set is
+    /// treated as 0, 0.
+    ///
+    /// In the BufferCollectionInfo returned from sysmem, this field has the max
+    /// across all participants' required_max_size fields, for width and height
+    /// separately. In addition, the allocated buffer is large enough to store
+    /// an image that is this max-of-all-widths by max-of-all-heights. This has
+    /// the potential to allocate buffers that are larger than necessary, for
+    /// example if the participant is trying to make sure the buffer can store
+    /// both landscape and portrait images. In contrast, required_max_size_list
+    /// allows listing those separately so they can be handled better by the
+    /// server. See required_max_size_list and please switch to that field.
+    ///
+    /// When this field is set, the provided size is aggregated by taking max of
+    /// across all participants' required_max_size fields, and that aggregated
+    /// result is put in this field in the BufferCollectionInfo from the server,
+    /// and is also treated as an additional item in the aggregated
+    /// required_max_size_list (even if that field is not set by any client).
+    /// See required_max_size_list. This behavior is for maintaining backward
+    /// compatibility for clients using required_max_size before it was
+    /// deprecated, and for overall compatibility with required_max_size_list,
+    /// but this behavior is itself deprecated as well. Please switch to only
+    /// using required_max_size_list.
+    ///
+    /// Please don't add additional usages of this field.
+    @available(deprecated=29, note="use required_max_size_list instead")
+    12: required_max_size fuchsia.math.SizeU;
+
+    /// If an entry in this list has width or height greater than max_size width
+    /// or height respectively (evaluated both before and again after
+    /// aggregation), allocation will fail.
+    ///
+    /// This field aggregates by appending the entries to an overall list, or in
+    /// other words, this field does not aggregate; all entries from all
+    /// participants must be satisfied by the allocated buffer(s) or the
+    /// allocation will fail. This lack of aggregation is to avoid
+    /// larger-than-necessary buffers if one participant specifies a large width
+    /// and small height and another participant specifies a small width and
+    /// large height, or more likely, if a single participant specifies those
+    /// two entries (for example). In that case, the buffer's
+    /// `BufferMemorySettings.size_bytes` needs to be large enough to store the
+    /// larger (in bytes) of the specified sizes (given available ranges of
+    /// other ImageFormatConstraints), but not the max width and max height
+    /// across all specified sizes used as the width and height of a single
+    /// image.
+    ///
+    /// Under the resulting `BufferCollectionInfo`, `max_size` is the max
+    /// allowed value for each dimension separately, but this does not imply
+    /// that an image of max_size can fit in the buffer (typically won't). In
+    /// contrast, any image that's no bigger than an entry in the returned
+    /// `required_max_size_list` will fit in the buffer. The returned list will
+    /// have redundant entries removed, so a client's entry may not be present
+    /// if another entry covers the client's entry; this also removes any
+    /// duplicates. The correct way to check if an image will fit is to check
+    /// that `ImageFormatImageSize()` is less than or equal to
+    /// `BufferMemorySettings.size_bytes`.
+    ///
+    /// Until `required_max_size` is removed, the returned
+    /// `required_max_size_list` will, if any participants specified
+    /// `required_max_size`, ensure that the aggregated (using max width and max
+    /// height) `required_max_size` will fit in the allocated buffer. This does
+    /// not imply that there will necessarily be an entry that indicates this
+    /// specific aggregated `required_max_size`, as that entry can be removed if
+    /// it's covered by another entry.
+    ///
+    /// In contrast to `max_size`, an entry can be added to
+    /// `required_max_size_list` to ensure the buffer actually has the capacity
+    /// to store an image that has both width and height less than or equal to
+    /// the entry's width and height respectively. See
+    /// `BufferMemorySettings.size_bytes` for more on what "capacity" means
+    /// here.
+    ///
+    /// A typical usage of more than one entry in this list would be specifying
+    /// that each buffer needs to be able to store up to a given portrait size
+    /// and also up to a given landscape size. In general, more than one entry
+    /// makes sense if the participant needs to ensure that the buffer can be
+    /// used to store images of a few different aspect ratios at up to the
+    /// listed size per aspect ratio. In the response from the server, redundant
+    /// entries are removed.
+    @available(added=29)
+    18: required_max_size_list
+            vector<fuchsia.math.SizeU>:MAX_COUNT_IMAGE_FORMAT_CONSTRAINTS_REQUIRED_MAX_SIZE_LIST;
+
+    /// `fuchsia_images2.ImageFormat.bytes_per_row % bytes_per_row_divisor` must
+    /// be 0. Un-set is treated as 1.
+    ///
+    /// Prefer to use `require_bytes_per_row_at_pixel_boundary` when the intent
+    /// is to ensure that `bytes_per_row' will be a multiple of the pixel size
+    /// in bytes.
+    ///
+    /// Prefer to use `size_alignment.width` when the intent is to ensure that
+    /// the width in pixels is aligned. In contrast, this field can specify that
+    /// the "stride in bytes" (byte offset from start of image to start of row n
+    /// minus byte offset from start of image to start of row n-1, with result
+    /// in bytes) needs to be aligned to the specified number of bytes. For
+    /// example, when `PixelFormat.BGR24` (24 bit color; 3 bytes per pixel) is
+    /// used, it's not uncommon for a participant to need each row of pixels to
+    /// start at a 4 byte aligned offset from the start of the image, which can
+    /// imply some padding bytes at the end of each row of pixels, before the
+    /// start of the next row of pixels.
+    ///
+    /// While any value of `bytes_per_row_divisor` could instead be enforced by
+    /// setting `size_alignment.width` to the least-common-multiple of the
+    /// "stride bytes per width pixel" and the stride alignment requirement,
+    /// enforcing the stride alignment requirement that way can lead to more
+    /// padding than necessary (implying larger buffer than necessary), and can
+    /// also result in a "fake" `size.width` values that other participants
+    /// would need to care about; this field exists to avoid that situation.
+    /// Instead, the stride alignment requirement in bytes is specified directly
+    /// here.
+    13: bytes_per_row_divisor uint32;
+
+    /// `vmo_usable_start % start_offset_divisor` must be 0. Un-set is treated
+    /// as 1.
+    ///
+    /// Producer participants are discouraged from setting non-zero image start
+    /// offset (from the buffer base) unless actually required, as not all
+    /// participants correctly handle non-zero image start offset.
+    14: start_offset_divisor uint32;
+
+    /// Iff set and true, bytes_per_row_divisor in the resulting
+    /// ImageFormatConstraints is guaranteed to be a value which requires
+    /// bytes_per_row to be an integral number of pixels. This can result in
+    /// more padding at the end of each row than when this field is not set to
+    /// true, but ensures that the stride can be expressed as an integral number
+    /// of pixels.
+    ///
+    /// For example, if the chosen `PixelFormat` is `B8G8R8`, if this field is
+    /// set to true, the resulting bytes_per_row_divisor will be a multiple of
+    /// 3. In this example, if another participant sets `bytes_per_row_divisor`
+    /// to 4, the resulting `bytes_per_row_divisor` will be a multiple of 12.
+    16: require_bytes_per_row_at_pixel_boundary bool;
+
+    /// If unset, any A channel of any format in this ImageFormatConstraints is
+    /// is ignored or not ignored according to semantics conveyed out of band.
+    ///
+    /// If set to false, the A channel of any format in this
+    /// ImageFormatConstraints is arbitrary values that don't mean anything.
+    /// Producers don't need to ensure any particular values in the A channel
+    /// and consumers should ignore the A channel. This is the same thing as
+    /// calling the 'A' channel 'X' instead.
+    ///
+    /// If set to true, the A channel of any format in this
+    /// ImageFormatConstraints is set to meaningful values. A producer should
+    /// fill out the A values, and a consumer should pay attention to the A
+    /// values as appropriate.
+    ///
+    /// If set values of this field don't match for the same pixel format and
+    /// modifier, that format and modifier will be eliminated from
+    /// consideration.
+    ///
+    /// A participant that knows that the semantics of the A channel are
+    /// conveyed via out of band means can leave this field un-set, even if the
+    /// out of band means is already known to specify alpha present or not
+    /// present, but in this situation it's also ok to fill out this field for
+    /// informational / debugging purposes.
+    ///
+    /// If no participant sets this field, the default is un-set.
+    ///
+    /// If the format chosen for allocation doesn't have an A channel, this
+    /// field will be un-set in the allocation result.
+    @available(added=24)
+    17: is_alpha_present bool;
+
+    // 18: see required_max_size_list above.
+
+    /// `pad_for_block_size` ensures that a participant will be able to access
+    /// pixel data in blocks of the specified size, even for the lower right
+    /// pixel whose access block can extend beyond that pixel, sometimes
+    /// requiring more page(s) in the VMO to avoid access fault or out-of-bounds
+    /// DMA. The extra "pixel" data of blocks on the right and bottom will not
+    /// overlap with any other pixel (or "pixel") data.
+    ///
+    /// At least for now this field is only accepted for linear single-plane
+    /// formats. This corresponds to `PixelFormatModifier.Linear` and
+    /// `ImageFormatPlaneByteOffset` returning false when plane is 1.
+    ///
+    /// This field being set is not accepted if the ImageFormatConstraints has
+    /// PixelFormat.DO_NOT_CARE or PixelFormatModifier.DO_NOT_CARE.
+    ///
+    /// For linear single-plane formats, we don't need to force size_alignment
+    /// to be the access block size, as (a) there's no intent by any participant
+    /// to actually store more (valid) pixels in the buffer, and (b) no other
+    /// non-block-accessing participant needs to know about block access by a
+    /// different participant to correctly locate the data of any pixel. The
+    /// accesses by the block-accessing participant just need to remain within
+    /// the VMO, so that all accesses remain within the VMO's pages.
+    ///
+    /// This field ensures the VMO size is sufficient to store the lower right
+    /// "pixel" of the lower right block, but by design, that "pixel" data is
+    /// not necessarily within `BufferMemorySettings.size_bytes`. Participants
+    /// specifying `pad_for_block_size` are allowed to access beyond
+    /// `BufferMemorySettings.size_bytes`. Block access per `pad_for_block_size`
+    /// will automatically be within the VMO sze (but participants may check as
+    /// well of course).
+    ///
+    /// For a motivating example, see the top of pad_for_block_size_test.cc.
+    ///
+    /// If setting `pad_for_block_size.height` to a value greater than 1, the
+    /// same participant must (enforced) set a `max_size.width` less than
+    /// 0xFFFFFFFF (preferably no more than a small multiple of the expected
+    /// actual max width). This helps in controlling the space overhead incurred
+    /// by the participant's use of blocks. If not burdensome, any of the
+    /// following can also help:
+    ///   * `min_size.height` - any participant setting a value greater than 1
+    ///   * `size_alignment.height` - any participant setting to a value greater
+    ///     than 1
+    @available(added=30)
+    19: pad_for_block_size fuchsia.math.SizeU;
+
+    /// pad_beyond_image_size_bytes ensures that there will be at least this
+    /// many bytes in the VMO beyond the image size. Some SW video codecs need
+    /// this for performance reasons.
+    ///
+    /// Some video decoders and encoders can require that a few more bytes be
+    /// safe to access beyond the image's size as calculated by
+    /// ImageFormatImageSize. This can sometimes require an additional page to
+    /// be allocated. The padding specified by this field starts at byte 0 of
+    /// the row beyond the last image row.
+    ///
+    /// This semantic is chosen because (a) it makes some video decoders used in
+    /// ffmpeg happy (needs 16 bytes fully after the image as a run-out zone),
+    /// and (b) it can serve as a not-particularly-wastful way to avoid adding
+    /// pad_beyond_last_pixel_bytes as well, because this padding always starts
+    /// at or beyond where that padding would without wasting more than
+    /// bytes_per_row - pixel_stride_in_bytes * width which is very unlikely to
+    /// result in wasting more than 1 page (and won't typically waste any
+    /// pages).
+    ///
+    /// If the participant needs extra bytes beyond the image size to accomodate
+    /// performance optimization(s), the number of extra bytes needed goes here.
+    /// Do _not_ store valid pixels or metadata in these bytes; some or all of
+    /// these bytes may be the same bytes requested via other participant's
+    /// pad_* constraints.
+    ///
+    /// Do not write to these bytes outside time intervals during which
+    /// writing to pixel data is permitted.
+    @available(added=30)
+    20: pad_beyond_image_size_bytes uint64;
+};

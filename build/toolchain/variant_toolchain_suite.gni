@@ -1,0 +1,478 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# NOTE: Event though this file does not directly reference clang_toolchain()
+# nor zircon_toolchain(), invoking it through toolchain_template below, GN will
+# refuse to compile if the template is not previously defined.
+import("//build/config/clang/clang_toolchain_info.gni")
+import("//build/toolchain/clang_toolchain.gni")
+import("//build/toolchain/toolchain_tags.gni")
+import("//build/toolchain/variant_tags.gni")
+import("//build/toolchain/zircon/zircon_toolchain.gni")
+
+# List of keys in toolchain_variant scope related to configs.
+_config_keys = [
+  "configs",
+  "deps",
+  "executable_configs",
+  "executable_deps",
+  "link_deps",
+  "prefix_configs",
+  "remove_common_configs",
+  "remove_executable_configs",
+  "remove_shared_configs",
+  "source_deps",
+]
+
+# Private subroutine of variant_toolchain_suite(), below, used to instantiate
+# a single variant toolchain() instance.
+#
+# Parameters:
+#
+#   toolchain_template: Name of GN template that is invoked to instantiate
+#     a GN toolchain() instance.
+#
+#   toolchain_template_args: Scope of arguments passed to the
+#     $toolchain_template() call. Note that the value of 'toolchain_variant' in
+#     this scope is ignored. Instead, these values should appear in this_variant.
+#
+#   this_variant: Scope of variables that will appear in this variant
+#     toolchain's toolchain_variant global variable.
+#
+#   this_invoker: The variant_toolchain_suite() call's parent invoker.
+#     Only its with_shared and toolchain_args keys will be forwarded,
+#     to its toolchain_variant and toolchain_args scope, respectively.
+#
+#   is_pic_default: Required boolean flag that is forwarded to the
+#     toolchain()'s toolchain_variant scope, overriding any value from
+#     this_variant, if any.
+#
+#   with_shared: Required boolean flag that is forwarded to the toolchain()'s
+#   toolchain_variant scope, overriding any value from this_variant, if any.
+#
+template("_variant_toolchain") {
+  this_variant = invoker.this_variant
+  this_invoker = invoker.this_invoker
+  not_needed([ "this_invoker" ])
+
+  # Every toolchain needs the global select_variant_canonical and
+  # all_toolchain_variants passed down explicitly via toolchain_args.
+  # See BUILDCONFIG.gn.
+  pass_through_select_variant_canonical = select_variant_canonical
+  pass_through_all_toolchain_variants = all_toolchain_variants
+
+  pass_through_clang_toolchain_info = clang_toolchain_info
+
+  _target_type = invoker.toolchain_template
+
+  # Build the toolchain_variant scope used for this toolchain() instance.
+  _toolchain_variant = {
+    # First forward variables from the variant.
+    configs = []
+    deps = []
+    executable_configs = []
+    executable_deps = []
+    link_deps = []
+    prefix_configs = []
+    remove_common_configs = []
+    remove_executable_configs = []
+    remove_shared_configs = []
+    source_deps = []
+    forward_variables_from(this_variant, "*")
+
+    # Then add toolchain-specific configs.
+    if (defined(this_invoker.configs)) {
+      configs += this_invoker.configs
+    }
+    if (defined(this_invoker.deps)) {
+      deps += this_invoker.deps
+    }
+    if (defined(this_invoker.executable_configs)) {
+      executable_configs += this_invoker.executable_configs
+    }
+    if (defined(this_invoker.executable_deps)) {
+      executable_deps += this_invoker.executable_deps
+    }
+    if (defined(this_invoker.link_deps)) {
+      link_deps += this_invoker.link_deps
+    }
+    if (defined(this_invoker.prefix_configs)) {
+      prefix_configs += this_invoker.prefix_configs
+    }
+    if (defined(this_invoker.remove_common_configs)) {
+      remove_common_configs += this_invoker.remove_common_configs
+    }
+    if (defined(this_invoker.remove_executable_configs)) {
+      remove_executable_configs += this_invoker.remove_executable_configs
+    }
+    if (defined(this_invoker.remove_shared_configs)) {
+      remove_shared_configs += this_invoker.remove_shared_configs
+    }
+    if (defined(this_invoker.source_deps)) {
+      source_deps += this_invoker.source_deps
+    }
+
+    is_pic_default = invoker.is_pic_default
+    with_shared = invoker.with_shared
+  }
+
+  target(_target_type, target_name) {
+    forward_variables_from(invoker.toolchain_template_args, "*")
+    if (defined(toolchain_deps)) {
+      deps = toolchain_deps
+    }
+    toolchain_args = {
+      # GN's "can't overwrite a nonempty scope/list" rule also applies
+      # to shadowing bindings in inner scopes.  Since there is always
+      # a global binding of `toolchain_variant` that is being shadowed
+      # here, we have to set it to the empty scope first.
+      toolchain_variant = {
+      }
+      toolchain_variant = _toolchain_variant
+      if (defined(this_variant.toolchain_args)) {
+        forward_variables_from(this_variant.toolchain_args, "*")
+      }
+      if (defined(this_invoker.toolchain_args)) {
+        forward_variables_from(this_invoker.toolchain_args, "*")
+      }
+
+      clang_toolchain_info = {
+      }
+      clang_toolchain_info = pass_through_clang_toolchain_info
+
+      # See comment above.
+      select_variant_canonical = []
+      select_variant_canonical = pass_through_select_variant_canonical
+
+      all_toolchain_variants = []
+      all_toolchain_variants = pass_through_all_toolchain_variants
+    }
+  }
+}
+
+# Defines a standard suite of toolchain variants.
+#
+# This creates one or more GN toolchain() instances based on the values of
+# $known_variants, $universal_variants and $select_variant_canonical as
+# defined in BUILDCONFIG.gn.
+#
+# $target_name corresponds to the name of the base toolchain, and all
+# variant toolchains will have a name like ${target_name}-${variant_suffix}
+#
+# Parameters
+#
+#   * toolchain_template:
+#     - Required: A GN template name that will be invoked to instantiate the
+#     final toolchain() instance.
+#     - Type: string
+#
+#   * with_shared:
+#     - Optional: If these toolchains will have a "-shared" companion.
+#     (Each variant toolchain has its own "-shared" companion.)
+#     - Type: bool
+#     - Default: false
+#
+#   * is_pic_default:
+#     - Optional: If these toolchains will generate PIC-friendly code by
+#     default on ELF platforms. If true, this is incompatible with
+#     `with_shared == true`.
+#     - Type: bool
+#     - Default: false
+#
+#   * toolchain_tags:
+#     - Optional: A list of tags applied to each toolchain instantiated in this
+#     suite. See //build/toolchain/toolchain_tags.gni for the list of valid
+#     values and their meaning.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * exclude_variant_tags:
+#     - Optional: A list of variant tags that this toolchain suite should
+#     *not* instantiate.
+#     - Type: list(string)
+#     - Default: []
+#
+#   * configs:
+#     - Optional: A list of configs added to all targets built by toolchain()
+#     instances in this suite. Note that these are added after the default
+#     configs set in //build/config/BUILDCONFIG.gn.
+#     - Type: list(label_no_toolchain)
+#     - Default: []
+#
+#   * executable_configs:
+#     - Optional: Additional configs only for executable() targets.
+#     - Type: list(label_no_toolchain)
+#     - Default: []
+#
+#   * prefix_configs:
+#     - Optional: Like configs, but these configs are added before the default
+#     configs. Should only be used for kernel toolchains that need to
+#     override the system include directories to provide their own
+#     standard C and C++ headers.
+#     - Type: list(label_no_toolchain)
+#     - Default: []
+#
+#   * remove_common_configs:
+#     - Optional: A list of configs that are removed for all targets built by
+#     toolchain() instances in this suite. Useful to remove specific default
+#     configs when needed.
+#     - Type: list(label_no_toolchain)
+#     - Default: []
+#
+#   * remove_executable_configs:
+#     - Optional: Same as remove_common_configs, but will only apply to
+#     executable() targets.
+#     - Type: list(label_no_toolchain)
+#     - Default: []
+#
+#   * remove_shared_configs:
+#     - Optional: Same as remove_common_configs, but will only apply to
+#     shared_library() targets.
+#     - Type: list(label_no_toolchain)
+#     - Default: []
+#
+#   * toolchain_args:
+#     - Optional: Scope of common variables to be set in the variant
+#     toolchains' toolchain_args scope. Note that values in each selected
+#     variant's toolchain_args scope will override these values.
+#     - Type: scope
+#     - Default: {}
+#
+#   * enable_variants:
+#     - Optional: A list of variant names that should always be enabled,
+#     independent of the content of the global `select_variant` list. This
+#     should only be used for specific targets that need it, e.g. the C
+#     library needs to be built with the regular as well as ASan-enabled
+#     toolchains for the Fuchsia SDK.
+#     - Type: list(string)
+#     - Default: []
+#
+# All other parameters are passed to ${toolchain_template}().  See
+# clang_toolchain() and zircon_toolchain() for their values.
+#
+template("variant_toolchain_suite") {
+  # Expand all_toolchain_variants into a canonicalized, list of variant specs
+  # that don't have `host_only`/`target_only` but instead take the body of one
+  # or the other., and have .base.
+  is_host = defined(invoker.toolchain_os) && invoker.toolchain_os == host_os
+  not_needed([ "is_host" ])
+
+  is_pic_default = defined(invoker.is_pic_default) && invoker.is_pic_default
+  with_shared = defined(invoker.with_shared) && invoker.with_shared
+  assert(!is_pic_default || !with_shared,
+         "is_pic_default and with_shared cannot be true at the same!")
+
+  exclude_tags = []
+  if (defined(invoker.exclude_variant_tags)) {
+    exclude_tags = invoker.exclude_variant_tags
+    _unknown_tags = exclude_tags + all_variant_tags - all_variant_tags
+    assert(
+        _unknown_tags == [],
+        "Unknown exclude_variant_tags ${_unknown_tags} in toolchain suite definition ${target_name}")
+  }
+
+  _toolchain_tags = []
+  if (defined(invoker.toolchain_tags)) {
+    _toolchain_tags = invoker.toolchain_tags
+    _unknown_tags = []
+    _unknown_tags = _toolchain_tags + all_toolchain_tags - all_toolchain_tags
+    assert(
+        _unknown_tags == [],
+        "Unknown toolchain_tags ${_unknown_tags} in toolchain suite definition ${target_name}")
+  }
+
+  # As a special case, always ensure that 'kernel-excluded' or 'kernel-only' is
+  # part of exclude_tags, based on whether 'kernel' appears in
+  # invoker.toolchain_tags.
+  _is_kernel = _toolchain_tags + [ "kernel" ] - [ "kernel" ] != _toolchain_tags
+  if (_is_kernel) {
+    _kernel_exclude_tags = [ "kernel-excluded" ]
+  } else {
+    _kernel_exclude_tags = [ "kernel-only" ]
+  }
+  exclude_tags += _kernel_exclude_tags
+  exclude_tags -= _kernel_exclude_tags
+  exclude_tags += _kernel_exclude_tags
+
+  # Ensure that `fuchsia-only` xor `excluded` are part or exclude_tags based on
+  # whether the `toolchain_os` is fuchsia.
+  if (defined(invoker.toolchain_os)) {
+    _is_fuchsia = invoker.toolchain_os == "fuchsia"
+  } else if (defined(invoker.os)) {
+    # Note that the zircon toolchain doesn't define `toolchain_os`. Instead they
+    # use `os`.
+    _is_fuchsia = invoker.os == "fuchsia"
+  } else {
+    assert(false,
+           "Unable to determine if toolchain $target_name targets fuchsia")
+  }
+  if (_is_fuchsia) {
+    _fuchsia_exclude_tags = [ "fuchsia-excluded" ]
+  } else {
+    _fuchsia_exclude_tags = [ "fuchsia-only" ]
+  }
+  exclude_tags += _fuchsia_exclude_tags
+  exclude_tags -= _fuchsia_exclude_tags
+  exclude_tags += _fuchsia_exclude_tags
+
+  variants = []
+  foreach(variant, all_toolchain_variants) {
+    variants += [
+      {
+        base = get_label_info(":$target_name", "label_no_toolchain")
+
+        forward_variables_from(variant,
+                               "*",
+                               [
+                                 "host_only",
+                                 "target_only",
+                               ])
+
+        if (is_host) {
+          if (defined(variant.host_only)) {
+            forward_variables_from(variant.host_only, "*")
+          }
+        } else {
+          if (defined(variant.target_only)) {
+            forward_variables_from(variant.target_only, "*")
+          }
+        }
+
+        # NOTE: foreach() is used here to ensure that `unknown_tags` is not
+        # recorded in the scope.
+        foreach(unknown_tags, [ [] ]) {
+          unknown_tags = tags + all_variant_tags - all_variant_tags
+          assert(
+              unknown_tags == [],
+              "Unknown tags ${unknown_tags} in variant definition: ${variant}")
+        }
+
+        if (_toolchain_tags != []) {
+          tags += _toolchain_tags
+          tags -= _toolchain_tags
+          tags += _toolchain_tags
+        }
+
+        # Recompute `instrumented` flag based on tags.
+        instrumented = tags + [ "instrumented" ] - [ "instrumented" ] != tags
+      },
+    ]
+  }
+
+  # Exclude the arguments that are for us or are verboten.
+  invoker_toolchain_template_args = {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                                 "enable_variants",
+                                 "is_pic_default",
+                                 "toolchain_args",
+                                 "toolchain_template",
+                                 "with_shared",
+                               ] + _config_keys)
+  }
+  not_needed([ "invoker_toolchain_template_args" ])
+
+  # Build up an array of boolean that's parallel to `select_variant`.
+  # Below, we'll set `selectors_used[i]` to true when `select_variant[i]`
+  # matches the name of some variant.
+  selectors_used = []
+  i = 0
+  foreach(selector, select_variant_canonical) {
+    selectors_used += [ false ]
+    i = i + 1
+  }
+
+  # Handle `enable_variants` here. First ensure that the list of names
+  # corresponds to known variant names.
+  enabled_variant_names = []
+  if (defined(invoker.enable_variants) && invoker.enable_variants != []) {
+    _all_variant_names = []
+    foreach(variant, variants) {
+      _all_variant_names += [ variant.name ]
+    }
+
+    enabled_variant_names = invoker.enable_variants
+    unknown_enabled_variants =
+        invoker.enable_variants + _all_variant_names - _all_variant_names
+    assert(
+        unknown_enabled_variants == [],
+        "Unknown variant names in enable_variants argument: $unknown_enabled_variants")
+  }
+
+  foreach(variant, variants) {
+    # Figure out if this variant is actually used.  Don't bother to define
+    # toolchains for variants that are never used.  This cuts down on extra
+    # GN processing so `gn gen` is faster.  More importantly, it ensures
+    # that there isn't a toolchain defined using toolchain_args build
+    # arguments whose declare_args() block hasn't been imported because
+    # it's defined in a BUILD.gn file containing only configs that are
+    # never referenced by any target if the variant is never selected.
+    variant_used = variant.name == ""
+    if (!variant_used) {
+      i = 0
+      foreach(selector, select_variant_canonical) {
+        assert(defined(selector.variant),
+               "`select_variant` clause missing `variant` field: $selector")
+        if (selector.variant == variant.name) {
+          selectors_used[i] = true
+
+          # Only use the variant if its tags allow it.
+          if (variant.tags + exclude_tags - exclude_tags == variant.tags) {
+            variant_used = true
+          }
+        } else if (selector.variant == false) {
+          selectors_used[i] = true
+        }
+        i = i + 1
+      }
+    }
+
+    # Ensure that any variant listed in invoker.enable_variants is used too.
+    if (enabled_variant_names != []) {
+      if (enabled_variant_names + [ variant.name ] - [ variant.name ] !=
+          enabled_variant_names) {
+        variant_used = true
+      }
+    }
+
+    if (variant_used) {
+      # Ensure that the exclude tags list is passed to toolchain_variant,
+      # as it will be used in BUILDCONFIG.gn by variant_target()
+      if (exclude_tags != []) {
+        variant.exclude_variant_tags = exclude_tags
+      }
+
+      _variant_toolchain("${target_name}${variant.suffix}") {
+        toolchain_template = invoker.toolchain_template
+        toolchain_template_args = invoker_toolchain_template_args
+        this_variant = variant
+        this_invoker = invoker
+        is_pic_default = is_pic_default
+        with_shared = with_shared
+      }
+      if (with_shared) {
+        _variant_toolchain("${target_name}${variant.suffix}-shared") {
+          toolchain_template = invoker.toolchain_template
+          toolchain_template_args = {
+            forward_variables_from(invoker_toolchain_template_args, "*")
+            propagates_configs = true
+          }
+          this_variant = variant
+          this_invoker = invoker
+          is_pic_default = true
+          with_shared = true
+        }
+      }
+    }
+  }
+
+  i = 0
+  foreach(selector, select_variant_canonical) {
+    assert(selectors_used[i],
+           "unknown variant in `select_variant` clause: ${selector}")
+    i = i + 1
+  }
+  not_needed([ "selectors_used" ])
+}

@@ -1,0 +1,246 @@
+{{/*
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "TableDeclaration" }}
+{{- if EmitType .IsValueType }}
+{{- range .DocComments }}
+///{{ . }}
+{{- end }}
+{{- if .HasSensitive }}
+{{ .Derives.RemoveCustom "Debug" }}
+{{ else }}
+{{ .Derives }}
+{{- end }}
+pub struct {{ .Name }} {
+    {{- range .Members }}
+    {{- range .DocComments }}
+    ///{{ . }}
+    {{- end }}
+    pub {{ .Name }}: Option<{{ .Type.Owned }}>,
+    {{- end }}
+    #[doc(hidden)]
+    pub __source_breaking: fidl::marker::SourceBreaking,
+}
+
+impl fidl::{{ if .IsValueType }}Persistable{{ else }}Standalone<{{ ResourceDialect }}>{{ end }} for {{ .Name }} {}
+
+{{- if .Serializable.IsSerializable }}
+impl fidl::Serializable for {{ .Name }} {
+      const SERIALIZABLE_NAME: &'static str = "{{ .Serializable.Name }}";
+}
+{{- end }}
+
+{{ if .HasSensitive }}
+impl std::fmt::Debug for {{ .Name }} {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        {{- if .Sensitive }}
+        f.write_str("SENSITIVE{")?;
+        f.debug_struct("{{ .Name }}")
+        {{- range .Members }}
+            .field("{{ .Name }}", &self.{{ .Name }})
+        {{- end }}
+            .field("__source_breaking", &self.__source_breaking)
+            .finish()?;
+        f.write_str("}")
+        {{- else }}
+        f.debug_struct("{{ .Name }}")
+        {{- range .Members }}
+        {{- if .Sensitive }}
+            .field("{{ .Name }}", &self.{{ .Name }}.as_ref().map(fidl::marker::SensitiveDebug))
+        {{- else }}
+            .field("{{ .Name }}", &self.{{ .Name }})
+        {{- end }}
+        {{- end }}
+            .field("__source_breaking", &self.__source_breaking)
+            .finish()
+        {{- end }}
+    }
+}
+{{- end }}
+
+{{- end }}
+{{- end }}
+
+{{- define "TableInternal" }}
+{{- if EmitType .IsValueType }}
+impl {{ .Name }} {
+    #[inline(always)]
+    fn max_ordinal_present(&self) -> u64 {
+        {{- range .ReversedMembers }}
+        if let Some(_) = self.{{ .Name }} {
+            return {{ .Ordinal }};
+        }
+        {{- end }}
+        0
+    }
+}
+
+{{ $resourceDialectName := "D" }}
+{{ $resourceDialectGeneric := "<D: fidl::encoding::ResourceDialect>" }}
+{{- if .IsResourceType }}
+{{ $resourceDialectName = ResourceDialect }}
+{{ $resourceDialectGeneric = "" }}
+impl fidl::encoding::ResourceTypeMarker for {{ .Name }} {
+    type Borrowed<'a> = &'a mut Self;
+    fn take_or_borrow<'a>(value: &'a mut <Self as fidl::encoding::TypeMarker>::Owned) -> Self::Borrowed<'a> {
+        value
+    }
+}
+{{- else }}
+impl fidl::encoding::ValueTypeMarker for {{ .Name }} {
+    type Borrowed<'a> = &'a Self;
+    fn borrow(value: &<Self as fidl::encoding::TypeMarker>::Owned) -> Self::Borrowed<'_> {
+        value
+    }
+}
+{{- end }}
+
+unsafe impl fidl::encoding::TypeMarker for {{ .Name }} {
+    type Owned = Self;
+
+    #[inline(always)]
+    fn inline_align(_context: fidl::encoding::Context) -> usize {
+        8
+    }
+
+    #[inline(always)]
+    fn inline_size(_context: fidl::encoding::Context) -> usize {
+        16
+    }
+}
+
+unsafe impl{{ $resourceDialectGeneric }} fidl::encoding::Encode<{{ .Name }}, {{ $resourceDialectName }}> for &{{ if .IsResourceType }}mut {{ end }}{{ .Name }} {
+    unsafe fn encode(self, encoder: &mut fidl::encoding::Encoder<'_, {{ $resourceDialectName }}>, offset: usize, mut depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        encoder.debug_check_bounds::<{{ .Name }}>(offset);
+        // Vector header
+        let max_ordinal: u64 = self.max_ordinal_present();
+        encoder.write_num(max_ordinal, offset);
+        encoder.write_num(fidl::encoding::ALLOC_PRESENT_U64, offset + 8);
+        // Calling encoder.out_of_line_offset(0) is not allowed.
+        if max_ordinal == 0 {
+            return Ok(());
+        }
+        depth.increment()?;
+        let envelope_size = 8;
+        let bytes_len = max_ordinal as usize * envelope_size;
+        #[allow(unused_variables)]
+        let offset = encoder.out_of_line_offset(bytes_len);
+        let mut _prev_end_offset: usize = 0;
+
+        {{- range .Members }}
+        if {{ .Ordinal }} > max_ordinal {
+            return Ok(());
+        }
+
+        // Write at offset+(ordinal-1)*envelope_size, since ordinals are one-based and envelopes
+        // are envelope_size bytes.
+        let cur_offset: usize = ({{ .Ordinal }} - 1) * envelope_size;
+
+        // Zero reserved fields.
+        encoder.padding(offset + _prev_end_offset, cur_offset - _prev_end_offset);
+
+        // Safety:
+        // - bytes_len is calculated to fit envelope_size*max(member.ordinal).
+        // - Since cur_offset is envelope_size*(member.ordinal - 1) and the envelope takes
+        //   envelope_size bytes, there is always sufficient room.
+        fidl::encoding::encode_in_envelope_optional::<{{ .Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}>(
+            {{- if .Type.IsResourceType }}
+            self.{{ .Name }}.as_mut().map(<{{ .Type.Fidl $resourceDialectName }} as fidl::encoding::ResourceTypeMarker>::take_or_borrow),
+            {{- else }}
+            self.{{ .Name }}.as_ref().map(<{{ .Type.Fidl $resourceDialectName }} as fidl::encoding::ValueTypeMarker>::borrow),
+            {{- end }}
+            encoder, offset + cur_offset, depth
+        )?;
+
+        _prev_end_offset = cur_offset + envelope_size;
+        {{- end }}
+
+        Ok(())
+    }
+}
+
+impl{{ $resourceDialectGeneric }} fidl::encoding::Decode<Self, {{ $resourceDialectName }}> for {{ .Name }} {
+    #[inline(always)]
+    fn new_empty() -> Self {
+        Self::default()
+    }
+
+    unsafe fn decode(&mut self, decoder: &mut fidl::encoding::Decoder<'_, {{ $resourceDialectName }}>, offset: usize, mut depth: fidl::encoding::Depth) -> fidl::Result<()> {
+        decoder.debug_check_bounds::<Self>(offset);
+        let len = match fidl::encoding::decode_vector_header(decoder, offset)? {
+            None => return Err(fidl::Error::NotNullable),
+            Some(len) => len,
+        };
+        // Calling decoder.out_of_line_offset(0) is not allowed.
+        if len == 0 {
+            return Ok(());
+        };
+        depth.increment()?;
+        let envelope_size = 8;
+        let bytes_len = len * envelope_size;
+        let offset = decoder.out_of_line_offset(bytes_len)?;
+        // Decode the envelope for each type.
+        let mut _next_ordinal_to_read = 0;
+        let mut next_offset = offset;
+        let end_offset = offset + bytes_len;
+
+        {{- range .Members }}
+        _next_ordinal_to_read += 1;
+        if next_offset >= end_offset {
+            return Ok(());
+        }
+
+        // Decode unknown envelopes for gaps in ordinals.
+        while _next_ordinal_to_read < {{ .Ordinal }} {
+            fidl::encoding::decode_unknown_envelope(decoder, next_offset, depth)?;
+            _next_ordinal_to_read += 1;
+            next_offset += envelope_size;
+        }
+
+        let next_out_of_line = decoder.next_out_of_line();
+        let handles_before = decoder.remaining_handles();
+        if let Some((inlined, num_bytes, num_handles)) =
+            fidl::encoding::decode_envelope_header(decoder, next_offset)?
+        {
+            let member_inline_size = <{{ .Type.Fidl $resourceDialectName }} as fidl::encoding::TypeMarker>::inline_size(decoder.context);
+            if inlined != (member_inline_size <= 4) {
+                return Err(fidl::Error::InvalidInlineBitInEnvelope);
+            }
+            let inner_offset;
+            let mut inner_depth = depth.clone();
+            if inlined {
+                decoder.check_inline_envelope_padding(next_offset, member_inline_size)?;
+                inner_offset = next_offset;
+            } else {
+                inner_offset = decoder.out_of_line_offset(member_inline_size)?;
+                inner_depth.increment()?;
+            }
+            let val_ref =
+                self.{{ .Name }}.get_or_insert_with(|| fidl::new_empty!({{ .Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}));
+            fidl::decode!({{ .Type.Fidl $resourceDialectName }}, {{ $resourceDialectName }}, val_ref, decoder, inner_offset, inner_depth)?;
+            if !inlined && decoder.next_out_of_line() != next_out_of_line + (num_bytes as usize) {
+                return Err(fidl::Error::InvalidNumBytesInEnvelope);
+            }
+            if handles_before != decoder.remaining_handles() + (num_handles as usize) {
+                return Err(fidl::Error::InvalidNumHandlesInEnvelope);
+            }
+        }
+
+        next_offset += envelope_size;
+        {{- end }}
+
+        // Decode the remaining unknown envelopes.
+        while next_offset < end_offset {
+            _next_ordinal_to_read += 1;
+            fidl::encoding::decode_unknown_envelope(decoder, next_offset, depth)?;
+            next_offset += envelope_size;
+        }
+
+        Ok(())
+    }
+}
+{{- end }}
+{{ end }}

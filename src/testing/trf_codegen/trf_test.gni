@@ -1,0 +1,339 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/components.gni")
+import("//build/fidl/fidl.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_test.gni")
+import("//sdk/ctf/build/ctf.gni")
+
+# Defines a Fuchsia integration test using the TRF Codegen framework.
+#
+# Parameters
+#
+#   source (required)
+#     The path to the Rust test source file (e.g. "src/tester.rs").
+#     Type: path
+#
+#   cut (required)
+#     List of Component Under Test (CUT) GN target labels to include in the test realm.
+#     Type: list(label)
+#
+#   cut_component_name (optional)
+#     Explicit name of the CUT component. If omitted, the GN label name from the first
+#     target in the `cut` list will be used with any trailing `_component` stripped out.
+#     Type: string
+#
+#   cut_manifest (optional)
+#     The path to the cml manifest of the CUT, used to parse exposed capability configurations.
+#     Type: path
+#
+#   deps (optional)
+#     Additional Rust dependencies for the test driver and injectable universe binary targets.
+#     Type: list(label)
+#
+#   mocks (optional)
+#     List of Rust source files containing mock implementations.
+#     Type: list(path)
+#
+#   is_ctf (optional)
+#     If true, the test package will additionally be archived in the Compatibility Test Framework (CTF)
+#     release artifacts, allowing it to be preserved across branch cuts. Defaults to false.
+#     Type: boolean
+#
+template("trf_test") {
+  assert(defined(invoker.source), "source must be defined for trf_test")
+  assert(defined(invoker.cut), "cut must be defined for trf_test")
+
+  _main_target_name = target_name
+
+  target_out_dir_base = "${target_gen_dir}/$target_name"
+
+  # Find CUT dependencies and optional manifest input
+  _cut_manifest_inputs = []
+  _cut_codegen_deps = []
+  foreach(label, invoker.cut) {
+    _cut_codegen_deps += [ label ]
+  }
+  if (defined(invoker.cut_manifest)) {
+    _cut_manifest_inputs = [ invoker.cut_manifest ]
+  }
+
+  # 1. Action invoking trf_codegen_bin compiler
+  codegen_target_name = "${target_name}_codegen"
+  compiled_action(codegen_target_name) {
+    testonly = true
+    tool = "//src/testing/trf_codegen/bin:trf_codegen_bin"
+    inputs = [ invoker.source ] + _cut_manifest_inputs
+    if (defined(invoker.mocks)) {
+      inputs += invoker.mocks
+    }
+    outputs = [
+      "$target_out_dir_base/fidl/mock_control.fidl",
+      "$target_out_dir_base/cml/injectable_universe.cml",
+      "$target_out_dir_base/src/injectable_universe.rs",
+      "$target_out_dir_base/cml/realm_factory.cml",
+      "$target_out_dir_base/src/realm_factory.rs",
+      "$target_out_dir_base/cml/test_driver.cml",
+      "$target_out_dir_base/cml/test_root.cml",
+      "$target_out_dir_base/src/realm_builder_generated.rs",
+    ]
+    if (defined(invoker.mocks)) {
+      _j = 0
+      foreach(mock_file, invoker.mocks) {
+        _name = get_path_info(mock_file, "name")
+        outputs += [ "$target_out_dir_base/src/mock_${_j}_${_name}.rs" ]
+        _j += 1
+      }
+    }
+    deps = _cut_codegen_deps
+    if (defined(invoker.cut_component_name)) {
+      _cut_component_name = invoker.cut_component_name
+    } else {
+      _cut_list = invoker.cut
+      _cut_label_name = get_label_info(_cut_list[0], "name")
+      _cut_component_name = string_replace(_cut_label_name, "_component", "")
+    }
+
+    args = [
+      "--source",
+      rebase_path(invoker.source, root_build_dir),
+      "--out-dir",
+      rebase_path(target_out_dir_base, root_build_dir),
+      "--target-name",
+      _main_target_name,
+      "--cut-component-name",
+      _cut_component_name,
+    ]
+    if (defined(invoker.mocks)) {
+      foreach(mock_file, invoker.mocks) {
+        args += [
+          "--mock",
+          rebase_path(mock_file, root_build_dir),
+        ]
+      }
+    }
+    if (_cut_manifest_inputs != []) {
+      args += [
+        "--manifest",
+        rebase_path(_cut_manifest_inputs[0], root_build_dir),
+      ]
+    }
+  }
+
+  # 2. FIDL compilation targets
+  fidl_target_name = "${target_name}_mock_control_fidl"
+  _fidl_suffix = string_replace(target_name, "_", "")
+  _fidl_suffix = string_replace(_fidl_suffix, "-", "")
+
+  fidl(fidl_target_name) {
+    testonly = true
+    name = "fuchsia.trf.mockcontrol.${_fidl_suffix}"
+    sources = [ "$target_out_dir_base/fidl/mock_control.fidl" ]
+    non_fidl_deps = [ ":$codegen_target_name" ]
+  }
+
+  rb_generated_target_name = "${target_name}_rb_generated"
+  rustc_library(rb_generated_target_name) {
+    testonly = true
+    edition = "2024"
+    name = "trf_generated_realm"
+    source_root = "$target_out_dir_base/src/realm_builder_generated.rs"
+    sources = [ "$target_out_dir_base/src/realm_builder_generated.rs" ]
+    deps = [
+      ":${fidl_target_name}_rust",
+      "//src/testing/trf_codegen/fidl:fuchsia.trf.factory_rust",
+      "//src/testing/trf_codegen/lib/runtime:trf_codegen_runtime",
+      "//third_party/rust_crates:anyhow",
+    ]
+    non_rust_deps = [ ":$codegen_target_name" ]
+  }
+
+  # 3. Test Driver binary compiled from test source
+  td_bin_target_name = "${target_name}_td_bin"
+  rustc_test(td_bin_target_name) {
+    edition = "2024"
+    source_root = invoker.source
+    sources = [ invoker.source ]
+    deps = [
+      ":$codegen_target_name",
+      ":$rb_generated_target_name",
+      "//src/lib/fuchsia",
+      "//src/testing/trf_codegen/lib/macro:trf_codegen_macro",
+      "//third_party/rust_crates:anyhow",
+    ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+  }
+
+  # 4. Injectable Universe component, config, and binary
+  iu_manifest_target_name = "${target_name}_iu_manifest"
+  fuchsia_component_manifest(iu_manifest_target_name) {
+    testonly = true
+    component_name = "injectable_universe"
+    manifest = "$target_out_dir_base/cml/injectable_universe.cml"
+    deps = [ ":$codegen_target_name" ]
+  }
+
+  iu_config_target_name = "${target_name}_iu_config"
+  fuchsia_structured_config_rust_lib(iu_config_target_name) {
+    testonly = true
+    name = "injectable_universe_config"
+    cm_label = ":$iu_manifest_target_name"
+  }
+
+  iu_cvf_target_name = "${target_name}_iu_cvf"
+  fuchsia_structured_config_values(iu_cvf_target_name) {
+    testonly = true
+    cm_label = ":$iu_manifest_target_name"
+    values = {
+      # The injectable universe dynamically expects a 'hat' parameter via
+      # structured config which serves as a namespace partition string routing
+      # concurrent mock data, but it defaults to an empty global namespace.
+      hat = ""
+    }
+  }
+
+  iu_bin_target_name = "${target_name}_iu_bin"
+  rustc_binary(iu_bin_target_name) {
+    testonly = true
+    edition = "2024"
+    source_root = "$target_out_dir_base/src/injectable_universe.rs"
+    sources = [ "$target_out_dir_base/src/injectable_universe.rs" ]
+    if (defined(invoker.mocks)) {
+      _i = 0
+      foreach(mock, invoker.mocks) {
+        _name = get_path_info(mock, "name")
+        sources += [ "$target_out_dir_base/src/mock_${_i}_${_name}.rs" ]
+        _i += 1
+      }
+    }
+    deps = [
+      ":$iu_config_target_name",
+      ":${fidl_target_name}_rust",
+      "//src/lib/fuchsia",
+      "//src/lib/fuchsia-async",
+      "//src/lib/fuchsia-component",
+      "//src/testing/trf_codegen/lib/macro:trf_codegen_macro",
+      "//third_party/rust_crates:anyhow",
+      "//third_party/rust_crates:futures",
+      "//third_party/rust_crates:tracing",
+    ]
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    non_rust_deps = [ ":$codegen_target_name" ]
+  }
+
+  iu_comp_target_name = "${target_name}_injectable_universe"
+  fuchsia_component(iu_comp_target_name) {
+    testonly = true
+    cm_label = ":$iu_manifest_target_name"
+    deps = [ ":$iu_bin_target_name" ]
+  }
+
+  iu_pkg_target_name = "${iu_comp_target_name}_pkg"
+  fuchsia_package(iu_pkg_target_name) {
+    package_name = "${_main_target_name}_injectable_universe"
+    testonly = true
+    validate_structured_config = false
+    deps = [
+      ":$iu_comp_target_name",
+      ":$iu_cvf_target_name",
+    ]
+  }
+
+  # 5. Test Driver component
+  td_comp_target_name = "${target_name}_test_driver"
+  fuchsia_component(td_comp_target_name) {
+    testonly = true
+    component_name = "test_driver"
+    manifest = "$target_out_dir_base/cml/test_driver.cml"
+    deps = [
+      ":$codegen_target_name",
+      ":$td_bin_target_name",
+    ]
+  }
+
+  # 6. Realm Factory component & package
+  rf_bin_target_name = "${target_name}_rf_bin"
+  rustc_binary(rf_bin_target_name) {
+    testonly = true
+    edition = "2024"
+    source_root = "$target_out_dir_base/src/realm_factory.rs"
+    sources = [ "$target_out_dir_base/src/realm_factory.rs" ]
+    deps = [
+      "//sdk/fidl/fuchsia.component.decl:fuchsia.component.decl_rust",
+      "//sdk/fidl/fuchsia.testing.harness:fuchsia.testing.harness_rust",
+      "//sdk/rust/zx",
+      "//src/lib/fidl/rust/fidl",
+      "//src/lib/fuchsia",
+      "//src/lib/fuchsia-async",
+      "//src/lib/fuchsia-component",
+      "//src/lib/fuchsia-component-test",
+      "//src/sys/lib/cm_rust",
+      "//src/testing/realm_proxy",
+      "//src/testing/trf_codegen/fidl:fuchsia.trf.factory_rust",
+      "//third_party/rust_crates:anyhow",
+      "//third_party/rust_crates:futures",
+      "//third_party/rust_crates:tracing",
+    ]
+    non_rust_deps = [ ":$codegen_target_name" ]
+  }
+
+  rf_comp_target_name = "${target_name}_realm_factory_comp"
+  fuchsia_component(rf_comp_target_name) {
+    testonly = true
+    component_name = "realm_factory"
+    manifest = "$target_out_dir_base/cml/realm_factory.cml"
+    deps = [
+      ":$codegen_target_name",
+      ":$rf_bin_target_name",
+    ]
+  }
+
+  rf_pkg_target_name = "${target_name}_realm_factory_pkg"
+  fuchsia_package(rf_pkg_target_name) {
+    package_name = "${_main_target_name}_realm_factory"
+    testonly = true
+    deps = [
+      ":$rf_comp_target_name",
+      "//src/lib/fuchsia-component-test/realm_builder_server:realm_builder_server_component",
+    ]
+    subpackages = invoker.cut + [ ":${iu_pkg_target_name}" ]
+  }
+
+  # 7. Test Root component
+  test_root_comp_target_name = "${target_name}_test_root"
+  fuchsia_test_component(test_root_comp_target_name) {
+    testonly = true
+    component_name = "test_root"
+    test_type = "system"
+    manifest = "$target_out_dir_base/cml/test_root.cml"
+    deps = [ ":$codegen_target_name" ]
+  }
+
+  # 8. Main Test Package
+  fuchsia_test_package(target_name) {
+    validate_structured_config = false
+    test_components = [ ":$test_root_comp_target_name" ]
+    deps = [ ":$td_comp_target_name" ]
+    subpackages = [ ":$rf_pkg_target_name" ]
+  }
+
+  _is_ctf = defined(invoker.is_ctf) && invoker.is_ctf
+  if (_is_ctf) {
+    main_target_name = target_name
+    ctf_fuchsia_package_archive("${target_name}_ctf_archive") {
+      package = ":$main_target_name"
+      package_name = main_target_name
+      test_component_names = [ "test_root" ]
+    }
+  } else {
+    group("${target_name}_ctf_archive") {
+    }
+  }
+}

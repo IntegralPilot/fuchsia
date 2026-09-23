@@ -1,0 +1,127 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/dist/resource.gni")
+
+# Define a component ID index which maps monikers (component URL + realm path)
+# to component instance IDs. component_manager uses this index to key a
+# component's storage directory to its instance ID.
+#
+# There may be multiple component_id_index()s in the build, which are merged
+# into a single index in the build and delivered to component_manager as a
+# bootfs or package dependency at "config/component_id_index".
+#
+# See //docs/development/components/component_id_index.md for more details on
+# how to define a component ID index.
+#
+# Parameters
+#
+#   source (required)
+#     [string] This is a relative path to index file.
+#
+#   visibility (optional)
+#   testonly (optional)
+#     Usual GN meanings.
+template("component_id_index") {
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "testonly",
+                           ])
+
+    assert(defined(invoker.source), "source must be specified.")
+    metadata = {
+      component_id_index = [ rebase_path(invoker.source, root_build_dir) ]
+    }
+  }
+}
+
+# Collect and merge component ID indices supplied from component_id_index()s.
+#
+# This template results in a resource() which contains a FIDL-wireformat encoded
+# index supplied through a resource(). A "-config-data" suffixed sub-target
+# contains a JSON-encoded index supplied through config_data().
+#
+# A target defined from this template must take a (transitive) dependency on
+# targets defined from the component_id_index() template.
+#
+# For more details on how to include this target in a system assembly, see:
+# //docs/development/components/component_id_index.md
+#
+# Parameters
+#
+#   deps (optional)
+#     A list of deps to traverse to collect component_id_index()s.
+#
+#   public_deps (optional)
+#   testonly (optional)
+#     Usual GN meanings.
+template("component_id_index_config") {
+  # Step 1:  Collect a list of index file paths into intermediary file
+  # `component_id_index_merge_input_manifest`.
+  component_id_index_input_manifest_path =
+      "${target_gen_dir}/${target_name}_merge_input_manifest"
+  component_id_index_merged_inputs = "${target_name}_merged_inputs"
+  generated_file(component_id_index_merged_inputs) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "public_deps",
+                             "testonly",
+                           ])
+    visibility = [ ":*" ]
+    walk_keys = [ "component_id_index_barrier" ]
+    data_keys = [ "component_id_index" ]
+    outputs = [ component_id_index_input_manifest_path ]
+  }
+
+  # Step 2: Merge the collected index files (listed in the intermediary file)
+  # into 1 index.
+  component_id_index_merge = "${target_name}_merge"
+  component_id_index_merged_index_json_path =
+      "${target_out_dir}/${target_name}_merged_index.json"
+  component_id_index_merged_index_fidl_path =
+      "${target_out_dir}/${target_name}_merged_index.fidlbin"
+
+  compiled_action(component_id_index_merge) {
+    forward_variables_from(invoker, [ "testonly" ])
+    visibility = [ ":*" ]
+    tool = "//tools/component_id_index"
+    sources = [ component_id_index_input_manifest_path ]
+    outputs = [
+      component_id_index_merged_index_json_path,
+      component_id_index_merged_index_fidl_path,
+    ]
+    depfile = "${target_out_dir}/${target_name}.d"
+    args = [
+      "--input-manifest",
+      rebase_path(component_id_index_input_manifest_path, root_build_dir),
+      "--output-index-json",
+      rebase_path(component_id_index_merged_index_json_path, root_build_dir),
+      "--output-index-fidl",
+      rebase_path(component_id_index_merged_index_fidl_path, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+    deps = [ ":${component_id_index_merged_inputs}" ]
+  }
+
+  # This target produces the component_id_index as a resource pathed under
+  # "config/component_id_index".  This resource can be used to place the index
+  # in bootfs so that it is available to `component_manager` even before pkgfs
+  # is available.
+  resource("${target_name}") {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "metadata",
+                           ])
+    sources = [ component_id_index_merged_index_fidl_path ]
+    outputs = [ "config/component_id_index" ]
+    deps = [ ":${component_id_index_merge}" ]
+  }
+}

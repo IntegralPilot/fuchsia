@@ -1,0 +1,722 @@
+# Copyright 2020 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/zircon/standard.gni")
+import("//build/dist/generated_resource.gni")
+import("//build/testing/boot_tests/boot_test.gni")
+import("//build/testing/boot_tests/kernel_zbi_test.gni")
+import("//build/zbi/kernel_cmdline.gni")
+import("//build/zbi/zbi_input.gni")
+import("//src/bringup/lib/mexec/testing/zbi_test.gni")
+import("//zircon/kernel/kernel_package.gni")
+import("//zircon/kernel/lib/code-patching/code-patching.gni")
+import("//zircon/kernel/params.gni")
+import("//zircon/kernel/phys/boot-shim/devicetree.gni")
+import("//zircon/kernel/phys/devicetree_boot_test.gni")
+import("//zircon/kernel/phys/efi/efi_executable.gni")
+import("//zircon/kernel/phys/efi/efi_shell_test.gni")
+import("//zircon/kernel/phys/efi/efi_test.gni")
+import("//zircon/kernel/phys/kernel_elf_binary.gni")
+import("//zircon/kernel/phys/qemu.gni")
+import("//zircon/kernel/phys/qemu_kernel_test.gni")
+import("//zircon/kernel/phys/zbi_executable.gni")
+import("phys_zbi_test.gni")
+import("physload_binary_test.gni")
+import("turducken_zbi_test.gni")
+
+# Used for turducken_cuckoo_test(), instructing tuducken tests, when the tests
+# finishes successfully it should boot the next kernel item in the boot zbi.
+kernel_cmdline("turducken-boot-next") {
+  testonly = true
+  args = [ "turducken.boot-next=true" ]
+}
+
+config("includes") {
+  visibility = [ ":*" ]
+  include_dirs = [ "." ]
+}
+
+# This provides a PhysMain function appropriate for zbi_test() targets.
+source_set("qemu-test-main") {
+  testonly = true
+  sources = [ "qemu-test-main.cc" ]
+  defines = [ "BOOT_TEST_SUCCESS_STRING=\"$boot_test_success_string\"" ]
+  deps = [
+    "..:boot-options",
+    "..:exception",
+    "..:stdio",
+    "..:uart-console",
+    "//zircon/kernel/lib/arch",
+    "//zircon/kernel/lib/boot-options",
+    "//zircon/kernel/lib/libc",
+    "//zircon/system/ulib/uart",
+  ]
+  public_deps = [
+    # This is public to propagate its public_deps so dependents
+    # of qemu-test-main can use #include "test-main.h".
+    ":test-main",
+  ]
+}
+
+# This provides an environment that is bootstrapped from an input devicetree.
+# Appropriate for environments where devicetree is the boot protocol.
+source_set("devicetree-test-main") {
+  testonly = true
+  sources = [ "devicetree-test-main.cc" ]
+  defines = [ "BOOT_TEST_SUCCESS_STRING=\"$boot_test_success_string\"" ]
+  deps = [
+    "..:address-space",
+    "..:exception",
+    "..:main",
+    "..:stdio",
+    "..:uart",
+    "../boot-shim:devicetree",
+    "//zircon/kernel/lib/arch",
+    "//zircon/kernel/lib/boot-options",
+    "//zircon/kernel/lib/libc",
+    "//zircon/kernel/phys:allocation",
+    "//zircon/kernel/phys:allocation-init",
+    "//zircon/kernel/phys:uart-console",
+    "//zircon/kernel/phys/lib/boot-shim",
+    "//zircon/system/ulib/uart",
+  ]
+  public_deps = [
+    # This is public to propagate its public_deps so dependents
+    # of qemu-test-main can use #include "test-main.h".
+    ":test-main",
+  ]
+}
+
+source_set("zbi-test-main") {
+  testonly = true
+  sources = [ "zbi-test-main.cc" ]
+  defines = [ "BOOT_TEST_SUCCESS_STRING=\"$boot_test_success_string\"" ]
+  public_deps = [ ":test-main" ]
+  deps = [ "//zircon/kernel/lib/libc" ]
+}
+
+source_set("efi-test-main") {
+  testonly = true
+  sources = [ "efi-test-main.cc" ]
+  defines = [ "BOOT_TEST_SUCCESS_STRING=\"$boot_test_success_string\"" ]
+  public_deps = [ ":test-main" ]
+  deps = [
+    "//zircon/kernel/lib/libc",
+    "//zircon/kernel/phys/efi:main",
+    "//zircon/kernel/phys/efi:protocol",
+  ]
+}
+
+source_set("test-main") {
+  testonly = true
+  public = [ "test-main.h" ]
+  public_configs = [ ":includes" ]
+  public_deps = [
+    "..:main",
+    "..:symbolize",
+    "//zircon/kernel/lib/arch:headers",
+  ]
+}
+
+source_set("phys-unittest") {
+  testonly = true
+  public = [ "phys-unittest.h" ]
+  public_configs = [ ":includes" ]
+  public_deps = [
+    ":test-main",
+    "//zircon/kernel/lib/ktl",
+  ]
+  deps = [ "//zircon/kernel/lib/libc" ]
+}
+
+# Build a qemu_kernel_test(), zbi_test(), and an efi_test() from the
+# same sources.
+#
+# Parameters
+#
+#   * disabled_for_efi
+#     - Optional: Whether the efi_test() subtarget should be disabled.
+#     - Type: bool
+#     - Default: false
+#
+# Generates a target with a name of the form "qemu-xxx" for the QEMU test,
+# and "zbi-xxx" for the ZBI test.
+template("common_test") {
+  qemu_kernel_test("qemu-$target_name") {
+    visibility = [ ":*" ]
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "target_name",
+                             "disabled_for_efi",
+                           ])
+  }
+
+  if (have_devicetree) {
+    devicetree_boot_test("devicetree-$target_name") {
+      visibility = [ ":*" ]
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "target_name",
+                               "disabled_for_efi",
+                             ])
+    }
+  }
+
+  phys_zbi_test("zbi-$target_name") {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "target_name",
+                             "disabled_for_efi",
+                           ])
+  }
+
+  efi_test("efi-$target_name") {
+    visibility = [ ":*" ]
+    deps = []
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "target_name",
+                             "testonly",
+                           ])
+    deps += [ ":efi-test-main" ]
+    if (defined(disabled_for_efi)) {
+      disabled = disabled_for_efi
+    }
+  }
+
+  group(target_name) {
+    testonly = true
+    deps = [
+      ":qemu-$target_name",
+      ":zbi-$target_name",
+    ]
+
+    if (have_devicetree) {
+      deps += [ ":devicetree-$target_name" ]
+    }
+    if (have_efi) {
+      deps += [ ":efi-$target_name" ]
+    }
+  }
+}
+
+common_test("hello-world-test") {
+  deps = [ ":hello-world-test.source" ]
+}
+
+source_set("hello-world-test.source") {
+  testonly = true
+  sources = [ "hello-world-test.cc" ]
+  defines = [ "LIB_ARCH_PRINTERS" ]
+  deps = [
+    ":test-main",
+    "//zircon/kernel/lib/libc",
+  ]
+}
+
+common_test("backtrace-test") {
+  # TODO(https://fxbug.dev/42067126): Fix and enable me.
+  disabled_for_efi = true
+
+  sources = [
+    "asm-backtrace.S",
+    "backtrace-test.cc",
+  ]
+  deps = [
+    ":test-main",
+    "//sdk/lib/zbi-format",
+    "//zircon/kernel/lib/arch",
+    "//zircon/kernel/lib/libc",
+  ]
+}
+
+# Ideally we'd test all four combinations on arm64 and both combinations on
+# x86.  But the common library code is always compiled with shadow-call-stack
+# on arm64 so we can't disable the ABI support for it and with safe-stack on
+# x86 so we can't disable the ABI support for it there.  The start.S code
+# only enables extra stack support conditionally so as not to waste space, so
+# there isn't a good way to test non-default configurations.
+common_test("phys-unittests") {
+  sources = [
+    "phys-unittests.cc",
+    "stack-tests.cc",
+  ]
+  deps = [
+    ":phys-unittest",
+    ":test-main",
+    "//src/lib/zbitl",
+    "//zircon/kernel/lib/arch/test:kernel-tests",
+    "//zircon/kernel/lib/crypto:crypto-entropy-test",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+    "//zircon/kernel/lib/unittest",
+    "//zircon/kernel/tests:phys-tests",
+  ]
+}
+
+phys_zbi_test("zbi-handoff-entropy-test") {
+  sources = [ "handoff-entropy-test.cc" ]
+
+  deps = [
+    ":phys-unittest",
+    ":test-main",
+    "..:handoff-entropy",
+    "//src/lib/zbitl",
+    "//zircon/kernel/lib/boot-options",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+    "//zircon/kernel/lib/unittest",
+  ]
+}
+
+# The qemu_kernel_test only works on x86, but it's nowhere in deps.
+common_test("memory-test") {
+  sources = [ "phys-memory-test.cc" ]
+  deps = [
+    ":test-main",
+    "..:address-space",
+    "..:allocation",
+    "..:new",
+    "..:uart",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+  ]
+
+  # TODO(https://fxbug.dev/42126526): Replace usage of this with
+  # `#ifdef __UEFI__` once possible.
+  defines = [ "EFI=$is_efi_toolchain" ]
+
+  # TODO(https://fxbug.dev/42079666): Remove if this doesn't help
+  # because that means the timeout is likely not the issue.
+  #
+  # Any changes to this timeout should be reflected in
+  # `//zircon/kernel/phys/boot-shim:devicetree-shim-memory-test`
+  timeout = 150
+}
+
+zbi_input("decompress-test-data") {
+  visibility = [ ":*" ]
+  testonly = true
+  type = "ramdisk"
+  args = [
+    "--compressed=zstd.max",
+    "--entry=abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+  ]
+}
+
+# Test the zbitl decompression code.
+#
+# This requires a zbi_input, so we only run it as a ZBI test.
+phys_zbi_test("zbi-decompress-test") {
+  sources = [ "decompress-test.cc" ]
+  deps = [
+    ":test-main",
+    "..:address-space",
+    "..:allocation",
+    "..:zbi-memory",
+    "..:zbitl-allocation",
+    "//src/lib/zbitl",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+    "//zircon/system/ulib/zx",
+  ]
+  data_deps = [ ":decompress-test-data" ]
+}
+
+# Test BootZbi::Load. We need a valid bootable ZBI to be handed off to the test.
+# The contents of the ZBI are otherwise unimportant.
+zbi_executable("boot-zbi-load-test") {
+  testonly = true
+  sources = [ "boot-zbi-load-test.cc" ]
+  deps = [
+    #":physboot-test-data.zbi",
+    ":test-main",
+    ":turducken",
+    "..:address-space",
+    "..:allocation",
+    "..:boot-zbi",
+    "..:new",
+    "..:zbi-memory",
+    "..:zbitl-allocation",
+    "//src/lib/zbitl",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+    "//zircon/kernel/lib/unittest",
+    "//zircon/system/ulib/zx",
+  ]
+}
+
+turducken_zbi_test("zbi-boot-zbi-load-test") {
+  kernel = ":boot-zbi-load-test"
+
+  if (toolchain_environment == "kernel.phys") {
+    sources = get_target_outputs(":zbi-hello-world-test.executable")
+
+    # Prefer `data_deps` since zbi_input() adds `zbi_input_barrier` metadata,
+    # preventing this zbi_executable()'s kernel item from being prepended.
+    data_deps = [ ":zbi-hello-world-test.executable" ]
+  }
+}
+
+source_set("turducken") {
+  testonly = true
+  public = [ "turducken.h" ]
+  public_configs = [ ":includes" ]
+  public_deps = [
+    "..:allocation",
+    "..:boot-zbi",
+    "..:symbolize",
+    "//sdk/lib/zbi-format",
+    "//src/lib/zbitl",
+    "//zircon/kernel/lib/arch",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+  ]
+  sources = [ "turducken.cc" ]
+  deps = [
+    ":zbi-test-main",
+    "..:address-space",
+    "..:fixed-address-boot-zbi",
+    "..:zbi-memory",
+    "..:zbitl-allocation",
+    "//zircon/kernel/lib/boot-options",
+    "//zircon/kernel/lib/ktl",
+    "//zircon/kernel/lib/libc",
+  ]
+}
+
+zbi_executable("chain-load-test") {
+  visibility = [ ":*" ]
+  testonly = true
+  sources = [ "chain-load-test.cc" ]
+  deps = [ ":turducken" ]
+}
+
+turducken_zbi_test("zbi-chain-load-hello-world-test") {
+  kernel = ":chain-load-test"
+  if (toolchain_environment == "kernel.phys") {
+    sources = get_target_outputs(":zbi-hello-world-test.executable")
+
+    # Prefer `data_deps` since zbi_input() adds `zbi_input_barrier` metadata,
+    # preventing this zbi_executable()'s kernel item from being prepended.
+    data_deps = [ ":zbi-hello-world-test.executable" ]
+  }
+}
+
+core_tests_label = "//zircon/system/utest/core:core-tests.${default_kernel_test_image}.zbi($default_toolchain)"
+core_tests_zbi = get_label_info(core_tests_label, "target_out_dir") + "/" +
+                 get_label_info(core_tests_label, "name")
+
+turducken_zbi_test("zbi-chain-load-core-tests") {
+  kernel = ":chain-load-test"
+
+  sources = [ core_tests_zbi ]
+
+  # Prefer `data_deps` since `zhi_input` adds a `zbi_input_barrier`, preventing
+  # this zbi's kernel image from being prepended.
+  data_deps = [ core_tests_label ]
+
+  # Once it chain-loads Zircon, it will shut down by itself, but not
+  # necessarily really quickly since the tests take a little while to run.
+  timeout = false
+}
+
+zbi_executable("turducken-test") {
+  visibility = [ ":*" ]
+  testonly = true
+  sources = [ "turducken-test.cc" ]
+  deps = [ ":turducken" ]
+  data_deps = [ ":turducken-cmdline" ]
+}
+
+kernel_cmdline("turducken-cmdline") {
+  args = [
+    "turducken-test.smoke",
+    "turducken-test.flavor=turkey",
+  ]
+}
+
+mobius_turducken_test("turducken-zbi-test") {
+  kernel = ":turducken-test"
+  timeout = 300  # 5min
+}
+
+phys_zbi_test("zbi-phys-exception-test") {
+  sources = [ "phys-exception-test.cc" ]
+  deps = [
+    ":test-main",
+    "//zircon/kernel/lib/libc",
+  ]
+}
+
+qemu_kernel_test("qemu-phys-exception-test") {
+  sources = [ "phys-exception-test.cc" ]
+  deps = [
+    ":test-main",
+    "..:exception",
+    "//zircon/kernel/lib/libc",
+  ]
+}
+
+# turkey
+zbi_executable("trampoline-boot-test") {
+  testonly = true
+  sources = [ "trampoline-boot-test.cc" ]
+  deps = [
+    ":turducken",
+    "..:fixed-address-boot-zbi",
+    "..:new",
+    "..:zbi",
+    "//zircon/kernel/lib/boot-options",
+    "//zircon/kernel/lib/libc",
+    "//zircon/system/ulib/pretty",
+    "//zircon/system/ulib/zx",
+  ]
+  data_deps = [ ":trampoline-cmdline" ]
+}
+
+kernel_cmdline("trampoline-cmdline") {
+  testonly = true
+  visibility = [ ":*" ]
+
+  # Number of times to perform chain loading after initial bootstrapping.
+  # Currently in x86(with kvm) it takes ~40 secs to chain load 100 times,
+  # the biggest time consumption being printing to serial.
+  # On arm64, 80 iterations occasionally takes over 5 minutes (boot
+  # performance appears to have regressed since March 2023)
+  # so 50 leaves a little headroom for variance in performance, with a
+  # 5 min timeout leaves roughly 6 sec per iteration which should have
+  # enough spare time per iteration.
+  args = [ "trampoline.user_total_iters=50" ]
+}
+
+mobius_turducken_test("trampoline-boot-zbi-test") {
+  kernel = ":trampoline-boot-test"
+  timeout = 300  # 5min
+}
+
+turducken_cuckoo_test("turducken-boot-next-zbi-test") {
+  boot_zbi = ":turducken-zbi-test.zbi"
+  next_zbi = ":zbi-hello-world-test.zbi"
+}
+
+efi_shell_test("efi-shell-smoke-test") {
+  contents = [ "echo \"$boot_test_success_string\"" ]
+}
+
+source_set("physload-test-main") {
+  public = [ "physload-test-main.h" ]
+  public_deps = [
+    "..:kernel-package",
+    "..:physload.module",  # So public configs propagate.
+  ]
+
+  sources = [ "physload-test-main.cc" ]
+  defines = [ "BOOT_TEST_SUCCESS_STRING=\"$boot_test_success_string\"" ]
+}
+
+physload_binary_test("physload-handoff-test") {
+  visibility = [
+    ":*",
+    "//zircon/kernel/arch/riscv64/phys/boot-shim:*",
+  ]
+
+  target_type = "loadable_module"
+  has_patches = false
+
+  sources = [ "physload-handoff-test.cc" ]
+  defines = [ "BOOT_TEST_SUCCESS_STRING=\"$boot_test_success_string\"" ]
+
+  deps = [
+    "..:allocation",
+    "..:elf-image",
+    "..:log",
+    "..:main",
+    "..:stdio",
+    "..:symbolize",
+    "//zircon/kernel/arch/$zircon_cpu/phys",
+    "//zircon/kernel/lib/boot-options",
+  ]
+}
+
+kernel_package("physboot-zbi-kernel-test-data") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  # Just "physboot" at top level is the default for `kernel.phys.next`.
+  prefix = ""
+  deps = [ "..:physboot-zbi-kernel" ]
+}
+
+zbi("physboot-zbi-kernel-test-zircon") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  deps = [
+    ":physboot-zbi-kernel-test-data($phys_toolchain)",
+    default_test_vmzircon_label,
+  ]
+}
+
+kernel_elf_binary("physboot-hello-world-test") {
+  testonly = true
+  install_name = "vmzircon"
+  sources = [ "physboot-hello-world-test.cc" ]
+  defines = [
+    "HANDOFF_PTR_DEREF=1",
+    "BOOT_TEST_SUCCESS_STRING=\"$boot_test_success_string\"",
+  ]
+
+  deps = [
+    "..:address-space",
+    "..:physboot.kernel",
+    "..:zircon-abi-spec",
+    "//zircon/kernel/lib/boot-options",
+    "//zircon/kernel/lib/code-patching:self-test",
+    "//zircon/system/ulib/uart",
+  ]
+
+  # This can't use even the phys printf, which the custom ubsan runtime uses.
+  exclude_toolchain_tags = [ "ubsan" ]
+}
+
+kernel_package("physboot-test-data") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  deps = [
+    ":physboot-hello-world-test($phys_toolchain)",
+    ":physboot-test-data.cmdline",
+    ":physboot-test-data.version-string",
+
+    # These won't actually be used by the test kernel, but physboot will panic
+    # if it can't hand off loadable ELF files for vdso and userboot.
+    "//zircon/kernel/lib/userabi/trivial-test-userboot:trivial-test-userboot.basic",
+    "//zircon/kernel/lib/userabi/vdso",
+  ]
+}
+
+kernel_cmdline("physboot-test-data.cmdline") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  args = [
+    "kernel.select=physboot-test-data",
+    "kernel.select.userboot=trivial-test-userboot-with-very-long-name-needing-truncation",
+  ]
+}
+
+generated_resource("physboot-test-data.version-string") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  outputs = [ "version-string.txt" ]
+  contents = "fake-version-for-test"
+}
+
+zbi("physboot-test-data.zbi") {
+  visibility = [ ":*" ]
+  testonly = true
+
+  deps = [
+    ":physboot-test-data($phys_toolchain)",
+    "..:physboot.package",
+  ]
+}
+
+zbi_test("physboot-test") {
+  deps = [ ":physboot-test-data.zbi" ]
+}
+
+group("phys-test") {
+  testonly = true
+  deps = [
+    ":backtrace-test",
+    ":hello-world-test",
+    ":phys-unittests",
+    ":physboot-test",
+    ":physload-handoff-test",
+    ":trampoline-boot-zbi-test",
+    ":turducken-boot-next-zbi-test",
+    ":turducken-zbi-test",
+    ":zbi-boot-zbi-load-test",
+    ":zbi-chain-load-core-tests",
+    ":zbi-chain-load-hello-world-test",
+    ":zbi-decompress-test",
+    ":zbi-handoff-entropy-test",
+    ":zbi-memory-test",
+    ":zbi-phys-exception-test",
+    "code-patching",
+    "elf-loading",
+    "linux-boot-config:tests",
+    "//zircon/kernel/arch/$zircon_cpu/phys:tests",
+  ]
+
+  if (have_efi) {
+    deps += [
+      ":efi-memory-test",
+      ":efi-shell-smoke-test",
+    ]
+  }
+
+  if (have_devicetree) {
+    deps += [ ":devicetree-memory-test" ]
+  }
+
+  if (current_cpu == "x64") {
+    # Only x86 gets memory info directly from the legacy boot environments.
+    deps += [ ":qemu-memory-test" ]
+  } else {
+    # x86 qemu is 32-bit and we don't do exceptions for 32-bit.
+    deps += [ ":qemu-phys-exception-test" ]
+  }
+}
+
+if (current_toolchain ==
+    default_toolchain) {  # current_toolchain == default_toolchain
+  # We create mexec-chainloading variations of all of the phys ZBI tests.
+  test_deps = []
+  if (target_cpu != "riscv64") {  # TODO(mcgrathr): No mexec on riscv64 (yet?).
+    foreach(test,
+            [
+              "zbi-backtrace-test",
+              "zbi-hello-world-test",
+              "zbi-memory-test",
+              "zbi-phys-unittests",
+              "zbi-handoff-entropy-test",
+              "zbi-decompress-test",
+            ]) {
+      mexec_zbi_test("mexec-$test") {
+        child_zbi = ":$test($phys_toolchain)"
+        child_zbi_file =
+            get_label_info(child_zbi, "target_out_dir") + "/$test.zbi"
+      }
+
+      test_deps += [ ":mexec-$test" ]
+    }
+  }
+
+  group("test") {
+    testonly = true
+    deps = [
+             ":phys-test($phys_toolchain)",
+
+             # Debug Data propagation to userspace.
+             "debugdata-propagation:early-boot-debugdata-zbi-test",
+           ] + test_deps
+  }
+}
+
+foreach(cpu, standard_fuchsia_cpus) {
+  group(cpu) {
+    testonly = true
+    public_deps = [ ":test(//zircon/kernel/phys:kernel.phys_$cpu)" ]
+  }
+}

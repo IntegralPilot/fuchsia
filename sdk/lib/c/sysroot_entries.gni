@@ -1,0 +1,209 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This file is used to describe the sysroot entries contributed by the
+# C library. For historical reasons, it currently includes some Zircon
+# headers as well.
+#
+# To properly expose dependencies, this content must be parsed during the
+# `gn gen` phase of the Fuchsia build, i.e. it is not possible to write
+# it to a generated_file() target and later process it with a build-time
+# script.
+
+import("//build/config/sysroot.gni")
+import("//sdk/lib/c/include/libc_headers.gni")
+import("//sdk/lib/c/libc_toolchain.gni")
+import("//zircon/vdso/vdso.gni")
+
+# This describes the sysroot entries contributed by the C library
+# built without any binaries that may be affected by instrumentation.
+# In the Zircon build, this will be added to the metadata of the
+# base (i.e. non-instrumented) version of the C library.
+#
+# All versions then get sysroot_instrumented_libc_entries as well.
+#
+# For historical reason, this includes Zircon headers as well.
+sysroot_uninstrumented_libc_entries = [
+  {
+    sdk = {
+      include_dir = "//zircon/system/public"
+      headers = [
+        "zircon/analyzer.h",
+        "zircon/availability.h",
+        "zircon/availability_levels.inc",
+        "zircon/boot/crash-reason.h",
+        "zircon/compiler.h",
+        "zircon/errors.h",
+        "zircon/features.h",
+        "zircon/fidl.h",
+        "zircon/hw/debug/arm64.h",
+        "zircon/hw/debug/x86.h",
+        "zircon/hw/gpt.h",
+        "zircon/limits.h",
+        "zircon/listnode.h",
+        "zircon/processargs.h",
+        "zircon/rights.h",
+        "zircon/string_view.h",
+        "zircon/syscalls-next.h",
+        "zircon/syscalls.h",
+        "zircon/syscalls/clock.h",
+        "zircon/syscalls/debug.h",
+        "zircon/syscalls/exception.h",
+        "zircon/syscalls/hypervisor.h",
+        "zircon/syscalls/iob.h",
+        "zircon/syscalls/iommu.h",
+        "zircon/syscalls/log.h",
+        "zircon/syscalls/object.h",
+        "zircon/syscalls/policy.h",
+        "zircon/syscalls/port.h",
+        "zircon/syscalls/profile.h",
+        "zircon/syscalls/resource.h",
+        "zircon/syscalls/rseq.h",
+        "zircon/syscalls/sampler.h",
+        "zircon/syscalls/scheduler.h",
+        "zircon/syscalls/gen/cdecls.inc",
+        "zircon/syscalls/smc.h",
+        "zircon/syscalls/system.h",
+        "zircon/syscalls/types.h",
+        "zircon/time.h",
+        "zircon/tls.h",
+        "zircon/types.h",
+
+        # cdecls-next.inc is included in the SDK, but must only be included
+        # in files that ensure the target API level is unstable.
+        "zircon/syscalls/gen/cdecls-next.inc",
+
+        # Note: Most of zircon/device is excluded from SDKs.
+        # TODO(https://fxbug.dev/42155967,https://fxbug.dev/42107431): remove this allowlist.
+        "zircon/device/audio.h",
+      ]
+
+      if (!exclude_testonly_syscalls) {
+        headers += [
+          "zircon/testonly-syscalls.h",
+          "zircon/syscalls/gen/testonly-cdecls.inc",
+        ]
+      }
+    }
+  },
+  {
+    sdk = {
+      include_dir = "//sdk/lib/zircon-assert"
+      headers = [ "zircon/assert.h" ]
+    }
+  },
+  {
+    sdk = {
+      include_dir = "//zircon/system/public"
+      no_export = true
+      headers = [
+        # "zircon/device/audio.h",  (see above)
+        "zircon/device/bt-hci.h",
+        "zircon/device/intel-hda.h",
+      ]
+    }
+  },
+
+  {
+    sdk = {
+      link = "lib/libc.so"
+      deps = [ "//sdk/lib/c:c.stub" ]
+      source =
+          rebase_path(get_label_info(deps[0], "target_out_dir") + "/libc.so",
+                      root_build_dir)
+    }
+  },
+
+  {
+    sdk = {
+      link = "lib/Scrt1.o"
+
+      # The build-internal sysroot is the most convenient known path and direct
+      # deps label to use it as an input.
+      deps = [ "//sdk/lib/c/startup:startfiles($variant_base_toolchain)" ]
+      source = rebase_path(
+              get_label_info("//zircon/public/sysroot($variant_base_toolchain)",
+                             "target_gen_dir") + "/$link",
+              root_build_dir)
+    }
+  },
+]
+
+# libc_headers.gni provides the entries for libc's headers.
+sysroot_uninstrumented_libc_entries += libc_headers.sysroot_entries
+
+sysroot_stub_libs = [
+  "libdl.so",
+  "libm.so",
+  "libpthread.so",
+  "librt.so",
+]
+
+foreach(lib, sysroot_stub_libs) {
+  sysroot_uninstrumented_libc_entries += [
+    {
+      sdk = {
+        source =
+            rebase_path("//zircon/third_party/ulib/musl/lib.ld", root_build_dir)
+        link = "lib/$lib"
+      }
+    },
+  ]
+}
+
+# This corresponds to the metadata that will go into each instrumented
+# (and non-instrumented) version of the C library.
+
+sysroot_instrumented_libc_entries = []
+sysroot_variants = [
+  "",
+  "asan",
+]
+
+if (target_cpu == "arm64") {
+  # TODO(https://fxbug.dev/327442322): Support hwasan for x64 and riscv64.
+  sysroot_variants += [ "hwasan" ]
+}
+
+foreach(variant, sysroot_variants) {
+  if (variant == "") {
+    # Ensure that the non-instrumented version of libc.so distributed with
+    # the SDK is the same as the system one (i.e. potentially built with
+    # non instrumented toolchains like "gcc" or "thinlto"). This avoids
+    # conflicts later when creating Fuchsia packages which contains binaries
+    # who indirectly depend on the core SDK.
+    #
+    # IMPORTANT: KEEP THIS IN SYNC WITH THE toolchain_variant.libprefix
+    # computation in //build/config/BUILDCONFIG.gni
+    #
+    _libprefix = ""
+    _libc_target = system_libc_target
+    _libc_stripped = system_libc_stripped
+    _libc_unstripped = system_libc_unstripped
+  } else {
+    _libprefix = string_replace(variant, "-fuzzer", "") + "/"
+    _libc_toolchain = "//sdk/lib/c:user.libc_${current_cpu}-$variant"
+    _libc_target = "$sysroot_libc_label:libc($_libc_toolchain)"
+    _libc_stripped = get_label_info(_libc_target, "root_out_dir") + "/libc.so"
+    _libc_unstripped = _libc_stripped + ".debug"
+  }
+
+  # TODO(https://fxbug.dev/42052732): Correctly set link, debug, dist and deps here.
+  sysroot_instrumented_libc_entries += [
+    {
+      sdk = {
+        source = rebase_path(_libc_unstripped, root_build_dir)
+        debug = "debug/${_libprefix}libc.so"
+        deps = [ _libc_target ]
+      }
+    },
+    {
+      sdk = {
+        source = rebase_path(_libc_stripped, root_build_dir)
+        dist = "dist/lib/${_libprefix}ld.so.1"
+        deps = [ _libc_target ]
+      }
+    },
+  ]
+}

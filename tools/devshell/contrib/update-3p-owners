@@ -1,0 +1,122 @@
+#!/bin/bash
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Source tree
+### updates OWNERS files for third_party dependencies
+
+## usage: fx update-3p-owners  [--rust-metadata FILE]
+##                             [--integration-manifest FILE]
+##                             [--path PROJECT_PATH]
+##                             [--skip-rustc-3p-update]
+##                             [--skip-existing]
+##                             [--dry-run]
+##
+## Updates OWNERS files for projects, based on gn target references. For any
+## given project, the tool adds as owners the owners of the projects that depend
+## on that project.
+##
+##
+## Arguments:
+## --rust-metadata FILE:          update OWNERS for the projects specified in
+##                                the rust metadata JSON FILE.
+##
+## --integration-manifest FILE:   update OWNERS for the projects specified in
+##                                the integration manifest XML FILE.
+##
+## --skip-existing:               only generate OWNERS files for projects
+##                                missing owners; does not update existing
+##                                OWNERS files.
+##
+## --path PROJECT_PATH:           update OWNERS for the projects in the
+##                                specified path; accepts wildcard.
+##
+## --skip-rustc-3p-update:        skip updating rustc_library and rustc_binary
+##                                third_party dependencies.
+##
+## --dry-run:                     print the generated content without creating
+##                                OWNERS files.
+##
+## See https://fuchsia.dev/fuchsia-src/development/languages/rust/third_party.md
+## for more details.
+
+set -e
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../lib/vars.sh || exit $?
+fx-config-read
+
+# Parse arguments
+while [[ $# -ge 1 ]]; do
+  case "$1" in
+    -h|--help)
+      fx-command-help
+      exit 0
+      ;;
+    --rust-metadata)
+      shift
+      [[ ! $1 ]] && die "--rust-metadata requires an argument after it"
+      RUST_METADATA="--rust-metadata $1"
+      ;;
+    --integration-manifest)
+      shift
+      [[ ! $1 ]] && die "--integration-manifest requires an argument after it"
+      INTEGRATION_MANIFEST="--integration-manifest $1"
+      ;;
+    --path)
+      shift
+      [[ ! $1 ]] && die "--path requires at least an argument after it"
+      PROJECT_PATH="--path $1"
+      while [[ -n $2 && "$2" != "--"* ]]; do
+        PROJECT_PATH+=",$2"
+        shift
+      done
+      RUST_METADATA=""
+      JIRI_MANIFEST=""
+      # skip rustc update if not updating rust owners.
+      SKIP_RUSTC_3P_UPDATE="true"
+      ;;
+    --skip-rustc-3p-update)
+      SKIP_RUSTC_3P_UPDATE="true"
+      ;;
+    --skip-existing)
+      SKIP_EXISTING="--skip-existing"
+      ;;
+    --dry-run)
+      DRY_RUN="--dry-run"
+      ;;
+    -*)
+      echo "Cannot understand option $1"
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "$RUST_METADATA" ]] && [[ -z "$INTEGRATION_MANIFEST" ]] && [[ -z "$PROJECT_PATH " ]]; then
+  fx-warn "No project OWNERS will be updated."
+  fx-warn "Use [ --rust-metadata | --integration-manifest | --path ] to specify projects."
+fi
+
+fx-command-run build --host //tools/auto_owners:install_auto_owners --host //tools/gn_desc:install_gn_desc || ( \
+  fx-error "Failed to build owners tool."; \
+  exit 1
+)
+
+if [[ ! -n "$SKIP_RUSTC_3P_UPDATE" ]]; then
+  fx-command-run update-rustc-third-party || ( \
+    fx-error "Failed to run rustc 3p update script."; \
+    exit 1
+  )
+fi
+
+(cd $FUCHSIA_DIR; ${FUCHSIA_BUILD_DIR}/host-tools/auto_owners \
+  $RUST_METADATA \
+  $INTEGRATION_MANIFEST \
+  --overrides "$FUCHSIA_DIR/third_party/owners.toml" \
+  --fuchsia-dir "$FUCHSIA_DIR" \
+  --project-json "$FUCHSIA_BUILD_DIR/project.json" \
+  --filter <( git -C "$FUCHSIA_DIR" ls-files | grep "\/OWNERS$" ) \
+  $PROJECT_PATH \
+  $SKIP_EXISTING \
+  $DRY_RUN)

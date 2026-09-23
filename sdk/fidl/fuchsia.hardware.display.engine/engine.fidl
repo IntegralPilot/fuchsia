@@ -1,0 +1,611 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.display.engine;
+
+using fuchsia.hardware.display.types;
+using fuchsia.images2;
+using fuchsia.math;
+using fuchsia.sysmem2;
+using zx;
+
+type ColorConversionFlags = strict bits : uint32 {
+    /// If set, use the 0 vector for the color conversion preoffset
+    PREOFFSET = 0x1;
+    /// If set, use the identity matrix for the color conversion coefficients
+    COEFFICIENTS = 0x2;
+    /// If set, use the 0 vector for the color conversion postoffset
+    POSTOFFSET = 0x4;
+};
+
+/// Constants for display_config's mode_flags field
+type ModeFlag = strict bits : uint32 {
+    VSYNC_POSITIVE = 0x1;
+    HSYNC_POSITIVE = 0x2;
+    INTERLACED = 0x4;
+    ALTERNATING_VBLANK = 0x8;
+    DOUBLE_CLOCKED = 0x10;
+};
+
+type Layer = struct {
+    /// The display image (composited output) region occupied by the layer.
+    ///
+    /// The rectangle uses the Vulkan coordinate space. The origin is at the
+    /// display's top-left corner. The X axis points to the right, and the Y axis
+    /// points downwards.
+    ///
+    /// A valid layer definition requires a valid non-empty display destination
+    /// rectangle that is entirely contained within the display. A rectangle is
+    /// empty iff its size is 0x0 (width and height are both zero).
+    display_destination fuchsia.math.RectU;
+
+    /// The associated image region whose pixels are drawn by the layer.
+    ///
+    /// The rectangle uses the Vulkan coordinate space. The origin is at the
+    /// image's top-left corner. The X axis points to the right, and the Y axis
+    /// points downwards.
+    ///
+    /// A valid layer definition requires a valid image source rectangle that is
+    /// entirely contained within the image. If the rectangle is empty, the
+    /// hardware is configured to skip fetching image pixels, and instead fill
+    /// `display_destination` using a constant color, which is `fallback_color`
+    /// defined below.
+    ///
+    /// Hardware image scaling is requested implicitly, when the region's
+    /// dimensions differ from the dimensions of `display_destination`. Some
+    /// display hardware may not support scaling. All display hardware has
+    /// limitations in scaling support.
+    image_source fuchsia.math.RectU;
+
+    /// The image whose pixels are drawn by this layer.
+    ///
+    /// If valid, the image ID must be the result of a successful call to
+    /// [`fuchsia.hardware.display.engine/Engine.ImportImage`].
+    ///
+    /// A valid layer definition requires that the image ID is invalid iff
+    /// `image_source` specifies an empty rectangle.
+    ///
+    /// To allow for future evolution, Layer consumers must ignore the image ID
+    /// if `image_source` specifies an empty rectangle.
+    ///
+    /// Hardware image cropping is requested implicitly, when the source
+    /// region's dimensions differ from the image's dimensions. Some display
+    /// hardware may not support cropping.
+    image_id ImageId;
+
+    /// The arguments used to import `image_id`.
+    ///
+    /// If `image_id` is valid, the metadata must equal the argument passed
+    /// to [`fuchsia.hardware.display.engine/Engine.ImportImage`].
+    ///
+    /// A valid layer definition requires that the metadata is valid. A valid
+    /// layer definition requires that the metadata specifies an empty (0x0)
+    /// image with linear tiling if `image_source` specifies an empty rectangle.
+    image_metadata fuchsia.hardware.display.types.ImageMetadata;
+
+    /// Fallback when the pixel data for the layer's image cannot be retrieved.
+    ///
+    /// A valid layer definition requires that the color is valid.
+    ///
+    /// If `image_source` specifies an empty region, the hardware is configured
+    /// to fill the layer's pixels using this color. Conceptually, the source
+    /// image's pixel data will never be available for the image.
+    ///
+    /// The hardware may also use this color as a last resort for situations
+    /// such as buffer underruns, when the pixel data for the layer's image
+    /// cannot be retrieved fast enough to meet the display connection's timing
+    /// requirements.
+    fallback_color fuchsia.hardware.display.types.Color;
+
+    /// If `alpha_mode` is `AlphaMode.DISABLE`, the layer is opaque and
+    /// `alpha_layer_val` is ignored.
+    ///
+    /// If `alpha_mode` is `AlphaMode.PREMULTIPLIED` or `HW_MULTIPLY`, the
+    /// alpha used when blending is determined by the product of
+    /// `alpha_layer_val` and any per-pixel alpha.
+    ///
+    /// Additionally, if `alpha_mode` is `AlphaMode.PREMULTIPLIED`, then the
+    /// hardware must premultiply the color channel with `alpha_layer_val`
+    /// before blending.
+    ///
+    /// `alpha_layer_val` must be in the range [0, 1].
+    alpha_mode fuchsia.hardware.display.types.AlphaMode;
+    alpha_layer_val float32;
+
+    /// Applied to the input image pixels specified by `image_source`.
+    ///
+    /// `display_destination` must account for image dimensions changes caused
+    /// by rotations. For example, rotating a 600x300 pixel image by 90 degrees
+    /// would specify 300x600 pixel dimensions in `display_destination`.
+    ///
+    /// A valid layer definition requires that the transformation is the
+    /// identity transformation if `image_source` specifies an empty rectangle.
+    ///
+    /// To allow for future evolution, Layer consumers must ignore the
+    /// transformation if `image_source` specifies an empty rectangle.
+    image_source_transformation fuchsia.hardware.display.types.CoordinateTransformation;
+};
+
+/// Color conversion is applied to each pixel according to the formula:
+///
+/// (coefficients * (pixel + preoffsets)) + postoffsets
+///
+/// where pixel is a column vector consisting of the pixel's 3 components.
+//
+// The color conversion API is subject to change. Only in-tree display engine
+// drivers may use it.
+type ColorConversion = struct {
+    preoffsets array<float32, 3>;
+    coefficients array<array<float32, 3>, 3>;
+    postoffsets array<float32, 3>;
+};
+
+type DisplayConfig = struct {
+    /// the display id to which the configuration applies
+    display_id fuchsia.hardware.display.types.DisplayId;
+
+    /// Identifies the display mode provided by the panel.
+    /// Must be valid.
+    mode_id fuchsia.hardware.display.types.ModeId;
+
+    color_conversion ColorConversion;
+
+    /// Valid display configurations have at least one layer.
+    layers vector<Layer>:MAX;
+};
+
+// An E-EDID can contain up to 256 data blocks, each of which contains 128
+// bytes. So it can contain up to 256 * 128 = 32768 bytes of data.
+const MAX_COUNT_EDID_BYTES uint32 = 32768;
+
+const MAX_COUNT_DISPLAY_PIXEL_FORMATS uint32 = fuchsia.sysmem2.MAX_COUNT_PIXEL_FORMAT_AND_MODIFIERS;
+
+const MAX_COUNT_DISPLAY_INFO_PREFERRED_MODES uint32 = 32;
+
+// TODO(https://fxbug.dev/42150719): Convert RawDisplayInfo to a table, for
+// extensibility. The comments about empty vectors will mention members not
+// being present, instead.
+
+/// Collects the information reported by the engine hardware about a display.
+///
+/// The data representation closely matches the formats used by display engine
+/// hardware. The display coordinator is responsible for parsing these formats
+/// and converting the information into forms that are more suitable for
+/// higher-level software.
+type RawDisplayInfo = resource struct {
+    display_id fuchsia.hardware.display.types.DisplayId;
+
+    /// Operational modes known to be supported by the display.
+    ///
+    /// When this vector is not empty, the display modes here take precedence
+    /// over the modes retrieved from `edid_bytes`. The modes are ordered by
+    /// suitability. The first mode is most preferred. The display modes here
+    /// may overlap with the modes encoded in the display's E-EDID.
+    ///
+    /// Drivers for internal (embedded) displays typically report the display's
+    /// only supported operational mode in this member. Drivers that support
+    /// seamless display handoff from a bootloader report the display's initial
+    /// mode in this member.
+    preferred_modes
+            vector<fuchsia.hardware.display.types.Mode>:<MAX_COUNT_DISPLAY_INFO_PREFERRED_MODES>;
+
+    /// Display capabilities, encoded using the E-EDID standard.
+    ///
+    /// E-EDID (Enhanced Extended Display Identification Data) is a VESA
+    /// standard that describes display capabilities as a series of 128-byte
+    /// data blocks.
+    ///
+    /// When this vector is not empty and contains valid E-EDID information, it
+    /// is used as the definitive description of the display's capabilities.
+    ///
+    /// Drivers for external (connected) displays use this member to report the
+    /// display's E-EDID, when it is exposed in a non-standard manner.
+    edid_bytes vector<uint8>:<MAX_COUNT_EDID_BYTES>;
+
+    /// A list of pixel formats supported by the display.
+    ///
+    /// The pixel formats modes are ordered by suitability. The first format is
+    /// most preferred.
+    pixel_formats vector<fuchsia.images2.PixelFormat>:MAX_COUNT_DISPLAY_PIXEL_FORMATS;
+};
+
+/// Receives events on a display engine.
+///
+/// An [`EngineListener`] may be registered to the engine through the [`Engine`]
+/// protocol before it receives any events.
+///
+/// This protocol only consists of one-way calls.
+///
+/// This protocol is `open` while under development.
+/// TODO(https://fxbug.dev/316631158): Make it `closed` once the API is
+/// stabilized.
+@transport("Driver")
+open protocol EngineListener {
+    /// Called when a display is connected.
+    ///
+    /// Display Engine drivers must emit this event for all displays connected
+    /// prior to initialization.
+    flexible OnDisplayAdded(resource struct {
+        display_info RawDisplayInfo;
+    });
+
+    /// Called when a display is removed.
+    ///
+    /// Display Engine drivers must have finished accessing all images which
+    /// were on the removed display before calling this method.
+    flexible OnDisplayRemoved(struct {
+        /// Must be a valid ID reported by a previous call to
+        /// [`EngineListener.OnDisplayAdded`].
+        display_id fuchsia.hardware.display.types.DisplayId;
+    });
+
+    /// Called when a display finished showing a configuration.
+    flexible OnDisplayVsync(struct {
+        /// Must be a valid ID reported by a previous call to
+        /// [`EngineListener.OnDisplayAdded`].
+        display_id fuchsia.hardware.display.types.DisplayId;
+
+        /// The time when the engine driver learned about the VSync.
+        ///
+        /// This is the best available approximation for the VSync start time.
+        timestamp zx.InstantMono;
+
+        /// Identifies the configuration shown at VSync time.
+        ///
+        /// Must be valid. Engine drivers must not send VSync notifications for
+        /// displays that haven't received a configuration via
+        /// [`Engine.SubmitConfiguration`], as that would waste system resources.
+        config_stamp ConfigStamp;
+    });
+
+    /// Called when a previous display capture triggered by
+    /// [`Engine.StartCapture`] is completed.
+    ///
+    /// The display engine only emits [`OnCaptureComplete`] events if capture is
+    /// supported. Capture support is reported in
+    /// [`EngineInfo.is_capture_supported`] returned by
+    /// [`Engine.CompleteCoordinatorConnection`].
+    flexible OnCaptureComplete();
+};
+
+/// Upper bound on the number of layers in one display configuration.
+///
+/// This limit applies to [`EngineInfo.max_layer_count`]. The value reflects
+/// design assumptions in the display stack. The value may be increased in the
+/// future.
+const MAX_ALLOWED_MAX_LAYER_COUNT uint16 = 8;
+
+/// Upper bound on the number of concurrently connected displays.
+///
+/// This limit applies to [`EngineInfo.max_connected_display_count`]. The value
+/// reflects design assumptions in the display stack. The value will be
+/// increased in the future, when the display stack supports multi-display
+/// systems.
+const MAX_ALLOWED_MAX_CONNECTED_DISPLAY_COUNT uint16 = 1;
+
+/// Static description of the hardware managed by a display engine driver.
+///
+/// The information here is assumed to remain immutable during a boot cycle.
+type EngineInfo = struct {
+    /// Maximum number of layers in one display configuration.
+    ///
+    /// The engine driver will never support a display configuration where the
+    /// total number of layers (across all displays) exceeds this value.
+    ///
+    /// The value may reflect hardware limitations, such as the number of image
+    /// data fetch units in the hardware, or driver implementation limitations.
+    ///
+    /// In valid instances, the value is positve and at most
+    /// [`MAX_ALLOWED_MAX_LAYER_COUNT`].
+    max_layer_count uint16;
+
+    /// Maximum number of displays that can be connected at once.
+    ///
+    /// The number of connected displays reported by the display engine
+    /// will never exceed this value.
+    ///
+    /// The value may reflect hardware limitations, such as the number of
+    /// digital display interfaces in the hardware, or driver implementation
+    /// limitations.
+    ///
+    /// In valid instances, the value is positve and at most
+    /// [`MAX_ALLOWED_MAX_CONNECTED_DISPLAY_COUNT`].
+    max_connected_display_count uint16;
+
+    /// True if the driver and hardware implement display capture.
+    is_capture_supported bool;
+};
+
+/// This protocol is `open` while under development.
+/// TODO(b/316631158): We should make it `closed` once the API is stabilized.
+@discoverable(client="platform")
+@transport("Driver")
+open protocol Engine {
+    /// Starts the information flow from the engine driver to the Coordinator.
+    ///
+    /// Must be called exactly once, before all the other calls below.
+    flexible CompleteCoordinatorConnection(resource struct {
+        /// Receives events from the engine driver.
+        engine_listener client_end:EngineListener;
+    }) -> (struct {
+        engine_info EngineInfo;
+    });
+
+    /// Clears the `DisplayEngineListener` connection established by
+    /// [`Engine.CompleteCoordinatorConnection`].
+    // TODO(https://fxbug.dev/435040172): Remove this when banjo->FIDL
+    // migration is done.
+    flexible UnsetListener();
+
+    /// Sets up this driver to use a Sysmem BufferCollection.
+    ///
+    /// Fails with ZX_ERR_INTERNAL if any error occurs during the setup process,
+    /// which mainly consists of communicating with the Sysmem service.
+    flexible ImportBufferCollection(resource struct {
+        /// Identifies the imported BufferCollection.
+        ///
+        /// The ID must not be invalid, and must not be already assigned.
+        ///
+        /// The ID is assigned to the imported collection from the moment this
+        /// call is issued until the moment this call fails, or until the moment
+        /// a call to [`Engine.ReleaseBufferCollection`] with the same ID
+        /// completes.
+        buffer_collection_id BufferCollectionId;
+
+        /// Identifies the BufferCollection to the Sysmem service.
+        collection_token client_end:fuchsia.sysmem2.BufferCollectionToken;
+    }) -> () error zx.Status;
+
+    /// Releases the resources needed to use a Sysmem BufferCollection.
+    ///
+    /// TODO(https://fxbug.dev/394954078): Make this method infallible.
+    flexible ReleaseBufferCollection(struct {
+        /// Identifies a previously imported BufferCollection.
+        ///
+        /// The ID must be assigned to an imported BufferCollection, via a
+        /// successful call to [`Enigne.ImportBufferCollection2`].
+        ///
+        /// When the call completes, the ID is no longer assigned to the
+        /// BufferCollection, and can be used in a future call to
+        /// [`Engine.ImportBufferCollection2`].
+        buffer_collection_id BufferCollectionId;
+    }) -> () error zx.Status;
+
+    /// Sets up the hardware to use a buffer as a display image data source.
+    ///
+    /// Fails with ZX_ERR_SHOULD_WAIT if Sysmem reports that the
+    /// BufferCollection's buffers are not yet allocated. Fails with
+    /// ZX_ERR_INTERNAL if any other error occurs while obtaining the buffer
+    /// from the Sysmem service.
+    ///
+    /// The implementation must ignore any Sysmem information around weak VMO
+    /// handles. Display stack consumers are responsible for ensuring that weak
+    /// VMOs are closed in a timely manner, which may involve calling
+    /// [`Engine.ReleaseImage`] and [`Engine.SubmitConfiguration`].
+    flexible ImportImage(struct {
+        // TODO(https://fxbug.dev/329163718): Some of the information in
+        // `image_metadata` was negotiated by sysmem. The display coordinator or
+        // engine drivers should read that information directly from sysmem.
+        image_metadata fuchsia.hardware.display.types.ImageMetadata;
+
+        /// Identifies a previously imported BufferCollection.
+        ///
+        /// The ID must be assigned to an imported BufferCollection, via a
+        /// successful [`DisplayEngine.ImportBufferCollection`] call.
+        buffer_collection_id BufferCollectionId;
+
+        /// Must be a valid index in the imported BufferCollection.
+        buffer_collection_index uint32;
+    }) -> (struct {
+        /// Assigned to the imported image buffer.
+        ///
+        /// The ID is assigned to the imported image from the moment the call
+        /// succeeds until the moment a call to [`Engine.ReleaseImage`] with the
+        /// same ID completes.
+        image_id ImageId;
+    }) error zx.Status;
+
+    /// Sets up the hardware to use a buffer for display capture output.
+    ///
+    /// This call must only be issued when the engine driver supports capture.
+    /// Capture support is reported in [`EngineInfo.is_capture_supported`]
+    /// returned by [`Engine.CompleteCoordinatorConnection`].
+    ///
+    /// Fails with ZX_ERR_SHOULD_WAIT if Sysmem reports that the
+    /// BufferCollection's buffers are not yet allocated. Fails with
+    /// ZX_ERR_INTERNAL if any other error occurs while obtaining the buffer
+    /// from the Sysmem service.
+    ///
+    /// The implementation must ignore any Sysmem information around weak VMO
+    /// handles. Display stack consumers are responsible for ensuring that weak
+    /// VMOs are closed in a timely manner, which may involve calling
+    /// [`Engine.ReleaseImage`] and [`Engine.SubmitConfiguration`].
+    flexible ImportImageForCapture(struct {
+        /// Identifies a previously imported BufferCollection.
+        ///
+        /// The ID must be assigned to an imported BufferCollection, via a
+        /// successful [`DisplayEngine.ImportBufferCollection`] call.
+        buffer_collection_id BufferCollectionId;
+
+        /// Must be a valid index in the imported BufferCollection.
+        buffer_collection_index uint32;
+    }) -> (struct {
+        /// Assigned to the imported capture image buffer.
+        ///
+        /// The ID is assigned to the imported capture image from the moment the
+        /// call succeeds until the moment a call to
+        /// [`DisplayEngine.ReleaseImageCapture`] with the same ID completes.
+        capture_image_id ImageId;
+    }) error zx.Status;
+
+    /// Releases resources for using a buffer as a display image data source.
+    flexible ReleaseImage(struct {
+        /// Identifies a previously imported display image data source buffer.
+        ///
+        /// The ID must be assigned to an imported image buffer, via a
+        /// successful [`DisplayEngine.ImportImage`] call.
+        ///
+        /// The buffer must not be used by a display configuration that is
+        /// queued or latched.
+        ///
+        /// When the call completes, the ID is no longer assigned to the
+        /// imported image. The ID may be reused by a future call to
+        /// [`Engine.ImportImage`].
+        image_id ImageId;
+    });
+
+    /// Verifies that a configuration can be presented on a display.
+    ///
+    /// The verification result must be valid for any configuration derived from
+    /// the given configuration.
+    ///
+    /// A derived configuration can be obtained from another configuration by
+    /// applying one or more of the following operations. The list of operations
+    /// is expected to slowly grow over time.
+    ///
+    /// * Replace an image ID with another image ID. The two IDs must identify
+    ///   images that were imported with the same metadata.
+    flexible CheckConfiguration(struct {
+        /// The display configuration to be validated.
+        ///
+        /// TODO(https://fxbug.dev/399954526): Update the contract to cover
+        /// configurations that reference an unassigned DisplayId.
+        display_config DisplayConfig;
+    }) -> () error fuchsia.hardware.display.types.ConfigResult;
+
+    /// Submits a configuration for future presentation on a display.
+    flexible SubmitConfiguration(struct {
+        /// The display configuration to be submitted for presentation.
+        ///
+        /// Must be derived from a configuration that was validated via
+        /// [`Engine.CheckConfiguration`]. That call's documentation includes
+        /// the definition of a derived configuration.
+        ///
+        /// While the configuration is transmitted to the display, the driver
+        /// will hold references to the image whose handles are included in the
+        /// configuration.
+        ///
+        /// TODO(https://fxbug.dev/399954526): Update the contract to cover
+        /// configurations that reference an unassigned DisplayId.
+        display_config DisplayConfig;
+
+        /// Identifies the configuration to be submitted. Must be a valid value.
+        /// Must be strictly increasing across calls.
+        config_stamp ConfigStamp;
+    }) -> ();
+
+    /// Conveys the display hardware's limitations on image buffers to sysmem.
+    ///
+    /// Fails with ZX_ERR_INTERNAL if any error occurs while communicating with
+    /// the the Sysmem service.
+    flexible SetBufferCollectionConstraints(struct {
+        /// Describes how the image buffers will be used.
+        ///
+        /// After this call succeeds, calls to [`Engine.ImportImage`] or
+        /// [`Engine.ImportImageForCapture`] that are consistent with the
+        /// usage declared here are expected to succeed.
+        usage fuchsia.hardware.display.types.ImageBufferUsage;
+
+        /// Identifies a previously imported BufferCollection.
+        ///
+        /// The ID must be assigned to an imported BufferCollection, via a
+        /// successful [`DisplayEngine.ImportBufferCollection`] call.
+        buffer_collection_id BufferCollectionId;
+    }) -> () error zx.Status;
+
+    /// Sets a display's power mode.
+    ///
+    /// Returns `ZX_ERR_NOT_SUPPORTED` if the display driver or hardware does
+    /// not support the requested power mode.
+    flexible SetDisplayPowerMode(struct {
+        /// Identifies the display whose power state is changed.
+        ///
+        /// Must be a valid ID assigned to a display connected to the system.
+        ///
+        /// TODO(https://fxbug.dev/399954526): Update the contract to cover
+        /// configurations that reference an unassigned DisplayId.
+        display_id fuchsia.hardware.display.types.DisplayId;
+
+        /// The display's new power mode.
+        ///
+        /// Displays have `ON` power mode when they are connected to the system.
+        power_mode fuchsia.hardware.display.types.PowerMode;
+    }) -> () error zx.Status;
+
+    /// Set the minimum value of RGB channels.
+    ///
+    /// Fails with ZX_ERR_NOT_SUPPORTED if RGB clamping is not supported. Most
+    /// engine drivers are expected to fail in this manner.
+    //
+    // TODO(https://fxbug.dev/328903017): This is a provisional method meant to
+    // address a hardware issue where RGB channels need to get clamped in order
+    // to reduce backlight bleeding. Revise this method when stabilizing the
+    // Engine protocol API.
+    flexible SetMinimumRgb(struct {
+        /// Must be >= 0 and <= 255.
+        minimum_rgb uint8;
+    }) -> () error zx.Status;
+
+    /// Starts a display capture operation.
+    ///
+    /// The engine driver must not be performing another capture operation. The
+    /// capture operation is considered to be in-progress from the moment when a
+    /// successful call to [`DisplayEngine.StartCapture`] is issued, until the
+    /// moment when the engine driver issues a call to
+    /// [`DisplayEngineListener.OnCaptureComplete`].
+    ///
+    /// This call must only be issued when the engine driver supports capture.
+    /// Capture support is reported in [`EngineInfo.is_capture_supported`]
+    /// returned by [`Engine.CompleteCoordinatorConnection`].
+    ///
+    /// This call must only be issued after a configuration has been submitted to
+    /// the display.
+    ///
+    /// Fails with ZX_ERR_IO_REFUSED if the display engine hardware failed to
+    /// start the capture. This error could point to a systemic issue, such as
+    /// the system having insufficient DRAM bandwidth to capture the most recent
+    /// submitted display configuration. This error could also be caused by a
+    /// temporary hardware failure.
+    flexible StartCapture(struct {
+        /// Identifies a previously imported display capture output buffer.
+        ///
+        /// The ID must be assigned to an imported capture output buffer, via a
+        /// successful [`Engine.ImportImageForCapture`] call.
+        ///
+        /// If the call succeeds, the display capture output buffer is used by
+        /// the in-progress display capture operation. While this operation is
+        /// in-progress, the buffer must not be passed in calls to
+        /// [`Engine.StartCapture`] or [`Engine.ReleaseCapture`].
+        ///
+        /// Once the capture operation completes, the buffer will store the
+        /// image data captured from the display.
+        capture_image_id ImageId;
+    }) -> () error zx.Status;
+
+    /// Releases resources for using a buffer for display capture output.
+    ///
+    /// This call must only be issued when the engine driver supports capture.
+    /// Capture support is reported in [`EngineInfo.is_capture_supported`]
+    /// returned by [`Engine.CompleteCoordinatorConnection`].
+    ///
+    /// TODO(https://fxbug.dev/394954078): Make this method infallible.
+    flexible ReleaseCapture(struct {
+        /// Identifies a previously imported display capture output buffer.
+        ///
+        /// The ID must be assigned to an imported display capture output
+        /// buffer, via a successful [`Engine.ImportImageForCapture`] call.
+        ///
+        /// The display capture output buffer must not be used by an in-progress
+        /// display capture operation. See [`DisplayEngine.StartCapture`] for
+        /// the definition of an in-progress display capture operation.
+        ///
+        /// When the call completes, the ID is no longer assigned to the display
+        /// capture output buffer. The ID may be reused by a future call to
+        /// [`Engine.ImportImageForCapture`].
+        capture_image_id ImageId;
+    }) -> () error zx.Status;
+};
+
+service Service {
+    engine client_end:Engine;
+};

@@ -1,0 +1,217 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.driver.development;
+
+using fuchsia.component.sandbox;
+using fuchsia.driver.framework;
+using fuchsia.power.broker;
+using fuchsia.url;
+using zx;
+
+@available(removed=28)
+const BINDING_RESULT_MAX uint8 = 10;
+
+@available(added=28)
+const BINDING_RESULT_MAX_2 uint32 = 256;
+
+const HASH_LENGTH uint8 = 64;
+
+@available(added=HEAD)
+const POWER_TOKEN_OVERRIDES_MAX uint8 = 16;
+
+/// Specifies a custom power token override for a targeted child or composite node.
+/// Used during driver restart operations to replace default power topology tokens
+/// with mock or test power tokens.
+@available(added=HEAD)
+type NodePowerTokenOverride = resource struct {
+    /// Moniker or name of the target node whose power token should be overridden.
+    target_node string:NODE_MONIKER_MAX;
+    /// Custom power element token event handle to associate with the target node.
+    token zx.Handle:EVENT;
+};
+
+/// Interface for the driver development manager.
+/// This interface should only be used for development and disabled in release builds.
+@discoverable(server="platform")
+open protocol Manager {
+    /// Returns a list of all drivers that are known to the system.
+    /// If a |driver_filter| is provided, the returned list will be filtered to
+    /// only include drivers specified in the filter.
+    ///
+    /// |iterator| is closed with following epitaphs on error:
+    /// ZX_ERR_NOT_FOUND indicates that there is no driver matching the given path for at least
+    /// one driver in |driver_filter|.
+    /// ZX_ERR_BUFFER_TOO_SMALL indicates that the driver's bind program is longer than the
+    /// maximum number of instructions (BIND_PROGRAM_INSTRUCTIONS_MAX).
+    flexible GetDriverInfo(resource struct {
+        driver_filter vector<string:MAX>:MAX;
+        iterator server_end:DriverInfoIterator;
+    });
+
+    /// Returns a list of all composite node specs that are known to the system.
+    /// If a |name_filter| is provided, the returned list will only include 1 spec,
+    /// the one with that exact name.
+    ///
+    /// |iterator| is closed with following epitaphs on error:
+    /// ZX_ERR_NOT_FOUND indicates that there are no specs or if a |name_filter| is provided,
+    /// that there are no specs with that name.
+    flexible GetCompositeNodeSpecs(resource struct {
+        name_filter string:<MAX, optional>;
+        iterator server_end:CompositeNodeSpecIterator;
+    });
+
+    /// Returns the list of nodes that are running on the system.
+    ///
+    /// If a |node_filter| is provided, the returned list will be filtered to
+    /// only include nodes specified in the filter. If |exact_match| is true,
+    /// then the filter must exactly match a node's topological path;
+    /// otherwise, it performs a substring match. The list will be empty if no
+    /// nodes match the filter.
+    ///
+    /// |iterator| is closed with following epitaphs on error:
+    /// ZX_ERR_BAD_PATH indicates that the given path is not valid.
+    /// ZX_ERR_BUFFER_TOO_SMALL indicates either that the given path is too long,
+    /// or that the node has more than the maximum number of properties (PROPERTIES_MAX).
+    flexible GetNodeInfo(resource struct {
+        node_filter vector<string:MAX>:MAX;
+        iterator server_end:NodeInfoIterator;
+        exact_match bool;
+    });
+
+    /// Returns the list of composites in the system. This includes composites
+    /// that are not yet assembled and added into the node topology.
+    flexible GetCompositeInfo(resource struct {
+        iterator server_end:CompositeInfoIterator;
+    });
+
+
+    /// Returns a list of all driver hosts that are known to the system.
+    @available(added=27)
+    flexible GetDriverHostInfo(resource struct {
+        iterator server_end:DriverHostInfoIterator;
+    });
+
+    /// Restarts all driver hosts containing the driver specified by the `driver_url`,
+    /// and returns the number of driver hosts that were restarted.
+    /// The |rematch_flags| will be used to decide for which restarting nodes the existing driver
+    /// should be bound vs. for which ones the matching process should be performed again.
+    flexible RestartDriverHosts(struct {
+        driver_url fuchsia.url.Url;
+        rematch_flags RestartRematchFlags;
+    }) -> (struct {
+        count uint32;
+    }) error zx.Status;
+
+    /// Disables the driver with the given driver component url.
+    /// Disabled drivers will not be considered for matching to nodes.
+    /// If a |package_hash| is provided, only that specific version of the driver
+    /// package will be disabled. Otherwise this applies to all existing versions
+    /// of a driver with the given url.
+    /// Returns an error ZX_ERR_NOT_FOUND if no drivers were affected.
+    flexible DisableDriver(struct {
+        driver_url fuchsia.url.Url;
+        package_hash string:<HASH_LENGTH, optional>;
+    }) -> () error zx.Status;
+
+    /// Enables the driver with the given driver component url.
+    /// This is only meant to revert a |DisableDriver| action.
+    /// Returns an error ZX_ERR_NOT_FOUND if no drivers were affected.
+    flexible EnableDriver(struct {
+        driver_url fuchsia.url.Url;
+        package_hash string:<HASH_LENGTH, optional>;
+    }) -> () error zx.Status;
+
+    /// Attempts to bind all unbound nodes in the topology.
+    /// Returns new successful binds.
+    @available(removed=28)
+    flexible BindAllUnboundNodes() -> (struct {
+        /// List of new bindings that happened as a result of this.
+        binding_result vector<NodeBindingInfo>:BINDING_RESULT_MAX;
+    }) error zx.Status;
+
+    /// Attempts to bind all unbound nodes in the topology.
+    /// Returns new successful binds.
+    @available(added=28)
+    flexible BindAllUnboundNodes2() -> (struct {
+        /// List of new bindings that happened as a result of this.
+        binding_result vector<NodeBindingInfo>:BINDING_RESULT_MAX_2;
+    }) error zx.Status;
+
+    /// Adds test node under the root node.
+    flexible AddTestNode(struct {
+        args TestNodeAddArgs;
+    }) -> () error fuchsia.driver.framework.NodeError;
+
+    /// Removes the test node. The node is removed asynchronously and is
+    /// not guaranteed to be removed by the time this returns.
+    flexible RemoveTestNode(struct {
+        name string:NODE_MONIKER_MAX;
+    }) -> () error zx.Status;
+
+    /// Waits for bootup to complete.
+    @available(added=21)
+    strict WaitForBootup() -> ();
+
+    /// Restarts the driver components bound to the nodes identified in |node_ids|,
+    /// providing them with the given dictionary. All child nodes are also restarted
+    /// and provided with this dictionary. This operation is temporary and
+    /// is reversed by releasing the |release_fence| that is returned.
+    @available(added=HEAD)
+    strict RestartWithDictionary(resource struct {
+        /// Moniker of the node to restart with the dictionary.
+        moniker string:NODE_MONIKER_MAX;
+        /// Dictionary to give to the drivers on and under the nodes.
+        dictionary fuchsia.component.sandbox.DictionaryRef;
+    }) -> (resource struct {
+        /// The caller should keep this handle alive while the modified drivers are needed.
+        /// Releasing this will reset the operation.
+        release_fence zx.Handle:EVENTPAIR;
+    }) error zx.Status;
+
+    /// Restarts the driver components bound to the node identified by |moniker|,
+    /// providing it with the given dictionary and power dependencies.
+    /// All child nodes are also restarted and provided with the dictionary,
+    /// but only the node identified by |moniker| will be provided with the
+    /// power dependencies. An empty vector of power dependencies results in
+    /// the driver's power element having no dependencies other than a
+    /// dependency on CPU. The |cpu_token_override| will be used as the token
+    /// for making dependencies on the CPU power element. This override remains
+    /// in place for all restarted drivers until the fence is released.
+    ///
+    /// The effects of this call are temporary and are reversed by releasing
+    /// the |release_fence| that is returned.
+    /// TODO(https://fxbug.dev/494673577) Consolidate this API with
+    /// `RestartWithDictionary`.
+    @available(added=HEAD)
+    strict RestartWithDictionaryAndPowerDependencies(resource struct {
+        /// Moniker of the node to restart with the dictionary and power dependencies.
+        moniker string:NODE_MONIKER_MAX;
+        /// Dictionary to give to the drivers on and under the nodes.
+        dictionary fuchsia.component.sandbox.DictionaryRef;
+        /// Custom power dependencies to give to the restarted node.
+        power_dependencies
+                vector<fuchsia.power.broker.LevelDependency>:fuchsia.power.broker.MAX_DEPENDENCIES_IN_ADD_ELEMENT;
+        /// Custom cpu token to give to the restarted node.
+        cpu_token_override zx.Handle:<EVENT, optional>;
+        /// Overrides for power element tokens of specific child/composite target nodes.
+        node_power_token_overrides vector<NodePowerTokenOverride>:POWER_TOKEN_OVERRIDES_MAX;
+    }) -> (resource struct {
+        /// The caller should keep this handle alive while the modified drivers are needed.
+        /// Releasing this will reset the operation.
+        release_fence zx.Handle:EVENTPAIR;
+    }) error zx.Status;
+
+    /// Rebinds any composites and composite specs that have the given driver_url. This means the
+    /// spec is rematched with possibly another driver, or none if the only matching driver is
+    /// disabled, and any active nodes created from this spec are removed and re-bound.
+    ///
+    /// Returns the number of affected composite nodes.
+    @available(added=27)
+    strict RebindCompositesWithDriver(struct {
+        driver_url fuchsia.url.Url;
+    }) -> (struct {
+        count uint32;
+    }) error zx.Status;
+};

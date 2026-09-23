@@ -1,0 +1,473 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.wlan.wlanix;
+
+using fuchsia.wlan.ieee80211;
+using zx;
+
+type WlanixError = flexible enum {
+    INTERNAL_ERROR = 1;
+    INVALID_ARGS = 2;
+};
+
+/// Protocol used to proxy Wlanix requests from Starnix into Fuchsia.
+@discoverable
+open protocol Wlanix {
+    /// Register the channel to make WiFi request to.
+    flexible GetWifi(resource table {
+        1: wifi server_end:Wifi;
+    });
+    flexible GetSupplicant(resource table {
+        1: supplicant server_end:Supplicant;
+    });
+    flexible GetNl80211(resource table {
+        1: nl80211 server_end:Nl80211;
+    });
+    flexible GetWifiLegacyHal(resource table {
+        1: legacy_hal server_end:WifiLegacyHal;
+    });
+};
+
+open protocol Wifi {
+    /// Register a callback to be notified of future events (such when WiFi has
+    /// started or stopped)
+    flexible RegisterEventCallback(resource table {
+        1: callback client_end:WifiEventCallback;
+    });
+    /// Start WiFi. If this operation is not successful, return an error status.
+    /// If this operation is successful, the `started` state is now true and all
+    /// registered callbacks will be notified with an `OnStart` event.
+    flexible Start() -> () error zx.Status;
+    /// Stop WiFi. If this operation is not successful, return an error status.
+    /// If this operation is successful, the `started` state is now false and all
+    /// registered callbacks will be notified with an `OnStop` event.
+    flexible Stop() -> () error zx.Status;
+    /// Return a boolean based on whether WiFi is `started` or not.
+    flexible GetState() -> (table {
+        1: is_started bool;
+    });
+    /// Get the IDs of all the WiFi chips on the device.
+    flexible GetChipIds() -> (table {
+        1: chip_ids vector<uint32>:MAX;
+    });
+    /// Register the channel to make request to the `WifiChip` with the given
+    /// `chip_id`
+    flexible GetChip(resource table {
+        1: chip_id uint32;
+        2: chip server_end:WifiChip;
+    }) -> () error zx.Status;
+};
+
+open protocol WifiEventCallback {
+    flexible OnStart();
+    flexible OnStop();
+    flexible OnSubsystemRestart(resource table {
+        1: status zx.Status;
+    });
+};
+
+type ChipMode = table {
+    1: id uint32;
+    2: available_combinations vector<ChipConcurrencyCombination>:MAX;
+};
+
+type ChipConcurrencyCombination = table {
+    1: limits vector<ChipConcurrencyCombinationLimit>:MAX;
+};
+
+type ChipConcurrencyCombinationLimit = table {
+    1: types vector<IfaceConcurrencyType>:MAX;
+    2: max_ifaces uint32;
+};
+
+type IfaceConcurrencyType = flexible enum {
+    STA = 1;
+    AP = 2;
+    AP_BRIDGED = 3;
+    P2P = 4;
+    NAN_IFACE = 5;
+};
+
+type WifiChipTxPowerScenario = flexible enum {
+    VOICE_CALL = 0;
+    ON_HEAD_CELL_OFF = 1;
+    ON_HEAD_CELL_ON = 2;
+    ON_BODY_CELL_OFF = 3;
+    ON_BODY_CELL_ON = 4;
+};
+
+open protocol WifiChip {
+    /// Request the chip to create a STA iface.
+    flexible CreateStaIface(resource table {
+        1: iface server_end:WifiStaIface;
+    }) -> () error zx.Status;
+    /// Get the names of all active ifaces.
+    flexible GetStaIfaceNames() -> (table {
+        1: iface_names vector<string:16>:MAX;
+    });
+    /// Request a new connection to an existing iface.
+    flexible GetStaIface(resource table {
+        1: iface_name string:16;
+        2: iface server_end:WifiStaIface;
+    }) -> () error zx.Status;
+    /// Request the destruction of a STA iface on the chip.
+    flexible RemoveStaIface(resource table {
+        1: iface_name string:16;
+    }) -> () error zx.Status;
+    flexible SetCountryCode(resource table {
+        1: code array<byte, 2>;
+    }) -> () error zx.Status;
+    /// Get a set of operation modes that the chip supports.
+    /// This combination encodes what iface types and how many can be created,
+    /// and which ones can run concurrently.
+    flexible GetAvailableModes() -> (table {
+        1: chip_modes vector<ChipMode>:MAX;
+    });
+    /// Get the ID of the current chip.
+    flexible GetId() -> (table {
+        1: id uint32;
+    });
+    /// Get the current mode that the chip is in.
+    flexible GetMode() -> (table {
+        1: mode uint32;
+    });
+    /// Get capabilities supported by this chip.
+    flexible GetCapabilities() -> (table {
+        1: capabilities_mask uint32;
+    });
+    /// Restart the subsystem. This is called to attempt recovery when there
+    /// is a persistent issue with WiFi.
+    flexible TriggerSubsystemRestart() -> () error zx.Status;
+    /// Configures the SAR setting for this chip.
+    flexible SelectTxPowerScenario(struct {
+        scenario WifiChipTxPowerScenario;
+    }) -> ();
+    /// Restore the default SAR setting for this chip.
+    flexible ResetTxPowerScenario() -> ();
+};
+
+open protocol WifiStaIface {
+    /// Get the name of this iface.
+    flexible GetName() -> (table {
+        1: iface_name string:16;
+    });
+    flexible SetScanOnlyMode(resource table {
+        1: enable bool;
+    }) -> () error zx.Status;
+    /// Sets the MAC address of the client interface. To reset the MAC address to the default/factory
+    /// value, use the `GetFactoryMacAddress` method to retrieve the factory address and pass it to
+    /// this method.
+    flexible SetMacAddress(resource struct {
+        mac_addr fuchsia.wlan.ieee80211.MacAddr;
+    }) -> () error zx.Status;
+
+    // APF (Android Packet Filter) extensions
+    flexible GetApfPacketFilterSupport() -> (table {
+        1: version int32;
+        2: max_filter_length int32;
+    }) error zx.Status;
+    /// Installs an APF program, replacing an existing program if present. This method does not
+    /// enable the program. Rather, the upstream users expect that the program will be enabled
+    /// and disabled by the platform in response to other signals, like suspension.
+    flexible InstallApfPacketFilter(table {
+        1: program vector<uint8>:MAX;
+    }) -> () error zx.Status;
+    /// Fetches a consistent snapshot of the entire APF program and working
+    /// memory buffer and returns it to the host. The returned buffer contains
+    /// both code and data. Its length must match the most recently returned
+    /// GetApfPacketFilterSupport().max_filter_length.
+    ///
+    /// While the snapshot is being fetched, the APF interpreter must not execute
+    /// and all incoming packets must be passed to the host as if there was no
+    /// APF program installed.
+    flexible ReadApfPacketFilterData() -> (table {
+        1: memory vector<uint8>:MAX;
+    }) error zx.Status;
+};
+
+open protocol Supplicant {
+    flexible AddStaInterface(resource table {
+        1: iface server_end:SupplicantStaIface;
+        2: iface_name string:16;
+    });
+    flexible RemoveInterface(resource table {
+        1: iface_name string:16;
+    });
+};
+
+type BtCoexistenceMode = flexible enum {
+    ENABLED = 1;
+    DISABLED = 2;
+    SENSE = 3;
+};
+
+open protocol SupplicantStaIface {
+    flexible RegisterCallback(resource table {
+        1: callback client_end:SupplicantStaIfaceCallback;
+    });
+    flexible AddNetwork(resource table {
+        1: network server_end:SupplicantStaNetwork;
+    });
+    flexible Disconnect() -> ();
+    flexible GetMacAddress() -> (table {
+        1: mac_addr fuchsia.wlan.ieee80211.MacAddr;
+    }) error zx.Status;
+    flexible GetFactoryMacAddress() -> (struct {
+        mac_addr fuchsia.wlan.ieee80211.MacAddr;
+    }) error zx.Status;
+    flexible SetBtCoexistenceMode(table {
+        1: mode BtCoexistenceMode;
+    }) -> () error WlanixError;
+    flexible SetPowerSave(resource table {
+        1: enable bool;
+    }) -> ();
+    flexible SetSuspendModeEnabled(resource table {
+        1: enable bool;
+    }) -> ();
+    flexible SetStaCountryCode(resource table {
+        1: code array<byte, 2>;
+    }) -> () error zx.Status;
+
+    flexible GetSignalPollResults() -> (table {
+        1: current_rssi_dbm int32;
+        2: tx_bitrate_mbps uint32;
+        3: rx_bitrate_mbps uint32;
+        4: frequency_mhz uint32;
+    }) error zx.Status;
+};
+
+open protocol SupplicantStaIfaceCallback {
+    flexible OnStateChanged(table {
+        1: new_state StaIfaceCallbackState;
+        2: bssid fuchsia.wlan.ieee80211.MacAddr;
+        3: id uint32;
+        4: ssid fuchsia.wlan.ieee80211.Ssid;
+    });
+
+    flexible OnDisconnected(table {
+        1: bssid fuchsia.wlan.ieee80211.MacAddr;
+        2: locally_generated bool;
+        3: reason_code fuchsia.wlan.ieee80211.ReasonCode;
+    });
+
+    flexible OnAssociationRejected(table {
+        1: ssid fuchsia.wlan.ieee80211.Ssid;
+        2: bssid fuchsia.wlan.ieee80211.MacAddr;
+        3: status_code fuchsia.wlan.ieee80211.StatusCode;
+        4: timed_out bool;
+    });
+};
+
+type StaIfaceCallbackState = flexible enum : uint32 {
+    DISCONNECTED = 0;
+    IFACE_DISABLED = 1;
+    INACTIVE = 2;
+    SCANNING = 3;
+    AUTHENTICATING = 4;
+    ASSOCIATING = 5;
+    ASSOCIATED = 6;
+    FOURWAY_HANDSHAKE = 7;
+    GROUP_HANDSHAKE = 8;
+    COMPLETED = 9;
+};
+
+// Note: values of these bits should match the ones from the original HAL
+type KeyMgmtMask = flexible bits : uint32 {
+    WPA_EAP = 1;
+    WPA_PSK = 2;
+    NONE = 4;
+    IEEE8021X = 8;
+    FT_EAP = 32;
+    FT_PSK = 64;
+    OSEN = 32768;
+    WPA_EAP_SHA256 = 128;
+    WPA_PSK_SHA256 = 256;
+    SAE = 1024;
+    // WPA3-Enterprise Suite-B Key management
+    SUITE_B_192 = 131072;
+    OWE = 4194304;
+    // Easy Connect (DPP) Key management
+    DPP = 8388608;
+    WAPI_PSK = 4096;
+    WAPI_CERT = 8192;
+    // FILS shared key authentication with sha-256
+    FILS_SHA256 = 262144;
+    // FILS shared key authentication with sha-384
+    FILS_SHA384 = 524288;
+    // Pre-Association Security Negotiation (PASN) Key management
+    PASN = 33554432;
+};
+
+open protocol SupplicantStaNetwork {
+    flexible SetBssid(table {
+        1: bssid fuchsia.wlan.ieee80211.MacAddr;
+    });
+    flexible ClearBssid();
+    flexible SetSsid(table {
+        1: ssid fuchsia.wlan.ieee80211.Ssid;
+    });
+    flexible SetKeyMgmt(table {
+        1: key_mgmt_mask KeyMgmtMask;
+    });
+    flexible SetPskPassphrase(table {
+        1: passphrase vector<uint8>:MAX;
+    });
+    flexible SetSaePassword(table {
+        1: password vector<uint8>:MAX;
+    });
+    flexible SetWepKey(table {
+        1: key vector<uint8>:MAX;
+        2: key_idx int32;
+    });
+    /// Designate the key to use for the WEP connection based on its index. The key should have
+    /// been previously set with SetWepKey.
+    flexible SetWepTxKeyIdx(table {
+        1: key_idx int32;
+    });
+    flexible Select() -> () error zx.Status;
+};
+
+type Nl80211Message = flexible union {
+    1: done struct {};
+    2: error struct {
+        error_code zx.Status;
+    };
+    3: ack struct {};
+    4: message struct {
+        payload vector<uint8>;
+    };
+};
+
+type Nl80211MessageArray = struct {
+    messages vector<Nl80211Message>;
+};
+
+open protocol Nl80211 {
+    flexible GetMulticast(resource table {
+        1: group string:32;
+        2: multicast client_end:Nl80211Multicast;
+    });
+
+    // This is only used for E2E tests
+    flexible Message(resource table {
+        1: message Nl80211Message;
+    }) -> (resource table {
+        1: responses vector<Nl80211Message>:MAX;
+    }) error zx.Status;
+
+    flexible MessageV2(resource struct {
+        message Nl80211Message;
+    }) -> (resource struct {
+        response zx.Handle:<VMO>;
+    }) error zx.Status;
+};
+
+open protocol Nl80211Multicast {
+    flexible Message(resource table {
+        1: message Nl80211Message;
+    });
+};
+
+// SAR scenarios defined by Android's legacy Wi-Fi HAL.
+// https://android.googlesource.com/platform/hardware/interfaces/+/3e2ef57bb25bfc58e2b1e5134e42a7b4955c525f/wifi/legacy_headers/include/hardware_legacy/wifi_hal.h#76
+type WifiLegacyHalTxPowerScenario = flexible enum : int32 {
+    // Unknown scenario
+    INVALID = -2;
+    // Device is away from user
+    DEFAULT = -1;
+    // Voice call ongoing
+    VOICE_CALL_LEGACY = 0;
+    // Device near head, no cell activity
+    ON_HEAD_CELL_OFF = 1;
+    // Device near head, with cell activity
+    ON_HEAD_CELL_ON = 2;
+    // Device near user body, no cell activity
+    ON_BODY_CELL_OFF = 3;
+    // Device near user body, with cell activity
+    ON_BODY_CELL_ON = 4;
+    // Device near user body, BT streaming active
+    ON_BODY_BT = 5;
+    // Device near head, with hotspot active (cellular tethering)
+    ON_HEAD_HOTSPOT = 6;
+    // Device near head, with hotspot active (cellular tethering),
+    // with 5G NR MMW active
+    ON_HEAD_HOTSPOT_MMW = 7;
+    // Device near user body, with cell activity, BT streaming active
+    ON_BODY_CELL_ON_BT = 8;
+    // Device near user body, with hotspot active (cellular tethering)
+    ON_BODY_HOTSPOT = 9;
+    // Device near user body, with hotspot active (cellular tethering),
+    // BT streaming active
+    ON_BODY_HOTSPOT_BT = 10;
+    // Device near user body, with hotspot active (cellular tethering),
+    // with 5G NR MMW active
+    ON_BODY_HOTSPOT_MMW = 11;
+    // Device near user body, with hotspot active (cellular tethering),
+    // BT streaming active, with 5G NR MMW active
+    ON_BODY_HOTSPOT_BT_MMW = 12;
+    // Device near head, no cell activity, device unfolded
+    ON_HEAD_CELL_OFF_UNFOLDED = 13;
+    // Device near head, with cell activity, device unfolded
+    ON_HEAD_CELL_ON_UNFOLDED = 14;
+    // Device near head, with hotspot active (cellular tethering), device
+    // unfolded
+    ON_HEAD_HOTSPOT_UNFOLDED = 15;
+    // Device near head, with hotspot active (cellular tethering),
+    // with 5G NR MMW active, device unfolded
+    ON_HEAD_HOTSPOT_MMW_UNFOLDED = 16;
+    // Device near user body, no cell activity, BT streaming is off, device unfolded
+    ON_BODY_CELL_OFF_UNFOLDED = 17;
+    // Device near user body, no cell activity, BT streaming active, device unfolded
+    ON_BODY_BT_UNFOLDED = 18;
+    // Device near user body, with cell activity, device unfolded
+    ON_BODY_CELL_ON_UNFOLDED = 19;
+    // Device near user body, with cell activity, BT streaming active, device
+    // unfolded
+    ON_BODY_CELL_ON_BT_UNFOLDED = 20;
+    // Device near user body, with hotspot active (cellular tethering), device
+    // unfolded
+    ON_BODY_HOTSPOT_UNFOLDED = 21;
+    // Device near user body, with hotspot active (cellular tethering),
+    // BT streaming active, device unfolded
+    ON_BODY_HOTSPOT_BT_UNFOLDED = 22;
+    //  Device near user body, with hotspot active (cellular tethering),
+    //  with 5G NR MMW active, device unfolded
+    ON_BODY_HOTSPOT_MMW_UNFOLDED = 23;
+    // Device near user body, with hotspot active (cellular tethering),
+    // BT streaming active, with 5G NR MMW active, device unfolded
+    ON_BODY_HOTSPOT_BT_MMW_UNFOLDED = 24;
+    // Device near user body, with rear camera active
+    ON_BODY_REAR_CAMERA = 25;
+    // Device near user body, no cell activity, device unfolded, cap sensor on
+    ON_BODY_CELL_OFF_UNFOLDED_CAP = 26;
+    // Device near user body, no cell activity, BT streaming active,
+    // device unfolded, cap sensor on
+    ON_BODY_BT_UNFOLDED_CAP = 27;
+    // Device near user body, with cell activity, device unfolded, cap sensor on
+    ON_BODY_CELL_ON_UNFOLDED_CAP = 28;
+    // Device near user body, with cell activity, BT streaming active,
+    // device unfolded, cap sensor on
+    ON_BODY_CELL_ON_BT_UNFOLDED_CAP = 29;
+    //Device is in video recording
+    ON_BODY_VIDEO_RECORDING = 30;
+};
+
+type WifiLegacyHalStatus = flexible enum {
+    NOT_SUPPORTED = 1;
+    INTERNAL = 2;
+    INVALID_ARGUMENT = 3;
+};
+
+// This protocol emulates methods provided by Android's legacy Wi-Fi HAL.
+// https://android.googlesource.com/platform/hardware/interfaces/+/3e2ef57bb25bfc58e2b1e5134e42a7b4955c525f/wifi/aidl/default/wifi_legacy_hal.h#591
+open protocol WifiLegacyHal {
+    /// Sets the SAR scenario for all available PHYs.
+    flexible SelectTxPowerScenario(resource table {
+        1: scenario WifiLegacyHalTxPowerScenario;
+    }) -> () error WifiLegacyHalStatus;
+
+    /// Sets each PHY's SAR scenario to the default scenario.
+    flexible ResetTxPowerScenario() -> () error WifiLegacyHalStatus;
+};

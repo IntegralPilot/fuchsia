@@ -1,0 +1,269 @@
+{{/*
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "Protocol:EventHandler:WireMessagingHeader" }}
+{{- EnsureNamespace "" }}
+template<>
+class {{ .WireEventHandlerInterface }} : public ::fidl::internal::BaseEventHandlerInterface
+{{- if .HandlesOneWayUnknownInteractions -}}
+, public {{ .UnknownEventHandler }}
+{{- end }} {
+public:
+  {{ .WireEventHandlerInterface.Self }}() = default;
+  virtual ~{{ .WireEventHandlerInterface.Self }}() = default;
+  {{- range .Events -}}
+    {{- .Docs }}
+    virtual void {{ .Name }}({{ if .HasResponsePayload }}{{ .WireEvent }}* event{{ end }}) = 0;
+  {{- end }}
+};
+
+template<>
+class {{ .WireAsyncEventHandler }}
+    : public {{ .WireEventHandlerInterface }}, public ::fidl::internal::AsyncEventHandler {
+ public:
+  {{ .WireAsyncEventHandler.Self }}() = default;
+  {{- range .Events -}}
+    {{- .Docs }}
+    void {{ .Name }}({{ if .HasResponsePayload }}{{ .WireEvent }}* event{{ end }}) override;
+  {{- end }}
+};
+
+{{ if .Transport.HasEvents }}
+  template<>
+  class {{ .WireSyncEventHandler }}
+      : public {{ .WireEventHandlerInterface }}, public ::fidl::internal::SyncEventHandler {
+   public:
+    {{ .WireSyncEventHandler.Self }}() = default;
+
+    // Handle all possible events defined in this protocol.
+    // Blocks to consume exactly one message from the channel, then call the corresponding virtual
+    // method.
+    ::fidl::Status HandleOneEvent(
+        {{ .UnownedClientEnd }} client_end);
+  };
+{{- end }}
+
+template <>
+class {{ .WireEventDispatcher }} final :
+    public ::fidl::internal::IncomingEventDispatcher<{{ .WireEventHandlerInterface }}> {
+ public:
+  explicit {{ .WireEventDispatcher.Self }}({{ .WireEventHandlerInterface }}* event_handler);
+
+  {{- if or .Events .HandlesOneWayUnknownInteractions }}
+    ::fidl::Status DispatchEvent(
+        ::fidl::IncomingHeaderAndMessage& msg,
+        ::fidl::internal::MessageStorageViewBase* storage_view) override;
+  {{- end }}
+};
+{{- end }}
+
+
+
+{{- define "Protocol:EventHandler:WireMessagingSource" }}
+{{ EnsureNamespace "" }}
+
+{{ .WireEventDispatcher }}::{{ .WireEventDispatcher.Self }}({{ .WireEventHandlerInterface }}* event_handler)
+: IncomingEventDispatcher(event_handler) {}
+
+
+{{ if .Transport.HasEvents }}
+  ::fidl::Status {{ .WireSyncEventHandler.NoLeading }}::HandleOneEvent(
+      {{ .UnownedClientEnd }} client_end) {
+      {{ .IncomingEventsStorage }} event_storage;
+      {{ .WireEventDispatcher.NoLeading }} dispatcher{this};
+      return HandleOneEventImpl_(client_end.channel(), event_storage.view(), dispatcher);
+  }
+{{- end }}
+
+{{- if or .Events .HandlesOneWayUnknownInteractions }}
+  ::fidl::Status
+  {{ .WireEventDispatcher.NoLeading }}::DispatchEvent(
+      ::fidl::IncomingHeaderAndMessage& msg,
+      ::fidl::internal::MessageStorageViewBase* storage_view) {
+    switch (msg.header()->ordinal) {
+    {{- range .Events }}
+      case {{ .OrdinalName }}:
+      {
+        ::fit::result decoded = ::fidl::internal::InplaceDecodeTransactionalEvent<{{ .Marker }}>(
+            std::move(msg));
+        if (!decoded.is_ok()) {
+          return decoded.error_value();
+        }
+        if (event_handler()) {
+          {{- if .HasResponsePayload }}
+            auto* primary = decoded.value().pointer();
+          {{- end }}
+          event_handler()->{{ .Name }}({{ if .HasResponsePayload }}primary{{ end }});
+        }
+        return ::fidl::Status::Ok();
+      }
+    {{- end }}
+      default:
+        {{- if .HandlesOneWayUnknownInteractions }}
+        auto* hdr = msg.header();
+        ::fidl::UnknownMethodType unknown_method_type =
+            ::fidl::internal::UnknownMethodTypeFromHeader(hdr);
+        bool is_flexible_interaction = ::fidl::IsFlexibleInteraction(hdr);
+        auto ordinal = hdr->ordinal;
+        {{- end }}
+        {{- /* Close handles regardless of whether there is an unknown interaction handler. */}}
+        std::move(msg).CloseHandles();
+        {{- if .HandlesOneWayUnknownInteractions }}
+        if (is_flexible_interaction &&
+            ::fidl::internal::CanHandleEvent({{ . }}::kOpenness, unknown_method_type)) {
+          if (event_handler()) {
+            {{ .UnknownEventMetadata }} metadata {
+              .event_ordinal = ordinal,
+            };
+            event_handler()->handle_unknown_event(metadata);
+          }
+          return ::fidl::Status::Ok();
+        }
+        {{- end }}
+        return ::fidl::Status::UnknownOrdinal();
+    }
+  }
+{{- end }}
+
+
+{{- range .Events }}
+void {{ $.WireAsyncEventHandler.NoLeading }}::{{ .Name }}({{ if .HasResponsePayload }}{{ .WireEvent }}* event{{ end }}) {}
+{{- end }}
+
+
+{{- end }}
+
+
+
+{{- define "Protocol:EventHandler:NaturalMessagingHeader" }}
+{{- EnsureNamespace "" }}
+template<>
+class {{ .NaturalEventHandlerInterface }} : public ::fidl::internal::BaseEventHandlerInterface
+{{- if .HandlesOneWayUnknownInteractions -}}
+, public {{ .UnknownEventHandler }}
+{{- end }} {
+ public:
+  {{ .NaturalEventHandlerInterface.Self }}() = default;
+  virtual ~{{ .NaturalEventHandlerInterface.Self }}() = default;
+  {{- range .Events -}}
+    {{- .Docs }}
+    virtual void {{ .Name }}({{ if .HasResponsePayload }}{{ .NaturalEvent }}&{{ end }}) = 0;
+  {{- end }}
+};
+
+template<>
+class {{ .NaturalAsyncEventHandler }}
+    : public {{ .NaturalEventHandlerInterface }}, public ::fidl::internal::AsyncEventHandler {
+ public:
+  {{ .NaturalAsyncEventHandler.Self }}() = default;
+
+  {{- range .Events -}}
+    {{- .Docs }}
+    void {{ .Name }}({{ if .HasResponsePayload }}{{ .NaturalEvent }}&{{ end }}) override;
+  {{- end }}
+};
+
+{{ if .Transport.HasEvents }}
+  template<>
+  class {{ .NaturalSyncEventHandler }}
+      : public {{ .NaturalEventHandlerInterface }}, public ::fidl::internal::SyncEventHandler {
+   public:
+    {{ .NaturalSyncEventHandler.Self }}() = default;
+
+    // Handle all possible events defined in this protocol.
+    // Blocks to consume exactly one message from the channel, then call the corresponding virtual
+    // method.
+    ::fidl::Status HandleOneEvent(
+        {{ .UnownedClientEnd }} client_end);
+  };
+{{- end }}
+
+template <>
+class {{ .NaturalEventDispatcher }} final :
+    public ::fidl::internal::IncomingEventDispatcher<{{ .NaturalEventHandlerInterface }}> {
+ public:
+  explicit {{ .NaturalEventDispatcher.Self }}({{ .NaturalEventHandlerInterface }}* event_handler);
+
+  {{- if or .Events .HandlesOneWayUnknownInteractions }}
+    ::fidl::Status DispatchEvent(
+        ::fidl::IncomingHeaderAndMessage& msg,
+        internal::MessageStorageViewBase* storage_view) override;
+  {{- end }}
+};
+{{- end }}
+
+
+
+{{- define "Protocol:EventHandler:NaturalMessagingSource" }}
+{{- EnsureNamespace "" }}
+
+{{ if .Transport.HasEvents }}
+  ::fidl::Status {{ .NaturalSyncEventHandler.NoLeading }}::HandleOneEvent(
+      {{ .UnownedClientEnd }} client_end) {
+      {{ .IncomingEventsStorage }} event_storage;
+      {{ .NaturalEventDispatcher.NoLeading }} dispatcher{this};
+      return HandleOneEventImpl_(client_end.channel(), event_storage.view(), dispatcher);
+  }
+{{- end }}
+
+{{- if or .Events .HandlesOneWayUnknownInteractions }}
+  ::fidl::Status
+  {{ .NaturalEventDispatcher.NoLeading }}::DispatchEvent(
+      ::fidl::IncomingHeaderAndMessage& msg,
+      ::fidl::internal::MessageStorageViewBase* storage_view) {
+    switch (msg.header()->ordinal) {
+    {{- range .Events }}
+      case {{ .OrdinalName }}:
+      {
+        ::fit::result decoded = ::fidl::internal::DecodeTransactionalMessage
+              {{- if .HasResponsePayload }}<{{ .ResponsePayload }}>{{ end -}}(std::move(msg));
+        if (decoded.is_error()) {
+          return decoded.error_value();
+        }
+        if (event_handler()) {
+          {{- if .HasResponsePayload }}
+            {{ .NaturalEvent }} event = std::move(decoded.value())
+          {{- end }};
+          event_handler()->{{ .Name }}({{ if .HasResponsePayload }}event{{ end }});
+        }
+        return ::fidl::Status::Ok();
+      }
+    {{- end }}
+      default:
+        {{- if .HandlesOneWayUnknownInteractions }}
+        auto* hdr = msg.header();
+        ::fidl::UnknownMethodType unknown_method_type =
+            ::fidl::internal::UnknownMethodTypeFromHeader(hdr);
+        bool is_flexible_interaction = ::fidl::IsFlexibleInteraction(hdr);
+        auto ordinal = hdr->ordinal;
+        {{- end }}
+        {{- /* Close handles regardless of whether there is an unknown interaction handler. */}}
+        std::move(msg).CloseHandles();
+        {{- if .HandlesOneWayUnknownInteractions }}
+        if (is_flexible_interaction &&
+            ::fidl::internal::CanHandleEvent({{ . }}::kOpenness, unknown_method_type)) {
+          if (event_handler()) {
+            {{ .UnknownEventMetadata }} metadata {
+              .event_ordinal = ordinal,
+            };
+            event_handler()->handle_unknown_event(metadata);
+          }
+          return ::fidl::Status::Ok();
+        }
+        {{- end }}
+        return ::fidl::Status::UnknownOrdinal();
+    }
+  }
+{{- end }}
+
+{{ .NaturalEventDispatcher }}::{{ .NaturalEventDispatcher.Self }}({{ .NaturalEventHandlerInterface }}* event_handler)
+: IncomingEventDispatcher(event_handler) {}
+
+{{- range .Events }}
+void {{ $.NaturalAsyncEventHandler.NoLeading }}::{{ .Name }}({{ if .HasResponsePayload }}{{ .NaturalEvent }}&{{ end }}) {}
+{{- end }}
+
+{{- end }}

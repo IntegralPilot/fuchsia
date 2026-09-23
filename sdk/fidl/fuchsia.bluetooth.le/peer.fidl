@@ -1,0 +1,217 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.bluetooth.le;
+
+using fuchsia.bluetooth as bt;
+using fuchsia.bluetooth.gatt2 as gatt2;
+using zx;
+
+/// Information obtained from advertising and scan response data broadcast by a peer.
+type ScanData = table {
+    /// The radio transmit power level reported by an advertising and/or scannable peer.
+    ///
+    /// NOTE: This field should NOT be confused with the "connection TX Power Level" of a peer that
+    /// is currently connected to the system obtained via the "Transmit Power reporting" feature.
+    1: tx_power int8;
+
+    /// The appearance of the device.
+    2: appearance bt.Appearance;
+
+    /// Service UUIDs.
+    3: service_uuids vector<bt.Uuid>:MAX;
+
+    /// Service data entries.
+    4: service_data vector<ServiceData>:MAX;
+
+    /// Manufacturer-specific data entries.
+    5: manufacturer_data vector<ManufacturerData>:MAX;
+
+    /// String representing a URI to be advertised, as defined in [IETF STD 66](https://tools.ietf.org/html/std66).
+    /// Each entry should be a UTF-8 string including the scheme. For more information, see
+    /// https://www.iana.org/assignments/uri-schemes/uri-schemes.xhtml for allowed schemes;
+    /// NOTE: Bluetooth advertising compresses schemas over the air to save space. See
+    /// https://www.bluetooth.com/specifications/assigned-numbers/uri-scheme-name-string-mapping.
+    6: uris vector<string:MAX_URI_LENGTH>:MAX;
+
+    /// The monotonic time when this scan data was received.
+    7: timestamp zx.Time;
+
+    /// Identifies the peer as belonging to a Coordinated Set.
+    /// Resolution and generation of this parameter is defined in the
+    /// Coordinated Set Identification Service Specification.
+    @available(added=31)
+    8: resolvable_set_identifier array<uint8, 6>;
+
+    /// The broadcast name string can be used by a user interface on a scanning
+    /// device that displays information on the available broadcast sources.
+    ///
+    /// Multiple devices with the same Broadcast Name may be transmitting the
+    /// same data, allowing devices to choose one.  At least 4 unicode characters
+    /// long and no more than 32 characters.
+    ///
+    /// Defined in the Public Broadcast Profile specification.
+    @available(added=31)
+    9: broadcast_name string:MAX_BROADCAST_NAME_OCTETS;
+};
+
+/// Represents a Bluetooth Low Energy peer that may act in the broadcaster, peripheral, or central
+/// role. The peer's role depends on whether it is obtained from the Central or Peripheral protocol.
+type Peer = table {
+    /// Uniquely identifies this peer on the current system.
+    ///
+    /// This field is always present.
+    1: id bt.PeerId;
+
+    /// Whether or not this peer is connectable. Non-connectable peers are typically in the LE
+    /// broadcaster role.
+    ///
+    /// This field is always present.
+    2: connectable bool;
+
+    /// The last observed signal strength of this peer. This field is only present for a peer that
+    /// is broadcasting. The RSSI can be stale if the peer has not been advertising.
+    ///
+    /// NOTE: This field should NOT be confused with the "connection RSSI" of a peer that is currently
+    /// connected to the system.
+    3: rssi int8;
+
+    @deprecated("Use `data` instead")
+    4: advertising_data AdvertisingData;
+
+    /// The name of this peer. The name is often obtained during a scan procedure and can get
+    /// updated during the name discovery procedure following a connection.
+    ///
+    /// This field is present if the name is known.
+    5: name bt.DeviceName;
+
+    /// Information from advertising and scan response data broadcast by this peer. When present,
+    /// this contains the advertising data last received from the peer.
+    6: data ScanData;
+
+    /// Whether or not this peer is bonded.
+    ///
+    /// This field is always present.
+    7: bonded bool;
+
+    /// The value of the system monotonic clock, measured at the time this peer
+    /// was last updated (e.g. due to reception of an advertisement).
+    ///
+    /// This field is always present.
+    8: last_updated zx.Time;
+
+    /// Value of the Advertising SID.
+    ///
+    /// Range: 0x00 to 0x0F
+    @available(added=25)
+    9: advertising_sid uint8;
+
+    /// Interval of the periodic advertising.
+    /// The presence of this field indicates that a periodic advertising train
+    /// is associated with this advertisement.
+    ///
+    /// Range: 0x0006 to 0xFFFF
+    /// Time: N × 1.25 ms
+    @available(added=25)
+    10: periodic_advertising_interval uint16;
+};
+
+@available(added=28)
+type PeriodicAdvertisingSyncTransferError = flexible enum : uint32 {
+    FAILED = 0;
+    /// The `PeriodicAdvertisingSyncId` does not correspond to an active `PeriodicAdvertisingSync`.
+    INVALID_SYNC_ID = 1;
+    TRANSFER_ALREADY_PENDING = 2;
+    NOT_SUPPORTED_LOCAL = 3;
+    NOT_SUPPORTED_REMOTE = 4;
+};
+
+/// Protocol that represents the connection to a peer. This can be used to interact with GATT
+/// services and establish L2CAP channels.
+///
+/// This lifetime of this capability is tied to that of the LE connection it represents. Closing the
+/// channel results in a disconnection if no other clients hold a Connection to the same peer.
+closed protocol Connection {
+    @available(added=24)
+    compose CodecDelay;
+    // Bind the server end of a `fuchsia.bluetooth.gatt2/Client` corresponding to the connected
+    // peer.
+    /// The following epitaphs may be sent by the server on error:
+    /// + `ZX_ERR_ALREADY_BOUND`: A Client server has already been bound in this Connection
+    ///                           protocol. The existing Client should be used.
+    @available(added=24)
+    strict RequestGattClient(resource struct {
+        client server_end:gatt2.Client;
+    });
+
+    /// Accept a future CIS request from the peer with the specified CIG/CIS values. All
+    /// CIS requests that have not explicitly been allowed will be rejected.
+    ///
+    /// The provided IsochronousStream will be used for future notification of established
+    /// connections.
+    ///
+    /// The host may wait for multiple incoming connections simultaneously, although each
+    /// must have a combination of CIG/CIS values that is unique to this connection.
+    ///
+    /// If we are not operating in the peripheral role in this connection, connection_stream
+    /// will be closed with a ZX_ERR_NOT_SUPPORTED epitaph.
+    ///
+    /// If we are already waiting for another connection with the same combination of CIG/CIS
+    /// values, connection_stream will be closed with a ZX_ERR_INVALID_ARGS epitaph.
+    @available(added=24)
+    strict AcceptCis(resource table {
+        /// Identifier of the CIG that contains the requested CIS. Required.
+        1: cig_id uint8;
+
+        /// Identifier of the requested CIS. Required.
+        2: cis_id uint8;
+
+        /// When the stream is established, the server will invoke
+        /// IsochronousStream::OnCisEstablished() on this channel. Required.
+        ///
+        /// If the client end of this channel is closed, requests of the corresponding CIG/CIS
+        /// combination will be rejected until/unless another call is made to AcceptCis() with
+        /// the same CIG/CIS parameters.
+        3: connection_stream server_end:IsochronousStream;
+    });
+
+    /// Connect to an L2CAP LE connection-oriented channel.
+    @available(added=24)
+    strict ConnectL2cap(resource table {
+        /// Parameters for the local side of the channel.
+        1: parameters bt.ChannelParameters;
+        /// The channel protocol to open.
+        2: channel server_end:bt.Channel;
+        /// The PSM of the remote side to connect to.
+        3: psm Psm;
+        /// Channel offload extension. See [`fuchsia.bluetooth.le/ChannelOffloadExt`].
+        /// Only privileged clients are allowed to offload channels. This
+        /// protocol will be closed for other clients. The client must
+        /// additionally call `ChannelOffloadExt.StartOffload` to start offloading.
+        @available(added=31)
+        4: ext_offload server_end:ChannelOffloadExt;
+    });
+
+    /// Send synchronization information for a periodic advertising train identified by `sync_id` to
+    /// the connected peer.
+    @available(added=28)
+    strict TransferPeriodicAdvertisingSync(table {
+        /// Required.
+        1: sync_id PeriodicAdvertisingSyncId;
+        /// Application specific data to send with the sync.
+        /// Optional.
+        /// Default: 0
+        2: service_data uint16;
+    }) -> () error PeriodicAdvertisingSyncTransferError;
+
+    /// Accept the next Periodic Advertising Sync Transfer from the peer. A response will be sent
+    /// when the host is ready to accept the transfer. Only one request can be pending at a time.
+    @available(added=28)
+    strict AcceptPeriodicAdvertisingSyncTransfer(resource table {
+        /// When the sync is established, the `PeriodicAdvertisingSync.OnEstablished` event will be
+        /// sent containing the service data received with the transfer. Closing the client end will
+        /// cancel the transfer.
+        1: sync server_end:PeriodicAdvertisingSync;
+        2: config PeriodicAdvertisingSyncConfiguration;
+    }) -> () error PeriodicAdvertisingSyncTransferError;
+};

@@ -1,0 +1,150 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+"""Definitions used to test debug symbol collection.
+
+NOTE: For now, only manual verification is supported. See TODOs below.
+
+To verify that debug symbol collection works properly for all supported binary
+types, build the //build/bazel/debug_symbols/tests:debug_symbols target, which will
+generate a file under bazel-bin/build/bazel/debug_symbols/tests/debug_symbols.json
+which should include an entry for each target below compiled for each one of
+the "dbg", "fastbuild" and "opt" compilation modes.
+
+For example, for Linux:
+
+```
+fx bazel build --config=host \
+  --output_groups=+debug_symbol_files \
+  //build/bazel/debug_symbols/tests:debug_symbols
+
+python3 build/bazel/debug_symbols/tests/check_debug_binaries.py \
+  --manifest bazel-bin/build/bazel/debug_symbols/tests/debug_symbols.json
+```
+
+For Fuchsia, there is no comparable command until --config=fuchsia
+works (see https://fxrev.dev/1269985).
+
+TODO(digit): Ensure `fx bazel run //build/bazel/debug_symbols/tests:check_debug_binaries
+             works properly (it inherits Bazel options like --config=gcertauth !?).
+
+TODO(digit): Find a way to generate a single manifest and generate debug binaries
+             for both host and Fuchsia build configurations at the same time.
+             For now, trying to use a transition function to change --platforms
+             fails with a Rust toolchain resolution error !?
+
+TODO(digit): Make this a proper build-time test instead.
+"""
+
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_shared_library")
+load("@rules_fuchsia//fuchsia:defs.bzl", "fuchsia_cc_binary", "fuchsia_cc_test", "fuchsia_wrap_rust_binary")
+load("@rules_python//python:defs.bzl", "py_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+load(":defs.bzl", "debug_symbols_manifest", "multi_compilation_mode_filegroup")
+
+package(default_applicable_licenses = ["//:license"])
+
+debug_symbols_manifest(
+    name = "debug_symbols",
+    testonly = True,
+    dep = ":binaries",
+    output = "debug_symbols.json",
+)
+
+# A script used to check the content of a debug symbols manifest
+# and to verify that all debug binaries it points to are indeed
+# unstripped (to verify that toolchains are configured properly).
+py_binary(
+    name = "check_debug_binaries",
+    srcs = ["check_debug_binaries.py"],
+    deps = ["//build/python/modules:elf"],
+)
+
+# A single target that will build multiple dependencies in all
+# "dbg", "fastbuild" and "opt" compilation modes at the same time.
+multi_compilation_mode_filegroup(
+    name = "binaries",
+    testonly = True,
+    srcs = [
+        ":a_cc_shared_library",
+    ] + select({
+        "@platforms//os:fuchsia": [
+            ":a_fuchsia_cc_binary",
+            ":a_fuchsia_cc_test",
+            ":a_wrapped_rust_binary",
+            ":a_wrapped_rust_test",
+        ],
+        "//conditions:default": [
+            ":a_cc_binary",
+            ":a_cc_test",
+            ":a_rust_binary",
+            ":a_rust_test",
+        ],
+    }),
+)
+
+cc_binary(
+    name = "a_cc_binary",
+    srcs = ["a_main.cc"],
+)
+
+cc_test(
+    name = "a_cc_test",
+    srcs = ["a_main.cc"],
+)
+
+cc_library(
+    name = "a_cc_library",
+    srcs = ["a_library.cc"],
+    hdrs = ["a_library.h"],
+)
+
+cc_shared_library(
+    name = "a_cc_shared_library",
+    deps = [":a_cc_library"],
+)
+
+rust_binary(
+    name = "a_rust_binary",
+    srcs = ["a_main.rs"],
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+    ],
+)
+
+rust_test(
+    name = "a_rust_test",
+    crate = ":a_rust_binary",
+    rustc_flags = [
+        "-Zpanic_abort_tests",
+        "-Cpanic=abort",
+    ],
+)
+
+# The following targets will fail to compile in a non-Fuchsia build configuration
+# because these fuchsia_xx() macros inject dependencies to @fuchsia_sdk//pkg/sysroot:dist
+# which is only compatible with @platforms//os:fuchsia.
+
+fuchsia_cc_binary(
+    name = "a_fuchsia_cc_binary",
+    srcs = ["a_main.cc"],
+)
+
+fuchsia_cc_test(
+    name = "a_fuchsia_cc_test",
+    srcs = ["a_main.cc"],
+)
+
+fuchsia_wrap_rust_binary(
+    name = "a_wrapped_rust_binary",
+    native_binary = ":a_rust_binary",
+)
+
+fuchsia_wrap_rust_binary(
+    name = "a_wrapped_rust_test",
+    testonly = True,
+    native_binary = ":a_rust_test",
+)

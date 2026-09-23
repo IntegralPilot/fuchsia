@@ -1,0 +1,167 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_inputs.gni")
+import("//build/info/info.gni")
+import("//build/python/python_action.gni")
+
+# Creates an Assembly Input Bundle for the QEMU Kernel.
+#
+# This is a specialized template that is only used once, to define the AIB that
+# includes the QEMU kernel itself.
+#
+# The following parameters are for when this template is being used to create a
+# platform AIB for a non-standard QEMU kernel image (such as boot-shim only
+# tests).
+#
+# Parameters:
+#
+#   qemu_kernel (required)
+#     [label] Label of the QEMU kernel to use.  This needs to use the `emulator_support_aib_input`
+#     metadata key to provide the `path` from the root build directory.
+#
+#   bundle_name [optional; default: target_name]
+#     [string] A different name for the bundle, if not the name of the target.
+#
+#   bundles_dir [optional; default: target_out_dir]
+#     [GN file path] path to a dir to use instead of $target_out_dir as the
+#     parent of the legacy input bundle.
+#
+#
+#  Outputs
+#    A directory structure and manifest that matches that documented in
+#    //build/python/modules/assembly/assembly_input_bundle.py.
+#
+#   manifest path:
+#   $target_out_dir/$target_name/assembly_config.json
+#
+template("emulator_support_assembly_input_bundle") {
+  forward_variables_from(invoker,
+                         [
+                           "bundles_dir",
+                           "bundle_name",
+                           "qemu_kernel",
+                         ])
+  assert(defined(qemu_kernel))
+
+  if (!defined(bundles_dir)) {
+    bundles_dir = target_out_dir
+  }
+
+  if (!defined(bundle_name)) {
+    bundle_name = target_name
+  }
+
+  labels = {
+    # The AIB itself
+    assembly_input_bundle = "$target_name.bundle"
+
+    bazel_inputs = "${target_name}_bazel_inputs"
+    gn_targets_name = target_name
+
+    emulator_support_aib_input_metadata =
+        "${target_name}_emulator_support_aib_input_metadata"
+  }
+
+  files = {
+    emulator_support_aib_input_metadata =
+        "$target_out_dir/${target_name}_emulator_support_aib_input.gn_meta.json"
+
+    # Outputs
+
+    # The directory where all the bundle contents are written to
+    assembly_input_bundle_dir = "${bundles_dir}/${bundle_name}"
+
+    # Depfile for the AIB generation action below.
+    assembly_input_bundle_depfile = "${bundles_dir}/${bundle_name}.d"
+
+    # The "official" outputs file that we create in that directory
+    assembly_input_bundle_config =
+        "${assembly_input_bundle_dir}/assembly_config.json"
+
+    # The manifest of all files in the AIB, used to create pkgs and archives.
+    assembly_input_bundle_manifest =
+        "${assembly_input_bundle_dir}.fini_manifest"
+  }
+
+  # Write the emulator support metadata to a file, as this is the only way to
+  # get the path to the QEMU kernel provided.
+  generated_file(labels.emulator_support_aib_input_metadata) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    data_keys = [ "emulator_support_aib_input" ]
+    walk_keys = [ "emulator_support_aib_input_barrier" ]
+    outputs = [ files.emulator_support_aib_input_metadata ]
+    output_conversion = "json"
+    deps = [ qemu_kernel ]
+  }
+
+  python_action(labels.assembly_input_bundle) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    binary_label = "//build/assembly/scripts:emulator_support_aib_tool"
+    depfile = files.assembly_input_bundle_depfile
+    outputs = [ files.assembly_input_bundle_config ]
+    args = [
+      "--emulator-support-aib-input-metadata",
+      rebase_path(files.emulator_support_aib_input_metadata, root_build_dir),
+      "--depfile",
+      rebase_path(files.assembly_input_bundle_depfile, root_build_dir),
+      "--outdir",
+      rebase_path(files.assembly_input_bundle_dir, root_build_dir),
+    ]
+
+    inputs = [ files.emulator_support_aib_input_metadata ]
+    deps = [ ":${labels.emulator_support_aib_input_metadata}" ]
+
+    metadata = {
+      assembly_input_bundles = [
+        {
+          path = rebase_path(files.assembly_input_bundle_dir, root_build_dir)
+          label =
+              get_label_info(labels.assembly_input_bundle, "label_no_toolchain")
+        },
+      ]
+    }
+
+    # The creation of this subdirectory in the bundle involves a potential copy
+    # in the event of a failed hard link, which can happen for reasons outside
+    # the control of the build when the kernel is a prebuilt (e.g., a developer
+    # may have mounted their checkout on a partition separate from the build
+    # directory). Since this amounts in effect to a non-deterministic output,
+    # we disable hermeticity for this subdirectory.
+    hermetic_action_ignored_prefixes =
+        [ "${files.assembly_input_bundle_dir}/kernel" ]
+  }
+
+  # Make generated AIBs available to Bazel builds.
+  bazel_input_directory(labels.bazel_inputs) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    generator = ":${labels.assembly_input_bundle}"
+    output_directory = files.assembly_input_bundle_dir
+    gn_targets_name = labels.gn_targets_name
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = [ ":${labels.bazel_inputs}" ]
+    public_deps = [ ":${labels.assembly_input_bundle}" ]
+  }
+}

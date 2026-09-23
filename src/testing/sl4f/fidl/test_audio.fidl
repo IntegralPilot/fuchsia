@@ -1,0 +1,232 @@
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.test.audio;
+
+using zx;
+
+/// Support at most 20MiB of audio input data.
+///
+/// This represents ~27 seconds of 8-byte frame audio data at 96kHz.
+/// At 48kHz it provides at least 56 seconds.
+const INJECTED_AUDIO_MAXIMUM_FILE_SIZE uint32 = 20971520; // 20MiB
+
+/// Status code for Audio Test FIDL.
+type AudioTestError = flexible enum {
+    /// Internal failure.
+    ///
+    /// See device logs for the failure reason.
+    ///
+    /// Upon seeing this value a test client should immediately fail and exit.
+    FAIL = 1;
+};
+
+/// A protocol that supports audio input injection.
+///
+/// Connections to this protocol control a virtual input audio device which can be used to inject
+/// audio as if it came from a microphone.
+///
+/// The server contains indexed tracks which can be independently queued and played.
+/// When injecting audio, it is common to pre-load all required inputs for a test scenario and
+/// play them sequentially, using WaitUntilInputIsDone to determine when to start the next stage.
+@discoverable
+open protocol Injection {
+
+    /// Set the audio to be injected at `index`.
+    ///
+    /// The first time this is called, an empty vector will be created, subsequent calls will
+    /// append to `audio_data` to the same vector.
+    ///
+    /// Use `ClearInputAudio` to clear audio input data stored at `index`.
+    ///
+    /// Further requests on the same Injection connection are blocked until the audio_writer socket
+    /// is drained completely. To determine when injection is complete, users may initiate
+    /// a call to GetInputAudioSize immediately following the call to this method.
+    ///
+    /// + request `index` refers a specific `audio_data` input record. We can have multiple records.
+    /// + request `audio_writer` socket where audio data will be loaded from.
+    strict WriteInputAudio(resource struct {
+        index int32;
+        audio_writer zx.Handle:SOCKET;
+    });
+
+    /// Get the size of audio data stored at `index`.
+    ///
+    /// This method returns the number of bytes of input data stored at the given index.
+    ///
+    /// If a `WriteInputAudio` call is pending for the given index,
+    /// this method will block until the socket is drained and the data
+    /// is fully stored.
+    ///
+    /// + request `index` refers to a specific `audio_data` input record.
+    /// - response `error` description of failure action to take.
+    strict GetInputAudioSize(struct {
+        index int32;
+    }) -> (struct {
+        byte_count uint64;
+    }) error AudioTestError;
+
+    /// Clears audio data stored at `index`.
+    ///
+    /// If no data exists at `index` nothing will get cleared, but no error will be returned.
+    ///
+    /// + request `index` refers a specific `audio_data` input record to clear.
+    /// - response `error` description of failure action to take.
+    strict ClearInputAudio(resource struct {
+        index int32;
+    }) -> () error AudioTestError;
+
+    /// Wait until injected inputs are done playing.
+    ///
+    /// This function returns only when all injected audio tracks are complete.
+    ///
+    /// This is intended to be called after calling `StartInputInjection`.
+    /// If no tracks have been started, or all started tracks have already completed,
+    /// then this function will immediately return without error.
+    ///
+    /// - response `error` description of failure action to take.
+    strict WaitUntilInputIsDone() -> () error AudioTestError;
+
+    /// Start injecting the incoming audio for this device, using the audio at `index`.
+    ///
+    /// Before calling this, use `WriteInputAudio` to store audio data at the given index.
+    ///
+    /// + request `index` refers a specific `audio_data` input record to play on the virtual microphone.
+    /// - response `error` description of failure action to take.
+    strict StartInputInjection(resource struct {
+        index int32;
+    }) -> () error AudioTestError;
+
+    /// Stop injecting audio data.
+    ///
+    /// This stops playing all injected tracks.
+    ///
+    /// This is intended to be called after calling `StartInputInjection`.
+    /// If no tracks have been started, or if all started tracks have already completed,
+    /// then this function will immediately return without error.
+    ///
+    /// - response `error` description of failure action to take.
+    strict StopInputInjection() -> () error AudioTestError;
+};
+
+@discoverable
+open protocol Capture {
+    /// Start capturing the outgoing audio for this device.
+    ///
+    /// A virtual output device receives what would have played through the device's speakers.
+    /// This method reads from that virtual output device, into an internal buffer.
+    ///
+    /// After calling this method, use `StopOutputCapture` to stop recording output and
+    /// then `GetOutputAudio` to retrieve this captured audio.
+    ///
+    /// - response `error` description of failure action to take.
+    strict StartOutputCapture() -> () error AudioTestError;
+
+    /// Stop capturing the outgoing audio for this device.
+    ///
+    /// This method will succeed even if no output capture has been started.
+    ///
+    /// After calling this method, use `GetOutputAudio` to retrieve the captured
+    /// audio from the virtual device's internal buffer and return it to the client.
+    ///
+    /// - response `error` description of failure action to take.
+    strict StopOutputCapture() -> () error AudioTestError;
+
+    /// Wait for the specified period to elapse without any audio on the output device.
+    ///
+    /// This method waits until zero-filled packets corresponding to the specified quiet
+    /// period are observed on the virtual output device, and then it returns. This
+    /// method will only wait up to the specified maximum wait time.
+    ///
+    /// + request `requested_quiet_period_ms` duration of quiet period to wait for, in milliseconds.
+    /// + request `maximum_wait_time_ms` maximum duration to wait for, in milliseconds.
+    /// - response `result` description of whether the quiet period was observed or not.
+    /// - response `error` description of failure action to take.
+    strict WaitForQuiet(table {
+        1: requested_quiet_period_ms uint32;
+        2: maximum_wait_time_ms uint32;
+    }) -> (struct {
+        result WaitForQuietResult;
+    }) error AudioTestError;
+
+    /// Queue an asynchronous audio capture.
+    ///
+    /// This method sets up a triggered audio capture that will begin capturing when it first
+    /// observes audio on the virtual output device, and will continue either until a maximum
+    /// capture duration is reached or until the virtual output device observes a configurable
+    /// quiet period.
+    ///
+    /// This method returns immediately once the capture is queued. A subsequent call to
+    /// `WaitForTriggeredCapture` is required to wait for the completion of the operation.
+    ///
+    /// This method is incompatible with `StartOutputCapture` and `StopOutputCapture`, and mixing
+    /// calls in a single test is likely to result in an `AudioTestError` being raised.
+    ///
+    /// + request `maximum_time_to_wait_for_sound_ms` maximum time to wait for non-quiet on
+    ///     output device, in milliseconds.
+    /// + request `optional_quiet_before_stopping_ms` stop recording after this duration of
+    ///     quiet is observed, in milliseconds.
+    /// + request `maximum_capture_duration_ms` maximum duration of the recording, in milliseconds.
+    /// - response `error` description of failure action to take.
+    strict QueueTriggeredCapture(table {
+        1: maximum_time_to_wait_for_sound_ms uint32;
+        2: optional_quiet_before_stopping_ms uint32;
+        3: maximum_capture_duration_ms uint32;
+    }) -> () error AudioTestError;
+
+    /// Wait for a previously queued audio capture to trigger and record.
+    ///
+    /// This method waits for a previous call to `QueueTriggeredCapture` to either capture audio
+    /// or time out. Calling this method without a corresponding call to `QueueTriggeredCapture`
+    /// will result in an `AudioTestError` being returned.
+    ///
+    /// This method is incompatible with `StartOutputCapture` and `StopOutputCapture`, and mixing
+    /// calls in a single test is likely to result in an `AudioTestError` being raised.
+    ///
+    /// - response `result` the result of the completed triggered capture, including whether
+    ///     or not it was triggered.
+    /// - response `error` description of failure action to take.
+    strict WaitForTriggeredCapture() -> (struct {
+        result QueuedCaptureResult;
+    }) error AudioTestError;
+
+    /// Extract the captured outgoing audio data through a socket.
+    ///
+    /// The socket is closed once it is fully drained.
+    ///
+    /// User should have first called `StartOutputCapture` and `StopOutputCapture`. This method will
+    /// return the contents of the internal buffer that was populated between the calls to those
+    /// two methods.
+    ///
+    /// Audio output format is 2-channel 48kHz 16-bit PCM.
+    ///
+    /// + request `audio_reader` socket where full captured audio data will be streamed.
+    /// - response `error` description of failure action to take.
+    strict GetOutputAudio() -> (resource struct {
+        audio_reader zx.Handle:SOCKET;
+    }) error AudioTestError;
+};
+
+/// The result for a `WaitForQuiet` request.
+type WaitForQuietResult = flexible enum {
+    /// The virtual output device successfully observed the requested quiet period.
+    SUCCESS = 1;
+
+    /// The virtual output device did not observe the requested quiet period because audio was
+    /// still playing on the device.
+    QUIET_PERIOD_NOT_OBSERVED = 2;
+};
+
+/// The result for a `QueueTriggeredCapture` request.
+type QueuedCaptureResult = flexible enum {
+    /// The capture triggered, audio was recorded, and the requested quiet period was observed
+    /// ending the capture early.
+    CAPTURED = 1;
+    /// The capture triggered, audio was recorded, and the entire requested duration of audio
+    /// was captured. This could be because the trailing quiet period was not observed, or because
+    /// no trailing quiet period was configured.
+    CAPTURED_TO_TIME_LIMIT = 2;
+    /// The capture was not triggered, and no audio was recorded.
+    FAILED_NO_SOUND_TIMEOUT = 3;
+};

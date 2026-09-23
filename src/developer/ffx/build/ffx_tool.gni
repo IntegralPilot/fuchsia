@@ -1,0 +1,293 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/host.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/sdk/sdk_atom.gni")
+import("//build/testing/host_test_data.gni")
+import("//sdk/categories/compatibility.gni")
+import("//src/developer/ffx/build/ffx_action.gni")
+import("//src/developer/ffx/config.gni")
+import("//src/developer/ffx/lib/version/build/ffx_apply_version.gni")
+
+# Defines an ffx-compatible subtool in the form of a rust binary target
+#
+# All parameters to `rustc_binary` are available, along with the additional
+# parameters below.
+#
+# Additional Parameters
+#
+#   sdk_target_name (required if `sdk_category` is set)
+#      The target name to generate for an sdk atom definition. If not
+#      set, no sdk target will be generated.
+#
+#   sdk_category (optional)
+#      The sdk category this will be installed to.
+#      See `sdk_atom`'s `category` argument for more information.
+#
+#   sdk_area (optional; only allowed if `sdk_category` is set))
+#     [string] The API area responsible for maintaining this library.
+#     See //build/sdk/sdk_atom.gni.
+#
+#   sdk_deps (optional; only allowed if `sdk_category` is set))
+#      Dependencies for inclusion in the sdk. See `sdk_atom` for more
+#      information on this.
+#
+# The following targets will be produced, in addition to any from
+# `rustc_binary`:
+#
+#   `<target_name>`
+#     The rust binary before applying build version information to it.
+#     Output: `<output_name>_unversioned`
+#
+#   `<target_name>_versioned`
+#     The rust binary after applying build version information to it.
+#     Output: `<output_name>`
+#
+#   `<target_name>_metadata`
+#     The json metadata for this tool that allows ffx to discover it
+#     and determine compatibility information.
+#     Output: `<output_name>.json`
+#
+#   `<target_name>_host_tool`
+#     Installation of the versioned binary and metadata as a host tool.
+#     Output: `host-tools/<output_name>`, `host-tools/<output_name>.json`
+#
+#   `<target_name>_test_data`
+#     A `host_test_data` target that includes the files necessary to make sure
+#     this tool is available to tests.
+#
+# The following target will be produced only if `sdk_category` is set:
+#
+#   `<sdk_target_name>`
+#     Include the tool in the sdk as a host tool with metadata attached.
+#     Output: (see `sdk_atom` for more information)
+#
+template("ffx_tool") {
+  assert(
+      !defined(invoker.sdk_category) || defined(invoker.sdk_target_name),
+      "Must specify an SDK target name when generating an SDK atom for ffx tool")
+
+  if (!defined(invoker.output_name)) {
+    output_name = target_name
+  } else {
+    output_name = invoker.output_name
+  }
+
+  # targets that are part of the 'public interface' of ffx_tool
+  target_versioned = "${target_name}_versioned"
+  target_unversioned = target_name
+  target_metadata = "${target_name}_metadata"
+  target_host_tool = "${target_name}_host_tool"
+  target_test_data = "${target_name}_test_data"
+
+  # targets that are part of the private interface of ffx_tool
+  # (prefixed with _ to differentiate).
+  target_versioned_bin = "_${target_name}_versioned_bin"
+
+  output_versioned = output_name
+  output_unversioned = "${output_name}_unversioned"
+  output_metadata = "${output_name}.json"
+
+  # Make the rust binary
+  rustc_binary(target_unversioned) {
+    output_name = output_unversioned
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "output_name",
+                             "sdk_target_name",
+                             "sdk_category",
+                             "sdk_area",
+                             "sdk_deps",
+                           ])
+
+    # As these are large libraries that are slow to compile on RBE workers,
+    # switch them to the larger RBE workers.
+    _concurrent_jobs = concurrent_jobs.rust_highmem
+    configs += _concurrent_jobs.configs
+    forward_variables_from(_concurrent_jobs.vars, "*")
+  }
+
+  # Replace the special linker sections containing the version information with
+  # the real values
+  ffx_apply_version(target_versioned_bin) {
+    output_name = output_versioned
+    ffx_unversioned_binary_path = "${root_out_dir}/${output_unversioned}"
+    runtime_files = [ "$root_out_dir/$output_metadata" ]
+    deps = [
+      ":$target_metadata",
+      ":$target_unversioned",
+    ]
+  }
+
+  # internal target to create metadata about this tool for use by
+  # ffx when running hermetically.
+  tool_list_metadata_target = "${output_name}-ffx-tool-metadata"
+
+  # Create the metadata file for in-tree discovery
+  ffx_action(target_metadata) {
+    # The ffx_action() template will convert these names to the correct ones by
+    # adding the '_unversioned' suffix to the 'output_name'.
+    ffx_tool = ":$target_unversioned"
+    ffx_tool_output_name = output_versioned  # without _unversioned suffix
+
+    inputs = []
+    outputs = [ "$root_out_dir/$output_metadata" ]
+    args = [
+      "metadata",
+      rebase_path("$root_out_dir/$output_metadata", root_build_dir),
+    ]
+  }
+
+  # Combine those into a target that represents both the versioned binary
+  # and the metadata.
+  group(target_versioned) {
+    public_deps = [
+      ":$target_metadata",
+      ":$target_versioned_bin",
+    ]
+    deps = [ ":${tool_list_metadata_target}" ]
+  }
+
+  # Install host tool
+  install_host_tools(target_host_tool) {
+    deps = [ ":$target_versioned" ]
+    outputs = [
+      output_name,
+      output_metadata,
+    ]
+  }
+
+  # This is used to generate metadata about in-tree standalone ffx subtools.
+  group(tool_list_metadata_target) {
+    metadata = {
+      # LINT.IfChange(clidoc_subtool_manifest)
+
+      # this is a comment to remember to change clidoc.
+      # nested IfThisThenThat are not allowed.
+      # nor multiple files in the then clause.
+
+      # LINT.ThenChange(//tools/clidoc/src/ffx_doc.rs:clidoc_subtool_manifest)
+
+      # LINT.IfChange(subtool_manifest)
+      ffx_tool = [
+        {
+          name = output_name
+          category = "internal"
+          if (defined(invoker.sdk_category)) {
+            category = invoker.sdk_category
+          }
+          executable =
+              rebase_path("$host_tools_dir/$output_name", root_build_dir)
+          executable_metadata =
+              rebase_path("$host_tools_dir/$output_metadata", root_build_dir)
+        },
+      ]
+
+      # LINT.ThenChange(//src/developer/ffx/lib/fho/search/src/lib.rs:subtool_manifest)
+    }
+  }
+
+  # Install host tool and metadata as test data
+  host_test_data(target_test_data) {
+    forward_variables_from(invoker,
+                           [
+                             "assert_no_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    data_deps = [ ":$target_host_tool" ]
+    sources = [
+      "${host_tools_dir}/${output_metadata}",
+      "${host_tools_dir}/${output_name}",
+    ]
+  }
+
+  if (defined(invoker.sdk_category)) {
+    # Add to the sdk
+    file_base_root = "tools/ffx_tools"
+    if (host_os == "linux" || host_os == "mac") {
+      file_base_root = "tools/$current_cpu/ffx_tools"
+    }
+
+    file_base = "$file_base_root/$output_name"
+    file_base_metadata = "$file_base_root/$output_metadata"
+
+    # for the moment this goes directly to sdk_atom because this is a 'weird'
+    # host tool that includes a json metadata file.
+    sdk_atom(invoker.sdk_target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "assert_no_deps",
+                               "sdk_area",
+                             ])
+
+      category = invoker.sdk_category
+      id = "sdk://$file_base"
+
+      _target_files = {
+        executable = file_base
+        executable_metadata = file_base_metadata
+      }
+
+      meta = {
+        dest = "$file_base-meta.json"
+        type = "ffx_tool"
+        value = {
+          type = "ffx_tool"
+          name = output_name
+          root = "tools"
+          files = {
+          }
+          target_files = {
+          }
+          if (current_cpu == "arm64") {
+            target_files.arm64 = _target_files
+          } else if (current_cpu == "x64") {
+            target_files.x64 = _target_files
+          } else if (current_cpu == "riscv64") {
+            target_files.riscv64 = _target_files
+          } else {
+            assert(false, "Unknown CPU type: $current_cpu")
+          }
+        }
+      }
+
+      files = [
+        {
+          source = "$root_out_dir/$output_versioned"
+          dest = file_base
+        },
+        {
+          source = "$root_out_dir/$output_metadata"
+          dest = file_base_metadata
+        },
+      ]
+
+      if (defined(invoker.sdk_deps)) {
+        deps = invoker.sdk_deps
+      }
+
+      non_sdk_deps = [
+        ":$target_metadata",
+        ":$target_versioned",
+      ]
+
+      # Ensure all FIDL dependencies meet the compatibility and stability
+      # requirements.
+      # There are currently exceptions - see https://fxbug.dev/42081073.
+      if (!defined(assert_no_deps)) {
+        assert_no_deps = []
+      }
+
+      assert(invoker.sdk_category == "partner",
+             "Unexpected SDK category '${invoker.sdk_category}'.")
+
+      # Host tools in the IDK can depend on SDK categories up to "host_tool".
+      assert_no_deps += markers_partner_idk_host_tools_must_not_depend_on
+    }
+  }
+}

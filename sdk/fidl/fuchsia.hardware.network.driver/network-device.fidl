@@ -1,0 +1,710 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+/// Generic Network Device interface.
+///
+/// The definitions herein provide the API surface to expose a hardware device
+/// as a network device interface to the system through the FIDL protocol
+/// [`fuchsia.hardware.network/Device`]. A network device interface is the
+/// data-plane contract that allows the networking stack to send and receive
+/// frames on a physical or virtual network. A device exposes this capability by
+/// implementing the `NetworkDeviceImpl` protocol, which allows a middleware
+/// implementation to bind to it and offer the FIDL protocol to applications.
+///
+/// The API contract is based on three key concepts:
+/// - Frame Types
+/// - Receive and Transmit buffers
+/// - Memory layout
+///
+/// Frame Types are the defined contract that is exposed to applications, which
+/// convey the data type contained in a tx or rx buffer. The supported frame
+/// types are defined in [`fuchsia.hardware.network/FrameType`]. Upon
+/// initialization, the middleware implementation will fetch the supported frame
+/// types from the device through the `GetInfo` call.
+///
+/// Receive and Transmit buffers are buffers that are headed to different
+/// directions: a receive buffer is a piece of data that is received from the
+/// network, and makes its way to the application layer. A transmit buffer
+/// travels in the opposite direction: it originates in the application layer
+/// and makes its way out into the network. The device implementation receives
+/// buffers from the [`NetworkDeviceIfc`], which is offered by the middleware
+/// implementation.
+///
+/// A receive buffer flows from [`NetworkDeviceIfc`] into [`NetworkDeviceImpl`]
+/// through the [`NetworkDeviceImpl.QueueRxSpace`] method, which gives access to
+/// receive buffers. The diagram below illustrates the mechanism:
+/// ```text
+///  ++++++++++++++++++++                      +++++++++++++++++++++
+///  |       (1)        |  => RxSpaceBuffer => |       (2)         |
+///  | NetworkDeviceIfc |                      | NetworkDeviceImpl |
+///  |       (4)        |  <=    RxBuffer   <= |       (3)         |  <= Network data
+///  ++++++++++++++++++++                      +++++++++++++++++++++
+/// ```
+///
+/// - (1) `NetworkDeviceIfc` pushes available rx buffer space to
+/// `NetworkDeviceImpl` through [`NetworkDeviceImpl.QueueRxSpace`].
+/// - (2) `NetworkDeviceImpl` retains the available space buffers until network
+/// data comes in.
+/// - (3) `NetworkDeviceImpl` receives data from the network, stores it in one
+/// of its available [`RxSpaceBuffers`], making it a
+/// [`NetworkDeviceImpl.RxBuffer`].
+/// - (4) `NetworkDeviceImpl` sends the fulfilled `RxBuffer` to
+/// `NetworkDeviceIfc` through [`NetworkDeviceIfc.CompleteRx`], which, in turn,
+/// sends that data over to applications.
+///
+/// A transmit buffer flows from `NetworkDeviceIfc` into `NetworkDeviceImpl`
+/// through the [`NetworkDeviceImpl.QueueTx`] method, and it's returned to
+/// [`NetworkDeviceIfc`] as a [`TxResult`]. The diagram below illustrates the
+/// mechanism:
+///
+/// ```text
+///  ++++++++++++++++++++                 +++++++++++++++++++++
+///  |       (1)        |  => TxBuffer => |       (2)         |
+///  | NetworkDeviceIfc |                 | NetworkDeviceImpl |
+///  |       (4)        |  <= TxResult <= |       (3)         |  => Network data
+///  ++++++++++++++++++++                 +++++++++++++++++++++
+/// ```
+///
+/// - (1) `NetworkDeviceIfc` receives a transmit buffer from applications filled
+/// with data intended to be delivered to the network.
+/// - (2) `NetworkDeviceIfc` pushes the buffer into `NetworkDeviceImpl` through
+/// the [`NetworkDeviceImpl.QueueTx`] call.
+/// - (3) `NetworkDeviceImpl` sends the data contained in the buffer out into
+/// the network.
+/// - (4) When the data is successfully transmitted, `NetworkDeviceImpl` marks
+/// the transmission as complete referencing the buffer's identifier to
+/// [`NetworkDeviceIfc.CompleteTx`].
+@available(added=HEAD)
+library fuchsia.hardware.network.driver;
+
+using fuchsia.hardware.network;
+using zx;
+
+/// Maximum number of disjoint parts a buffer may have.
+// NOTE: the number 4 should cover the most common use case for split buffers: 1
+// contiguous buffer for header, 1 contiguous buffer for data, 0 or 1 contiguous
+// buffer for trailer. Rounded up to nearest power of two.
+const MAX_BUFFER_PARTS uint32 = 4;
+
+/// Buffer identifier.
+///
+/// Rx space buffers and tx buffers are identified by these when exchanged
+/// between interface and implementation.
+alias BufferId = uint32;
+
+/// A contiguous memory region in a VMO.
+///
+/// Note that a `BufferRegion` is only contiguous in terms of the VMO it
+/// references, it does not necessarily translate into contiguous physical
+/// memory.
+type BufferRegion = struct {
+    /// VMO backing this region.
+    vmo fuchsia.hardware.network.VmoId;
+    /// Offset, in bytes, of data chunk in VMO.
+    offset uint64;
+    /// Length, in bytes, of data chunk in VMO.
+    length uint64;
+};
+
+/// Metadata associated with a [`TxBuffer`] or an [`RxBuffer`].
+type BufferMetadata = struct {
+    /// Destination or source port identifier for this buffer.
+    port fuchsia.hardware.network.BasePortId;
+    /// Frame tx or rx flags, as defined in
+    /// [`fuchsia.hardware.network/RxFlags`],
+    /// [`fuchsia.hardware.network/TxFlags`], and
+    /// [`fuchsia.hardware.network/TxReturnFlags`].
+    flags uint32;
+    /// Type of frame contained in this buffer, as defined in
+    /// [`fuchsia.hardware.network/FrameType`].
+    frame_type fuchsia.hardware.network.FrameType;
+};
+
+/// Partial checksum metadata.
+type TxPartialCsumMetadata = struct {
+    /// The offset in bytes from the start of the frame to where the device
+    /// must begin computing the checksum.
+    start uint16;
+    /// The offset in bytes from the start of the checksummed portion of the
+    /// buffer to where the device must place the checksum result. The
+    /// checksum field itself is included in the checksum.
+    offset uint16;
+};
+
+/// A transmit buffer containing a single frame.
+type TxBuffer = struct {
+    /// Unique buffer identifier.
+    id BufferId;
+    /// Regions of VMO holding frame data.
+    data vector<BufferRegion>:MAX_BUFFER_PARTS;
+    /// Metadata associated with this buffer.
+    meta BufferMetadata;
+    /// Length of header bytes in the data contained in this buffer.
+    ///
+    /// Will always be either 0 or the requested [`DeviceInfo.tx_head_length`]
+    /// value. The head bytes are always at the beginning of the buffer.
+    head_length uint16;
+    /// Length of tail bytes in the data contained in this buffer.
+    ///
+    /// Will always be either 0 or the requested [`DeviceInfo.tx_tail_length`]
+    /// value. The tail bytes are always at the end of the buffer.
+    tail_length uint16;
+    /// Metadata sent by the stack to request generic checksum offloading.
+    ///
+    /// Only meaningful if `meta.flags` contains
+    /// `TxFlags::COMPUTE_GENERIC_CHECKSUM`.
+    partial_csum_metadata TxPartialCsumMetadata;
+};
+
+/// A buffer with allocated space to receive frames in. An `RxSpaceBuffer` must
+/// always be returned as an [`RxBufferPart`] within an [`RxBuffer`].
+type RxSpaceBuffer = struct {
+    /// Unique buffer identifier.
+    id BufferId;
+    /// VMO region where buffer space is located.
+    region BufferRegion;
+};
+
+/// A single contiguous part of an [`RxBuffer`], created from an
+/// [`RxSpaceBuffer`].
+type RxBufferPart = struct {
+    /// The buffer identifier informed in the [`RxSpaceBuffer`] that originated
+    /// this `RxBuffer`.
+    id BufferId;
+    /// Offset in bytes from [`RxSpaceBuffer`]'s start where inbound data
+    /// begins.
+    ///
+    /// This is a relative offset within the region defined by the originating
+    /// space, not an absolute offset in the space's VMO.
+    offset uint32;
+    /// The total length in bytes written in the [`RxSpaceBuffer`] referenced by
+    /// `id`, excluding any `offset` bytes.
+    length uint32;
+};
+
+/// A buffer containing a single frame received by the device.
+type RxBuffer = struct {
+    /// Metadata associated with buffer.
+    meta BufferMetadata;
+    /// Fulfilled rx buffer space comprising this frame.
+    ///
+    /// Must have at least one part.
+    data vector<RxBufferPart>:MAX_BUFFER_PARTS;
+    /// The number of full checksums, minus one, verified by the device.
+    ///
+    /// Only meaningful if `meta.flags` contains
+    /// `RxFlags::FULL_CHECKSUMS_VERIFIED`.
+    full_csums_verified uint16;
+};
+
+/// The result of a tx operation, reported to [`NetworkDeviceIfc`] through
+/// [`NetworkDeviceIfc.CompleteTx`].
+type TxResult = struct {
+    /// The buffer identifier informed in the [`TxBuffer`] that originated this
+    /// `TxResult`.
+    id BufferId;
+    /// The result status to report.
+    ///
+    /// Error results map to their equivalents in
+    /// [`fuchsia.hardware.network/TxReturnFlags`].
+    ///
+    /// - `ZX_OK` if the frame was sent successfully.
+    /// - `ZX_ERR_NOT_SUPPORTED` if any of the frame's flags are not supported.
+    /// - `ZX_ERR_NO_RESOURCES` if the transmit failed to allocate space in its
+    /// output queue for the frame.
+    /// - `ZX_ERR_UNAVAILABLE` if the device is offline (or went offline before
+    /// getting a confirmation that the frame was sent) or stopped.
+    /// - `ZX_ERR_INTERNAL` or any other unlisted errors will be reported as a
+    /// generic [`fuchsia.hardware.network/TxReturnFlags.TX_RET_ERROR`].
+    status zx.Status;
+};
+
+@transport("Driver")
+closed protocol NetworkPort {
+    /// Gets information about the port.
+    ///
+    /// Port information must not change over the port's lifetime.
+    ///
+    /// - response `info` port information.
+    strict GetInfo() -> (struct {
+        info fuchsia.hardware.network.PortBaseInfo;
+    });
+    /// Gets operational status of the port.
+    ///
+    /// Changes to operational status must be reported via
+    /// [`NetworkDeviceIfc.StatusChanged`]
+    ///
+    /// - response `status` snapshot of port's operational status.
+    strict GetStatus() -> (struct {
+        status fuchsia.hardware.network.PortStatus;
+    });
+    /// Notifies the port that there are sessions interested in it.
+    ///
+    /// An active port has sessions attached to it. Implementations may employ
+    /// power saving or other strategies on disabled ports. Implementations that
+    /// do employ such strategies:
+    ///   - should not report inbound frames for inactive ports;
+    ///   - must return errors for outbound frames destined to inactive ports.
+    ///
+    /// All ports are inactive on creation.
+    ///
+    /// + request `active` `true` if port has sessions attached to it, `false`
+    /// otherwise.
+    strict SetActive(struct {
+        active bool;
+    });
+    /// Gets an interface to the MAC addressing layer of the port.
+    ///
+    /// Ports that do not support MAC addressing must return an empty interface.
+    ///
+    /// - response `mac_ifc` mac addressing handle.
+    strict GetMac() -> (resource struct {
+        mac_ifc client_end:<MacAddr, optional>;
+    });
+    /// Notifies this port has been removed from the interface.
+    ///
+    /// Resources associated with the port must only be freed upon receiving the
+    /// `Removed` call. Note that Removed will ONLY be called if AddPort has
+    /// returned and indicated success. If AddPort fails this will not be called,
+    /// check the return status of AddPort instead.
+    strict Removed();
+};
+
+/// The maximum number of `TxResult` structs that could be sent in a single FIDL
+/// message while staying within the maximum message size enforced by the
+/// bindings.
+///
+/// At the time of writing, FIDL messages are limited to 65 KiB. In the current
+/// FIDL wire format, the size of each `TxResult` is 8 bytes, and the fixed
+/// overhead of the `CompleteTx` request is 32 bytes (16 for the FIDL message
+/// header + 16 for the vector), so we selected the maximum N where
+/// 32 + N * 8 <= 65 KiB.
+const MAX_TX_RESULTS uint32 = 8188;
+
+/// The maximum number of `RxBuffer` structs that could be sent in a single FIDL
+/// message while staying within the maximum message size enforced by the
+/// bindings.
+///
+/// At the time of writing, FIDL messages are limited to 65 KiB. In the current
+/// FIDL wire format, the size of an `RxBuffer` is 88 bytes, and the fixed
+/// overhead of the `CompleteRx` request is 32 bytes (16 for the FIDL message
+/// header + 16 for the vector), so we selected the maximum N where 32
+/// + N * 88 <= 65 KiB.
+const MAX_RX_BUFFERS uint32 = 744;
+
+/// Parameters for Rx buffer management.
+type RxBufferManagement = flexible union {
+    /// No dynamic management, queue everything. The default algorithm.
+    1: static struct {};
+    /// Use Little's Law: Queue size is the product of packet arrival rate and
+    /// the average time each packet spend in the queue (L = lambda * W).
+    2: simple struct {
+        /// This is used to calculate the arrival rate:
+        /// `Rate_n = alpha * Sample_n + (1 - alpha) * Rate_(n-1)`
+        /// The bigger this value, the more sensitive it is to the latest sample.
+        ///
+        /// Must be in the range (0, 1]. Defaults to server-assigned value if zero
+        /// or unset.
+        alpha float64;
+        /// Wait time budget at the driver.
+        ///
+        /// This is equivalent to W in Little's Law. More practically, this is an
+        /// upper bound for the average time buffers spend waiting in the queue
+        /// of the device impl before they are processed by the device interface.
+        ///
+        /// Guidance for driver implementors:
+        /// 1. If your driver uses a interrupt coalescing timeout, then this W should
+        ///    just be that or slightly larger to account for the processing time.
+        /// 2. If your driver does not use moderation, this value can be tuned:
+        ///    a starting point would be to use (bit rate, MTU, Rx depth) to derive
+        ///    a W under maximum pressure. As a reference (1Gbps, 1500, 256) leads to
+        ///    a W of 3.0 ms (256 / (10**9 / 8 / 1500) seconds). It will make little
+        ///    sense to go any bigger than that and you can decrease it and monitor
+        ///    for packet drops. You can compare the value against common interrupt
+        ///    coalescing configurations for reference.
+        ///
+        /// Defaults to server-assigned value if zero or unset.
+        delay_budget zx.Duration;
+        /// The sampling interval for estimating packet arrival rate.
+        ///
+        /// Determines how frequently the arrival rate is sampled and updated.
+        ///
+        /// Defaults to server-assigned value if zero or unset.
+        sample_interval zx.Duration;
+        /// The multiple of variance to consider when triggering immediate
+        /// buffer requests.
+        ///
+        /// When the current packet arrival rate exceeds the average arrival
+        /// rate by more than `variance_threshold` times the variance, the
+        /// queue will immediately request additional buffers.
+        ///
+        /// Must be positive. Defaults to server-assigned value if zero or unset.
+        variance_threshold float64;
+    };
+};
+
+@transport("Driver")
+closed protocol NetworkDeviceIfc {
+    /// Notifies the interface of status changes on port with `id`.
+    ///
+    /// Port status changes must always be notified through `StatusChanged`. The
+    /// interface will not poll ports for status via [`NetworkPort.GetStatus`].
+    ///
+    /// + request `id` port identifier.
+    /// + request `new_status` new port's status.
+    strict PortStatusChanged(struct {
+        id fuchsia.hardware.network.BasePortId;
+        new_status fuchsia.hardware.network.PortStatus;
+    });
+    /// Instantiates a new port with `id`.
+    ///
+    /// `id` must not be currently in use by any other ports. `id`s may be
+    /// reused once the provided port is destroyed by [`NetworkPort.Removed`].
+    ///
+    /// Port identifiers do not need to be stable across instantiations or
+    /// reboots. Port identifiers don't need to be allocated in any specific
+    /// order as long as [`MAX_PORTS`] is not exceeded.
+    ///
+    /// + request `id` new port identifier.
+    /// + request `port` handle to network port implementation.
+    @async
+    strict AddPort(resource struct {
+        id fuchsia.hardware.network.BasePortId;
+        port client_end:NetworkPort;
+    }) -> (struct {
+        status zx.Status;
+    });
+    /// Destroys port with `id`.
+    ///
+    /// NOTE: Resources associated with the port must not be freed until
+    /// [`NetworkPort.Removed`] is called.
+    ///
+    /// + request `id` removed port identifier.
+    strict RemovePort(struct {
+        id fuchsia.hardware.network.BasePortId;
+    });
+    /// Notifies interface of incoming rx data, contained in [`RxBuffer`].
+    ///
+    /// Callers should attempt to batch as many buffers as possible in a single
+    /// call. Number of buffers in a single call must be limited to the
+    /// [`DeviceInfo.rx_depth`] reported by the `NetworkDeviceImpl` that is
+    /// returning the buffers.
+    ///
+    /// Buffers with zero length are considered "unfulfilled". They're not
+    /// reported to any sessions and the buffer space comprising them may be
+    /// reused. Devices should return any outstanding buffer space as
+    /// unfulfilled on stop. See [`NetworkDeviceImpl.Stop`].
+    ///
+    /// By calling `CompleteRx` the caller relinquishes ownership of all buffers
+    /// that are being marked as complete.
+    ///
+    /// + request `rx` buffers containing incoming data.
+    strict CompleteRx(struct {
+        rx vector<RxBuffer>:MAX_RX_BUFFERS;
+    });
+    /// Notifies interface of complete transmit buffers.
+    ///
+    /// Callers should attempt to batch as many buffers as possible in a single
+    /// call.
+    ///
+    /// Number of buffers in a single call must be limited to the
+    /// [`DeviceInfo.tx_depth`] reported by the `NetworkDeviceImpl` that is
+    /// returning the buffers.
+    ///
+    /// By calling `CompleteTx` the caller relinquishes ownership of all buffers
+    /// that are being returned.
+    ///
+    /// + request `tx` transmit results.
+    strict CompleteTx(struct {
+        tx vector<TxResult>:MAX_TX_RESULTS;
+    });
+
+    /// Transfers a receive wake lease up to the application.
+    ///
+    /// Devices that allow applications to fully deal with a frame after a wake
+    /// from network traffic may use this method as a "lease baton passing"
+    /// strategy. Applications that support wake handling hold on to the lease
+    /// until the rx traffic is fully processed.
+    ///
+    /// Devices must keep track of the number of rx frames sent over
+    /// [`NetworkDeviceIfc.CompleteRx`] and use the latest issued frame number
+    /// as [`fuchsia.hardware.network/DelegatedRxLease.hold_until_frame`] to
+    /// guarantee processing. *Every* frame successfully given to `CompleteRx`
+    /// should increase the rx frame count. Note that the frame number is
+    /// 1-based, see `hold_until_frame` docs for details.
+    ///
+    /// Note that this is a one-way method and flow-control is enforced via the
+    /// regular rx space -> rx completion flow.
+    strict DelegateRxLease(resource struct {
+        delegated fuchsia.hardware.network.DelegatedRxLease;
+    });
+    /// Provides the `NetworkDeviceIfc` with a set of parameters to use for
+    /// buffer management.
+    ///
+    /// + ZX_ERR_INVALID_VALUE if the given parameters are invalid.
+    strict UpdateRxBufferParams(struct {
+        param RxBufferManagement;
+    }) -> () error zx.Status;
+
+    /// Notifies network device of buffer starvation.
+    ///
+    /// The server of this protocol needs to queue more RX buffers into the
+    /// implementation. The network device impl can ask for a number of
+    /// buffers, but it is used as a hint and the server tries its best
+    /// to fulfill the request.
+    ///
+    /// This is a better-effort method, if the network-device is also out of Rx
+    /// space buffers, then there is nothing more we can do.
+    ///
+    /// Note that this is a one-way asynchronous call, this only serves as
+    /// a signaling method to the platform driver, the queue action may not
+    /// happen inline with interrupt handling. Packets may get dropped within
+    /// the time window. The NetworkDeviceImpl can raise this signal when a
+    /// certain threshold is hit instead of waiting for the buffer space to be
+    /// actually empty.
+    strict RequestRxSpace(struct {
+        /// Note: the requested parameter is only a hint and it may not be
+        /// fully fulfilled. The implementation may not make assumptions about
+        /// the number of buffers queued as a result of this call.
+        ///
+        /// The device interface also respects other restraints, e.g.
+        /// rx_depth of the device impl. It never queues more buffers
+        /// than allowed by the device impl.
+        requested uint64;
+    });
+};
+
+/// Static device information.
+/// `DeviceImplInfo` must not change for the entire lifetime of a device.
+type DeviceImplInfo = table {
+    /// Device features
+    /// Required.
+    1: device_features uint32;
+    /// Maximum depth of tx frames in device's outgoing queue.
+    /// Required.
+    2: tx_depth uint16;
+    /// Maximum number of rx frames in a device's incoming queue.
+    /// Required.
+    3: rx_depth uint16;
+    /// Rx depth threshold at which the device should be fed new rx buffers.
+    ///
+    /// New buffer notifications from [`NetworkDeviceIfc`] may be skipped while
+    /// the number of rx buffers held by the implementation is larger than
+    /// `rx_threshold`. It is invalid to provide a value larger than `rx_depth`.
+    /// `rx_threshold = rx_depth` is functionally equivalent to `rx_threshold =
+    /// rx_depth - 1`.
+    ///
+    /// A large value (close to `rx_depth`) may cause considerable CPU thrash
+    /// for small rx completion transaction sizes, while a small value may cause
+    /// the implementation to be starved of buffers. The typical choice of value
+    /// is `rx_depth / 2`.
+    /// Required.
+    4: rx_threshold uint16;
+    /// Maximum virtual discontiguous buffer parts accepted by the device.
+    ///
+    /// Devices that can't perform scatter-gather operations must set
+    /// `max_buffer_parts` to 1.
+    ///
+    /// Must be in the range [1, `MAX_BUFFER_PARTS`].
+    /// Required.
+    5: max_buffer_parts uint8;
+    /// Maximum total length of buffers. May be set to zero for no maximum.
+    ///
+    /// Devices that do not support scatter-gather DMA may set this to a value
+    /// smaller than a page size to guarantee compatibility.
+    /// Required.
+    6: max_buffer_length uint32;
+    /// Alignment requirement for buffers relative to the start of VMOs.
+    ///
+    /// Must be greater than zero.
+    /// Required.
+    7: buffer_alignment uint32;
+    /// The minimum rx buffer length for correct operation, in bytes.
+    /// Required.
+    8: min_rx_buffer_length uint32;
+    /// The minimum tx buffer length for correct operation, in bytes.
+    ///
+    /// This length accounts only for the buffer's body, and should not account
+    /// for `tx_head_length` or `tx_tail_length`.
+    /// Required.
+    9: min_tx_buffer_length uint32;
+    /// Number of bytes requested as header bytes on tx buffers.
+    ///
+    /// If set to zero, tx buffers will never contain header space. Otherwise,
+    /// tx buffers will start at the beginning of the header space, and the
+    /// header region will be informed.
+    /// Required.
+    10: tx_head_length uint16;
+    /// Number of bytes requested as tail bytes on tx buffers.
+    ///
+    /// If set to zero, tx buffers will never contain tail space. Otherwise, tx
+    /// buffers will end at the end of the tail space, and the tail region will
+    /// be informed.
+    /// Required.
+    11: tx_tail_length uint16;
+    /// Minimum amount of Rx buffers to be queued. If unset, rx_threshold
+    /// is assumed to be the minimum.
+    12: min_rx_buffers uint16;
+    /// Initial Rx buffer management parameters.
+    /// If unset, `static` is assumed for Rx buffer managing.
+    13: rx_buffer_management RxBufferManagement;
+};
+
+/// The maximum number of `TxBuffer` structs that could be sent in a single FIDL
+/// message while staying within the maximum message size enforced by the
+/// bindings.
+///
+/// At the time of writing, FIDL messages are limited to 65 KiB. In the current
+/// FIDL wire format, the size of a `TxBuffer` is 144 bytes, and the
+/// fixed overhead of the `QueueTx` request is 32 bytes (16 for the FIDL message
+/// header + 16 for the vector), so we selected the maximum N where
+/// 32 + N * 144 <= 65 KiB.
+const MAX_TX_BUFFERS uint32 = 454;
+
+/// The maximum number of `RxSpaceBuffer` structs that could be sent in a single
+/// FIDL message while staying within the maximum message size enforced by the
+/// bindings.
+///
+/// At the time of writing, FIDL messages are limited to 65 KiB. In the current
+/// FIDL wire format, the maximum size of an `RxSpaceBuffer` is 32 bytes, and
+/// the fixed overhead of the `QueueRxSpace` request is 32 bytes (16 for the
+/// FIDL message header + 16 for the vector), so we selected the maximum N where
+/// 32 + N * 32 <= 65 KiB.
+const MAX_RX_SPACE_BUFFERS uint32 = 2047;
+
+@discoverable
+@transport("Driver")
+closed protocol NetworkDeviceImpl {
+    /// Initializes the network device.
+    ///
+    /// `Init` is only called once during the lifetime of the device to register
+    /// `iface` as the callback target for the Network Device implementation.
+    ///
+    /// Upon initialization, the device is expected to be in the "Stopped"
+    /// state, the `Start` method will be called once the data path needs to be
+    /// opened.
+    ///
+    /// + request `iface` handle to the device interface.
+    /// - response `s` initialization status. A value other than `ZX_OK` will
+    /// cause the device to unbind.
+    @async
+    strict Init(resource struct {
+        iface client_end:NetworkDeviceIfc;
+    }) -> (struct {
+        s zx.Status;
+    });
+    /// Starts the device's data path.
+    ///
+    /// `start` signals to the device implementation that it should bring up its
+    /// data path and be ready to receive tx frames and `iface` will start
+    /// accepting rx frames.
+    ///
+    /// The device is only considered started once `Start` returns successfully.
+    /// Until then, the contract guarantees that no other data-path calls will
+    /// be made to the device (`QueueTx`, `RxAvailable`, `Stop`, or a second
+    /// call to `Start`), so implementers can safely assume or assert that this
+    /// contract is upheld.
+    ///
+    /// - response `s` start status. `ZX_OK` indicates a successful start.
+    /// `ZX_ERR_ALREADY_BOUND` indicates that the device has already been
+    /// successfully started. Any other status value indicates an implementation
+    /// specific error.
+    @async
+    strict Start() -> (struct {
+        s zx.Status;
+    });
+    /// Stops the network device.
+    ///
+    /// The device implementation must return all outstanding Tx and Rx buffers
+    /// upon receiving this call. Any new buffers received in the stopped state
+    /// must be returned with an appropriate error (tx) or unfulfilled (rx). See
+    /// [`NetworkDeviceIfc.CompleteTx`] and [`NetworkDeviceIfc.CompleteRx`] for
+    /// details.
+    ///
+    /// The device implementation may perform any power saving measures after
+    /// observing stop.
+    @async
+    strict Stop() -> ();
+    /// Gets information about the device.
+    ///
+    /// Device information must not change over the course of the lifetime of
+    /// the device.
+    ///
+    /// - response `info` device information.
+    strict GetInfo() -> (struct {
+        info DeviceImplInfo;
+    });
+    /// Enqueues a list of buffers for transmission on the network device.
+    ///
+    /// The driver takes ownership of the buffer and must complete the tx
+    /// transaction by using [`NetworkDeviceIfc.CompleteTx`] operations once it
+    /// is done with each buffer in `buffers`.
+    ///
+    /// The total number of outstanding tx buffers given to a device will never
+    /// exceed the reported [`DeviceInfo.tx_depth`] value. Which also means that
+    /// no more than `tx_depth` buffers are going to be informed at once in a
+    /// single call to `QueueTx`.
+    ///
+    /// Buffers enqueued while the device in is the stopped state must be
+    /// returned with an appropriate error. See [`TxResult.status`] for specific
+    /// error codes.
+    ///
+    /// + request `buffers` tx buffers to enqueue for sending.
+    strict QueueTx(struct {
+        buffers vector<TxBuffer>:MAX_TX_BUFFERS;
+    });
+    /// Enqueues a list of rx buffer space on the network device.
+    ///
+    /// The driver takes ownership of the buffer and must complete the
+    /// transaction (once network data arrives) using
+    /// [`NetworkDeviceIfc.CompleteRx`].
+    ///
+    /// The total number of outstanding rx buffers given to a device will never
+    /// exceed the reported [`DeviceInfo.rx_depth`] value. Which also means that
+    /// no more than `rx_depth` buffers are going to be informed at once in a
+    /// single call to `QueueRxSpace`.
+    ///
+    /// Buffers enqueued while the device in is the stopped state must be
+    /// returned with a zero length.
+    ///
+    /// + request `buffers` rx space buffers to be filled with network data when
+    /// it arrives.
+    strict QueueRxSpace(struct {
+        buffers vector<RxSpaceBuffer>:MAX_RX_SPACE_BUFFERS;
+    });
+    /// Informs device that a new VMO is being used to store frame data.
+    ///
+    /// Implementers must store the VMO handle referenced by `id` until
+    /// [`NetworkDeviceImpl.ReleaseVmo`] is called with the same `id`.
+    ///
+    /// + request `id` identifier used to reference this VMO.
+    /// + request `vmo` VMO where frame data will be stored.
+    /// - response `s` vmo registration status. `ZX_OK` indicates a successful
+    /// VMO preparation. Any other status value indicates an implementation
+    /// specific error and causes the client session which owns the VMO to be
+    /// closed.
+    @async
+    strict PrepareVmo(resource struct {
+        id fuchsia.hardware.network.VmoId;
+        vmo zx.Handle:VMO;
+    }) -> (struct {
+        s zx.Status;
+    });
+    /// Device may dispose of all references to the VMO referenced by `id`.
+    ///
+    /// No more buffers will be sent with this `id`.
+    ///
+    /// `ReleaseVmo` is guaranteed to only be called when the implementation
+    /// holds no buffers that reference that `id`.
+    ///
+    /// + request `id` VMO identifier.
+    strict ReleaseVmo(struct {
+        id fuchsia.hardware.network.VmoId;
+    }) -> ();
+};
+
+/// Provide NetworkDeviceImpl as a service so that it can be discovered and used
+/// by DFv1 children.
+service Service {
+    network_device_impl client_end:NetworkDeviceImpl;
+};

@@ -1,0 +1,140 @@
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Device management
+### attach to a serial console
+## usage: fx serial [--output-file file] [--baud rate] [device-path]
+##
+## Options:
+##   --output-file file      Record the serial output to the specified file.
+##   --baud rate             Set the baud rate for the serial connection.
+##                           Default is 115200.
+##
+## Note: Options above only work with physical devices, not supported for emulators.
+##
+## If no device path is given, a list of options will be presented.
+##
+## If the selected device is not readable by the active user account, it will
+## first be chmod'd to provide access to the current user.
+##
+## Exit the session with CTRL+o
+##
+## In order to have arrow keys work, execute `export TERM=xterm; /boot/bin/sh`
+## on in the console.
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+fx-config-read
+
+function serial-emulator {
+  fx-info "Assuming emulator already started with \`ffx emu start --headless\`"
+  fx-command-run ffx emu console -s
+  return $?
+}
+
+if ! which socat >/dev/null 2>&1; then
+  fx-warn "The command \`socat\` was not found!"
+  if [[ "$(uname)" == "Linux" ]]; then
+    fx-warn "  If connecting to physical device, maybe \`apt install socat\`"
+  else
+    fx-warn "  If connecting to physical device, maybe \`brew install socat\`"
+  fi
+  fx-info "Trying to connect to emulator instead"
+  serial-emulator
+  exit $?
+fi
+
+pontis_message=""
+if [[ -e "$(find_executable "pontis-pts")" ]]; then
+  if pontis_serials="$(fx-command-run pontis-pts)"; then
+    pontis_message="\nNo serial devices found on pontis"
+    while IFS= read -r pontis_serial; do
+      pontis_options+=("$pontis_serial")
+    done <<<"$pontis_serials"
+  fi
+fi
+
+BAUD_RATE=115200
+DEVICE=""
+OUTPUT_ARGS=()
+# Separate output file from device path
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-file)
+      # The next argument is the file path
+      shift
+      OUTPUT_ARGS=("-R" "$1")
+      shift
+      ;;
+    --baud)
+      shift
+      BAUD_RATE="$1"
+      shift
+      ;;
+    *)
+      if [[ -z "$DEVICE" ]]; then
+        DEVICE="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$DEVICE" ]]; then
+  options=($(find /dev -maxdepth 1 -name ttyUSB\* -or -name tty.SLAB_USBtoUART\* -or -name tty.usbserial\* | sort))
+  options+=("${pontis_options[@]}")
+  if [[ "${#options}" = 0 ]]; then
+    fx-warn "No ttyUSB*, tty.SLAB_USBtoUSART* or tty.usbserial* found in /dev${pontis_message}\nIf connecting to physical device, please specify any known path exactly."
+    fx-info "Trying to connect to emulator instead"
+    serial-emulator
+    exit $?
+  fi
+  if [[ "${#options[@]}" -eq 1 ]]; then
+    echo >&2 "Found one device at ${options[0]}"
+    DEVICE="${options[0]}"
+  elif [[ "${#options[@]}" -gt 1 ]]; then
+    echo >&2 "Select a serial device from the following list:"
+    select device in "${options[@]}"; do
+      DEVICE="$device"
+      break
+    done
+  fi
+fi
+
+
+if [[ ! -e "$DEVICE" ]]; then
+  fx-error "$DEVICE not found"
+  fx-info "Trying to connect to emulator instead"
+  serial-emulator
+  exit $?
+fi
+
+if [[ ! -r "$DEVICE" ]]; then
+  if [[ "$(uname)" == "Linux" ]]; then
+    owninggroup=$(stat "$DEVICE" --printf="%G")
+    if [[ ! -r "$DEVICE" ]]; then
+      fx-error "$DEVICE is not readable by $USER"
+      fx-error " fix: sudo usermod -a -G "$owninggroup" $USER"
+      fx-error "You need to start a new login session for a group change to take effect"
+      exit 1
+    fi
+  else
+    fx-warn "$DEVICE is not readable by $USER"
+    fx-warn "Fix the permissions on $DEVICE or group membership of $USER"
+  fi
+fi
+
+echo >&2 "SERIAL: Connecting to $DEVICE..."
+echo >&2 "SERIAL: Use CTRL-o to exit"
+echo >&2 "SERIAL: Run: \`export TERM=xterm; /boot/bin/sh\` for improved key bindings"
+
+# This is the method recommended in the socat manual to detect the presence /
+# omission of this feature.
+if $(socat -hh | grep ' ospeed' >/dev/null); then
+  speed="ospeed=${BAUD_RATE},ispeed=${BAUD_RATE}"
+else
+  speed="b${BAUD_RATE}"
+fi
+
+exec socat "${OUTPUT_ARGS[@]}" -,sane,cfmakeraw,escape=0x0f "file:${DEVICE}",sane,cfmakeraw,"${speed}",cs8,parenb=0,cstopb=0,ixoff=0,ixon=0,crtscts=0,clocal=1,nonblock=1

@@ -1,0 +1,742 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/board.gni")
+import("//build/config/fuchsia/target_api_level.gni")
+import("//build/group_with_inputs.gni")
+import("//build/testing/environments.gni")
+import("//build/testing/platforms.gni")
+
+declare_args() {
+  # A list of device types this build is allowed to run tests on. If set, only
+  # these device types will be used for tests.
+  allowed_test_device_types = []
+
+  # A list of host device types this build is allowed to run tests on. If set,
+  # only these host device types will be used for tests.
+  allowed_test_host_device_types = []
+}
+
+_log_severity_allowed_val = [
+  "FATAL",
+  "ERROR",
+  "WARN",
+  "INFO",
+  "DEBUG",
+  "TRACE",
+]
+
+# Call "expanding" the operation that takes a scope
+# {
+#  x = a
+#  y = b
+#  z = c
+#  ...
+# }
+# and converts it to a list [{x=a}, {y=b}, {z=c},...].
+#
+# Expand each scope of test platform dimensions and group them by architecture
+# (i.e., cpu). The same thing is done below with each environment's dimensions
+# scope to more easily compare.
+#
+# This is done outside of the template so that the results are cached on a
+# per-toolchain basis, instead of done for each of the 3600+ invocations of
+# the test_spec() template.
+#
+_target_platform_dims = []
+_other_platform_dims = []
+foreach(platform, test_platforms) {
+  platform_dims = []  # Clear from previous iteration.
+  foreach(key, all_dimension_keys) {
+    platform_dims += [
+      {
+        forward_variables_from(platform, [ key ])
+      },
+    ]
+  }
+
+  # Empty scopes may have been introduced to platform_dims, corresponding to
+  # non-existent keys;
+  # Add and then subtract an empty scope to remove them.
+  empty_dim = {  # Clear from previous iteration.
+  }
+  platform_dims += [ empty_dim ]
+  platform_dims -= [ empty_dim ]
+
+  if (!defined(platform.cpu) || platform.cpu == target_cpu) {
+    _target_platform_dims += [ platform_dims ]
+  } else {
+    _other_platform_dims += [ platform_dims ]
+  }
+}
+
+# A given board, by definition, restrict which devices it meant for.
+# We constrain the allowed device types and the dimensions considered as
+# a function of this.
+# TODO(joshuaseaton): Use board_name instead of cpu in the reasoning above.
+allowed_device_types = allowed_test_device_types
+allowed_host_device_types = allowed_test_host_device_types
+
+# If the build specified no test device types, add the default set.
+# If they _did_ specify test device types, don't add any.
+if (allowed_device_types == []) {
+  if (board_name == "x64") {
+    allowed_device_types = [
+      "AEMU",
+      "QEMU",
+      "Intel NUC Kit NUC11TNHv5",
+      "GCE",
+      "crosvm",
+    ]
+  } else if (board_name == "arm64") {
+    allowed_device_types = [
+      "QEMU",
+      "GCE",
+      "crosvm",
+    ]
+  } else if (board_name == "riscv64") {
+    allowed_device_types = [ "QEMU" ]
+  } else if (board_name == "qemu-arm64") {
+    allowed_device_types = [
+      "QEMU",
+      "crosvm",
+    ]
+  } else if (board_name == "astro") {
+    allowed_device_types = [ "Astro" ]
+  } else if (board_name == "luis") {
+    allowed_device_types = [ "Luis" ]
+  } else if (board_name == "sherlock") {
+    allowed_device_types = [ "Sherlock" ]
+  } else if (board_name == "nelson") {
+    allowed_device_types = [ "Nelson" ]
+  } else if (board_name == "vim3") {
+    allowed_device_types = [ "Vim3" ]
+  } else if (board_name == "chromebook-x64") {
+    allowed_device_types = [ "Atlas" ]
+  } else if (board_name == "kola") {
+    allowed_device_types = [ "Kola" ]
+  } else if (board_name == "lilac") {
+    allowed_device_types = [ "Lilac" ]
+  } else if (board_name == "maple") {
+    allowed_device_types = [ "Maple" ]
+  } else if (board_name == "sorrel") {
+    allowed_device_types = [ "Sorrel" ]
+  } else if (board_name == "iris") {
+    allowed_device_types = [ "Iris" ]
+  }
+}
+
+# If the build specified no test host device types, add the default set.
+if (allowed_host_device_types == []) {
+  if (board_name == "arm64") {
+    allowed_host_device_types = [ host_device_types.gcp_c4a_highmem_96_bm ]
+  }
+}
+
+# Describes the target device environment in which a test should
+# run. This specification is written to a tests.json file in the build
+# directory, to be aggregated at test-time.
+#
+# The format is documented at
+# https://fuchsia.dev/fuchsia-src/reference/testing/tests-json-format
+#
+# Parameters
+#
+#   path (optional for fuchsia; required for host)
+#     [string]: The path on the target OS at which the test will be installed.
+#
+#   name (optional)
+#     [string]: A name to associate with the test. Defaults to `package_url`
+#     for Fuchsia tests, or a variant-stable version of `path` for host.
+#
+#   target (required)
+#     [label_with_toolchain]: The test target. This will be used directly as the
+#     `label` field.
+#
+#   source_label (optional)
+#     [label_no_toolchain]: The build label of the test target that corresponds
+#     to where the test is actually defined in source code. This will be used
+#     directly as the `source_label` field. This defaults to the value of the
+#     `target` field, but should be overridden for Bazel tests where the test's
+#     source code is not colocated with its GN target definition.
+#
+#   package_url (optional)
+#     [string] In the case of a fuchsia test, this describes the packaged test
+#     via a fuchsia package URL. See //docs/the-book/package_url.md for more
+#     details.
+#
+#   package_label (optional)
+#     [string] In the case of a fuchsia test, this describes the GN label
+#     (with toolchain) of the fuchsia package.
+#
+#   package_manifests (optional)
+#     [list of strings] In the case of a fuchsia test, this contains a set of
+#     paths to package manifests that describe the blobs needed by this test.
+#
+#   package_deps (optional)
+#     [list of labels] List of package labels that the test depends on which it
+#     will try to resolve at runtime. This will be used to generate a file that
+#     contains the package manifests of these package deps which can be used to
+#     know the blobs required by the test. If not set correctly, this can result
+#     in test resolution errors.
+#
+#   package_resolution_timeout_secs (optional)
+#     [int] The timeout in seconds needed to resolve the test package.
+#
+#   component_label (optional)
+#     [string] In case of test component, this describes the Gn label (with
+#     toolchain) of the fuchsia component.
+#
+#   deps (optional)
+#     [list of labels]: List of labels that the test depends on.
+#
+#   product_bundle (optional)
+#     [string] The name of a product bundle describing the system against which
+#     the test should be run (describing the test itself in the case of boot
+#     tests). Associated product bundle artifacts can be looked up with this
+#     name in the product bundle build API module.
+#
+#   bootup_timeout_secs (optional)
+#     [int] The timeout in seconds the test expects the provided product_bundle
+#     and environment it's run against will take to boot up. This value is only
+#     respected when `is_boot_test` is true.
+#
+#   expects_ssh (optional, default: True)
+#     [bool] Whether the test is expected to run against a product bundle that
+#     supports SSH. This value should be the same for all tests with the same
+#     product_bundle.
+#
+#   environments (optional, default: Emu for fuchsia; else a VM)
+#     [list of scopes] Device environments in which the test should run.
+#
+#     Each scope in $environments contains:
+#
+#       dimensions (required)
+#         [scope] Dimensions of bots to target. Valid dimensions are
+#         element-wise subsets of the test platform entries defined in
+#         //build/testing/platforms.gni.
+#
+#       emulator (optional)
+#         [scope] Emulator-specific configuration, mirroring the command-line
+#         options of `ffx emu start`.
+#
+#         Each scope contains the following:
+#
+#           name (required)
+#             [string] A unique name to describe this configuration, which will also
+#             be featured into the name of the test shard in which this emulator
+#             configuration is to run.
+#
+#           device (optional, default: "${board_name}-emu-recommended")
+#             [string] The name of a virtual device specification to run. See
+#             //build/virtual-devices/BUILD.gn for valid options.
+#
+#           accel (optional, default: "auto")
+#             [string] Virtualization acceleration. Valid choices are "none" to
+#             disable acceleration, "hyper" to use the host's hypervisor interface
+#             (KVM on Linux and HVF on MacOS), or "auto" to use the hypervisor if
+#             detected.
+#
+#           kernel_args (optional)
+#             [list of strings] Additional kernel arguments to pass to the emulator.
+#
+#           uefi (optional)
+#             [bool] Whether to create and start an emulator with a full GPT disk including
+#             UEFI boot environment and all partitions in one flat file.
+#
+#           vbmeta_key (required if uefi=true)
+#             [string] The path to a certificate (PEM file) to be used to sign the vbmeta.
+#             There is no default, the path has to be specified explicitly.
+#
+#           vbmeta_key_metadata (required if uefi=true)
+#             [string] The path to the metadata file (bin file) accompanying the certificate.
+#             There is no default, the path has to be specified explicitly.
+#
+#       tags (optional)
+#         [list of strings] keys on which tests may be grouped. Tests with
+#         given tags will be run (1) together, and (2) only with support from
+#         the Infrastructure team. Labels are used as an escape hatch from the
+#         default testing pipeline for special tests or environments.
+#
+#
+#   log_settings (optional, default: see below properties)
+#     [json] Properties of logs produced by this test run.
+#
+#     Following properties are supported:
+#
+#     max_severity (optional, default: WARN)
+#       [string] Defines maximum severity of logs which can be produced by test
+#       environment. This can only be defined for test components. Test will fail
+#       if any component in its environment produces log with greater severity
+#       than defined here.
+#
+#     min_severity (optional)
+#       [string] Defines minimum severity of logs for the test environment to produce,
+#       overriding default values in the binaries themselves (usually INFO). Messages
+#       below this severity will not be printed.
+#
+#   parallel (optional)
+#     [int] Defines maximum concurrent test cases to run. This only works with v2 tests.
+#     If not defined, test runner will decide the default value.
+#
+#   isolated (optional)
+#     [bool] Whether the test needs to be run in isolation to other tests.
+#
+#   is_boot_test (optional)
+#     [bool] Whether the test is a boot test. This implies isolated=true and requires a
+#     `product_bundle` to be provided.
+#
+#   timeout_secs (optional)
+#     [int] The timeout in seconds for the test.
+#
+#   os (optional)
+#     [string] The intended os for the test to run on. If not defined, the
+#     current_os will be used.
+#
+#   cpu (optional)
+#     [string] The intended cpu for the test to run on. If not defined, the
+#     current_cpu will be used.
+#
+#   create_no_exception_channel (optional)
+#     [bool] Indicates that test_manager should create no exception channels as it would
+#     otherwise do to detect panics. Some tests that create exception channels at the job
+#     level will fail if test_manager creates its customary exception channels.
+#
+#   test_filters (optional)
+#     [list of strings] Test case filter patterns to apply when running the test.
+#
+template("test_spec") {
+  testonly = true
+
+  # The test is to be built, but not run.
+  build_only = defined(invoker.build_only) && invoker.build_only
+  if (build_only) {
+    assert(!defined(environments),
+           "build_only tests should not specify environments")
+    _test_environments = []
+  } else {
+    if (defined(invoker.environments)) {
+      _test_environments = invoker.environments
+      # assert(
+      #     invoker.environments != [],
+      #     "Test 'environments' must not be empty.  Build-only tests should use 'build_only = true' instead of specifying an empty set of environments.")
+    } else {
+      # Set default environments: Emu for a fuchsia test, and VMs for linux and
+      # mac tests.
+      if (is_fuchsia || is_kernel) {
+        _test_environments = basic_envs
+      } else if (is_linux) {
+        _test_environments = [ host_env ]
+      } else {
+        assert(false, "$current_os not supported")
+      }
+    }
+  }
+  foreach(env, _test_environments) {
+    empty_scope = {  # Clear from previous iteration
+    }
+    assert(defined(env.dimensions) && env.dimensions != empty_scope,
+           "each environment must specify dimensions")
+  }
+
+  if (is_fuchsia) {
+    _log_settings = {
+    }
+    if (defined(invoker.log_settings)) {
+      _log_settings = invoker.log_settings
+    }
+    if (!defined(_log_settings.max_severity)) {
+      _log_settings.max_severity = "WARN"
+    }
+    if (defined(_log_settings.min_severity)) {
+      assert(
+          _log_severity_allowed_val + [ _log_settings.min_severity ] -
+              [ _log_settings.min_severity ] != _log_severity_allowed_val,
+          "Invalid 'log_settings.min_severity': ${_log_settings.min_severity}, valid values are ${_log_severity_allowed_val}")
+    }
+
+    assert(
+        _log_severity_allowed_val + [ _log_settings.max_severity ] -
+            [ _log_settings.max_severity ] != _log_severity_allowed_val,
+        "Invalid 'log_settings.max_severity': ${_log_settings.max_severity}, valid values are ${_log_severity_allowed_val}")
+
+    if (defined(invoker.package_url)) {
+      s = string_split(invoker.package_url, ".cm")
+      is_v2_component = false
+      foreach(s, string_split(invoker.package_url, ".cm")) {
+        is_v2_component = s == ""
+      }
+
+      # Running test cases in parallel is slow (https://fxbug.dev/42167081) for
+      # "coverage" variant. Run cases serially for that variant by default.
+      # Also let devs override the default if needed.
+      if (!defined(invoker.parallel) && is_v2_component &&
+          select_variant + [ "coverage" ] - [ "coverage" ] != select_variant) {
+        _parallel = 1
+      }
+    }
+  } else {
+    not_needed(invoker, [ "log_settings" ])
+  }
+
+  if (defined(invoker.parallel)) {
+    assert(is_fuchsia, "'parallel' can only be used when target is fuchsia.")
+    assert(invoker.parallel > 0)
+    assert(defined(invoker.package_url))
+    assert(is_v2_component, "'parallel' only works for v2 test components.")
+    _parallel = invoker.parallel
+  }
+
+  if (defined(invoker.create_no_exception_channel)) {
+    assert(
+        is_fuchsia,
+        "'create_no_exception_channel' can only be used when target is fuchsia.")
+    assert(defined(invoker.package_url))
+    assert(is_v2_component,
+           "'create_no_exception_channel' only works for v2 test components.")
+    _create_no_exception_channel = invoker.create_no_exception_channel
+  }
+
+  _expects_ssh = true
+  if (defined(invoker.expects_ssh)) {
+    _expects_ssh = invoker.expects_ssh
+  } else if (is_linux && _test_environments == [ host_env ]) {
+    # If the test is a pure host test, expects_ssh should be false
+    # because there is no target to run against.
+    _expects_ssh = false
+  }
+
+  target_envs = []
+  foreach(env, _test_environments) {
+    dims = []  # Clear from previous iteration.
+    if (defined(env.dimensions)) {
+      dim = {
+      }
+      dim = env.dimensions
+      assert(!defined(dim.tags),
+             "tags are only valid in an environments scope, not in dimensions")
+      assert(
+          !defined(dim.dimensions),
+          "found nested dimensions environment field. Did you set `dimensions = some_env`? It should be `dimensions = some_env.dimensions`")
+
+      foreach(key, all_dimension_keys) {
+        dims += [
+          {
+            forward_variables_from(env.dimensions, [ key ])
+          },
+        ]
+      }
+    }
+    empty_dim = {  # Clear from previous iteration.
+    }
+    dims += [ empty_dim ]
+    dims -= [ empty_dim ]
+
+    # Check if the environment's dimensions match those of a platform of the
+    # target architecture; if a match, include the environment among the
+    # test spec's.
+    # Note that in GN "A is a subset of B" is equivalent to `A + B - B == []`.
+    match = false
+    foreach(platform_dims, _target_platform_dims) {
+      if (dims + platform_dims - platform_dims == []) {
+        match = true
+        target_envs += [ env ]
+      }
+    }
+
+    # If the environment's dimensions do not match a target architecture, ensure
+    # that they match those of a platform of another architecture.
+    if (!match) {
+      foreach(platform_dims, _other_platform_dims) {
+        match = match || dims + platform_dims - platform_dims == []
+      }
+      if (!match) {
+        print("Could not match environment specifications for '$target_name':")
+        print("$env")
+        assert(
+            match,
+            "Consult //build/testing/platforms.gni for all allowable specifications")
+      }
+    }
+  }
+
+  target_name_deps = []
+  target_name_data_deps = []
+
+  # Rely on metadata reachable through deps to determine any runtime
+  # dependencies of the test; record them to a file.
+  runtime_deps_file = ""
+  if ((defined(invoker.deps) && invoker.deps != []) ||
+      (defined(invoker.data_deps) && invoker.data_deps != []) ||
+      (defined(invoker.public_deps) && invoker.public_deps != [])) {
+    runtime_deps_file = "$target_gen_dir/${target_name}.deps.json"
+    runtime_deps_target_name = "${target_name}_deps"
+
+    generated_file(runtime_deps_target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "data_deps",
+                               "deps",
+                               "public_deps",
+                             ])
+      outputs = [ runtime_deps_file ]
+      data_keys = [ "test_runtime_deps" ]
+      walk_keys = [ "test_runtime_deps_barrier" ]
+      rebase = root_build_dir
+      output_conversion = "json"
+    }
+
+    target_name_deps += [ ":$runtime_deps_target_name" ]
+  }
+
+  # Some tests depend on other packages so get the paths to the
+  # package_manifests of those package dependencies to attach to
+  # the test_spec of the test so we know what blobs it depends on.
+  # Most target tests use debug_agent to get backtraces so include
+  # it by default. A target test can be defined by a test that has a
+  # package_manifests field.
+  pkg_manifest_deps_file = ""
+  package_deps = []
+  if (defined(invoker.package_deps)) {
+    package_deps = invoker.package_deps
+  }
+  if (package_deps != [] || defined(invoker.package_label)) {
+    if (target_cpu != "riscv64" &&
+        current_build_target_api_level == "PLATFORM") {
+      # TODO(https://fxbug.dev/42074048): Remove conditional once
+      # debug_agent works for riscv64.
+      package_deps += [ "//src/developer/debug/debug_agent" ]
+    }
+    pkg_manifest_deps_file = "$target_gen_dir/${target_name}.pkg_manifests.json"
+    pkg_manifest_deps_target_name = "${target_name}_pkg_manifest_deps"
+
+    _manifest_entries = []
+    _manifest_inputs = []
+    _package_deps_with_toolchain = []
+    foreach(package_dep, package_deps) {
+      _package_deps_with_toolchain +=
+          [ get_label_info(package_dep, "label_no_toolchain") +
+            "(${target_toolchain})" ]
+    }
+    foreach(package_target, _package_deps_with_toolchain) {
+      _package_out_dir = get_label_info(package_target, "target_out_dir")
+      _package_name = get_label_info(package_target, "name")
+      _manifest_path =
+          "${_package_out_dir}/${_package_name}/package_manifest.json"
+      _manifest_path_rebased = rebase_path(_manifest_path, root_build_dir)
+      _manifest_entries += [ _manifest_path_rebased ]
+      _manifest_inputs += [ _manifest_path ]
+    }
+    generated_file(pkg_manifest_deps_target_name) {
+      forward_variables_from(invoker, [ "testonly" ])
+      deps = _package_deps_with_toolchain
+      outputs = [ pkg_manifest_deps_file ]
+      output_conversion = "json"
+      contents = _manifest_entries
+    }
+    pkg_manifest_deps_inputs_name = "${target_name}.pkg_manifest_deps.inputs"
+    group_with_inputs(pkg_manifest_deps_inputs_name) {
+      deps = _package_deps_with_toolchain
+      inputs = _manifest_inputs
+    }
+    target_name_data_deps += [
+      ":${pkg_manifest_deps_inputs_name}",
+      ":${pkg_manifest_deps_target_name}",
+    ]
+  }
+
+  _environments = []
+
+  foreach(env, target_envs) {
+    dims = []  # Clear from previous iteration.
+    dims = env.dimensions
+
+    if (defined(env.emulator)) {
+      # Clear from previous iteration.
+      emu_config = {
+      }
+      emu_config = env.emulator
+
+      assert(defined(emu_config.name),
+             "The `emulator` scope requires a unique `name`")
+      if (defined(emu_config.uefi) && emu_config.uefi) {
+        assert(
+            defined(emu_config.vbmeta_key) &&
+                defined(emu_config.vbmeta_key_metadata),
+            "Emulator environments with `uefi` set to true must provide a `vbmeta_key` and `vbmeta_key_metadata`")
+      }
+      not_needed([ "emu_config" ])
+    }
+
+    if ((!defined(dims.device_type) ||
+         allowed_device_types + [ dims.device_type ] - [ dims.device_type ] !=
+         allowed_device_types) &&
+        (!defined(dims.host_device_type) ||
+         allowed_host_device_types + [ dims.host_device_type ] -
+         [ dims.host_device_type ] != allowed_host_device_types)) {
+      # GN idiom for adding to a list without adding duplicate elements.
+      _environments += [ env ]
+      _environments -= [ env ]
+      _environments += [ env ]
+    }
+  }
+
+  # If we've reached the point where all environments have been filtered out,
+  # and _environments is empty, mark this test as build_only.
+  if (_environments == []) {
+    build_only = true
+  }
+
+  test_spec = {
+    forward_variables_from(invoker,
+                           [
+                             "product_bundle",
+                             "bootup_timeout_secs",
+                             "is_boot_test",
+                           ])
+    expects_ssh = _expects_ssh
+    if (defined(is_boot_test) && is_boot_test) {
+      assert(defined(product_bundle),
+             "product bundle must be provided for boot tests.")
+    } else {
+      assert(!defined(bootup_timeout_secs),
+             "bootup_timeout_secs is only respected if is_boot_test=true.")
+    }
+    test = {
+      forward_variables_from(invoker,
+                             [
+                               "cpu",
+                               "isolated",
+                               "name",
+                               "os",
+                               "path",
+                               "new_path",
+                               "package_url",
+                               "package_label",
+                               "package_resolution_timeout_secs",
+                               "component_label",
+                               "package_manifests",
+                               "timeout_secs",
+                               "build_rule",
+                               "has_generated_manifest",
+                               "list_cases_argument",
+                               "test_filters",
+                             ])
+      if (defined(_parallel)) {
+        parallel = _parallel
+      }
+      if (defined(_create_no_exception_channel)) {
+        create_no_exception_channel = _create_no_exception_channel
+      }
+      label = invoker.target
+      assert(label == get_label_info(label, "label_with_toolchain"),
+             "target '${label}' must be a label_with_toolchain.")
+
+      if (is_fuchsia) {
+        log_settings = _log_settings
+      }
+
+      if (!defined(package_url)) {
+        assert(defined(path), "path or package_url must be defined.")
+        if (is_linux || (defined(invoker.os) && invoker.os == "linux")) {
+          # Trim leading //.
+          path = rebase_path(path, root_build_dir)
+        }
+      } else if (defined(new_path)) {
+        # Trim leading //.
+        new_path = rebase_path(new_path, root_build_dir)
+      }
+
+      source_label = get_label_info(label, "label_no_toolchain")
+      if (defined(invoker.source_label)) {
+        source_label = invoker.source_label
+        assert(
+            source_label == get_label_info(source_label, "label_no_toolchain"),
+            "invoker.source_label ('${source_label}') must be a label_no_toolchain.")
+      }
+
+      if (!defined(name)) {
+        if (defined(package_url)) {
+          name = package_url
+        } else {
+          # We want the test name to be the same regardless of variant.
+          # Path is of the form <toolchain_variant.name>/<basename>, so
+          # removing the left-most appearance should do what we want.
+          name = string_replace(path, toolchain_variant.suffix, "", 1)
+        }
+      }
+
+      if (!defined(os)) {
+        os = current_os
+      }
+      if (!defined(cpu)) {
+        cpu = current_cpu
+      }
+      if (runtime_deps_file != "") {
+        runtime_deps = rebase_path(runtime_deps_file, root_build_dir)
+      }
+      if (pkg_manifest_deps_file != "") {
+        package_manifest_deps =
+            rebase_path(pkg_manifest_deps_file, root_build_dir)
+      }
+    }
+    build_only = build_only
+    environments = _environments
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "assert_no_deps",
+                           ])
+    metadata = {
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+      tests_barrier = []
+      tests = [ test_spec ]
+    }
+    deps = target_name_deps
+    data_deps = target_name_data_deps
+    if (defined(invoker.isolated) && invoker.isolated &&
+        # Tests that use product bundles, primarily boot tests, must necessarily
+        # run in isolated mode, so they need not be explicitly included in the
+        # isolated allowlist.
+        !defined(invoker.product_bundle)) {
+      isolated_dir =
+          string_replace(get_label_info(invoker.target, "dir"), "//", "")
+      isolated_split = string_split(isolated_dir, "/")
+      if (isolated_split[0] == "vendor") {
+        # Use the vendor repo's allowlist.
+        deps += [ "//vendor/" + isolated_split[1] +
+                  "/build/testing/isolated:isolated_test_spec_allowlist" ]
+      } else {
+        deps += [ "//build/testing/isolated:isolated_test_spec_allowlist" ]
+      }
+    }
+    if (defined(invoker.timeout_secs) &&
+        # Tests that use product bundles, primarily boot tests, are known to
+        # run slower, so they need not be explicitly included in the allowlist.
+        !defined(invoker.product_bundle)) {
+      timeout_secs_dir =
+          string_replace(get_label_info(invoker.target, "dir"), "//", "")
+      timeout_secs_split = string_split(timeout_secs_dir, "/")
+      if (timeout_secs_split[0] == "vendor") {
+        # Use the vendor repo's allowlist.
+        deps += [ "//vendor/" + timeout_secs_split[1] +
+                  "/build/testing/timeouts:per_test_timeout_allowlist" ]
+      } else {
+        deps += [ "//build/testing/timeouts:per_test_timeout_allowlist" ]
+      }
+    }
+  }
+
+  # When an unreferenced board_name is used, the allowed_device_types
+  # assignment will have no effect.
+  not_needed([
+               "allowed_device_types",
+               "allowed_host_device_types",
+             ])
+}

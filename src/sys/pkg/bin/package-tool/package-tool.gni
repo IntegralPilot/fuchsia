@@ -1,0 +1,400 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/images/args.gni")
+import("//build/packages/package_metadata.gni")
+
+# Extract a package from an archive.
+#
+# Parameters
+#
+#   The following two items are only required in order to produce metadata about
+#   the package sets, and may be removed in the future:
+#
+#   archive (required)
+#     [path] Path to archive containing a package.
+#
+#   package_name (default: the target name)
+#     [string] Name of the package.
+#
+#   package_out_dir (default: "$target_out_dir/$target_name")
+#     [path] The directory into which package artifacts should be placed.
+#
+#   repository (default: "fuchsia.com")
+#     [string] The repository host name part of the package URL.
+#     See https://fuchsia.dev/fuchsia-src/concepts/packages/package_url#repository
+#     for more details.
+#
+#   deps (optional)
+#   test (optional)
+#   visibility (optional)
+#   metadata (optional)
+#     Same as for any GN `action()` target.
+template("package_tool_package_archive_extract") {
+  forward_variables_from(invoker,
+                         [
+                           "archive",
+                           "package_name",
+                           "package_out_dir",
+                           "repository",
+                         ])
+  assert(defined(archive), "archive is required")
+
+  if (!defined(package_name)) {
+    package_name = target_name
+  }
+
+  if (!defined(repository)) {
+    repository = "fuchsia.com"
+  }
+
+  if (!defined(package_out_dir)) {
+    package_out_dir = "$target_out_dir/$target_name"
+  }
+  pkg_output_manifest = "$package_out_dir/package_manifest.json"
+
+  metadata_target_name = "${target_name}_metadata"
+  define_package_metadata(metadata_target_name) {
+    package_name = package_name
+    snapshot_entry = "$package_name/0=" +
+                     rebase_path("$package_out_dir/blobs.json", root_build_dir)
+    blob_manifest = "$package_out_dir/blobs.manifest"
+    package_output_manifest = pkg_output_manifest
+  }
+
+  compiled_action(target_name) {
+    tool = "//src/sys/pkg/bin/package-tool"
+    tool_output_name = "package-tool"
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "data_deps",
+                             "deps",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    if (!defined(deps)) {
+      deps = []
+    }
+
+    if (!defined(inputs)) {
+      inputs = []
+    }
+
+    inputs += [ archive ]
+    depfile = "$package_out_dir/meta.far.d"
+
+    metadata = {
+      if (defined(invoker.metadata)) {
+        forward_variables_from(invoker.metadata, "*")
+      }
+    }
+    deps += [ ":$metadata_target_name" ]
+
+    outputs = [
+      # package output manifest
+      pkg_output_manifest,
+
+      # package blob json manifest
+      "$package_out_dir/blobs.json",
+    ]
+
+    args = [
+      "package",
+      "archive",
+      "extract",
+      rebase_path(archive, root_build_dir),
+      "-o",
+      rebase_path(package_out_dir, root_build_dir),
+      "--repository",
+      repository,
+      "--blobs-json",
+    ]
+
+    hermetic_action_ignored_prefixes = [
+      "$package_out_dir/blobs",
+      "$package_out_dir/manifests",  # Subpackage manifests are written here.
+    ]
+  }
+}
+
+declare_args() {
+  # Controls which mode to use when copying blobs into the repository.
+  # Supported modes are:
+  #
+  # * `copy`: copy the blob if the blob does not already exist in the
+  #   repository. This will use copy-on-write to efficiently copy the blob on
+  #   file systems that support it.
+  #
+  # * `copy-overwrite`: always copy the blob, overwriting any blob that
+  #   exists in the blob repository. This will use copy-on-write to efficiently
+  #   copy the blob on file systems that support it.
+  #
+  # * `hard-link`: hard link the blob into the repository, or copy if we cannot
+  #   create a hard link between the blob and the blob repository. Note that it
+  #   is possible to modify the blob through the hard link, which would result
+  #   in the blob not matching the blob's merkle.
+  repository_publish_blob_copy_mode = "hard-link"
+}
+
+# Publish package manifests to a repository.
+#
+# Parameters
+#
+#   output_repository_dir (required)
+#     A publish packages to this directory path.
+#
+#   package_list_manifests (required)
+#     A list of package list manifest paths.
+#
+#   initial_trusted_root_metadata (optional)
+#     Initialize TUF trust with this root metadata. Defaults to
+#     ${repository_dir}/repository/1.root.json if unspecified.
+#
+#   output_blob_manifest_path (optional)
+#     If set, write the blob manifest of all staged blobs to the given path.
+#
+#   repo_deps (optional)
+#     A list of GN dependencies that the package publishing tool & repository depends on.
+#     This should not be the deps of the contents of the repository, but of the repository itself.
+template("package_tool_repository_publish") {
+  assert(defined(invoker.output_repository_dir) &&
+             invoker.output_repository_dir != "",
+         "output_repository_dir must be defined")
+
+  assert(
+      repository_publish_blob_copy_mode == "copy" ||
+          repository_publish_blob_copy_mode == "copy-overwrite" ||
+          repository_publish_blob_copy_mode == "hard-link",
+      "`repository_publish_blob_copy_mode` can only be `copy`, `copy-overwrite`, or `hard-link`")
+
+  _output_repository_dir = invoker.output_repository_dir
+
+  assert(defined(invoker.package_list_manifests),
+         "package_list_manifests must be defined")
+
+  _publish_opts = [
+    "--time-versioning",
+    "--copy-mode",
+    repository_publish_blob_copy_mode,
+  ]
+
+  if (defined(invoker.initial_trusted_root_metadata)) {
+    assert(invoker.initial_trusted_root_metadata != "",
+           "initial_trusted_root_metadata cannot be empty")
+    _publish_opts += [
+      "--trusted-root",
+      rebase_path(invoker.initial_trusted_root_metadata, root_build_dir),
+    ]
+  }
+
+  if (defined(invoker.output_blob_manifest_path)) {
+    assert(invoker.output_blob_manifest_path != "",
+           "output_blob_manifest_path cannot be empty")
+    _publish_opts += [
+      "--blob-manifest",
+      rebase_path(invoker.output_blob_manifest_path, root_build_dir),
+    ]
+  }
+
+  if (delivery_blob_type != false) {
+    _publish_opts += [
+      "--delivery-blob-type",
+      "${delivery_blob_type}",
+    ]
+  }
+
+  # Expose build-time package publishing arguments to devshell commands. (`fx
+  # publish`)
+  publish_tool_opts_dep = "${target_name}_tool_opts"
+  generated_file(publish_tool_opts_dep) {
+    outputs = [ "${_output_repository_dir}/publish_tool_opts" ]
+    contents = _publish_opts
+  }
+
+  group("${target_name}_repo_deps") {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    public_deps = [ ":${publish_tool_opts_dep}" ]
+    if (defined(invoker.repo_deps)) {
+      public_deps += invoker.repo_deps
+    }
+  }
+
+  compiled_action(target_name) {
+    tool = "//src/sys/pkg/bin/package-tool"
+    tool_output_name = "package-tool"
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "data_deps",
+                             "inputs",
+                             "testonly",
+                             "visibility",
+                             "metadata",
+                           ])
+
+    if (!defined(deps)) {
+      deps = []
+    }
+
+    deps += [ ":${target_name}_repo_deps" ]
+
+    # The contents of these folders is dynamic, and managed entirely by this
+    # action.
+    hermetic_action_ignored_prefixes =
+        [ "${_output_repository_dir}/repository" ]
+
+    sources = invoker.package_list_manifests
+
+    depfile = "${target_out_dir}/${target_name}.d"
+
+    outputs = [
+      # Note: the first output is the one that appears in the depfile.
+      "${_output_repository_dir}/repository/targets.json",
+      "${_output_repository_dir}/repository/snapshot.json",
+      "${_output_repository_dir}/repository/timestamp.json",
+    ]
+
+    args = [
+      "repository",
+      "publish",
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+      "--clean",
+    ]
+
+    if (defined(invoker.output_blob_manifest_path)) {
+      outputs += [ invoker.output_blob_manifest_path ]
+    }
+
+    if (defined(sources)) {
+      foreach(package_list, invoker.package_list_manifests) {
+        args += [
+          "--package-list",
+          rebase_path(package_list, root_build_dir),
+        ]
+      }
+    }
+
+    args += _publish_opts
+
+    args += [ rebase_path(_output_repository_dir, root_build_dir) ]
+  }
+}
+
+# Generate a package archive in the format produced by `ffx package archive
+# create'.
+#
+# The archive is generated at $target_out_dir/$package_name where package_name
+# is `get_label_info($package, "name")`
+#
+# Parameters
+#
+#   package (required)
+#     [label] A pm_build() target defined earlier in the same file.
+#
+#   archive_name (optional)
+#     [string] The name of the far file to output.
+template("package_tool_archive_create") {
+  assert(defined(invoker.package), "package is required")
+
+  package_name = get_label_info(invoker.package, "name")
+  pkg_out_dir =
+      get_label_info(invoker.package, "target_out_dir") + "/${package_name}"
+
+  if (defined(invoker.archive_name)) {
+    archive_name = invoker.archive_name
+  } else {
+    archive_name = package_name
+  }
+
+  # LINT.IfChange
+  archive_out = "${target_out_dir}/${archive_name}.far"
+
+  # LINT.ThenChange(//build/packages/exported_fuchsia_package_archive.gni)
+
+  archive_depfile = "${archive_out}.d"
+
+  compiled_action(target_name) {
+    tool = "//src/sys/pkg/bin/package-tool"
+    tool_output_name = "package-tool"
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "metadata",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                             "check_for_output_dir_leaks",
+                           ])
+
+    deps = [ invoker.package ]
+    depfile = archive_depfile
+    inputs = [ "${pkg_out_dir}/package_manifest.json" ]
+    outputs = [ archive_out ]
+    args = [
+      "package",
+      "archive",
+      "create",
+      rebase_path(pkg_out_dir, root_build_dir) + "/package_manifest.json",
+      "--depfile",
+      rebase_path(archive_depfile, root_build_dir),
+      "-o",
+      rebase_path(archive_out, root_build_dir),
+    ]
+  }
+}
+
+# Generate a package manifests list.
+#
+# Parameters
+#
+#   product_bundle (required)
+#     [path] A path to Product Bundle dir.
+#
+#   manifests_dir (required)
+#     [path] A directory where package manifest will be written to.
+#
+template("package_tool_package_manifest_list_create") {
+  assert(defined(invoker.product_bundle), "product_bundle is required")
+  assert(defined(invoker.manifests_dir), "manifests_dir is required")
+  _manifests_dir = invoker.manifests_dir
+
+  compiled_action(target_name) {
+    tool = "//src/sys/pkg/bin/package-tool"
+    tool_output_name = "package-tool"
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "metadata",
+                             "public_deps",
+                             "deps",
+                             "testonly",
+                             "visibility",
+                             "check_for_output_dir_leaks",
+                           ])
+
+    # The contents of these folders is dynamic, and managed entirely by this
+    # action.
+
+    hermetic_action_ignored_prefixes = [
+      _manifests_dir,
+      invoker.product_bundle,
+    ]
+    inputs = [ "${invoker.product_bundle}/product_bundle.json" ]
+    outputs = [ "${_manifests_dir}/package_manifests.list" ]
+    args = [
+      "repository",
+      "create-package-manifest-list",
+      rebase_path(invoker.product_bundle, root_build_dir),
+      rebase_path(_manifests_dir, root_build_dir),
+    ]
+  }
+}

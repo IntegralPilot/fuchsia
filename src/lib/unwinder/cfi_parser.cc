@@ -1,0 +1,620 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "src/lib/unwinder/cfi_parser.h"
+
+#include <cstdint>
+#include <optional>
+
+#include "src/lib/unwinder/error.h"
+#include "src/lib/unwinder/registers.h"
+
+#define LOG_DEBUG(...)
+// #define LOG_DEBUG printf
+
+namespace unwinder {
+
+namespace {
+
+// Read a RegisterID in ULEB128 encoding.
+//
+// Unwind tables could encode rules for registers that we don't support, e.g. float point or vector
+// registers. It's safe to save them in the Registers class.
+Error ReadRegisterIDAndAdvance(Memory* elf, uint64_t& addr, RegisterID& reg) {
+  uint64_t reg_id;
+  if (auto err = elf->ReadULEB128AndAdvance(addr, reg_id); err.has_err()) {
+    return err;
+  }
+  if (reg_id > static_cast<uint64_t>(RegisterID::kInvalid)) {
+    return Error("register_id out of range");
+  }
+  reg = static_cast<RegisterID>(reg_id);
+  return Success();
+}
+
+}  // namespace
+
+CfiParser::CfiParser(Registers::Arch arch, Module::AddressSize size, uint64_t code_alignment_factor,
+                     int64_t data_alignment_factor)
+    : code_alignment_factor_(code_alignment_factor),
+      data_alignment_factor_(data_alignment_factor),
+      address_size_(size) {
+  // Initialize those callee-preserved registers as kSameValue.
+  static const RegisterID x64_preserved[] = {
+      RegisterID::kX64_rbx, RegisterID::kX64_rbp, RegisterID::kX64_r12,
+      RegisterID::kX64_r13, RegisterID::kX64_r14, RegisterID::kX64_r15,
+  };
+  // x18 (shadow call stack pointer) is considered preserved. SCS-enabled functions will have
+  // DW_CFA_val_expression rules for x18, and SCS-disabled functions don't touch x18.
+  //
+  // LR is considered to be preserved, because a function has to ensure that when it returns, LR has
+  // the same value as when the function begins. And the LR will be unset when we simulate the
+  // return, to reflect the fact that LR is clobbered during the bl/blr instruction.
+  //
+  // SP is not considered to be preserved: its value will be recovered from CFA, unless it's
+  // overridden by custom rules, e.g., in starnix restricted executor.
+  static const RegisterID arm64_preserved[] = {
+      RegisterID::kArm64_x18, RegisterID::kArm64_x19, RegisterID::kArm64_x20,
+      RegisterID::kArm64_x21, RegisterID::kArm64_x22, RegisterID::kArm64_x23,
+      RegisterID::kArm64_x24, RegisterID::kArm64_x25, RegisterID::kArm64_x26,
+      RegisterID::kArm64_x27, RegisterID::kArm64_x28, RegisterID::kArm64_x29,
+      RegisterID::kArm64_x30,
+  };
+
+  // Similar to arm64, arm32's LR is considered preserved for the same reason as arm64 (LR is
+  // clobbered by virtue of using the bl instruction). Likewise, SP is also not considered
+  // preserved, since it will be recovered either by CFA or ARM EHABI unwinding instructions.
+  static const RegisterID arm32_preserved[] = {
+      RegisterID::kArm64_x4,  RegisterID::kArm64_x5,  RegisterID::kArm64_x6,
+      RegisterID::kArm64_x7,  RegisterID::kArm64_x8,  RegisterID::kArm64_x9,
+      RegisterID::kArm64_x10, RegisterID::kArm64_x11, RegisterID::kArm32_lr,
+  };
+
+  static const RegisterID riscv64_preserved[] = {
+      RegisterID::kRiscv64_ra, RegisterID::kRiscv64_gp,  RegisterID::kRiscv64_tp,
+      RegisterID::kRiscv64_s0, RegisterID::kRiscv64_s1,  RegisterID::kRiscv64_s2,
+      RegisterID::kRiscv64_s3, RegisterID::kRiscv64_s4,  RegisterID::kRiscv64_s5,
+      RegisterID::kRiscv64_s6, RegisterID::kRiscv64_s7,  RegisterID::kRiscv64_s8,
+      RegisterID::kRiscv64_s9, RegisterID::kRiscv64_s10, RegisterID::kRiscv64_s11,
+  };
+
+  const RegisterID* preserved;
+  size_t length;
+  switch (arch) {
+    case Registers::Arch::kX64:
+      preserved = x64_preserved;
+      length = sizeof(x64_preserved) / sizeof(RegisterID);
+      break;
+    case Registers::Arch::kArm32:
+      preserved = arm32_preserved;
+      length = sizeof(arm32_preserved) / sizeof(RegisterID);
+      break;
+    case Registers::Arch::kArm64:
+      preserved = arm64_preserved;
+      length = sizeof(arm64_preserved) / sizeof(RegisterID);
+      break;
+    case Registers::Arch::kRiscv64:
+      preserved = riscv64_preserved;
+      length = sizeof(riscv64_preserved) / sizeof(RegisterID);
+      break;
+  }
+
+  for (size_t i = 0; i < length; i++) {
+    register_locations_[preserved[i]].type = RegisterLocation::Type::kSameValue;
+  }
+}
+
+// Instruction                High 2 Bits  Low 6 Bits  Operand 1         Operand 2
+// DW_CFA_advance_loc         0x1          delta
+// DW_CFA_offset              0x2          register    ULEB128 offset
+// DW_CFA_restore             0x3          register
+// DW_CFA_set_loc             0            0x01        address
+// DW_CFA_advance_loc1        0            0x02        1-byte delta
+// DW_CFA_advance_loc2        0            0x03        2-byte delta
+// DW_CFA_advance_loc4        0            0x04        4-byte delta
+// DW_CFA_offset_extended     0            0x05        ULEB128 register  ULEB128 offset
+// DW_CFA_restore_extended    0            0x06        ULEB128 register
+// DW_CFA_undefined           0            0x07        ULEB128 register
+// DW_CFA_same_value          0            0x08        ULEB128 register
+// DW_CFA_register            0            0x09        ULEB128 register  ULEB128 register
+// DW_CFA_remember_state      0            0x0a
+// DW_CFA_restore_state       0            0x0b
+// DW_CFA_def_cfa             0            0x0c        ULEB128 register  ULEB128 offset
+// DW_CFA_def_cfa_register    0            0x0d        ULEB128 register
+// DW_CFA_def_cfa_offset      0            0x0e        ULEB128 offset
+// DW_CFA_nop                 0            0
+// DW_CFA_def_cfa_expression  0            0x0f        BLOCK
+// DW_CFA_expression          0            0x10        ULEB128 register  BLOCK
+// DW_CFA_offset_extended_sf  0            0x11        ULEB128 register  SLEB128 offset
+// DW_CFA_def_cfa_sf          0            0x12        ULEB128 register  SLEB128 offset
+// DW_CFA_def_cfa_offset_sf   0            0x13        SLEB128 offset
+// DW_CFA_val_offset          0            0x14        ULEB128 register  ULEB128 offset
+// DW_CFA_val_offset_sf       0            0x15        ULEB128 register  SLEB128 offset
+// DW_CFA_val_expression      0            0x16        ULEB128 register  BLOCK
+// DW_CFA_lo_user             0            0x1c
+// DW_CFA_hi_user             0            0x3f
+Error CfiParser::ParseInstructions(Memory* elf, uint64_t instructions_begin,
+                                   uint64_t instructions_end, uint64_t pc_limit) {
+  // Boundary is tricky here! Consider the following program
+  //
+  //         .cfi_startproc
+  //     0:  push    rbp
+  //         .cfi_def_cfa_offset 16
+  //         .cfi_offset rbp, -16
+  //     1:  mov     rbp, rsp
+  //         .cfi_def_cfa_register rbp
+  //     4:  call    f()
+  //     9:  pop     rbp
+  //         .cfi_def_cfa rsp, 8
+  //    10:  ret
+  //         .cfi_endproc
+  //
+  // ..which produces the following CFI.
+  //
+  //         DW_CFA_advance_loc: 1           // pc = 1
+  //         DW_CFA_def_cfa_offset: +16
+  //         DW_CFA_offset: RBP -16
+  //         DW_CFA_advance_loc: 3           // pc = 4
+  //         DW_CFA_def_cfa_register: RBP
+  //         DW_CFA_advance_loc: 6           // pc = 10
+  //         DW_CFA_def_cfa: RSP +8
+  //
+  // Suppose we have some exception at address 0x1 (pc_limit = 1), we want to stop at
+  // "DW_CFA_advance_loc: 3" (pc = 4), not at "DW_CFA_advance_loc: 1" (pc = 1).
+  uint64_t pc = 0;
+  while (instructions_begin < instructions_end && pc <= pc_limit) {
+    uint8_t opcode;
+    LOG_DEBUG("%#" PRIx64 "   ", instructions_begin);
+    if (auto err = elf->ReadAndAdvance(instructions_begin, opcode); err.has_err()) {
+      return err;
+    }
+    switch (opcode >> 6) {
+      case 0x1: {  // DW_CFA_advance_loc  delta-in-opcode
+        LOG_DEBUG("DW_CFA_advance_loc %" PRId64 "\n", (opcode & 0x3F) * code_alignment_factor_);
+        pc += (opcode & 0x3F) * code_alignment_factor_;
+        continue;
+      }
+      case 0x2: {  // DW_CFA_offset  register-in-opcode  ULEB128 offset
+        uint64_t offset;
+        if (auto err = elf->ReadULEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        RegisterID reg = static_cast<RegisterID>(opcode & 0x3F);
+        int64_t real_offset = static_cast<int64_t>(offset) * data_alignment_factor_;
+        LOG_DEBUG("DW_CFA_offset %hhu %" PRId64 "\n", reg, real_offset);
+        register_locations_[reg].type = RegisterLocation::Type::kOffset;
+        register_locations_[reg].offset = real_offset;
+        continue;
+      }
+      case 0x3: {  // DW_CFA_restore  register-in-opcode
+        RegisterID reg = static_cast<RegisterID>(opcode & 0x3F);
+        LOG_DEBUG("DW_CFA_restore %hhu\n", reg);
+        register_locations_[reg] = initial_register_locations_[reg];
+        continue;
+      }
+    }
+    switch (opcode) {
+      case 0x0: {  // DW_CFA_nop
+        LOG_DEBUG("DW_CFA_nop\n");
+        continue;
+      }
+      // case 0x1:  // DW_CFA_set_loc  address
+      // Not implemented because it doesn't seem to be usable for position independent code.
+      case 0x2: {  // DW_CFA_advance_loc1  1-byte delta
+        uint8_t delta;
+        if (auto err = elf->ReadAndAdvance(instructions_begin, delta); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_advance_loc1 %" PRId64 "\n", delta * code_alignment_factor_);
+        pc += delta * code_alignment_factor_;
+        continue;
+      }
+      case 0x3: {  // DW_CFA_advance_loc2  2-byte delta
+        uint16_t delta;
+        if (auto err = elf->ReadAndAdvance(instructions_begin, delta); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_advance_loc2 %" PRId64 "\n", delta * code_alignment_factor_);
+        pc += delta * code_alignment_factor_;
+        continue;
+      }
+      case 0x4: {  // DW_CFA_advance_loc4  4-byte delta
+        uint32_t delta;
+        if (auto err = elf->ReadAndAdvance(instructions_begin, delta); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_advance_loc4 %" PRId64 "\n", delta * code_alignment_factor_);
+        pc += delta * code_alignment_factor_;
+        continue;
+      }
+      case 0x5: {  // DW_CFA_offset_extended  ULEB128 register  ULEB128 offset
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        uint64_t offset;
+        if (auto err = elf->ReadULEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        int64_t real_offset = static_cast<int64_t>(offset) * data_alignment_factor_;
+        LOG_DEBUG("DW_CFA_offset_extended %hhu %" PRId64 "\n", reg, real_offset);
+        register_locations_[reg].type = RegisterLocation::Type::kOffset;
+        register_locations_[reg].offset = real_offset;
+        continue;
+      }
+      case 0x6: {  // DW_CFA_restore_extended  ULEB128 register
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_restore_extended %hhu\n", reg);
+        register_locations_[reg] = initial_register_locations_[reg];
+        continue;
+      }
+      case 0x7: {  // DW_CFA_undefined  ULEB128 register
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_undefined %hhu\n", reg);
+        register_locations_[reg].type = RegisterLocation::Type::kUndefined;
+        continue;
+      }
+      case 0x8: {  // DW_CFA_same_value  ULEB128 register
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_same_value %hhu\n", reg);
+        register_locations_[reg].type = RegisterLocation::Type::kSameValue;
+        continue;
+      }
+      case 0x9: {  // DW_CFA_register  ULEB128 register  ULEB128 register
+        RegisterID reg1;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg1); err.has_err()) {
+          return err;
+        }
+        RegisterID reg2;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg2); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_register %hhu %hhu\n", reg1, reg2);
+        register_locations_[reg1].type = RegisterLocation::Type::kRegister;
+        register_locations_[reg1].reg_id = reg2;
+        continue;
+      }
+      case 0xA: {  // DW_CFA_remember_state
+        LOG_DEBUG("DW_CFA_remember_state\n");
+        state_stack_.emplace_back(cfa_location_, register_locations_);
+        continue;
+      }
+      case 0xB: {  // DW_CFA_restore_state
+        LOG_DEBUG("DW_CFA_restore_state\n");
+        if (state_stack_.empty()) {
+          return Error("invalid DW_CFA_restore_state");
+        }
+        std::tie(cfa_location_, register_locations_) = std::move(state_stack_.back());
+        state_stack_.pop_back();
+        continue;
+      }
+      case 0xC: {  // DW_CFA_def_cfa  ULEB128 register  ULEB128 offset
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, cfa_location_.reg);
+            err.has_err()) {
+          return err;
+        }
+        uint64_t offset;
+        if (auto err = elf->ReadULEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_def_cfa %hhu %" PRIu64 "\n", cfa_location_.reg, offset);
+        cfa_location_.type = CfaLocation::Type::kOffset;
+        cfa_location_.offset = static_cast<int64_t>(offset);
+        continue;
+      }
+      case 0xD: {  // DW_CFA_def_cfa_register  ULEB128 register
+        if (cfa_location_.type != CfaLocation::Type::kOffset) {
+          return Error("invalid DW_CFA_def_cfa_register");
+        }
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, cfa_location_.reg);
+            err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_def_cfa_register %hhu\n", cfa_location_.reg);
+        continue;
+      }
+      case 0xE: {  // DW_CFA_def_cfa_offset  ULEB128 offset
+        if (cfa_location_.type != CfaLocation::Type::kOffset) {
+          return Error("invalid DW_CFA_def_cfa_offset");
+        }
+        uint64_t offset;
+        if (auto err = elf->ReadULEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_def_cfa_offset %" PRIu64 "\n", offset);
+        cfa_location_.offset = static_cast<int64_t>(offset);
+        continue;
+      }
+      case 0xF: {  // DW_CFA_def_cfa_expression  BLOCK
+        uint64_t length;
+        if (auto err = elf->ReadULEB128AndAdvance(instructions_begin, length); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_def_cfa_expression length=%" PRIu64 "\n", length);
+        cfa_location_.type = CfaLocation::Type::kExpression;
+        cfa_location_.expression = DwarfExpr(elf, instructions_begin, length);
+        instructions_begin += length;
+        continue;
+      }
+      case 0x10: {  // DW_CFA_expression  ULEB128 register  BLOCK
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        uint64_t length;
+        if (auto err = elf->ReadULEB128AndAdvance(instructions_begin, length); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_expression %hhu length=%" PRIu64 "\n", reg, length);
+        register_locations_[reg].type = RegisterLocation::Type::kExpression;
+        register_locations_[reg].expression = DwarfExpr(elf, instructions_begin, length);
+        instructions_begin += length;
+        continue;
+      }
+      case 0x11: {  // DW_CFA_offset_extended_sf  ULEB128 register  SLEB128 offset
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        int64_t offset;
+        if (auto err = elf->ReadSLEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        int64_t real_offset = offset * data_alignment_factor_;
+        LOG_DEBUG("DW_CFA_offset_extended_sf %hhu %" PRId64 "\n", reg, real_offset);
+        register_locations_[reg].type = RegisterLocation::Type::kOffset;
+        register_locations_[reg].offset = real_offset;
+        continue;
+      }
+      case 0x12: {  // DW_CFA_def_cfa_sf  ULEB128 register  SLEB128 offset
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, cfa_location_.reg);
+            err.has_err()) {
+          return err;
+        }
+        int64_t offset;
+        if (auto err = elf->ReadSLEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        cfa_location_.type = CfaLocation::Type::kOffset;
+        cfa_location_.offset = offset * data_alignment_factor_;
+        LOG_DEBUG("DW_CFA_def_cfa_sf %hhu %" PRId64 "\n", cfa_location_.reg, cfa_location_.offset);
+        continue;
+      }
+      case 0x13: {  // DW_CFA_def_cfa_offset_sf  SLEB128 offset
+        if (cfa_location_.type != CfaLocation::Type::kOffset) {
+          return Error("invalid DW_CFA_def_cfa_offset_sf");
+        }
+        int64_t offset;
+        if (auto err = elf->ReadSLEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        cfa_location_.offset = offset * data_alignment_factor_;
+        LOG_DEBUG("DW_CFA_def_cfa_offset_sf %" PRId64 "\n", cfa_location_.offset);
+        continue;
+      }
+      case 0x14: {  // DW_CFA_val_offset  ULEB128 register  ULEB128 offset
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        uint64_t offset;
+        if (auto err = elf->ReadULEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        int64_t real_offset = static_cast<int64_t>(offset) * data_alignment_factor_;
+        LOG_DEBUG("DW_CFA_val_offset %hhu %" PRId64 "\n", reg, real_offset);
+        register_locations_[reg].type = RegisterLocation::Type::kValOffset;
+        register_locations_[reg].offset = real_offset;
+        continue;
+      }
+      case 0x15: {  // DW_CFA_val_offset_sf  ULEB128 register  SLEB128 offset
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        int64_t offset;
+        if (auto err = elf->ReadSLEB128AndAdvance(instructions_begin, offset); err.has_err()) {
+          return err;
+        }
+        int64_t real_offset = offset * data_alignment_factor_;
+        LOG_DEBUG("DW_CFA_val_offset_sf %hhu %" PRId64 "\n", reg, real_offset);
+        register_locations_[reg].type = RegisterLocation::Type::kValOffset;
+        register_locations_[reg].offset = real_offset;
+        continue;
+      }
+      case 0x16: {  // DW_CFA_val_expression  ULEB128 register  BLOCK
+        RegisterID reg;
+        if (auto err = ReadRegisterIDAndAdvance(elf, instructions_begin, reg); err.has_err()) {
+          return err;
+        }
+        uint64_t length;
+        if (auto err = elf->ReadULEB128AndAdvance(instructions_begin, length); err.has_err()) {
+          return err;
+        }
+        LOG_DEBUG("DW_CFA_val_expression %hhu length=%" PRIu64 "\n", reg, length);
+        register_locations_[reg].type = RegisterLocation::Type::kValExpression;
+        register_locations_[reg].expression = DwarfExpr(elf, instructions_begin, length);
+        instructions_begin += length;
+        continue;
+      }
+      case 0x2d: {  // DW_CFA_AARCH64_negate_ra_state
+        // TODO(https://fxbug.dev/442418152): Handle DW_CFA_AARCH64_negate_ra_state.
+        // DW_CFA_AARCH64_negate_ra_state is an ARM DWARF extension:
+        // https://github.com/ARM-software/abi-aa/blob/main/aadwarf64/aadwarf64.rst#44call-frame-instructions
+        // (which reuses the same opcode as DW_CFA_GNU_window_save) for adjusting the PC when
+        // pointer authentication (PAC) is enabled. The instruction is supposed to modify the
+        // RA_SIGN_STATE pseudoregister, also defined by the same ARM DWARF extension:
+        // https://github.com/ARM-software/abi-aa/blob/main/aadwarf64/aadwarf64.rst#41dwarf-register-names
+        //
+        // Currently, this is ignored by this unwinder, which doesn't seem to cause any immediate
+        // harm, but we may need to take special actions if this ends up being an issue:
+        // https://github.com/llvm/llvm-project/blob/37664cd991246aeba988b963d534cb10b4ab0681/libunwind/src/DwarfInstructions.hpp#L304
+        continue;
+      }
+    }
+    return Error("unsupported CFA instruction: %#x", opcode);
+  }
+  return Success();
+}
+
+Error CfiParser::Step(Memory* stack, RegisterID return_address_register, const Registers& current,
+                      Registers& next, std::optional<uint64_t> maybe_cfa) {
+  uint64_t cfa;
+  if (!maybe_cfa) {
+    if (auto err = PrepareToStep(stack, current, cfa); err.has_err()) {
+      return err;
+    }
+  } else {
+    cfa = *maybe_cfa;
+  }
+
+  for (auto& [reg, location] : register_locations_) {
+    // Always allow failures when recovering individual registers.
+    switch (location.type) {
+      case RegisterLocation::Type::kUndefined:
+        next.Unset(reg);
+        break;
+      case RegisterLocation::Type::kSameValue:
+        if (uint64_t val; current.Get(reg, val).ok()) {
+          next.Set(reg, val);
+        }
+        break;
+      case RegisterLocation::Type::kRegister:
+        if (uint64_t val; current.Get(location.reg_id, val).ok()) {
+          next.Set(reg, val);
+        }
+        break;
+      case RegisterLocation::Type::kOffset: {
+        uint64_t val = 0;
+        const uint64_t size = address_size_ == Module::AddressSize::k32Bit ? 4 : 8;
+        if (stack->ReadBytes(cfa + location.offset, size, &val).ok()) {
+          next.Set(reg, val);
+        }
+        break;
+      }
+      case RegisterLocation::Type::kValOffset:
+        next.Set(reg, cfa + location.offset);
+        break;
+      case RegisterLocation::Type::kExpression:
+        if (uint64_t loc; location.expression.Eval(stack, current, {cfa}, loc).ok()) {
+          uint64_t val = 0;
+          const uint64_t size = address_size_ == Module::AddressSize::k32Bit ? 4 : 8;
+          if (stack->ReadBytes(loc, size, &val).ok()) {
+            next.Set(reg, val);
+          }
+        }
+        break;
+      case RegisterLocation::Type::kValExpression:
+        if (uint64_t val; location.expression.Eval(stack, current, {cfa}, val).ok()) {
+          next.Set(reg, val);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  // By definition, the CFA is the stack pointer at the call site, so restoring SP means setting it
+  // to CFA. However, if there's a rule that defines SP, we don't override that. This is used in
+  // the starnix restricted executor to achieve "unwinding into restricted mode".
+  if (uint64_t sp; next.GetSP(sp).has_err()) {
+    next.SetSP(cfa);
+  }
+
+  // Usually the PC will be undefined and should be recovered from |return_address_register|, as PC
+  // is technically not part of the DWARF standard.  However, in starnix restricted executor we want
+  // to unwind into restricted mode and recover both LR and PC for the restricted frame, so PC is
+  // defined directly in the CFI and we want to skip the assignment PC = LR.
+  //
+  // PC will also be defined on x64 as the return_address_register is just PC. It doesn't matter
+  // whether we skip the assignment or not as it's just a noop.
+  if (uint64_t pc; next.GetPC(pc).has_err()) {
+    // Return address is the address after the call instruction, so setting PC to that simulates a
+    // return. It's RIP on x64, LR on Arm64, r14 on Arm, and RA on Riscv64.
+    //
+    // An unavailable return address, usually because of "DW_CFA_undefined: RIP/LR", marks the end
+    // of the unwinding. We don't consider it an error.
+    if (uint64_t return_address; next.Get(return_address_register, return_address).ok()) {
+      // It's important to unset the return_address_register because we want to restore all
+      // registers to the previous frame. Since the value of return_address_register is changed
+      // during the call, it's not possible to recover it any more.
+      next.Unset(return_address_register);
+      next.SetPC(return_address);
+    }
+  }
+
+  LOG_DEBUG("%s => %s\n", current.Describe().c_str(), next.Describe().c_str());
+  return Success();
+}
+
+void CfiParser::AsyncStep(AsyncMemory* stack, RegisterID return_address_register,
+                          const Registers& current, fit::callback<void(Error, Registers)> cb) {
+  uint64_t cfa;
+  if (auto err = PrepareToStep(stack, current, cfa); err.has_err()) {
+    return cb(err, Registers(current.arch()));
+  }
+
+  std::vector<std::pair<uint64_t, uint32_t>> ranges;
+  // At this level all of the fetches will be for exactly one machine register sized integer.
+  constexpr uint32_t kSize = 8;
+
+  for (auto& [reg, location] : register_locations_) {
+    if (location.type == RegisterLocation::Type::kOffset) {
+      ranges.emplace_back(cfa + location.offset, kSize);
+    } else if (location.type == RegisterLocation::Type::kExpression ||
+               location.type == RegisterLocation::Type::kValExpression) {
+      uint64_t addr;
+      // Create a copy so we don't invalidate the location's expr.
+      auto expr = location.expression;
+      expr.Eval(stack, current, {cfa}, addr);
+      ranges.emplace_back(addr, kSize);
+    }
+  }
+
+  stack->FetchMemoryRanges(ranges, [=, this, cb = std::move(cb)]() mutable {
+    // Now we should have all the needed memory fetched from the target so we can call the
+    // synchronous Step to do the evaluations.
+    Registers next(current.arch());
+
+    if (address_size_ == Module::AddressSize::k32Bit) {
+      next = Registers(Registers::Arch::kArm32);
+    }
+
+    auto err = Step(stack, return_address_register, current, next, cfa);
+
+    LOG_DEBUG("%s => %s\n", current.Describe().c_str(), next.Describe().c_str());
+    cb(err, next);
+  });
+}
+
+Error CfiParser::PrepareToStep(Memory* stack, const Registers& current, uint64_t& cfa) {
+  switch (cfa_location_.type) {
+    case CfaLocation::Type::kUndefined:
+      return Error("undefined CFA");
+    case CfaLocation::Type::kOffset:
+      if (auto err = current.Get(cfa_location_.reg, cfa); err.has_err()) {
+        return err;
+      }
+      cfa += cfa_location_.offset;
+      break;
+    case CfaLocation::Type::kExpression:
+      if (auto err = cfa_location_.expression.Eval(stack, current, {}, cfa); err.has_err()) {
+        return err;
+      }
+      break;
+  }
+
+  return Success();
+}
+
+}  // namespace unwinder

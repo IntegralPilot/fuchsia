@@ -1,0 +1,144 @@
+// Copyright 2016 The Fuchsia Authors
+// Copyright (c) 2014 Travis Geiselbrecht
+//
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT
+
+#include <zircon/compiler.h>
+
+#ifndef ZIRCON_KERNEL_ARCH_ARM64_INCLUDE_ARCH_ARCH_THREAD_H_
+#define ZIRCON_KERNEL_ARCH_ARM64_INCLUDE_ARCH_ARCH_THREAD_H_
+
+#define CURRENT_PERCPU_PTR_OFFSET 16
+#define CURRENT_SCSP_OFFSET 24
+
+#if __has_feature(shadow_call_stack)
+#define CURRENT_MDSCR_OFFSET 56
+#else
+#define CURRENT_MDSCR_OFFSET 48
+#endif
+
+#ifndef __ASSEMBLER__
+
+#include <stddef.h>
+#include <sys/types.h>
+#include <zircon/tls.h>
+
+#include <arch/arm64/registers.h>
+#include <arch/kernel_aspace.h>
+
+// Bit 63 of the data_fault_resume field is used to indicate whether a data fault should first
+// handle the fault, or immediately return the resume location. The 63'rd bit is selected as this
+// bit is invariant over all kernel addresses.
+static constexpr uint64_t ARM64_DFR_RUN_FAULT_HANDLER_BIT = 63;
+// Check that the fault handler bit would always be 1 for a kernel address.
+static_assert(((KERNEL_ASPACE_BASE >> ARM64_DFR_RUN_FAULT_HANDLER_BIT) & 1) == 1 &&
+                  ((KERNEL_ASPACE_SIZE - 1) & KERNEL_ASPACE_BASE) == 0,
+              "DFR fault handler bit not invariant over kernel addresses");
+
+// Bit 62 of the data_fault_resume field is used to indicate whether an access fault should first
+// handle the fault, or immediately return the resume location. The 62nd bit is selected as this
+// bit is also invariant over all kernel addresses. Note that this bit should only be set to 0 if
+// the ARM64_DFR_RUN_FAULT_HANDLER_BIT is also set to 0. In other words, callers cannot capture
+// only access faults; they must either capture both page and access faults, capture only page
+// faults, or capture no faults at all.
+static constexpr uint64_t ARM64_DFR_RUN_ACCESS_FAULT_HANDLER_BIT = 62;
+// Check that the access fault handler bit would always be 1 for a kernel address.
+static_assert(((KERNEL_ASPACE_BASE >> ARM64_DFR_RUN_ACCESS_FAULT_HANDLER_BIT) & 1) == 1 &&
+                  ((KERNEL_ASPACE_SIZE - 1) & KERNEL_ASPACE_BASE) == 0,
+              "DFR access fault handler bit not invariant over kernel addresses");
+
+struct fpstate {
+  // align the save state on a 16 byte offset to optimally handle vector load/stores
+  alignas(16) uint64_t regs[64];
+  uint32_t fpcr;
+  uint32_t fpsr;
+};
+
+struct arm64_percpu;
+
+struct arch_thread {
+  // The compiler (when it's Clang with -mtp=el1) knows the position of these
+  // two fields relative to TPIDR_EL1, which is what __builtin_thread_pointer()
+  // returns.  The thread_pointer_location pseudo-member marks where TPIDR_EL1
+  // points.
+  uintptr_t stack_guard;
+  vaddr_t unsafe_sp;  // Never used in the kernel, but the ABI needs the space.
+  union {
+    char thread_pointer_location;
+    vaddr_t sp;
+  };
+
+  // Debugger access to userspace general regs while suspended or stopped
+  // in an exception.
+  // The regs are saved on the stack and then a pointer is stored here.
+  // Nullptr if not suspended or not stopped in an exception.
+  // TODO(https://fxbug.dev/42105394): Also nullptr for synthetic exceptions that don't provide
+  // them yet.
+  struct iframe_t* suspended_general_regs;
+
+  // Point to the current cpu pointer when the thread is running, used to
+  // restore the fixed register on exception entry. Swapped on context switch.
+  struct arm64_percpu* current_percpu_ptr;
+
+  // Saved pointer to the shadow call sp to restore similar to the percpu ptr above.
+  // Must be placed immediately after current_percpu_ptr in the structure because some
+  // code in exception save/restore path in exceptions.S uses a double load/store to load
+  // this and current_percpu_ptr in one instruction.
+#if __has_feature(shadow_call_stack)
+  uintptr_t* shadow_call_sp;
+#endif
+
+  // If non-NULL, address to return to on data fault. Additionally the
+  // ARM64_DFR_RUN_FAULT_HANDLER_BIT controls whether the fault handler is invoked or not. If not
+  // invoked resume is called with iframe_t::r[1] = fault address and iframe_t::r[2] = page fault
+  // flags.
+  uint64_t data_fault_resume;
+
+  // User mode's TPIDR and TPIDRRO.
+  //
+  // TODO(https://fxbug.dev/42072547): User mode registers state is stored in two places, on the
+  // stack
+  // (|iframe_t|) and here.  Consider consolidating and moving it all here so that it's in one
+  // place.  Motivation is to reduce code complexity.
+  uint64_t tpidr_el0;
+  uint64_t tpidrro_el0;
+
+  // The value of the mdscr_el1 register at the time the thread entered the kernel. Stored here
+  // instead of the iframe to allow access without needing to be suspended or in an exception.
+  uint64_t mdscr_el1;
+
+  // Saved fpu state.
+  struct fpstate fpstate;
+
+  // |track_debug_state| tells whether the kernel should keep track of the whole debug state for
+  // this thread. Normally this is set explicitly by a user that wants to make use of HW
+  // breakpoints or watchpoints.
+  // Userspace can still read the complete |debug_state| even if |track_debug_state| is false.
+  bool track_debug_state;
+  arm64_debug_state_t debug_state;
+};
+
+#define thread_pointer_offsetof(field)        \
+  ((int)offsetof(struct arch_thread, field) - \
+   (int)offsetof(struct arch_thread, thread_pointer_location))
+
+static_assert(thread_pointer_offsetof(stack_guard) == ZX_TLS_STACK_GUARD_OFFSET,
+              "stack_guard field in wrong place");
+static_assert(thread_pointer_offsetof(unsafe_sp) == ZX_TLS_UNSAFE_SP_OFFSET,
+              "unsafe_sp field in wrong place");
+static_assert(thread_pointer_offsetof(current_percpu_ptr) == CURRENT_PERCPU_PTR_OFFSET,
+              "per cpu ptr offset in wrong place");
+static_assert(thread_pointer_offsetof(mdscr_el1) == CURRENT_MDSCR_OFFSET,
+              "mdscr_el1 offset in wrong place");
+#if __has_feature(shadow_call_stack)
+static_assert(thread_pointer_offsetof(shadow_call_sp) == CURRENT_SCSP_OFFSET,
+              "shadow call stack pointer offset in wrong place");
+static_assert(CURRENT_SCSP_OFFSET == CURRENT_PERCPU_PTR_OFFSET + 8,
+              "shadow call stack pointer not immediately after percpu");
+#endif
+
+#endif  // __ASSEMBLER__
+
+#endif  // ZIRCON_KERNEL_ARCH_ARM64_INCLUDE_ARCH_ARCH_THREAD_H_

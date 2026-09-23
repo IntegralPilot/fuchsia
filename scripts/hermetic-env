@@ -1,0 +1,194 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All Rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This script is a replacement for /usr/bin/env that adds Fuchsia-specific
+# information and provides access to prebuilt tools in the source tree.
+#
+# This is not a subcommand of `fx` because multiple pieces of project
+# infrastructure run outside of the build and need access to in-tree prebuilts.
+
+set -e
+
+# Filter out invalid FUCHSIA_DIR settings.
+if [[ -n "${FUCHSIA_DIR}" ]]; then
+  if [[ ! -d "${FUCHSIA_DIR}" ]]; then
+    unset FUCHSIA_DIR
+  elif [[ "${FUCHSIA_DIR#/}" == "${FUCHSIA_DIR}" ]]; then
+    unset FUCHSIA_DIR
+  else
+    PWD="$(pwd)"
+    if [[ "${PWD#"${FUCHSIA_DIR}"}" = "${PWD}" ]]; then
+      # FUCHSIA_DIR does not contain the current directory
+      unset FUCHSIA_DIR
+    fi
+  fi
+fi
+
+# LINT.IfChange
+function find_tree_root {
+  local parent="$1"
+  if [[ ! -d "$parent" ]]; then
+    return 1
+  fi
+  while [[ ! -f "${parent}/.fx-root" ]]; do
+    if [[ "$parent" == "/" ]]; then
+      return 1
+    fi
+    parent="$(dirname "${parent}")"
+  done
+  echo "$parent"
+}
+
+# Mimic `fx` behavior to set up a consistent root and get prebuilt paths.
+#
+# We walk the parent directories looking for //.fx-root rather than using
+# BASH_SOURCE so that we find the fuchsia_dir enclosing the current working
+# directory instead of the one containing this file in case the user has
+# multiple source trees and is picking up this file from another one.
+#
+# NOTE: The FUCHSIA_DIR environment variable is ignored here because it
+# could point to a different Fuchsia checkout in some developer setups.
+if ! fuchsia_dir="$(find_tree_root "$(pwd)")"; then
+  echo >&2 "ERROR: Cannot find the Platform Source Tree in a parent of the current directory: $(pwd)"
+  exit 1
+fi
+
+script_dir="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+
+# NOTE: This check MUST be executed immediately after `fuchsia_dir` is set.
+# Do NOT add any metric gathering or other setup before this block, as this
+# `hermetic-env` instance may be run in a foreign fuchsia checkout.
+if [[ "${script_dir}/" != "${fuchsia_dir}/"* && "${script_dir}/" != "$(realpath "${fuchsia_dir}")/"* ]]; then
+  # When running `hermetic-env` from `$PATH` within a foreign fuchsia checkout
+  # that is owned by the current user, run the version of `hermetic-env` from
+  # the foreign checkout instead.
+  if [[ "$0" == *"/.jiri_root/bin/"* ]] && \
+     [[ -O "${fuchsia_dir}" ]] && \
+     [[ -x "${fuchsia_dir}/scripts/hermetic-env" ]]; then
+    exec "${fuchsia_dir}/scripts/hermetic-env" "$@"
+  fi
+
+  echo >&2 "ERROR: You are executing hermetic-env from outside of the current source tree"
+  echo >&2 "ERROR: This is not supported as fx does not have a stable internal API"
+  echo >&2
+  echo >&2 "    'hermetic-env' was executed from: ${BASH_SOURCE[0]}"
+  echo >&2 "    'fuchsia directory' resolved to: ${fuchsia_dir}"
+  echo >&2 "    'script_dir' resolved to: ${script_dir}"
+  echo >&2
+  echo >&2 "To run a command in the current Fuchsia directory, run hermetic-env from:"
+  echo >&2 "  ${fuchsia_dir}/scripts/hermetic-env"
+  echo >&2 "Or, if you use fx-env.sh, source fx-env from the current fuchsia dir:"
+  echo >&2 "  source ${fuchsia_dir}/scripts/fx-env.sh"
+  echo >&2 "To change your current environment, update your 'PATH':"
+  echo >&2 "  source ${fuchsia_dir}/scripts/fx-env.sh && fx-update-path"
+  exit 1
+fi
+# LINT.ThenChange(
+#   //scripts/fx,
+#   //scripts/zsh-completion/_fx,
+#   //src/developer/ffx/scripts/ffx,
+# )
+
+export FUCHSIA_DIR="${fuchsia_dir}"
+declare -r platform_sh="${fuchsia_dir}/tools/devshell/lib/platform.sh"
+# shellcheck source=/dev/null
+source "${platform_sh}" || exit $?
+
+if [[ "${PATH#"${PREBUILT_ALL_PATHS}"}" == "${PATH}" ]]; then
+  # Prebuilts have not been added to the path
+  if [[ "${FUCHSIA_HERMETIC_TOOLS}" == "y" ]]; then
+    readonly newpath="${PREBUILT_ALL_PATHS}:${FUCHSIA_DIR}/tools/system"
+  else
+    readonly newpath="${PREBUILT_ALL_PATHS}:${PATH}"
+  fi
+else
+  readonly newpath="${PATH}"
+fi
+
+# Remove problematic PATH entries to avoid hermeticity errors, such
+# as the one from https://fxbug.dev/530479291. The following removes
+# empty path components (interpreted as the current directory), the
+# current directory (.), and any relative path from PATH.
+sanitized_path=""
+for path in $(printf "%s" "${newpath}" | awk -v RS=: '{print}'); do
+  case "${path}" in
+    /*)
+       # Keep this absolute path, append it to current list.
+       if [[ -n "${sanitized_path}" ]]; then
+         sanitized_path+=":"
+       fi
+       sanitized_path+="${path}"
+       ;;
+   "")
+       echo >&2 "WARNING: Empty path component removed from PATH!"
+       ;;
+   .)
+       echo >&2 "WARNING: Current directory removed from PATH!"
+       ;;
+   *)
+       echo >&2 "WARNING: Relative path removed from PATH: $path"
+       ;;
+  esac
+done
+
+export PATH="${sanitized_path}"
+
+# Always populate FUCHSIA_BUILD_DIR_FROM_FX.
+if [[ -z "${FUCHSIA_BUILD_DIR_FROM_FX}" && -f "${FUCHSIA_DIR}/.fx-build-dir" ]]; then
+  FUCHSIA_BUILD_DIR_FROM_FX=$(cd "${FUCHSIA_DIR}" && realpath "$(cat .fx-build-dir)")
+  export FUCHSIA_BUILD_DIR_FROM_FX
+fi
+
+# Forward agent environment variables defined in agents.txt.
+agent_env_args=()
+readonly agents_file="${fuchsia_dir}/tools/devshell/lib/agents.txt"
+if [[ -f "${agents_file}" ]]; then
+  while IFS= read -r agent_var || [[ -n "${agent_var}" ]]; do
+    [[ -z "${agent_var}" || "${agent_var}" =~ ^# ]] && continue
+    if [[ -n "${!agent_var+x}" ]]; then
+      agent_env_args+=("${agent_var}=${!agent_var}")
+    fi
+  done < "${agents_file}"
+fi
+
+# Forward the args to the system `env`.
+exec /usr/bin/env -i \
+  "FUCHSIA_DIR=${fuchsia_dir}" \
+  "TERM=${TERM}" \
+  "PATH=${newpath}" \
+  "HOME=${HOME}" \
+  "USER=${USER}" \
+  "FUCHSIA_HERMETIC_TOOLS=${FUCHSIA_HERMETIC_TOOLS}" \
+  "FUCHSIA_NODENAME=${FUCHSIA_NODENAME}" \
+  "FUCHSIA_NODENAME_IS_FROM_FILE=${FUCHSIA_NODENAME_IS_FROM_FILE}" \
+  "FUCHSIA_TEST_FETCH_REMOTE=${FUCHSIA_TEST_FETCH_REMOTE}" \
+  ${FUCHSIA_BAZEL_DISK_CACHE+"FUCHSIA_BAZEL_DISK_CACHE=${FUCHSIA_BAZEL_DISK_CACHE}"} \
+  ${FUCHSIA_BAZEL_DISK_CACHE_SIZE+"FUCHSIA_BAZEL_DISK_CACHE_SIZE=${FUCHSIA_BAZEL_DISK_CACHE_SIZE}"} \
+  ${FUCHSIA_BAZEL_PRINT_COMMANDS+"FUCHSIA_BAZEL_PRINT_COMMANDS=${FUCHSIA_BAZEL_PRINT_COMMANDS}"} \
+  ${FUCHSIA_BUILD_DIR_FROM_FX+"FUCHSIA_BUILD_DIR_FROM_FX=${FUCHSIA_BUILD_DIR_FROM_FX}"} \
+  ${FUCHSIA_DEBUG_BAZEL_SANDBOX+"FUCHSIA_DEBUG_BAZEL_SANDBOX=${FUCHSIA_DEBUG_BAZEL_SANDBOX}"} \
+  ${FX_BUILD_RBE_STATS+"FX_BUILD_RBE_STATS=${FX_BUILD_RBE_STATS}"} \
+  ${FX_RA_EXPERIMENTS_ENABLED+"FX_RA_EXPERIMENTS_ENABLED=${FX_RA_EXPERIMENTS_ENABLED}"} \
+  ${NINJA_STATUS+"NINJA_STATUS=${NINJA_STATUS}"} \
+  ${NINJA_STATUS_MAX_COMMANDS+"NINJA_STATUS_MAX_COMMANDS=${NINJA_STATUS_MAX_COMMANDS}"} \
+  ${NINJA_STATUS_REFRESH_MILLIS+"NINJA_STATUS_REFRESH_MILLIS=${NINJA_STATUS_REFRESH_MILLIS}"} \
+  ${NINJA_PERSISTENT_MODE+"NINJA_PERSISTENT_MODE=${NINJA_PERSISTENT_MODE}"} \
+  ${NINJA_PERSISTENT_LOG_FILE+"NINJA_PERSISTENT_LOG_FILE=${NINJA_PERSISTENT_LOG_FILE}"} \
+  ${NINJA_PERSISTENT_TIMEOUT_SECONDS+"NINJA_PERSISTENT_TIMEOUT_SECONDS=${NINJA_PERSISTENT_TIMEOUT_SECONDS}"} \
+  ${GOMA_DISABLED+"GOMA_DISABLED=${GOMA_DISABLED}"} \
+  ${TMPDIR+"TMPDIR=${TMPDIR}"} \
+  ${SSH_AUTH_SOCK+"SSH_AUTH_SOCK=${SSH_AUTH_SOCK}"} \
+  ${LUCI_AUTH_CREDENTIAL_HELPER+"LUCI_AUTH_CREDENTIAL_HELPER=${LUCI_AUTH_CREDENTIAL_HELPER}"} \
+  ${FUCHSIA_FX_ITERATIVE+"FUCHSIA_FX_ITERATIVE=${FUCHSIA_FX_ITERATIVE}"} \
+  ${FUCHSIA_FX_TEST_RUN+"FUCHSIA_FX_TEST_RUN=${FUCHSIA_FX_TEST_RUN}"} \
+  ${FUCHSIA_FX_MULTI_RUN+"FUCHSIA_FX_MULTI_RUN=${FUCHSIA_FX_MULTI_RUN}"} \
+  ${FUCHSIA_FX_INVOKER+"FUCHSIA_FX_INVOKER=${FUCHSIA_FX_INVOKER}"} \
+  ${XDG_DATA_HOME+"XDG_DATA_HOME=${XDG_DATA_HOME}"} \
+  ${GEMINI_API_KEY+"GEMINI_API_KEY=${GEMINI_API_KEY}"} \
+  ${XDG_RUNTIME_DIR+"FUCHSIA_XDG_RUNTIME_DIR_FROM_FX=${XDG_RUNTIME_DIR}"} \
+  ${FUCHSIA_METRICS_CALL_STACK+"FUCHSIA_METRICS_CALL_STACK=${FUCHSIA_METRICS_CALL_STACK}"} \
+  ${LLVM_PROFILE_FILE+"LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}"} \
+  ${agent_env_args[@]+"${agent_env_args[@]}"} \
+  "$@"

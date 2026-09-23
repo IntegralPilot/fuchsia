@@ -1,0 +1,842 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.media;
+
+using fuchsia.sysmem;
+
+const MAX_KEY_ID_SIZE uint32 = 16;
+const MAX_INIT_VECTOR_SIZE uint32 = 16;
+const MAX_ENCRYPTION_SCHEME_SIZE uint32 = 100;
+
+/// Value
+///
+/// Generic "value" for use within generic "Parameter" struct.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type Value = strict union {
+    1: bool_value bool;
+    2: uint64_value uint64;
+    3: int64_value int64;
+    4: string_value string;
+    // Prefer using oob_bytes instead.
+    5: bytes_value vector<uint8>:MAX;
+};
+
+/// Parameter
+///
+/// Generic parameter.
+///
+/// We want to minimize use of this generic "Parameter" structure by natively
+/// defining as many stream-specific parameter semantics as we can.
+///
+// TODO: When possible, describe the very limited scenarios in which it would
+// still be reasonable to use a generic Parameter.
+type Parameter = struct {
+    // Some indication of the scope of applicability of this Parameter.
+    scope string;
+    // Specific name of this parameter, without the scope prefix.
+    name string;
+    // The particular value of this parameter.
+    value Value;
+};
+
+/// StreamError
+///
+/// This error code encapsulates various errors that might emanate from a
+/// StreamProcessor server. It can be sent either as an OnStreamFailed event or
+/// as an epitaph for the channel.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type StreamError = strict enum : uint32 {
+    // Common errors 0x00
+    /// An internal error with an unspecified reason.
+    UNKNOWN = 0x00000001;
+    /// The client provided invalid input format details.
+    INVALID_INPUT_FORMAT_DETAILS = 0x00000002;
+    /// The server received buffers that are not suitable for the operation to
+    /// be performed. An example of this would be if a Decoder received output
+    /// buffers that are too small to decode a frame into.
+    INCOMPATIBLE_BUFFERS_PROVIDED = 0x00000003;
+    /// Processing of input EOS (end of stream) failed, so the stream failed.
+    /// Currently this can occur if a core codec watchdog fires while processing
+    /// EOS.
+    EOS_PROCESSING = 0x00000004;
+
+    // Decoder errors 0x01
+    /// An internal decoder error with an unspecified reason.
+    DECODER_UNKNOWN = 0x01000001;
+    /// Input data that can't be parsed.  Only some parsing problems/errors are
+    /// reported this way.  Corrupt input data may be reported as other
+    /// StreamError, or may not cause a StreamError.
+    DECODER_DATA_PARSING = 0x01000002;
+
+    // Encoder errors 0x02
+    /// An internal encoder error with an unspecified reason.
+    ENCODER_UNKNOWN = 0x02000001;
+
+    // Decryptor errors 0x03
+    /// An internal decryptor error with an unspecified reason.
+    DECRYPTOR_UNKNOWN = 0x03000001;
+    /// The requested KeyId is not available for use by the Decryptor. The
+    /// client may try again later if that key becomes available.
+    DECRYPTOR_NO_KEY = 0x03000002;
+};
+
+type AudioCompressedFormat = flexible union {
+    1: aac AudioCompressedFormatAac;
+    2: sbc AudioCompressedFormatSbc;
+    @available(added=HEAD)
+    3: cvsd AudioCompressedFormatCvsd;
+    @available(added=HEAD)
+    4: lc3 AudioCompressedFormatLc3;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AudioBitrateMode = strict enum {
+    // Used mainly when a client is configuring an encoder's output format.  May
+    // also be present in an OnOutputConstraints() message from an encoder, but
+    // should not be relied upon to be present by any consumer downstream of an
+    // encoder.
+    UNSPECIFIED = 0;
+    CBR = 1;
+    VBR = 2;
+};
+
+type AudioCompressedFormatAac = struct {};
+
+type AudioCompressedFormatSbc = struct {};
+
+/// AudioCompressedFormatCvsd contains no fields for now since we will be
+/// using the parameter values recommended by Bluetooth Core Spec v5.3
+/// section 9.2.
+@available(added=HEAD)
+type AudioCompressedFormatCvsd = table {};
+
+/// AudioCompressedFormatLc3 contains no fields. The required parameters
+/// for setting up the decoder would be embedded as Codec_Specific_Configuration
+/// (Assigned Numbers section 6.12.5) in `FormatDetails.oob_bytes`.
+@available(added=HEAD)
+type AudioCompressedFormatLc3 = table {};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AudioPcmMode = strict enum {
+    // 16 bit signed int linear or 32 bit float linear, for now
+    // 1-N channels ok, with "A.B" channels designated as A+B channel_count -
+    // the channel map is separately specified.  So 5.1 becomes channel_count 6.
+    LINEAR = 0;
+    // G.711 8 bit format-defined waveform semantics
+    // 1 channel
+    ALAW = 1;
+    // G.711 8 bit format-defined waveform semantics
+    // 1 channel
+    MULAW = 2;
+};
+
+/// AudioChannelId
+///
+/// Used in specifying which audio channel is for which speaker location / type.
+///
+/// TODO(b/529511595): Do we need/want more channel IDs than this?
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AudioChannelId = strict enum {
+    SKIP = 0; // unused channel
+    LF = 1; // left front
+    RF = 2; // right front
+    CF = 3; // center front
+    LS = 4; // left surround
+    RS = 5; // right surround
+    LFE = 6; // low frequency effects
+    CS = 7; // back surround
+    LR = 8; // left rear
+    RR = 9; // right rear
+    // This is the last explicitly-defined value + 1.  This name will be
+    // re-defined in future if we add more defined channel IDs above.
+    END_DEFINED = 10;
+    // This is where format-specific (or ad-hoc) channel ID values should go, to
+    // avoid colliding with any additional values allocated above.  The values
+    // here are not guaranteed to avoid collision across different formats.
+    EXTENDED_CHANNEL_ID_BASE = 0x6f000000;
+    // Extended channel IDs should be <= Max.
+    MAX = 0x7fffffff;
+};
+
+/// PcmFormat
+///
+/// PCM audio format details.
+type PcmFormat = struct {
+    // Implicit details:
+    //   * For bits_per_sample > 8, host-endian is implied.
+    //   * At least for now, for channel_count >= 2, interleaved layout is
+    //     implied.
+
+    pcm_mode AudioPcmMode;
+
+    // bits_per_sample
+    //
+    // A "sample" is for a single channel.
+    //
+    // For example, CD quality is 16.  See PcmMode comments, as the mode
+    // constrains this value.
+    bits_per_sample uint32;
+
+    // frames_per_second
+    //
+    // A "frame" is one datapoint (one "sample") for each channel.  Each channel
+    // is sampled this many times per second.  For example, CD quality is 44100.
+    frames_per_second uint32;
+
+    // channel_map
+    //
+    // channel_map.size() is the channel count.  See PcmMode comments, as some
+    // modes constrain the channel count to 1.
+    //
+    // Values from AudioChannelId should be used if they are suitable.
+    //
+    // If a channel has no suitable AudioChannelId, an ad-hoc value can be used
+    // in a range starting from AudioChannel_ExtendedChannelIdBase.
+    channel_map vector<AudioChannelId>:16;
+};
+
+/// AudioUncompressedFormat
+///
+// Uncompressed audio format details.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AudioUncompressedFormat = strict union {
+    1: pcm PcmFormat;
+};
+
+/// AudioFormat
+///
+// Audio format details.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AudioFormat = strict union {
+    1: compressed AudioCompressedFormat;
+    2: uncompressed AudioUncompressedFormat;
+};
+
+/// VideoCompressedFormat
+///
+/// Compressed video format details.
+///
+// If a compressed video format has no fields here, it's because it's a good
+// format and is already self-describing given the mime_type + format-defined
+// oob_bytes as appropriate + in-band data.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type VideoCompressedFormat = strict union {
+    /// Temp field to make the compiler happy until we have at least one real
+    /// field. Do not reference this field in code.
+    1: temp_field_todo_remove uint32;
+};
+
+// Deprecated. Do not use.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+@available(added=7, deprecated=32)
+type VideoColorSpace = strict enum {
+    INVALID = 0;
+};
+
+/// VideoUncompressedFormat
+///
+/// Uncompressed video format details.
+///
+// TODO(b/529511595): Switch to fuchsia.images2.ImageFormat for this purpose.
+type VideoUncompressedFormat = struct {
+    image_format fuchsia.sysmem.ImageFormat_2;
+
+    // fourcc
+    //
+    // A human-readable fourcc like RGBA should be 0x41424752 in the fourcc
+    // field (regardless of host endian-ness). Note that the R (first character)
+    // of the fourcc is in the low-order byte of this fourcc field.
+    //
+    // There are some fourcc codes that don't format nicely as a string.  While
+    // I don't foresee any use of any of the purely numeric fourcc codes (not
+    // corresponding to packed ascii character values), those would be stored
+    // such that their numeric value has it's low-order byte in the low-order
+    // byte of this fourcc value.  So a fourcc with "hex value" 0x00000001 would
+    // have the numeric value 1 in this field.
+    //
+    // The endian-ness of fourcc values stored in files or in network packets is
+    // outside the scope of these comments, other than to state that regardless
+    // of the source of the fourcc code and the order that storage /
+    // transmission format stores these bytes, a human-readable fourcc should
+    // have its human-read first ascii character value in the low order byte of
+    // this field.
+    fourcc uint32;
+
+    // For formats with different planes having different resolution, this is
+    // the resolution of the highest-resolution plane(s).  Else it's the
+    // resolution of all the planes.
+    primary_width_pixels uint32;
+    primary_height_pixels uint32;
+
+    // For formats where the secondary planes are the same resolution, these
+    // fields will be the same as primary_width_pixels and
+    // primary_height_pixels.  For formats with smaller secondary resolutions,
+    // these indicate that resolution.
+    secondary_width_pixels uint32;
+    secondary_height_pixels uint32;
+
+    // Planar means the various planes are separately stored in their own chunks
+    // of memory.
+    planar bool;
+
+    // If a format is swizzled, the swizzling parameters are not directly here.
+    swizzled bool;
+
+    primary_line_stride_bytes uint32;
+    // Formats with the same stride for all planes will have this field equal to
+    // primary_line_stride_bytes.
+    secondary_line_stride_bytes uint32;
+
+    // R or Y
+    primary_start_offset uint32;
+    // G or U
+    secondary_start_offset uint32;
+    // B or V
+    tertiary_start_offset uint32;
+
+    primary_pixel_stride uint32;
+    // For formats with the same pixel stride for all planes, this field will be
+    // equal to primary_pixel_stride.
+    secondary_pixel_stride uint32;
+
+    // These override the primary_width_pixels and primary_height_pixels for
+    // purposes of display (but not for purposes of determining the pixel layout
+    // in memory).  These can crop on the right and bottom.  These must be <=
+    // the corresponding coded dimension.
+    //
+    // This value must be <= primary_width_pixels.
+    primary_display_width_pixels uint32;
+    // This value must be <= primary_height_pixels.
+    primary_display_height_pixels uint32;
+
+    // The pixel_aspect_ratio_width : pixel_aspect_ratio_height is the pixel
+    // aspect ratio (AKA sample aspect ratio aka SAR) for the luma (AKA Y)
+    // samples. A pixel_aspect_ratio of 1:1 mean square pixels. A
+    // pixel_aspect_ratio of 2:1 would mean pixels that are displayed twice as
+    // wide as they are tall. Codec implementation should ensure these two
+    // values are relatively prime by reducing the fraction (dividing both by
+    // GCF) if necessary.
+    //
+    // When has_pixel_aspect_ratio == false, pixel_aspect_ratio_width and
+    // pixel_aspect_ratio_height will both be 1, but in that case the
+    // pixel_aspect_ratio_width : pixel_aspect_ratio_height of 1:1 is just a
+    // very weak suggestion re. reasonable-ish handling, not in any way
+    // authoritative. In this case (or in any case really) the receiver of this
+    // message may have other OOB means to determine the actual
+    // pixel_aspect_ratio.
+    @allow_deprecated_struct_defaults
+    has_pixel_aspect_ratio bool = false;
+    @allow_deprecated_struct_defaults
+    pixel_aspect_ratio_width uint32 = 1;
+    @allow_deprecated_struct_defaults
+    pixel_aspect_ratio_height uint32 = 1;
+};
+
+/// VideoFormat
+///
+/// Video (compress or uncompressed) format details.  In this context,
+/// "uncompressed" can include block-based image compression formats that still
+/// permit fairly fast random access to image data.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type VideoFormat = strict union {
+    1: compressed VideoCompressedFormat;
+    2: uncompressed VideoUncompressedFormat;
+};
+
+// Encryption schemes as defined by ISO 23001-7: Common encryption in ISO base
+// media file format files. These are defined as strings rather than enums so as
+// to not limit the encryption schemes that an implementation supports to the
+// constants that are defined here.
+alias EncryptionScheme = string:MAX_ENCRYPTION_SCHEME_SIZE;
+const ENCRYPTION_SCHEME_UNENCRYPTED string = "unencrypted";
+const ENCRYPTION_SCHEME_CENC string = "cenc";
+const ENCRYPTION_SCHEME_CBC1 string = "cbc1";
+const ENCRYPTION_SCHEME_CENS string = "cens";
+const ENCRYPTION_SCHEME_CBCS string = "cbcs";
+
+alias KeyId = vector<uint8>:MAX_KEY_ID_SIZE;
+alias InitVector = vector<uint8>:MAX_INIT_VECTOR_SIZE;
+
+/// SubsampleEntry
+///
+/// A subsample is a byte range within a sample consisting of a clear byte range
+/// followed by an encrypted byte range. This structure specifies the size of
+/// each range in the subsample.
+type SubsampleEntry = struct {
+    clear_bytes uint32;
+    encrypted_bytes uint32;
+};
+
+/// EncryptionPattern
+///
+/// Pattern encryption utilizes a pattern of encrypted and clear 16 byte blocks
+/// over the protected range of a subsample (the encrypted_bytes of a
+/// `SubsampleEntry`). This structure specifies the number of encrypted data
+/// blocks followed by the number of clear data blocks.
+type EncryptionPattern = struct {
+    clear_blocks uint32;
+    encrypted_blocks uint32;
+};
+
+/// EncryptedFormat
+///
+/// The stream format details payload of a decrypting stream processor. This is
+/// a sparsely populated table to specify parameters necessary for decryption
+/// other than the data stream. It is only necessary to update fields if they
+/// changed, but not an error if the same value is repeated.
+type EncryptedFormat = table {
+    /// `scheme` specifies which encryption scheme to use, such as
+    /// `fuchsia.media.ENCRYPTION_SCHEME_CENC`.
+    /// Usage:
+    ///  - It is required to be set prior to delivery of input packets.
+    ///  - Changing the scheme mid-stream is only permitted in some scenarios.
+    ///    Once an encrypted scheme is selected for a stream, the scheme may
+    ///    only be set to `fuchsia.media.ENCRYPTION_SCHEME_UNENCRYPTED` or that
+    ///    same initial encrypted scheme. The scheme may be set to
+    ///    `fuchsia.media.ENCRYPTION_SCHEME_UNENCRYPTED` at any point.
+    6: scheme string;
+
+    /// `key_id` identifies the key that should be used for decrypting
+    /// subsequent data.
+    /// Usage:
+    ///  - It is required to be set prior to delivery of input packets to a
+    ///    decryptor.
+    ///  - This may be changed multiple times during a data stream.
+    8: key_id KeyId;
+
+    /// `init_vector` is used in combination with a key and a block of content
+    /// to create the first cipher block in a chain and derive subsequent cipher
+    /// blocks in a cipher block chain.
+    /// Usage:
+    ///  - It is required to be set prior to the delivery of input packets to a
+    ///    decryptor.
+    ///  - This may be changed multiple times during a data stream.
+    3: init_vector InitVector;
+
+    /// `subsamples` is used to identify the clear and encrypted portions of a
+    /// subsample.
+    /// Usage:
+    ///  - For whole sample encryption, this parameter should not be sent.
+    ///  - This may be changed multiple times during a data stream.
+    4: subsamples vector<SubsampleEntry>;
+
+    /// `pattern` is used to identify the clear and encrypted blocks for pattern
+    /// based encryption.
+    /// Usage:
+    /// - This is not allowed for CENC and CBC1 and required for CENS and CBCS.
+    /// - If required, it must be set prior to the delivery of input packets to
+    ///   a decryptor.
+    /// - This may be changed multiple times during a data stream.
+    5: pattern EncryptionPattern;
+};
+
+/// DecryptedFormat
+///
+/// This describes the format of the decrypted content. It is required to be
+/// sent by the StreamProcessor server prior to the delivery of output packets.
+/// Currently, there is no additional format details for decrypted output.
+type DecryptedFormat = table {
+    // TODO(https://fxbug.dev/42160640): Empty tables cause dart analysis error. Remove this
+    // unused field once the issue is resolved.
+    1: ignore_this_field bool;
+};
+
+/// CryptoFormat
+///
+/// Crypto (encrypted or decrypted) format details.
+type CryptoFormat = flexible union {
+    1: encrypted EncryptedFormat;
+    2: decrypted DecryptedFormat;
+};
+
+/// DomainFormat
+///
+// Domain-specific format details (audio or video, compressed or uncompressed).
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type DomainFormat = strict union {
+    1: audio AudioFormat;
+    2: video VideoFormat;
+    3: crypto CryptoFormat;
+};
+
+const kMaxOobBytesSize uint64 = 8192;
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type SbcSubBands = strict enum {
+    SUB_BANDS_4 = 4;
+    SUB_BANDS_8 = 8;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type SbcBlockCount = strict enum {
+    BLOCK_COUNT_4 = 4;
+    BLOCK_COUNT_8 = 8;
+    BLOCK_COUNT_12 = 12;
+    BLOCK_COUNT_16 = 16;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type SbcAllocation = strict enum {
+    ALLOC_LOUDNESS = 0;
+    ALLOC_SNR = 1;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type SbcChannelMode = strict enum {
+    MONO = 0;
+    DUAL = 1;
+    STEREO = 2;
+    JOINT_STEREO = 3;
+};
+
+/// Settings for an SBC Encoder.
+///
+/// SBC Encoders take signed little endian 16 bit linear PCM samples and
+/// return encoded SBC frames. SBC encoder PCM data in batches of
+/// `sub_bands * block_count` PCM frames. This encoder will accept PCM data on
+/// arbitrary frame boundaries, but the output flushed when EOS is queued may be
+/// zero-padded to make a full batch for encoding.
+type SbcEncoderSettings = struct {
+    @allow_deprecated_struct_defaults
+    sub_bands SbcSubBands = SbcSubBands.SUB_BANDS_8;
+    @allow_deprecated_struct_defaults
+    allocation SbcAllocation = SbcAllocation.ALLOC_LOUDNESS;
+    @allow_deprecated_struct_defaults
+    block_count SbcBlockCount = SbcBlockCount.BLOCK_COUNT_4;
+    channel_mode SbcChannelMode;
+    /// SBC bit pool value.
+    bit_pool uint64;
+};
+
+/// Raw AAC access units.
+type AacTransportRaw = struct {};
+
+/// AAC inside LATM
+type AacTransportLatm = struct {
+    /// Whether MuxConfiguration stream element is present
+    mux_config_present bool;
+};
+
+/// AAC inside ADTS
+type AacTransportAdts = struct {};
+
+type AacTransport = flexible union {
+    1: raw AacTransportRaw;
+    2: latm AacTransportLatm;
+    3: adts AacTransportAdts;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AacChannelMode = strict enum {
+    MONO = 0;
+    STEREO = 2;
+};
+
+type AacConstantBitRate = struct {
+    /// Bits per second
+    bit_rate uint32;
+};
+
+/// Variable bit rate modes. The actual resulting bitrate
+/// varies based on input signal and other encoding settings.
+///
+/// See https://wiki.hydrogenaud.io/index.php?title=Fraunhofer_FDK_AAC#Bitrate_Modes
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AacVariableBitRate = strict enum {
+    V1 = 1;
+    V2 = 2;
+    V3 = 3;
+    V4 = 4;
+    V5 = 5;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AacBitRate = strict union {
+    1: constant AacConstantBitRate;
+    2: variable AacVariableBitRate;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type AacAudioObjectType = strict enum {
+    /// MPEG-2 Low Complexity
+    MPEG2_AAC_LC = 0;
+    /// MPEG-4 Low Complexity
+    MPEG4_AAC_LC = 1;
+};
+
+type AacEncoderSettings = struct {
+    transport AacTransport;
+    channel_mode AacChannelMode;
+    bit_rate AacBitRate;
+    aot AacAudioObjectType;
+};
+
+/// Customization of h264 encoder parameters for macroblock quantization. The values
+/// can range from 0 to 51, with lower numbers indicating higher
+/// quality/bitrate. While encoders should support these fields if feasible,
+/// some encoders may ignore these fields. It's ok to not set this table, or
+/// not set some of the fields in this table, as encoders can determine their
+/// own defaults. If the targeted bitrate can't be achieved with the specified values,
+/// then the user should expect the resulting encoded stream bitrate to differ from
+/// the requested bitrate.
+type H264QuantizationParameters = table {
+    /// Starting value for quantization of key frames.
+    1: i_base uint32;
+    /// Smallest allowed value for quantization of key frames.
+    2: i_min uint32;
+    /// Largest allowed value for quantization of key frames.
+    3: i_max uint32;
+    /// Starting value for quantization of predicted frames.
+    4: p_base uint32;
+    /// Smallest allowed value for quantization of predicted frames.
+    5: p_min uint32;
+    /// Largest allowed value for quantization of predicted frames.
+    6: p_max uint32;
+};
+
+/// Settings for H264 Encoders.
+type H264EncoderSettings = table {
+    /// Target bits per second for encoded stream.
+    /// If omitted, interpreted as 200,000.
+    1: bit_rate uint32;
+    /// Target frames per second for encoded stream.
+    /// If omitted, interpreted as 30.
+    2: frame_rate uint32;
+    /// Number of pictures per keyframe.  Setting to 0 will disable key frame
+    /// encoding, except for if force_key_frame is set to true.
+    /// If omitted, interpreted as 8.
+    3: gop_size uint32;
+    /// Whether to enable frame rate adjustments in order to meet target bitrate.
+    /// If omitted, interpreted as false.
+    4: variable_frame_rate bool;
+    /// Lowest frame rate allowed if `variable_frame_rate` is enabled. If
+    /// omitted, interpreted as 10.
+    5: min_frame_rate uint32;
+    /// If true, next frame encoded will be a key frame. If omitted, interpreted
+    /// as false.
+    6: force_key_frame bool;
+    /// Allow customization of quantization parameters for encoding. Each frame
+    /// submitted after setting this will use the new values. If omitted, no
+    /// change from encoder defaults is made.
+    7: quantization_params H264QuantizationParameters;
+};
+
+/// Settings for HEVC/H265 Encoders.
+type HevcEncoderSettings = table {
+    /// Target bits per second for encoded stream. Defaults to 200,000 if
+    /// omitted.
+    1: bit_rate uint32;
+    /// Target frames per second for encoded stream. Defaults to 30 if omitted.
+    2: frame_rate uint32;
+    /// Number of pictures per keyframe. Defaults to 8 if omitted.
+    3: gop_size uint32;
+};
+
+/// Settings for CVSD Encoders. It contains no fields for now since we will be
+/// using the parameter values recommended by Bluetooth Core Spec v5.3
+/// section 9.2.
+@available(added=HEAD)
+type CvsdEncoderSettings = table {};
+
+@available(added=HEAD)
+type Lc3FrameDuration = flexible enum {
+    // 10ms duration.
+    D10_MS = 1;
+    // 7.5ms duration.
+    D7P5_MS = 2;
+};
+
+
+/// Settings for LC3 Encoders. Contains parameters stated in LC3 Specification v1.0.
+/// Contains fields that are not represented by PcmFormat.
+@available(added=HEAD)
+type Lc3EncoderSettings = table {
+    /// External byte count values to be used for the frame encoding of audio.
+    /// According to the LC3 Specification v1.0, each audio channel could have different
+    /// output byte size value, but for Fuchsia use case, we use the same `nbytes` value
+    /// for all channels.
+    1: nbytes uint16;
+    /// Frame duration is used together with sampling frequency to determine the
+    /// frame size.
+    2: frame_duration Lc3FrameDuration;
+};
+
+/// Settings for the mSBC encoder. There are no settings as the mSBC encoder uses the values
+/// required by HFP Spec v1.8.
+@available(added=HEAD)
+type MSbcEncoderSettings = table {};
+
+/// Settings for encoders that tell them how to encode raw
+/// formats.
+type EncoderSettings = flexible union {
+    1: sbc SbcEncoderSettings;
+    2: aac AacEncoderSettings;
+    3: h264 H264EncoderSettings;
+    4: hevc HevcEncoderSettings;
+    @available(added=HEAD)
+    5: cvsd CvsdEncoderSettings;
+    @available(added=HEAD)
+    6: lc3 Lc3EncoderSettings;
+    @available(added=HEAD)
+    7: msbc MSbcEncoderSettings;
+};
+
+/// A list of permitted codec profiles. This list should be flexible since codecs can and will be added
+/// in the future. This can contain both video and audio profiles if needed.
+type CodecProfile = flexible enum : uint32 {
+    H264PROFILE_BASELINE = 0;
+    H264PROFILE_MAIN = 1;
+    H264PROFILE_EXTENDED = 2;
+    H264PROFILE_HIGH = 3;
+    H264PROFILE_HIGH10PROFILE = 4;
+    H264PROFILE_HIGH422PROFILE = 5;
+    H264PROFILE_HIGH444PREDICTIVEPROFILE = 6;
+    H264PROFILE_SCALABLEBASELINE = 7;
+    H264PROFILE_SCALABLEHIGH = 8;
+    H264PROFILE_STEREOHIGH = 9;
+    H264PROFILE_MULTIVIEWHIGH = 10;
+    VP8PROFILE_ANY = 11;
+    VP9PROFILE_PROFILE0 = 12;
+    VP9PROFILE_PROFILE1 = 13;
+    VP9PROFILE_PROFILE2 = 14;
+    VP9PROFILE_PROFILE3 = 15;
+    HEVCPROFILE_MAIN = 16;
+    HEVCPROFILE_MAIN10 = 17;
+    HEVCPROFILE_MAIN_STILL_PICTURE = 18;
+    MJPEG_BASELINE = 19;
+};
+
+/// FormatDetails
+///
+/// This describes/details the format on input or output of a StreamProcessor
+/// (separate instances for input vs. output).
+//
+// The purpose of FormatDetails is to fill in additional details not
+// conveyed via other means.
+//
+// For decoder input, the format details tend to be fairly sparse, since most
+// compressed formats tend to be mostly self-describing.
+//
+// For decoder output and encoder input, the format details need to include all
+// the out-of-band information regarding the uncompressed data, which tends not
+// to be self-describing.
+//
+// Settings that are completely redundant with the data in the format itself
+// should not be in a required field here. An encoder may set oob_bytes on its
+// output.
+//
+// This stuff should be limited to things we need to know to properly process the
+// data which we can't already determine from the data itself, and which isn't
+// already covered by a format's defined OOB binary config blob, which is
+// conveyed in oob_bytes.
+//
+// Most decoders can have FormatDetails.domain null.
+type FormatDetails = table {
+    // Particular instances of FormatDetails will set this field to make it
+    // easier for a receiver to determine if any part of the format has changed
+    // vs. the last FormatDetails received for the same context.
+    1: format_details_version_ordinal uint64;
+
+    // See also `DetailedCodecDescription.mime_type`.
+    2: mime_type string;
+
+    // Some streams have their own binary configuration structure.  For those
+    // streams we allow that binary structure to be directly conveyed to the
+    // stream processor here. For many bitstream formats, this can alternately
+    // be provided in-band within the stream.
+    //
+    // For example:
+    //   * audio/aac - this is an AudioSpecificConfig().
+    //
+    // For some formats whose "ES" data format is always self-contained, or for
+    // which there is no format-defined binary OOB config, this is null.
+    //
+    // A server can close the channel if the count of bytes is >
+    // kMaxOobBytesSize or is larger than makes any sense for the stream
+    // processor.  If any stream actually needs more than kMaxOobBytesSize
+    // bytes here, we could potentially increase this restriction some, but
+    // this interface isn't designed to support OOB config blobs that approach
+    // ZX_CHANNEL_MAX_MSG_BYTES.
+    3: oob_bytes vector<uint8>:MAX;
+
+    // Decoder input format:
+    //
+    // If a format is not self-describing given the mime_type and a
+    // format-spec-defined oob_bytes, this domain field can be set to
+    // provide the additional compressed-format-specific details.  This is
+    // expected to be fairly rare, so most compressed input formats will have
+    // only the mime_type and possibly oob_bytes set, with domain typically
+    // null.  If an encoder is upstream however, domain may be set to convey the
+    // encoder settings that were used, but a decoder consumer doesn't need to
+    // look at those.
+    //
+    // Encoder output format:
+    //
+    // The encoder's compressed data output typically needs some configuration
+    // (provided in this field) that's convenient to provide in a form that's
+    // not oob_bytes, and the codec can convert that config to oob_bytes on
+    // encoder output via OnOutputConstraints().  We retain these encoder settings
+    // in the output FormatDetails to allow for cases where a downstream
+    // consumer knowing the encoder settings could be useful.
+    //
+    // Encoder input format / decoder output format:
+    //
+    // This field contains fairly detailed information re. uncompressed data
+    // format details, which tends to _not_ be self-describing in-band.
+    4: domain DomainFormat;
+
+    // TODO(b/476248640): Soft migration from VideoUncompressedFormat to an
+    // ImageFormat field here.
+    //
+    // X: image_format fuchsia.images2.ImageFormat;
+
+    // See comments above on Parameter.  At the time we lock relevant FIDL
+    // interfaces, there should be zero use of this field outside tests, but
+    // this is here in case we need to allow a stream processor client to
+    // convey additional config parameters to/from a stream processor which we
+    // didn't anticipate before locking.
+    //
+    // If there are any known "official" exceptions to the previous paragraph,
+    // we'll list them here by corresponding mime_type (none so far):
+    //   * "<mime_type>" - <usage_description>
+    //
+    // For streams that define their own stream-specific config/OOB data, put
+    // that in oob_bytes above instead of this field.
+    5: pass_through_parameters vector<Parameter>;
+
+    /// Instructs an encoder on how to encode raw data.
+    ///
+    /// Decoders may ignore this field but are entitled to rejected requests with
+    /// this field set because it doesn't make sense.
+    6: encoder_settings EncoderSettings;
+
+    /// The number of ticks of the timebase of input packet timestamp_ish values
+    /// per second.
+    ///
+    /// The timebase is only used used for optional extrapolation of timestamp_ish
+    /// values when an input timestamp which applies to byte 0 of the valid portion
+    /// of the input packet does not correspond directly to byte 0 of the valid
+    /// portion of any output packet.
+    ///
+    /// Leave unset if timestamp extrapolation is not needed, either due to lack of
+    /// timestamps on input, or due to input being provided in increments of the
+    /// encoder's input chunk size (based on the encoder settings and calculated
+    /// independently by the client).  Set if timestamp extrapolation is known to be
+    /// needed or known to be acceptable to the client.
+    7: timebase uint64;
+
+    /// The codec profile for the given encoder or decoder.
+    ///
+    /// For encoders: This value is completely optional. A client may want to specify the codec
+    /// profile used for protocol compatibility reasons (i.e. WebRTC). However if the value is not
+    /// set then the the encoder is free to choose any supported codec profile.
+    ///
+    /// For decoders: This value is optional but providing it is best practice (at least of
+    /// unencrypted streams). Container formats include the encoded profile and this should be
+    /// provided to the decoder. Certain formats like VP9 and AV1 include the encoded profile in
+    /// their elementary bitstream so it is possible for those decoders to figure out the profile
+    /// the stream is encoded in. Regardless, clients should provide the encoded profile if
+    /// possible.
+    8: profile CodecProfile;
+};

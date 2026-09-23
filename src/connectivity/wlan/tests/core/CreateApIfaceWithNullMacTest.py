@@ -1,0 +1,40 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import logging
+
+import fidl_fuchsia_wlan_common as fw_common
+import fuchsia_wlan_base_test
+import honeydew.affordances.connectivity.wlan.core as wlan_core
+from mobly import asserts, test_runner
+
+logger = logging.getLogger(__name__)
+
+
+class CreateApIfaceWithNullMacTest(fuchsia_wlan_base_test.FuchsiaWlanBaseTest):
+    phy: wlan_core.Phy
+
+    async def setup_class(self) -> None:
+        await super().setup_class()
+        self.phy = await self.dut.wlan_core.ensure_single_phy()
+
+    async def setup_test(self) -> None:
+        await super().setup_test()
+        await self.dut.wlan_core.destroy_all_ifaces()
+
+    async def test_create_ap_iface_with_null_mac(self) -> None:
+        iface = await self.phy.create_ap_iface()
+        query_iface_response = await iface.query()
+        asserts.assert_equal(iface.id, query_iface_response.id_)
+        asserts.assert_equal(self.phy.id, query_iface_response.phy_id)
+        asserts.assert_equal(
+            fw_common.WlanMacRole.AP, query_iface_response.role
+        )
+        asserts.assert_not_equal(
+            [0, 0, 0, 0, 0, 0], list(query_iface_response.sta_addr)
+        )
+
+
+if __name__ == "__main__":
+    test_runner.main()

@@ -1,0 +1,231 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/dist/resource.gni")
+import("//build/sdk/sdk_atom.gni")
+import("//build/testing/host_test_data.gni")
+import("//src/lib/vulkan/build/config.gni")
+import("//src/lib/vulkan/layers.gni")
+
+# Centralizing the GN points of entry into Vulkan ecosystem repositories here is
+# helpful
+# for grasping the full scope. Note, there are also entry points in
+# //sdk/BUILD.gn.
+
+# Provides the Vulkan headers and entry points via the Vulkan loader.
+group("vulkan") {
+  public_configs = [ ":vulkan_hpp" ]
+  public_deps = [
+    ":headers",
+    "//third_party/Vulkan-Loader/src:libvulkan",
+  ]
+}
+
+group("vulkan_headers_and_loader") {
+  public_deps = [
+    ":headers",
+    "//third_party/Vulkan-Loader/src:libvulkan",
+  ]
+}
+
+# Provides only the Vulkan headers without the loader.
+group("headers") {
+  public_deps = [ "//third_party/Vulkan-Headers/src:vulkan_headers" ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":loader_and_validation_tests",
+    "tests",
+  ]
+
+  # Ensure loader builds for Linux x64
+  deps += [ ":vulkan_headers_and_loader(//build/toolchain:linux_x64-shared)" ]
+}
+
+# Tests for the Vulkan loader and validation layers.
+group("loader_and_validation_tests") {
+  testonly = true
+  public_deps = [
+    "//third_party/Vulkan-Loader/src:tests",
+    "//third_party/Vulkan-ValidationLayers/src:tests",
+  ]
+}
+
+config("vulkan_hpp") {
+  defines = [ "VULKAN_HPP_NO_EXCEPTIONS" ]
+  if (is_release) {
+    defines += [ "VULKAN_HPP_ASSERT(expr)=do {} while(0)" ]
+  } else {
+    defines += [ "VULKAN_HPP_ASSERT(expr)=((void)(expr))" ]
+  }
+}
+
+import("//src/lib/vulkan/swapchain/sdk_atom_info.gni")
+import("//src/lib/vulkan/validation_layers/sdk_atom_info.gni")
+
+# A list of scopes describing the Vulkan layers to add to the SDK.
+# Each item is a scope describing a given layer, which consists
+# in a loadable module and a JSON configuration file.
+#
+# The expected schema is the following:
+#
+#   module_name (optional)
+#     [string] Name of the loadable module (e.g. 'VkLayer_khrnos_validation.so).
+#     If not specified, then 'module_file' is required and will be used to
+#     determine the name.
+#
+#   module_label (required)
+#     [GN label] Label of the target generating the module, if it is not a
+#     prebuilt one.
+#
+#   module_file (optional)
+#     [GN path] Path to the loadable module. Required if 'module_name' is not
+#     defined. Otherwise, if 'module_label' is defined, this defaults to
+#     '$root_out_dir/$module_name'.
+#
+#   config_name (optional)
+#     [string] Name of the configuration file (e.g. 'VkLayer_khronos_validation.json').
+#     If not specified, then 'config_file' is required and will be used to
+#     determine the name.
+#
+#   config_label (optional)
+#     [GN label] Label of the target generating the config file, if it is not
+#     a prebuilt one.
+#
+#   config_file (required)
+#     [GN path] Path to the configuration file.
+#
+vulkan_layers_sdk_atom_infos = vulkan_validation_layers_sdk_atom_infos
+vulkan_layers_sdk_atom_infos += [ vulkan_image_pipe_swapchain_sdk_atom_info ]
+
+sdk_atom("vulkan_layers") {
+  id = "sdk://pkg/vulkan_layers"
+
+  category = "partner"
+
+  files = []
+  non_sdk_deps = []
+
+  _sdk_binaries = []
+  _sdk_resources = []
+
+  foreach(info, vulkan_layers_sdk_atom_infos) {
+    # Add loadable module to metadata and file list
+    if (defined(info.module_name)) {
+      _module_name = info.module_name
+    } else {
+      assert(defined(info.module_file),
+             "module_file is required if module_name is not defined: $info")
+      _module_name = get_path_info(info.module_file, "file")
+    }
+    if (defined(info.module_file)) {
+      _module_file = info.module_file
+    } else {
+      assert(defined(info.module_name),
+             "module_name is required if module_file is not defined: $info")
+      _module_file = "$root_out_dir/${_module_name}"
+    }
+
+    base = "arch/$target_cpu"
+    _destination = "${base}/dist/" + _module_name
+
+    _sdk_binaries += [ _destination ]
+    files += [
+      {
+        source = _module_file
+        dest = _destination
+      },
+    ]
+    if (defined(info.module_label)) {
+      non_sdk_deps += [ info.module_label ]
+    }
+
+    # Add config file to metadata and file list
+    if (defined(info.config_name)) {
+      _config_name = info.config_name
+    } else {
+      assert(defined(info.config_file),
+             "config_file is required if config_name is not defined: $info")
+      _config_name = get_path_info(info.config_file, "file")
+    }
+    assert(defined(info.config_file), "config_file is required: $info")
+    _config_file = info.config_file
+    _destination =
+        "pkg/vulkan_layers/data/vulkan/explicit_layer.d/${_config_name}"
+    _sdk_resources += [ _destination ]
+    files += [
+      {
+        source = _config_file
+        dest = _destination
+      },
+    ]
+    if (defined(info.config_label)) {
+      non_sdk_deps += [ info.config_label ]
+    }
+  }
+
+  meta = {
+    dest = "pkg/vulkan_layers/meta.json"
+    type = "loadable_module"
+    value = {
+      type = "loadable_module"
+      name = "vulkan_layers"
+      root = "pkg/vulkan_layers"
+      resources = []
+      resources = _sdk_resources
+      binaries = {
+      }
+      if (target_cpu == "arm64") {
+        binaries.arm64 = _sdk_binaries
+      } else if (target_cpu == "x64") {
+        binaries.x64 = _sdk_binaries
+      } else if (target_cpu == "riscv64") {
+        binaries.riscv64 = _sdk_binaries
+      } else {
+        assert(false, "Unknown CPU type: %target_cpu")
+      }
+    }
+  }
+}
+
+#
+# Vulkan dependencies required for Vulkan executables / tests / source sets.
+# This includes headers, loader linkage, and copying of runtime files for host
+# executables.
+#
+config("vulkan_host_loader_config") {
+  if (current_cpu == "x64" && is_host) {
+    # Use the runtime libs instead of the downloaded SDK libs to avoid linking
+    # issues. The SDK libs may have dependencies on newer C library symbols (for
+    # example from SDK 1.3.268:
+    # ld.lld: error: undefined reference due to --no-allow-shlib-undefined: pow@GLIBC_2.29
+    # >>> referenced by ../../prebuilt/third_party/vulkansdk/linux/x86_64/lib/libvulkan.so
+    #)
+    _lib_dir = vulkan_host_runtime_sub_dirs.lib
+    lib_dirs = [ "$vulkan_host_runtime_dir/$_lib_dir" ]
+
+    # Link Vulkan loader to host executables.
+    libs = [ "vulkan" ]
+  }
+}
+
+group("vulkan_host_loader") {
+  public_configs = [ ":vulkan_host_loader_config" ]
+}
+
+group("vulkan_validation_layers") {
+  deps = [
+    ":vklayer_khronos_validation_json",
+    "//third_party/Vulkan-ValidationLayers/src:vulkan_validation_layers",
+  ]
+}
+
+resource("vklayer_khronos_validation_json") {
+  sources = [ "$vulkan_data_dir/VkLayer_khronos_validation.json" ]
+  outputs = [ "data/vulkan/explicit_layer.d/VkLayer_khronos_validation.json" ]
+  deps = [ "//third_party/Vulkan-ValidationLayers/src:vulkan_gen_json_files" ]
+}

@@ -1,0 +1,259 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_host_test.gni")
+import("//build/python/python_library.gni")
+import("//third_party/protobuf/proto_library.gni")
+
+# Most of this file is collecting protobufs from perfetto and compiling
+# them into a python library. These are used send and received messages over
+# the RPC interface to `trace_processor_shell`.
+
+# Packages the third-party Python protobuf library. The package is split into
+# static and generated targets to resolve GN's strict input-dependency checks
+# for build-time generated files (such as descriptor_pb2.py and
+# python_edition_defaults.py). The empty aggregator target ":protobuf_py"
+# combines all three to expose the complete "google.protobuf" package at
+# runtime.
+python_library("protobuf_static_py") {
+  visibility = [ ":*" ]
+  library_name = "google"
+  source_root = "//third_party/protobuf/src/python/google"
+  sources = [
+    "__init__.py",
+    "protobuf/__init__.py",
+    "protobuf/any.py",
+    "protobuf/compiler/__init__.py",
+    "protobuf/descriptor.py",
+    "protobuf/descriptor_database.py",
+    "protobuf/descriptor_pool.py",
+    "protobuf/duration.py",
+    "protobuf/internal/__init__.py",
+    "protobuf/internal/api_implementation.py",
+    "protobuf/internal/builder.py",
+    "protobuf/internal/containers.py",
+    "protobuf/internal/decoder.py",
+    "protobuf/internal/encoder.py",
+    "protobuf/internal/enum_type_wrapper.py",
+    "protobuf/internal/extension_dict.py",
+    "protobuf/internal/field_mask.py",
+    "protobuf/internal/message_listener.py",
+    "protobuf/internal/numpy/__init__.py",
+    "protobuf/internal/python_message.py",
+    "protobuf/internal/type_checkers.py",
+    "protobuf/internal/well_known_types.py",
+    "protobuf/internal/wire_format.py",
+    "protobuf/json_format.py",
+    "protobuf/message.py",
+    "protobuf/message_factory.py",
+    "protobuf/proto.py",
+    "protobuf/proto_builder.py",
+    "protobuf/proto_json.py",
+    "protobuf/pyext/__init__.py",
+    "protobuf/pyext/cpp_message.py",
+    "protobuf/reflection.py",
+    "protobuf/runtime_version.py",
+    "protobuf/service_reflection.py",
+    "protobuf/symbol_database.py",
+    "protobuf/text_encoding.py",
+    "protobuf/text_format.py",
+    "protobuf/timestamp.py",
+    "protobuf/unknown_fields.py",
+    "protobuf/util/__init__.py",
+  ]
+  enable_mypy = false
+}
+
+# Compiles standard protobuf library .proto files to Python.
+# This target is restricted to this file to prevent external misuse;
+# external targets should depend on the public ":tp_shell" target instead.
+proto_library("common_python_protos") {
+  visibility = [ ":*" ]
+  proto_in_dir = "//third_party/protobuf/src/src"
+  proto_out_dir = ""
+  sources = [
+    "//third_party/protobuf/src/src/google/protobuf/any.proto",
+    "//third_party/protobuf/src/src/google/protobuf/api.proto",
+    "//third_party/protobuf/src/src/google/protobuf/compiler/plugin.proto",
+    "//third_party/protobuf/src/src/google/protobuf/descriptor.proto",
+    "//third_party/protobuf/src/src/google/protobuf/duration.proto",
+    "//third_party/protobuf/src/src/google/protobuf/empty.proto",
+    "//third_party/protobuf/src/src/google/protobuf/field_mask.proto",
+    "//third_party/protobuf/src/src/google/protobuf/source_context.proto",
+    "//third_party/protobuf/src/src/google/protobuf/struct.proto",
+    "//third_party/protobuf/src/src/google/protobuf/timestamp.proto",
+    "//third_party/protobuf/src/src/google/protobuf/type.proto",
+    "//third_party/protobuf/src/src/google/protobuf/wrappers.proto",
+  ]
+  generate_cc = false
+  generate_python = true
+}
+
+# Generates the `python_edition_defaults.py` file dynamically at build time.
+#
+# Starting with Protobuf v26+, the Python protobuf runtime library requires
+# `google.protobuf.internal.python_edition_defaults` to resolve edition-specific
+# feature sets and defaults (e.g. proto2, proto3, and 2023 edition).
+#
+# This file is generated (usually with
+# `bazel build //python/dist:source`, which will unfortunately build
+# a ton of different things).
+#
+# This action generates `python_edition_defaults.py` with the string
+# representation of `descriptor.proto` expanded inside a template
+# file.  The result must be available in the protoc python package as
+# google/protobuf/internal/python_edition_defaults.py
+#
+# See $PROTOBUF/editions/defaults.bzl for details.
+#
+# Fortunately, Pigweed has a helper script that handles this, avoiding
+# reinventing a wheel.
+action("python_edition_defaults_py") {
+  script = "//third_party/pigweed/backends/pw_protobuf_compiler/expand_python_edition_defaults.py"
+  _protoc_label = "//third_party/protobuf:protoc($host_toolchain)"
+  _protoc_path = get_label_info(_protoc_label, "root_out_dir") + "/protoc"
+  inputs = [
+    "//third_party/protobuf/src/src/google/protobuf/descriptor.proto",
+    "//third_party/protobuf/src/python/google/protobuf/internal/python_edition_defaults.py.template",
+    _protoc_path,
+  ]
+  outputs = [ "$target_out_dir/protobuf/internal/python_edition_defaults.py" ]
+  args = [
+    "--protoc",
+    rebase_path(_protoc_path, root_build_dir),
+    "--descriptor-proto",
+    rebase_path(inputs[0], root_build_dir),
+    "--template-file",
+    rebase_path(inputs[1], root_build_dir),
+    "--output",
+    rebase_path(outputs[0], root_build_dir),
+    "--edition-defaults-minimum=PROTO2",
+    "--edition-defaults-maximum=2023",
+  ]
+  deps = [ _protoc_label ]
+}
+
+python_library("protobuf_compiled_protos_py") {
+  visibility = [ ":*" ]
+  library_name = "google"
+  source_root = "$root_out_dir/pyproto/google"
+  sources = [
+    "protobuf/any_pb2.py",
+    "protobuf/api_pb2.py",
+    "protobuf/compiler/plugin_pb2.py",
+    "protobuf/descriptor_pb2.py",
+    "protobuf/duration_pb2.py",
+    "protobuf/empty_pb2.py",
+    "protobuf/field_mask_pb2.py",
+    "protobuf/source_context_pb2.py",
+    "protobuf/struct_pb2.py",
+    "protobuf/timestamp_pb2.py",
+    "protobuf/type_pb2.py",
+    "protobuf/wrappers_pb2.py",
+  ]
+  deps = [ ":common_python_protos" ]
+  enable_mypy = false
+}
+
+python_library("protobuf_edition_defaults_py_lib") {
+  visibility = [ ":*" ]
+  library_name = "google"
+  source_root = "$target_out_dir"
+  sources = [ "protobuf/internal/python_edition_defaults.py" ]
+  deps = [ ":python_edition_defaults_py" ]
+  enable_mypy = false
+}
+
+python_library("protobuf_py") {
+  visibility = [ ":*" ]
+  library_name = "google"
+  sources = []
+  library_deps = [
+    ":protobuf_compiled_protos_py",
+    ":protobuf_edition_defaults_py_lib",
+    ":protobuf_static_py",
+  ]
+  enable_mypy = false
+}
+
+# Packages the third-party Perfetto Python SDK. Including the RPC/HTTP APIs, URI
+# resolvers, and prebuilt manifests from the third-party Perfetto directory
+# under the "perfetto" namespace. Depends on ":protobuf_py" to enable
+# protobuf-based query execution over RPC. Since GN does not support python
+# libraries natively, we need to use the fuchsia python_library template here
+# vs. perfetto's template in order to build in fuchsia. Refer to
+# //src/performance/lib/tp_shell/README.md for more details.
+python_library("perfetto_py") {
+  visibility = [ ":*" ]
+  library_name = "perfetto"
+  source_root = "//third_party/perfetto/python/perfetto"
+  sources = [
+    "__init__.py",
+    "common/exceptions.py",
+    "common/query_result_iterator.py",
+    "prebuilts/manifests/heapprofd_glibc_preload.py",
+    "prebuilts/manifests/perfetto-c-sdk-src.py",
+    "prebuilts/manifests/perfetto-cpp-sdk-src.py",
+    "prebuilts/manifests/trace_processor_shell.py",
+    "prebuilts/manifests/tracebox.py",
+    "prebuilts/manifests/traceconv.py",
+    "prebuilts/perfetto_prebuilts.py",
+    "tools/download_trace.py",
+    "trace_processor/__init__.py",
+    "trace_processor/api.py",
+    "trace_processor/http.py",
+    "trace_processor/metrics.descriptor",
+    "trace_processor/platform.py",
+    "trace_processor/process_tree.py",
+    "trace_processor/protos.py",
+    "trace_processor/shell.py",
+    "trace_processor/trace_processor.descriptor",
+    "trace_uri_resolver/__init__.py",
+    "trace_uri_resolver/path.py",
+    "trace_uri_resolver/registry.py",
+    "trace_uri_resolver/resolver.py",
+    "trace_uri_resolver/util.py",
+  ]
+  library_deps = [ ":protobuf_py" ]
+  enable_mypy = false
+}
+
+# The public API entrypoint library for the trace processor toolkit.
+# External projects, scripts, and tools should depend on this target to access
+# the persistent RPC Trace Processor and its platform delegates.
+python_library("tp_shell") {
+  source_root = "."
+  sources = [
+    "__init__.py",
+    "tp_utils.py",
+  ]
+  library_deps = [ ":perfetto_py" ]
+  enable_mypy = true
+
+  _arch = host_cpu
+  data_sources = [ "//prebuilt/third_party/perfetto/trace_processor_shell/linux-$_arch/trace_processor_shell" ]
+  data_package_name = "bin"
+}
+
+if (is_host) {
+  python_host_test("tp_shell_test") {
+    main_source = "tp_shell_test.py"
+    libraries = [ ":tp_shell" ]
+
+    data_sources = [
+      "//src/performance/lib/fxt/rust/tests/goldens/data/perfetto_golden.fxt",
+    ]
+    data_package_name = "test_data"
+  }
+} else {
+  group("tp_shell_test") {
+    testonly = true
+    public_deps = [ ":tp_shell_test($host_toolchain)" ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [ ":tp_shell_test" ]
+}

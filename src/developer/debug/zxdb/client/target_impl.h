@@ -1,0 +1,103 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_DEVELOPER_DEBUG_ZXDB_CLIENT_TARGET_IMPL_H_
+#define SRC_DEVELOPER_DEBUG_ZXDB_CLIENT_TARGET_IMPL_H_
+
+#include "src/developer/debug/ipc/records.h"
+#include "src/developer/debug/zxdb/client/process.h"
+#include "src/developer/debug/zxdb/client/process_observer.h"
+#include "src/developer/debug/zxdb/client/target.h"
+#include "src/developer/debug/zxdb/symbols/target_symbols.h"
+#include "src/lib/fxl/macros.h"
+#include "src/lib/fxl/memory/weak_ptr.h"
+
+namespace zxdb {
+
+class ProcessImpl;
+class System;
+
+class TargetImpl : public Target {
+ public:
+  // The system owns this object and will outlive it.
+  explicit TargetImpl(System* system);
+  ~TargetImpl() override;
+
+  System* system() { return system_; }
+  ProcessImpl* process() { return process_.get(); }
+  TargetSymbols* symbols() { return &symbols_; }
+
+  // Allocates a new target with the same settings as this one. This isn't a real copy, because any
+  // process information is not cloned.
+  std::unique_ptr<TargetImpl> Clone(System* system);
+
+  // Create a process in the target. The process should have been attached in debug_agent.
+  void CreateProcess(Process::StartType start_type, uint64_t koid, const std::string& process_name,
+                     uint64_t timestamp,
+                     const std::vector<debug_ipc::ComponentInfo>& component_info,
+                     std::optional<debug_ipc::AddressRegion> shared_aspace);
+
+  // Tests can use this to create a target for mocking purposes without making any IPC. To destroy
+  // call ImplicitlyDetach().
+  void CreateProcessForTesting(uint64_t koid, const std::string& process_name);
+
+  // Removes the process from this target without making any IPC calls. This can be used to clean up
+  // after a CreateProcessForTesting(), and during final shutdown. In final shutdown, we assume
+  // anything still left running will continue running as-is and just clean up local references.
+  //
+  // If the process is not running, this will do nothing.
+  void ImplicitlyDetach();
+
+  // Target implementation:
+  State GetState() const override;
+  Process* GetProcess() const override;
+  const TargetSymbols* GetSymbols() const override;
+  const std::vector<std::string>& GetArgs() const override;
+  void SetArgs(std::vector<std::string> args) override;
+  void Launch(CallbackWithTimestamp callback) override;
+  void Kill(Callback callback) override;
+  void Attach(uint64_t koid, debug_ipc::AttachConfig config,
+              CallbackWithTimestamp callback) override;
+  void Detach(Callback callback) override;
+  void OnProcessExiting(int return_code, uint64_t timestamp) override;
+  void AssignPreviousConnectedProcess(const debug_ipc::ProcessRecord& record) override;
+
+ private:
+  // Most logic between attaching and starting is shared so these functions handle both cases. The
+  // thunk resolves the weak pointer and issues special errors if it's gone. It also maps the
+  // transport errors in |err| and the report errors in |status| to a single error value.
+  static void OnLaunchOrAttachReplyThunk(
+      fxl::WeakPtr<TargetImpl> target, CallbackWithTimestamp callback, const Err& err,
+      uint64_t koid, const debug::Status& status, const std::string& process_name,
+      uint64_t timestamp, const std::vector<debug_ipc::ComponentInfo>& component_info,
+      std::optional<debug_ipc::AddressRegion> shared_aspace);
+  void OnLaunchOrAttachReply(CallbackWithTimestamp callback, const Err& err, uint64_t koid,
+                             const std::string& process_name, uint64_t timestamp,
+                             const std::vector<debug_ipc::ComponentInfo>& component_info,
+                             std::optional<debug_ipc::AddressRegion> shared_aspace);
+
+  void OnKillOrDetachReply(ProcessObserver::DestroyReason reason, const Err& err,
+                           const debug::Status& status, Callback callback, uint64_t timestamp);
+
+  System* system_;  // Owns |this|.
+
+  State state_ = kNone;
+
+  std::vector<std::string> args_;
+
+  // Associated process if there is one.
+  std::unique_ptr<ProcessImpl> process_;
+
+  TargetSymbols symbols_;
+
+  fxl::WeakPtrFactory<TargetImpl> impl_weak_factory_;
+
+  uint64_t mock_timestamp_ = 0;
+
+  FXL_DISALLOW_COPY_AND_ASSIGN(TargetImpl);
+};
+
+}  // namespace zxdb
+
+#endif  // SRC_DEVELOPER_DEBUG_ZXDB_CLIENT_TARGET_IMPL_H_

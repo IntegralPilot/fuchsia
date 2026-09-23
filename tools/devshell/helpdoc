@@ -1,0 +1,483 @@
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Documentation
+### create markdown docs for fx subcommands
+
+## usage: fx helpdoc [OPTIONS] OUTPUT_PATH
+##
+## Create markdown documentation for fx and its subcommands, based on
+## the same metadata that is used to create the output of `fx help`
+##
+##     --vendor                  create docs for subcommands in //vendor/*/scripts/devshell.
+##                                 If specified, only vendor docs are documented. There's
+##                                 no way to generate docs for vendor and non-vendor at the
+##                                 same time.
+##     --toc-prefix URL_PREFIX   use URL_PREFIX instead of "/reference/tools/fx"
+##                                 as an URL prefix in generated _toc.yaml files.
+##     --escape-jinja            escape jinja tags in fx help text to avoid
+##                                 parsing errors in fuchsia.dev.
+##     --no-deprecated           do not create docs for deprecated subcommands
+##     --no-contrib              do not create docs for contrib scripts in //tools/devshell/contrib/*
+##     --archive                 creates a compressed archive at OUTPUT_PATH.
+##                                 If specified, output will be compressed
+##                                 and OUTPUT_PATH must end with .tgz or .tar.gz.
+##                                 This must be the last option specified before the OUTPUT_PATH
+##     --depfile DEPFILENAME     creates a depfile for helpdoc generation. Must be run with archive
+
+# The generated documentation is laid out with all commands in /cmd/<cmd>.md is to make the URL predictable and stable. Categories
+# are arbitrary texts and used to change often, it is undesirable that a category change invalidates the previous command help URL.
+# Since the table of contents for each category needs to be in a file named _toc.yaml, these files are generated in the per-category
+# directory along with a README.md, which links to the markdown in ../cmd.
+
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh || exit $?
+
+categories=()
+
+function main {
+  show_vendor=0
+  show_contrib=1
+  escape_jinja=0
+  show_deprecated=1
+  archive_output=0
+  archive_path=
+  toc_prefix="/reference/tools/fx"
+  create_depfile=0
+  while [[ $# -ne 0 ]]; do
+    case $1 in
+      --vendor)
+        show_vendor=1
+        ;;
+      --toc-prefix)
+        if [[ $# -lt 2 ]]; then
+          fx-error "Invalid syntax"
+          fx-command-help
+          exit 1
+        fi
+        shift
+        toc_prefix="$1"
+        ;;
+      --depfile)
+        if [[ $# -lt 2 ]]; then
+          fx-error "Invalid syntax"
+          fx-command-help
+          exit 1
+        fi
+        shift
+        depfile_prefix="$1"
+        create_depfile=1
+        ;;
+      --no-deprecated)
+        show_deprecated=0
+        ;;
+      --escape-jinja)
+        escape_jinja=1
+        ;;
+      --no-contrib)
+        show_contrib=0
+        ;;
+      --archive)
+        archive_output=1
+        ;;
+      -*)
+        fx-error "Unknown argument $1"
+        fx-command-help
+        exit 1
+        ;;
+      *)
+        break
+        ;;
+    esac
+    shift
+  done
+
+  if [[ $# -ne 1 ]]; then
+    fx-error "No output path specified"
+    fx-command-help
+    return 1
+  fi
+
+  base_out="$1"
+  if [[ "${archive_output}" -eq 1 ]]; then
+    if [[ $base_out != *.tgz ]] && [[ $base_out != *.tar.gz ]]; then
+          fx-error "OUTPUT_PATH must end with .tgz or .tar.gz if the archive flag is specified: ${base_out}"
+          fx-command-help
+          exit 1
+    fi
+    archive_path="$base_out"
+    base_out="$(mktemp -d)"
+
+    temp_dir="$base_out"
+    base_out="${base_out}/helpdoc"
+    mkdir "$base_out"
+    trap 'cleanup' ERR INT TERM EXIT
+  fi
+
+  if [[ "${create_depfile}" -eq 1 ]]; then
+          if [[ "${archive_output}" -eq 0 ]]; then
+            fx-error "depfile currently not supported without archive_output"
+            fx-command-help
+            exit 1
+          fi
+   # This creates the depfile without quoting the archive_path or any of
+   # the dependencies labels/filenames. According to the MAKEFILE documentation
+   # which defines the format of depfiles, it is not clear if quoting will correctly
+   # deal with special characters, vs. using \ to escape them.
+    initial_deps="${archive_path}:  ../../scripts/fx ../../scripts/fx-help.awk
+${archive_path}:  ../../tools/devshell/lib/fx-cmd-locator.sh ../../tools/devshell/lib/vars.sh
+${archive_path}:  ../../tools/devshell/lib/fx-optional-features.sh ../../tools/devshell/lib/metrics.sh
+${archive_path}:  ../../tools/devshell/lib/platform.sh "
+    echo -n "$initial_deps" >> "${depfile_prefix}"
+    for vendor_dir in "${FUCHSIA_DIR}"/vendor/*/scripts/devshell; do
+      for d in "${vendor_dir}"/*; do
+          echo "vendor file ${d}"
+          if [[ "${d}" != *"/*" ]]; then
+            rel_path="$(realpath_relative_to_pwd "${d}")"
+            printf %s "${rel_path} " >> "${depfile_prefix}"
+          fi
+      done
+    done
+  fi
+
+  # Make the cmd subdirectory to hold the per-command generated markdown.
+  mkdir -p "${base_out}/cmd"
+
+  # initializes the main index.md
+  {
+    echo "# fx - Fuchsia development commands"
+    echo
+    echo "\`fx\` is the entry-point for a set of subcommands that make many tasks related to Fuchsia development easier."
+    echo
+    echo "It contains a large number of subcommands. Run \`fx help\` to see all the available subcommands."
+    echo "If you use bash or zsh as a shell, source \`scripts/fx-env.sh\`  "
+    echo "to get some auto-completion."
+    echo
+    echo "Also see the [global options and flags](fx.md) that affect all subcommands."
+    echo
+    echo "# fx subcommands"
+
+  } > "${base_out}/index.md"
+
+  {
+    echo "## fx command"
+    echo
+    echo "For help with specific subcommands, see [Overview page](index.md)."
+    echo
+    echo '```none'
+    print-redacted-fx-help
+    echo '```'
+    echo
+    echo "[fx source code](https://cs.opensource.google/fuchsia/fuchsia/+/main:scripts/fx)"
+  } > "${base_out}/fx.md"
+
+  if [[ "${show_vendor}" -eq 1 ]]; then
+    for d in "${FUCHSIA_DIR}"/vendor/*/scripts/devshell; do
+      if [[ -d "${d}" ]]; then
+        vendor="${d%/scripts/devshell}"
+        vendor="${vendor##*/}"
+        {
+          echo
+          echo "## ${vendor} subcommands"
+          echo
+          _md_main_table_header
+        } >> "${base_out}/index.md"
+        handle-directory "${d}"
+      fi
+    done
+  else
+    {
+      echo
+      echo "## Main subcommands"
+      echo
+      echo "Subcommands that are part of the [fx workflow](/docs/development/build/fx.md)."
+      echo
+      _md_main_table_header
+    } >> "${base_out}/index.md"
+    handle-directory "${FUCHSIA_DIR}/tools/devshell"
+    local d="${FUCHSIA_DIR}/tools/devshell/contrib"
+    if [[ "${show_contrib}" -eq 1 && -d "${d}" ]]; then
+      {
+        echo
+        echo "## Contrib subcommands"
+        echo
+        echo "Subcommands that have been contributed by project members that have other levels of support, ownership, or both."
+        echo "The [OWNERS file](https://cs.opensource.google/fuchsia/fuchsia/+/main:tools/devshell/contrib/OWNERS) in the"
+        echo "contrib directory provides a pointer to the member that supports each script."
+        echo
+        _md_main_table_header
+      } >> "${base_out}/index.md"
+      handle-directory "${d}"
+    fi
+  fi
+  create-main-toc
+  if [[ "${archive_output}" -eq 1 ]]; then
+    tar -C "$temp_dir" -czvf "$archive_path" .
+  fi
+
+}
+
+function realpath_relative_to_pwd {
+  local path="$1" rp source target
+
+  source="${PWD}"
+  target="${path}"
+  back=
+  common_part="${source}"
+  # shellcheck disable=SC2295
+  while [[ "${target#$common_part}" == "${target}" ]]; do
+    common_part="$(dirname "${common_part}")"
+    back="../${back}"
+  done
+  # shellcheck disable=SC2295
+  rp="${back}${target#$common_part/}"
+  echo "${rp}"
+}
+
+function cleanup {
+  if [[ -d "$temp_dir" ]]; then
+    rm -Rf "$temp_dir"
+  fi
+}
+
+function _md_main_table_header {
+  echo "Command | Category | Description"
+  echo "------- | -------- | -----------"
+}
+
+function print-redacted-fx-help {
+  local filter
+  filter="$(mktemp)"
+  cat > "${filter}" <<EOF
+  NR==1 || NR==3, /^$/ {
+    print
+  }
+
+  /^[^ ].*help flags.*:/,/^$/ {
+    print
+  }
+  /^Global .*:/,/^$/ {
+    print
+  }
+EOF
+  "${FUCHSIA_DIR}"/scripts/fx help --full | awk -f "${filter}"
+  rm "${filter}"
+}
+
+function handle-directory {
+  local d files cmds
+
+  d="$1"
+  files=( "${d}"/* )
+  cmds=()
+
+  for f in "${files[@]}"; do
+    if [[ "${create_depfile}" -eq 1 ]]; then
+      rel_path="$(realpath_relative_to_pwd "${f}")"
+      printf %s "${rel_path} " >> "${depfile_prefix}"
+    fi
+
+    if [[ -f "${f}" && ( -x "${f}" || "${f: -3}" == ".fx" ) ]]; then
+      cmds+=( "${f}" )
+    fi
+  done
+
+  # sort cmds
+  IFS=$'\n' sorted=($(sort <<< "${cmds[*]}"))
+  unset IFS
+
+  for c in "${sorted[@]}"; do
+    echo "Processing $(basename "${c}")"
+    handle-command "${c}"
+  done
+}
+
+
+function normalize {
+  local str="$1"
+  echo "${str}" | tr -s ', .' '_' | tr '[:upper:]' '[:lower:]'
+}
+
+function get_binary_metadata {
+  local file="$1"
+  local key="$2"
+  awk -F ' *= *' -f - "${file}" <<EOF
+    /^#### +${key} */ {
+      print 1;
+    }
+EOF
+}
+
+function get_metadata {
+  local file="$1"
+  local key="$2"
+  awk -F ' *= *' -f - "${file}" <<EOF
+    /^#### +${key} */ {
+      print \$2;
+    }
+EOF
+}
+
+function get_metadata_camelcase {
+  local file="$1"
+  local key="$2"
+  awk -F ' *= *' -f - "${file}" <<EOF
+    /^#### +${key} */ {
+      print toupper(substr(\$2,1,1)) tolower(substr(\$2,2));
+    }
+EOF
+}
+
+function get_summary {
+  local cmd_path="$1"
+  sed -n '1,/^### /s/^### //p' < "${cmd_path}" | sed 's/_/\\_/g; s/*/\\*/g; s/|/\\|/g'
+}
+
+function create-main-toc {
+  # initializes the global toc
+  {
+    echo "toc:"
+    echo "- title: Overview"
+    echo "  path: ${toc_prefix}/index.md"
+    echo "- title: fx command"
+    echo "  path: ${toc_prefix}/fx.md"
+  } > "${base_out}/_toc.yaml"
+
+  # sort categories
+  IFS=$'\n' sorted=($(sort -u <<< "${categories[*]}"))
+  unset IFS
+
+  for category in "${sorted[@]}"; do
+    local norm_cat
+
+    echo "Processing category ${category}"
+    norm_cat="$(normalize "${category}")"
+    # Make the category sub-dir to hold the toc.
+    mkdir -p "${base_out}/${norm_cat}"
+    # Appends the category to the global _toc.yaml
+    {
+      echo "- title: \"${category} commands\""
+      echo "  path: ${toc_prefix}/${norm_cat}/README.md"
+      echo "  section:"
+      echo "  - include: ${toc_prefix}/${norm_cat}/_toc.yaml"
+    } >> "${base_out}/_toc.yaml"
+  done
+}
+
+function get-category-title {
+  local category="$1"
+  if [[ -n "${vendor}" ]]; then
+    echo "${category} fx subcommands for ${vendor}"
+  else
+    echo "${category} fx subcommands"
+  fi
+}
+
+function maybe-add-category {
+  local cat_base category norm_cat toc
+  category="$1"
+  norm_cat="$(normalize "${category}")"
+  cat_base="${base_out}/${norm_cat}/README.md"
+  toc="${base_out}/${norm_cat}/_toc.yaml"
+  # Make the category sub-dir to hold the toc.
+  mkdir -p "${base_out}/${norm_cat}"
+  if [[ ! -f "${toc}" ]]; then
+    # initializes the per-category _toc.yaml
+    {
+      echo "toc:"
+    } > "${toc}"
+
+    # initializes the per-category index
+    {
+      echo "# $(get-category-title "${category}")"
+      echo
+      echo "Command | Description"
+      echo "------- | -----------"
+    } > "${cat_base}"
+  fi
+  echo "${norm_cat}"
+}
+
+function escape-jinja {
+  # the way fuchsia.dev processes jinja tags is complicated, so simple escaping
+  # techniques like {% verbatim %} or {{ '{' }} don't work, and since the help
+  # text for these commands are in a fenced block, regular html escaping also
+  # doesn't work. The "hack" below mixes jinja escaping with html escaping in
+  # order to avoid errors with the fuchsia.dev parser.
+  sed "s/{%/{{ '{\&ZeroWidthSpace;%' }}/g"
+}
+
+function handle-command {
+  local category cat_url cmd_name cmd_path cmd_url deprecated deprecated_str filename norm_cat rel_path summary
+
+  cmd_path="$1"
+  cmd_name="$(basename "${cmd_path}" ".fx")"
+
+  category="$(get_metadata_camelcase "${cmd_path}" "CATEGORY")"
+   if [[ -z "${category}" ]]; then
+    category="Other"
+  fi
+
+  norm_cat="$(maybe-add-category "${category}")"
+
+  # categories is a global list.
+  categories+=( "${category}" )
+
+  # filename is the name of the generated markdown for this command.
+  filename="${base_out}/cmd/${cmd_name}.md"
+  deprecated_str=""
+  deprecated="$(get_binary_metadata "${cmd_path}" "DEPRECATED")"
+
+  if [[ "${deprecated}" -eq 1 ]]; then
+    if [[ "${show_deprecated}" -eq 0 ]]; then
+      return
+    fi
+    deprecated_str="DEPRECATED! "
+  fi
+
+  summary="${deprecated_str}$(get_summary "${cmd_path}")"
+  cmd_url="cmd/${cmd_name}.md"
+  cat_url="${norm_cat}/README.md"
+  rel_path="${cmd_path#"${FUCHSIA_DIR}"/}"
+
+  # Creates the per-command markdown file
+  {
+    if [[ -n "${vendor}" ]]; then
+      echo "# ${deprecated_str}fx vendor ${vendor} ${cmd_name}"
+    else
+      echo "# ${deprecated_str}fx ${cmd_name}"
+    fi
+    echo ""
+    echo "${summary}"
+    echo
+    echo '```none'
+    fx-print-command-help "$cmd_path" |
+      ( [[ ${escape_jinja} -eq 0 ]] && cat || escape-jinja )
+    echo '```'
+    if [[ -z "${vendor}" ]]; then
+      echo
+      echo "[${cmd_name} source code](https://cs.opensource.google/fuchsia/fuchsia/+/main:${rel_path})"
+    fi
+  } > "${filename}"
+
+  # Appends the command to the per-category index
+  {
+    echo "[${cmd_name}](../${cmd_url}) | ${summary}"
+  } >> "${base_out}/${norm_cat}/README.md"
+
+  # Appends the command to the global index
+  {
+    echo "[${cmd_name}](${cmd_url}) | [${category}](${cat_url}) | ${summary}"
+  } >> "${base_out}/index.md"
+
+  # Appends the command to the per-category _toc.yaml
+  {
+    echo "- title: \"${deprecated_str}${cmd_name}\""
+    echo "  path: ${toc_prefix}/${cmd_url}"
+  } >> "${base_out}/${norm_cat}/_toc.yaml"
+
+}
+
+main "$@"

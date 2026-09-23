@@ -1,0 +1,351 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.netemul;
+
+using fuchsia.component;
+using fuchsia.component.decl;
+using fuchsia.io;
+using fuchsia.netemul.network;
+using fuchsia.url;
+using zx;
+
+type Empty = struct {};
+
+/// The name of the child component that runs the netemul services.
+const NETEMUL_SERVICES_COMPONENT_NAME string = "netemul-services";
+
+/// `Sandbox` is a hermetic container for network emulation testing.
+///
+/// Every connection to `Sandbox` represents a self-contained context where
+/// [`fuchsia.netemul/ManagedRealm`]s can be created. The
+/// [`fuchsia.netemul.network/NetworkContext`] instance offered by it is the
+/// same that is exposed to any `ManagedRealm`s created by the `Sandbox`.
+///
+/// The lifetime of the created realms (and the context services) is bound to
+/// the connection to the `Sandbox` protocol. If the channel is closed, all the
+/// realms and the components created within them will be terminated.
+@discoverable
+closed protocol Sandbox {
+    /// Creates a new realm configured by `options`.
+    ///
+    /// + request `realm` request handle to the newly created managed realm.
+    /// + request `options` configures the setup and child components of
+    ///     `realm`. If `options` is invalid, `realm` will be closed.
+    ///
+    /// Errors are presented as an epitaph on the `realm` channel.
+    /// * error `ZX_ERR_INVALID_ARGS` if `options` was invalid.
+    /// * error `ZX_ERR_INTERNAL` for internal errors, including failures to
+    ///     build the requested component topology.
+    strict CreateRealm(resource struct {
+        realm server_end:ManagedRealm;
+        options @generated_name("RealmOptions") resource table {
+            /// Realm name.
+            ///
+            /// The realm name is used for attribution and debugging purposes.
+            /// It is used to decorate logs that come from its constituent child
+            /// components.
+            ///
+            /// If not set, an automatically-generated name will be used.
+            1: name string:MAX;
+            /// Child components to dynamically create in this realm.
+            ///
+            /// If not set, interpreted as an empty vector.
+            2: children vector<@generated_name("ChildDef") resource table {
+                /// The runtime source for creating this child.
+                ///
+                /// Required.
+                1: source @generated_name("ChildSource") strict resource union {
+                    /// Spawn a child from a component with the provided URL.
+                    1: component fuchsia.url.Url;
+                    /// Spawn a mock child which serves its exposed directory
+                    /// through the provided handle.
+                    2: mock client_end:fuchsia.io.Directory;
+                };
+                /// The name of this child local to its containing realm.
+                ///
+                /// Required.
+                2: name fuchsia.component.name;
+                /// Protocols that this child exposes to the realm.
+                ///
+                /// If not set, interpreted as an empty vector.
+                3: exposes vector<fuchsia.component.name>:MAX;
+                /// Capabilities that this child uses.
+                ///
+                /// If not set, no capabilities will be routed to the component.
+                4: uses @generated_name("ChildUses") strict union {
+                    /// The child will be offered each of the specified
+                    /// capabilities.
+                    ///
+                    /// `capabilities` must be unique.
+                    1: capabilities vector<@generated_name("Capability") strict union {
+                        /// The `devfs` instance offered by netemul, where
+                        /// virtual devices are mounted.
+                        1: netemul_devfs @generated_name("DevfsDep") table {
+                            /// The name of the capability being offered.
+                            ///
+                            /// Required.
+                            1: name fuchsia.component.name;
+                            /// The subdirectory of `/dev` visible to the
+                            /// component.
+                            ///
+                            /// If not set, the entire contents of `/dev` will
+                            /// be visible to the component.
+                            2: subdir string:fuchsia.component.MAX_PATH_LENGTH;
+                        };
+
+                        /// The network context offered by netemul, shared
+                        /// between all the managed realms in a given sandbox.
+                        3: netemul_network_context Empty;
+                        /// The [`fuchsia.logger/LogSink`] offered by netemul.
+                        ///
+                        /// Decorates logs produced by components in the managed
+                        /// realm and forwards them to syslog.
+                        4: log_sink Empty;
+                        /// A dependency on a capability exposed by another
+                        /// child component in the same test realm.
+                        5: child_dep table {
+                            /// The name of the child exposing the needed
+                            /// capability.
+                            ///
+                            /// If not specified, route assumed to be from "void".
+                            1: name fuchsia.component.name;
+                            /// The exposed capability.
+                            ///
+                            /// Required.
+                            2: capability @generated_name("ExposedCapability") strict union {
+                                /// The name of the exposed protocol.
+                                1: protocol fuchsia.component.name;
+                                /// The name of the exposed capability.
+                                2: configuration fuchsia.component.name;
+                                /// The name of the exposed service.
+                                3: service fuchsia.component.name;
+                            };
+                            /// Should the child be depended upon weakly.
+                            ///
+                            /// If not specified, assumed to be false
+                            /// NOTE: this value may only be set for [`capability`] of type
+                            ///       [`protocol`].
+                            3: is_weak bool;
+                            /// Whether to dynamically offer this capability from void when the used
+                            /// protocol has not been exposed by another child in the realm.
+                            4: dynamically_offer_from_void bool;
+                        };
+
+                        /// A dependency on a storage capability offered by
+                        /// netemul.
+                        6: storage_dep table {
+                            /// The variant of the storage capability.
+                            ///
+                            /// Required.
+                            1: variant @generated_name("StorageVariant") strict enum : uint8 {
+                                /// The `data` storage capability variant.
+                                DATA = 0;
+                                /// The `cache` storage capability variant.
+                                CACHE = 1;
+                                /// The `tmp` storage capability variant.
+                                TMP = 2;
+                                /// The `custom_artifacts` storage capability variant.
+                                ///
+                                /// NB: due to the fact that per-component isolated storage is
+                                /// destroyed along with the component, the `custom_artifacts`
+                                /// storage capability is actually proxied as a *directory*
+                                /// capability to components created in a `ManagedRealm`, in order
+                                /// to ensure that artifacts are not destroyed when the realm is
+                                /// torn down and can be extracted by the test framework. This
+                                /// implies that a component that would like to use
+                                /// `custom_artifacts` must use it as a directory rather than a
+                                /// storage capability.
+                                ///
+                                /// The netemul sandbox routes a separate subdirectory of its
+                                /// `custom_artifacts` storage to each component that requests it to
+                                /// ensure per-component isolation.
+                                CUSTOM_ARTIFACTS = 3;
+                            };
+
+                            /// The path at which the storage capability will be
+                            /// offered.
+                            ///
+                            /// Required.
+                            2: path string:fuchsia.component.MAX_PATH_LENGTH;
+                        };
+
+                        /// A dependency on the capability to register a tracing
+                        /// provider.
+                        7: tracing_provider Empty;
+                    }>:MAX;
+                };
+
+                /// Arguments to be passed to the child at runtime. If
+                /// specified, overrides any arguments specified in the
+                /// manifest.
+                ///
+                /// If not set, the original arguments from the manifest are
+                /// used.
+                5: program_args vector<string:MAX>:MAX;
+                /// Whether the component should be started eagerly once the
+                /// realm is created.
+                ///
+                /// If not set, interpreted as false.
+                6: eager bool;
+                /// Structured configuration values to *override* when launching
+                /// the child.
+                ///
+                /// If not set, interpereted as an empty vector.
+                7: config_values vector<@generated_name("ChildConfigValue") struct {
+                    /// The configuration key to override.
+                    key fuchsia.component.decl.ConfigKey;
+                    /// The configuration value to use instead of the one loaded
+                    /// from the package.
+                    value fuchsia.component.decl.ConfigValue;
+                }>:MAX;
+            }>:MAX;
+        };
+    });
+    /// Gets this sandbox's network context.
+    ///
+    /// + request `network_context` request handle to the network context.
+    strict GetNetworkContext(resource struct {
+        network_context server_end:fuchsia.netemul.network.NetworkContext;
+    });
+};
+
+/// `ManagedRealm` is a netemul-managed realm.
+///
+/// A `ManagedRealm` is hermetic with respect to capabilities except for
+///  * netemul-provided capabilities to allow networking
+///  * logging
+///
+/// `ManagedRealm` also provides a `devfs` instance: a directory standing for a
+/// virtual device filesystem that can be controlled through the [`AddDevice`]
+/// and [`RemoveDevice`] methods.
+///
+/// The lifetime of a `ManagedRealm` and all its children are tied to its
+/// channel. Upon closure, all children of the realm will be destroyed.
+closed protocol ManagedRealm {
+    /// Returns the moniker of the root of the managed realm.
+    ///
+    /// - response `moniker` the moniker of the root of the generated
+    ///     topology that contains this realm's child components.
+    strict GetMoniker() -> (struct {
+        moniker string:fuchsia.component.MAX_MONIKER_LENGTH;
+    });
+    /// Connects to a protocol named `protocol_name` provided by a child in this
+    /// realm.
+    ///
+    /// If `child_name` is not provided, connects to the first child offering
+    /// `protocol_name`.
+    ///
+    /// + request `protocol_name` the name of the protocol to connect to.
+    /// + request `child_name` the name of the child component that is exposing
+    ///     the requested protocol.
+    /// + request `req` a channel to be bound to an implementation of the
+    ///     protocol.
+    strict ConnectToProtocol(resource struct {
+        protocol_name fuchsia.component.name;
+        child_name fuchsia.component.name:optional;
+        req zx.Handle:CHANNEL;
+    });
+    /// Connects to a service named `service_name` provided by a child in this
+    /// realm.
+    ///
+    /// If `child_name` is not provided, connects to the first child offering
+    /// `service_name`.
+    ///
+    /// + request `service_name` the name of the service to connect to.
+    /// + request `child_name` the name of the child component that is exposing
+    ///     the requested service.
+    /// + request `req` a channel to be bound to the service directory.
+    strict ConnectToService(resource struct {
+        service_name fuchsia.component.name;
+        child_name fuchsia.component.name:optional;
+        req zx.Handle:CHANNEL;
+    });
+    /// Mounts new virtual device `device` on netemul's `devfs` instance within
+    /// this realm.
+    ///
+    /// This `devfs` instance is available to components that have the
+    /// [`Capability.netemul_devfs`] capability.
+    ///
+    /// + request `path` relative path from `devfs` root to the virtual device
+    ///     to be added to the realm.
+    /// + request `device` virtual device server.
+    /// * error `ZX_ERR_ALREADY_EXISTS` if `device.path` is already in use.
+    /// * error `ZX_ERR_INVALID_ARGS` if an element of `path` exceeds
+    ///     [`fuchsia.io/MAX_FILENAME`] bytes in length.
+    strict AddDevice(resource struct {
+        path string:MAX;
+        device client_end:fuchsia.netemul.network.DeviceProxy;
+    }) -> () error zx.Status;
+    /// Removes virtual device mounted at `path`.
+    ///
+    /// + request `path` the path to virtual device to be removed from the
+    ///     realm, relative to `devfs` root.
+    /// * error `ZX_ERR_NOT_FOUND` if `path` is not currently bound to a device.
+    /// * error `ZX_ERR_INVALID_ARGS` if an element of `path` exceeds
+    ///     [`fuchsia.io/MAX_FILENAME`] bytes in length.
+    strict RemoveDevice(struct {
+        path string:MAX;
+    }) -> () error zx.Status;
+    /// Connects to netemul's `devfs` instance for this realm.
+    ///
+    /// + request `devfs` request handle to the `devfs` directory.
+    strict GetDevfs(resource struct {
+        devfs server_end:fuchsia.io.Directory;
+    });
+    /// Starts the specified child component in this realm. Starting an already
+    /// running child component is a no-op and returns success.
+    ///
+    /// + request `child_name` the name of the child component to be started.
+    /// * error `ZX_ERR_NOT_FOUND` if `child_name` is not a child component in
+    ///     this realm.
+    /// * error `ZX_ERR_INVALID_ARGS` if `child_name` cannot be composed into a
+    ///     well-formed moniker.
+    /// * error `ZX_ERR_INTERNAL` if the call to the service dependency fails.
+    strict StartChildComponent(struct {
+        child_name fuchsia.component.name;
+    }) -> () error zx.Status;
+    /// Stops the specified child component in this realm. Stopping an already
+    /// stopped child component is a no-op and returns success.
+    ///
+    /// + request `child_name` the name of the child component to be stopped.
+    /// * error `ZX_ERR_NOT_FOUND` if `child_name` is not a child component in
+    ///     this realm.
+    /// * error `ZX_ERR_INVALID_ARGS` if `child_name` cannot be composed into a
+    ///     well-formed moniker.
+    /// * error `ZX_ERR_INTERNAL` if the call to the service dependency fails.
+    strict StopChildComponent(struct {
+        child_name fuchsia.component.name;
+    }) -> () error zx.Status;
+    /// Request that the managed realm shut down.
+    ///
+    /// The realm will send an `OnShutdown` event when shutdown is complete and
+    /// before closing the channel.
+    strict Shutdown();
+    /// Opens the diagnostics directory exposed by the component `child_name`.
+    // TODO(https://fxbug.dev/324494668): remove when Netstack2 is gone.
+    strict OpenDiagnosticsDirectory(resource struct {
+        child_name fuchsia.component.name;
+        directory server_end:fuchsia.io.Directory;
+    });
+    /// Signals that shutdown is complete and the channel will be closed.
+    strict -> OnShutdown();
+    /// Creates a new [`CrashListener`] instance scoped to this realm.
+    strict GetCrashListener(resource struct {
+        listener server_end:CrashListener;
+    });
+};
+
+/// A listener that yields component monikers that have exited uncleanly.
+///
+/// `CrashListener` is always scoped to a [`ManagedRealm`].
+closed protocol CrashListener {
+    /// A hanging get call that yields component monikers (relative to the
+    /// [`ManagedRealm`] root) that exited with dirty exit codes.
+    ///
+    /// Yields an empty vector when the realm itself has terminated. The
+    /// listener server end is closed after yielding the empty sentinel.
+    strict Next() -> (struct {
+        crashed_monikers vector<string:fuchsia.component.MAX_MONIKER_LENGTH>:MAX;
+    });
+};

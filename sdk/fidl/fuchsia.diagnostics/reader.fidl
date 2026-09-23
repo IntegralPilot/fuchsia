@@ -1,0 +1,239 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.diagnostics;
+
+using fuchsia.mem;
+using zx;
+
+///  The size bound of 1024 is a reasonably low size restriction that meets most
+///  canonical selectors we've ecountered.
+const MAXIMUM_RAW_SELECTOR_LENGTH uint16 = 1024;
+
+/// The size 64 was chosen because entries in batches are handles to
+/// VMOs and there is a limit of 64 handles per fidl message.
+const MAXIMUM_ENTRIES_PER_BATCH uint16 = 64;
+
+/// Enum describing the potential failure states of the streaming protocol when serving results
+/// to the client over the result iterator.
+// TODO(https://fxbug.dev/42055808): Change this from `strict` to `flexible` #strictaudit
+@strict_audit(bug="https://fxbug.dev/467128231", state="PENDING_REVIEW")
+type ReaderError = strict enum {
+    // An IO error suggests that parsing of data hierarchy VMOs or writing of formatted data to
+    // sockets has failed.
+    IO = 1;
+};
+
+/// Argument used for Archive selectors, can be either the pre-parsed
+/// fidl struct or string representation.
+type SelectorArgument = flexible union {
+    /// A Selector defining a pattern-matcher which selects for components within a hierarchy
+    /// and properties in a data hierarchy namespaced by component.
+    1: structured_selector Selector;
+
+    /// A raw string representing a [fuchsia.diagnostics/Selector].
+    /// The Selector defines a pattern-matcher which selects for components within a hierarchy
+    /// and properties in a data hierarchy namespaced by component.
+    /// NOTE: All StringSelectors parsed from the raw_selector will be interpreted in
+    ///       string_pattern mode, giving significance to special characters.
+    /// See https://fuchsia.dev/fuchsia-src/reference/diagnostics/selectors for more information
+    2: raw_selector string:MAXIMUM_RAW_SELECTOR_LENGTH;
+};
+
+/// A fidl union containing a complete hierarchy of structured diagnostics
+/// data, such that the content can be parsed into a file by itself.
+type FormattedContent = flexible resource union {
+    /// A diagnostics schema encoded as json.
+    /// The VMO will contain up to 1mb of diagnostics data.
+    1: json fuchsia.mem.Buffer;
+
+    /// A diagnostics schema encoded as text.
+    /// The VMO will contain up to 1mb of diagnostics data.
+    @available(removed=27)
+    2: text fuchsia.mem.Buffer;
+
+    /// A diagnostics schema encoded as cbor.
+    /// The VMO will contain up to 1mb of diagnostics data.
+    /// The size will be in ZX_PROP_VMO_CONTENT_SIZE.
+    @available(added=HEAD)
+    3: cbor zx.Handle:<VMO>;
+
+    /// A diagnostics schema encoded as FXT.
+    /// This is only valid for logs data.
+    /// The VMO will contain up to PerformanceConfiguration/max_aggregate_content_size_bytes
+    /// of diagnostics data, or 1mb if not specified.
+    /// The size will be in ZX_PROP_VMO_CONTENT_SIZE.
+    @available(added=HEAD)
+    4: fxt zx.Handle:<VMO>;
+};
+
+/// Enum specifying the modes by which a user can connect to and stream diagnostics metrics.
+// TODO(https://fxbug.dev/42055808): Change this from `strict` to `flexible` #strictaudit
+@strict_audit(bug="https://fxbug.dev/467128231", state="PENDING_REVIEW")
+type StreamMode = strict enum : uint8 {
+    /// The stream will serve a snapshot of the diagnostics data at the time of
+    /// connection, then end.
+    SNAPSHOT = 1;
+    /// The stream will serve a snapshot of the diagnostics data at the time of
+    /// connection, then subsequent calls to the stream will hang until
+    /// new diagnostics data is available.
+    SNAPSHOT_THEN_SUBSCRIBE = 2;
+    /// Calls to the stream will hang until new diagnostics data is available. Between calls to
+    /// the stream, newly arrived data is buffered.
+    SUBSCRIBE = 3;
+};
+
+// Enum specifying the data types available through the diagnostics platform.
+// TODO(https://fxbug.dev/42055808): Change this from `strict` to `flexible` #strictaudit
+@strict_audit(bug="https://fxbug.dev/467128231", state="PENDING_REVIEW")
+type DataType = strict enum : uint8 {
+    /// Complete inspect hierarchies on the system.
+    INSPECT = 1;
+    /// Log streams on the system.
+    LOGS = 3;
+};
+
+type ClientSelectorConfiguration = flexible union {
+    /// A vector of [fuchsia.diagnostics/SelectorArgument] which
+    /// provide additional filters to scope data streams with. An empty vector is considered
+    /// a misconfiguration and will result in an epitaph signaling incorrect parameters.
+    1: selectors vector<SelectorArgument>:MAX;
+
+    /// select_all must be true if set, and specifies that the client wants to retrieve
+    /// all data that their connection is able to expose.
+    2: select_all bool;
+};
+
+/// Parameters which configure a diagnostics stream's performance properties.
+type PerformanceConfiguration = table {
+    /// Maximum aggregate size of all formatted contents returned by
+    /// the batch iterator for a diagnostics stream. If this value is set for a stream
+    /// configured in subscribe mode, the stream will terminate when the max size has
+    /// been reached.
+    /// NOTE: OPTIONAL
+    1: max_aggregate_content_size_bytes uint64;
+
+    /// Configuration specifying max number of seconds to wait for a single
+    /// component to have its diagnostics data "pumped". This value can used
+    /// for testing or if you know the component you are interested is in under
+    /// heavy load.
+    /// If not provided, then PER_COMPONENT_ASYNC_TIMEOUT_SECONDS as defined in
+    /// https://fuchsia.googlesource.com/fuchsia/+/refs/heads/master/src/diagnostics/archivist/src/constants.rs
+    /// will be used.
+    /// NOTE: OPTIONAL
+    2: batch_retrieval_timeout_seconds int64;
+};
+
+/// Parameters needed to configure a stream of diagnostics information.
+type StreamParameters = table {
+    /// A [fuchsia.diagnostics/DataType] that specifies the diagnostics data type
+    /// to stream to the client.
+    /// NOTE: REQUIRED
+    1: data_type DataType;
+
+    /// A [fuchsia.diagnostics/StreamMode] that specifies how the
+    /// streaming server provides streamed results.
+    /// NOTE: REQUIRED
+    2: stream_mode StreamMode;
+
+    /// A [fuchsia.diagnostics/Format] that specifies how to format the returned
+    /// diagnostics data.
+    /// NOTE: REQUIRED
+    3: format Format;
+
+    /// Configuration specifying what results the client wants returned from their
+    /// connection. The client can request a specific subset of data using a vector
+    /// of provided selectors, or can specify that they want all available data.
+    /// NOTE: REQUIRED
+    4: client_selector_configuration ClientSelectorConfiguration;
+
+    /// Configuration specifying max number of seconds to wait for a single
+    /// component to have its diagnostics data "pumped". This value can used
+    /// for testing or if you know the component you are interested is in under
+    /// heavy load.
+    /// If not provided, then PER_COMPONENT_ASYNC_TIMEOUT_SECONDS as defined in
+    /// https://fuchsia.googlesource.com/fuchsia/+/refs/heads/master/src/diagnostics/archivist/src/constants.rs
+    /// will be used.
+    /// NOTE: OPTIONAL
+    5: batch_retrieval_timeout_seconds int64;
+
+    /// Parameters which configure a diagnostics stream's performance properties.
+    /// NOTE: OPTIONAL
+    6: performance_configuration PerformanceConfiguration;
+};
+
+/// Outer protocol for interacting with the different diagnostics data sources.
+@discoverable(server="platform")
+closed(removed=18) open(added=18) protocol ArchiveAccessor {
+    /// Creates an iterator over diagnostics data on the system.
+    ///   * The iterator may be finite by streaming in SNAPSHOT mode, serving only the
+    ///     current state of diagnostics data on the system.
+    ///   * The iterator may be infinite by streaming in either SNAPSHOT_THEN_SUBSCRIBE
+    ///     or SUBSCRIBE mode; the prior first provides iteration over the current state of
+    ///     the sytem, and then both provide ongoing iteration over newly arriving diagnostics
+    ///     data.
+    ///
+    /// + request `result stream` a [fuchsia.diagnostics/BatchIterator] that diagnostic
+    ///   records are exposed to the client over.
+    ///   * epitaphs:
+    ///      - INVALID_ARGS: A required argument in the StreamParameters struct was missing.
+    ///      - WRONG_TYPE: A selector provided by the StreamParameters struct was incorrectly
+    ///                    formatted.
+    ///
+    /// + request `stream_parameters` is a [fuchsia.diagnostics/StreamParameter] which
+    ///   specifies how to configure the stream.
+    strict(removed=18) flexible(added=18) StreamDiagnostics(resource struct {
+        stream_parameters StreamParameters;
+        result_stream server_end:BatchIterator;
+    });
+
+    /// Stream diagnostics data directly to a socket.
+    /// This is intended for host tools or components that prefer socket-based streaming.
+    @available(added=HEAD)
+    flexible StreamDiagnosticsToSocket(resource struct {
+        stream_parameters StreamParameters;
+        stream zx.Handle:<SOCKET, zx.Rights.WRITE | zx.Rights.WAIT>;
+    }) -> ();
+
+    /// Ensures that the connection with the server was established to prevent
+    /// races when using other pipelined methods of this protocol.
+    @available(added=HEAD)
+    flexible WaitForReady() -> ();
+};
+
+/// Conceptually, a directory iterator, where each element in the iterator is a single
+/// complete file that can be concatenated with other results.
+closed(removed=18) open(added=18) protocol BatchIterator {
+    /// Returns a vector of [fuchsia.diagnostics/FormattedContent] structs
+    /// with a format dictated by the format_settings argument provided to the Reader protocol
+    /// which spawned this BatchIterator.
+    ///
+    /// An empty vector implies that the data hierarchy has been fully iterated, and subsequent
+    /// GetNext calls will always return the empty vector.
+    ///
+    /// When the BatchIterator is serving results via subscription model, calls to GetNext will
+    /// hang until there is new data available, it will not return an empty vector.
+    ///
+    /// - returns a vector of FormattedContent structs. Clients connected to a
+    ///   Batch are expected to call GetNext() until an empty vector
+    ///   is returned, denoting that the entire data hierarchy has been read.
+    ///
+    /// * error a [fuchsia.diagnostics/ReaderError]
+    ///   value indicating that there was an issue reading the underlying data hierarchies
+    ///   or formatting those hierarchies to populate the `batch`. Note, these
+    ///   issues do not include a single component's data hierarchy failing to be read.
+    ///   The iterator is tolerant of individual component data sources failing to be read,
+    ///   whether that failure is a timeout or a malformed binary file.
+    ///   In the event that a GetNext call fails, that subset of the data hierarchy results is
+    ///   dropped, but future calls to GetNext will provide new subsets of
+    ///   FormattedDataHierarchies.
+    ///
+    strict(removed=18) flexible(added=18) GetNext() -> (resource struct {
+        batch vector<FormattedContent>:MAXIMUM_ENTRIES_PER_BATCH;
+    }) error ReaderError;
+
+    /// Indicates that the BatchIterator has been connected. If the
+    /// BatchIterator hasn't been connected, this method will hang until it is.
+    @available(added=18)
+    flexible WaitForReady() -> ();
+};

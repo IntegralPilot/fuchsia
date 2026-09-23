@@ -1,0 +1,706 @@
+// Copyright 2024 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+{
+    children: [
+        {
+            name: "driver_manager",
+            url: "fuchsia-boot:///driver_manager#meta/driver_manager.cm",
+            environment: "#driver_manager-env",
+        },
+        {
+            name: "driver_index",
+            url: "fuchsia-boot:///driver-index#meta/driver-index.cm",
+            on_terminate: "reboot",
+        },
+        {
+            // Exists to augment capability graph with information about when #boot-drivers should
+            // be stopped. Most components should prefer depending on capabiliites provided by
+            // #devfs-with-pkg over this component
+            name: "devfs",
+            url: "fuchsia-boot:///devfs#meta/devfs.cm",
+            environment: "#devfs-env",
+        },
+        {
+            // Exists to augment capability graph with information about when #base-drivers and
+            // #full-drivers should be stopped. Most components should prefer depending on
+            // capabiliites provided by this component over #devfs.
+            name: "devfs-with-pkg",
+            url: "fuchsia-boot:///devfs#meta/devfs-pkg.cm",
+            environment: "#devfs-env",
+        },
+    ],
+    collections: [
+        {
+            // LINT.IfChange
+            name: "driver-hosts",
+
+            // LINT.ThenChange(//src/developer/forensics/exceptions/handler/component_lookup.cc)
+            environment: "#driver-host-env",
+            durability: "single_run",
+        },
+        {
+            name: "boot-drivers",
+            environment: "#boot-driver-env",
+            durability: "transient",
+            allowed_offers: "static_and_dynamic",
+            allow_long_names: true,
+        },
+    ],
+    capabilities: [
+        { dictionary: "driver-services-for-session" },
+    ],
+    offer: [
+        {
+            config: [
+                "fuchsia.driver.BaseDrivers",
+                "fuchsia.driver.BindEager",
+                "fuchsia.driver.BootDrivers",
+                "fuchsia.driver.DelayFallbackUntilBaseDriversIndexed",
+                "fuchsia.driver.DisabledDrivers",
+                "fuchsia.driver.DriverLoadFuzzerMaxDelayMs",
+                "fuchsia.driver.EnableDriverLoadFuzzer",
+                "fuchsia.driver.EnableEphemeralDrivers",
+            ],
+            from: "parent",
+            to: "#driver_index",
+        },
+        {
+            config: "fuchsia.driver.index.StopOnIdleTimeoutMillis",
+            from: "parent",
+            to: "#driver_index",
+            availability: "optional",
+        },
+        {
+            dictionary: "diagnostics",
+            from: "self",
+            to: [
+                "#boot-drivers",
+                "#devfs",
+                "#devfs-with-pkg",
+                "#driver-hosts",
+                "#driver_index",
+                "#driver_manager",
+            ],
+        },
+        {
+            config: [
+                "fuchsia.driver.DelayFallbackUntilBaseDriversIndexed",
+                "fuchsia.driver.manager.EnableTestShutdownDelays",
+                "fuchsia.driver.manager.RootDriver",
+                "fuchsia.power.SuspendEnabled",
+            ],
+            from: "parent",
+            to: "#driver_manager",
+        },
+        {
+            config: [
+                "fuchsia.driver.manager.PowerInjectOffer",
+                "fuchsia.driver.manager.SetRootDriverHostCritical",
+                "fuchsia.driver.manager.SuspendTimeoutFallback",
+            ],
+            from: "void",
+            to: "#driver_manager",
+            availability: "optional",
+        },
+        {
+            config: [
+                "fuchsia.display.FallbackHorizontalSizeMm",
+                "fuchsia.display.FallbackVerticalSizeMm",
+                "fuchsia.driver.devicetree.EnabledNodes",
+                "fuchsia.driver.ExposeDebugCapabilities",
+                "fuchsia.driver.UseHardwareIommu",
+                "fuchsia.power.RuntimeProcessorPowerManagementEnabled",
+                "fuchsia.power.StoragePowerManagementEnabled",
+                "fuchsia.power.SuspendEnabled",
+                "fuchsia.storage.SdmmcCommandQueueingEnabled",
+                "fuchsia.usb.PeripheralConfig.Functions",
+            ],
+            from: "parent",
+            to: "#boot-drivers",
+        },
+
+        // `VisualDebuggingLevel` to driver to change display configuration.
+        {
+            config: "fuchsia.ui.VisualDebuggingLevel",
+            from: "parent",
+            as: "fuchsia.display.VisualDebuggingLevel",
+            to: "#boot-drivers",
+            availability: "optional",
+        },
+        {
+            config: [
+                "fuchsia.platform.bus.SoftwareDeviceIds",
+                "fuchsia.platform.bus.SoftwareDeviceNames",
+            ],
+            from: "parent",
+            to: "#boot-drivers",
+        },
+        {
+            protocol: "fuchsia.tracing.provider.Registry",
+            from: "parent",
+            to: [
+                "#boot-drivers",
+                "#driver-hosts",
+                "#driver_manager",
+            ],
+            availability: "optional",
+        },
+        {
+            protocol: "fuchsia.diagnostics.LogFlusher",
+            from: "#archivist",
+            to: "#driver_manager",
+        },
+        {
+            protocol: "fuchsia.component.resolution.Resolver",
+            from: "parent",
+            as: "fuchsia.component.resolution.Resolver-boot",
+            to: "#driver_index",
+        },
+        {
+            // This is only used when the #driver_index |enable_ephemeral_drivers| config
+            // is set, which enables loading drivers ephemerally. This is intended for
+            // eng builds only and is set through product assembly.
+            //
+            // The #driver_manager will only use this protocol in DFv1.
+            // In DFv2 resolution is done by the component framework since drivers
+            // are componenets in DFv2.
+            protocol: "fuchsia.component.resolution.Resolver",
+            from: "#full_resolver",
+            as: "fuchsia.component.resolution.Resolver-full",
+            to: "#driver_index",
+            dependency: "weak",
+            source_availability: "unknown",
+        },
+        {
+            directory: "boot",
+            from: "parent",
+            as: "config",
+            to: "#driver_index",
+            rights: [ "r*" ],
+            subdir: "config/driver_index",
+        },
+        {
+            directory: "dev-topological",
+            from: "#devfs-with-pkg",
+            as: "dev",
+            to: "self/toolbox-directories",
+            target_availability: "unknown",
+        },
+        {
+            protocol: "fuchsia.driver.development.Manager",
+            from: "#driver_manager",
+            to: "self/toolbox",
+            target_availability: "unknown",
+        },
+        {
+            protocol: "fuchsia.driver.registrar.DriverRegistrar",
+            from: "#driver_index",
+            to: "self/toolbox",
+            target_availability: "unknown",
+        },
+        {
+            protocol: [
+                "fuchsia.boot.Items",
+                "fuchsia.boot.WriteOnlyLog",
+                "fuchsia.kernel.MexecResource",
+                "fuchsia.kernel.PowerResource",
+            ],
+            from: "parent",
+            to: "#driver_manager",
+        },
+        {
+            protocol: [
+                "fuchsia.component.Introspector",
+                "fuchsia.component.Realm",
+            ],
+            from: "framework",
+            to: "#driver_manager",
+        },
+        {
+            protocol: [
+                "fuchsia.driver.index.DevelopmentManager",
+                "fuchsia.driver.index.DriverIndex",
+                "fuchsia.driver.registrar.DriverRegistrar",
+            ],
+            from: "#driver_index",
+            to: "#driver_manager",
+        },
+        {
+            protocol: [ "fuchsia.boot.WriteOnlyLog" ],
+            from: "parent",
+            to: "#driver-hosts",
+        },
+        {
+            protocol: [
+                "fuchsia.boot.Items",
+                "fuchsia.kernel.CpuResource",
+                "fuchsia.kernel.IommuResource",
+                "fuchsia.kernel.IoportResource",
+                "fuchsia.kernel.IrqResource",
+                "fuchsia.kernel.MmioResource",
+                "fuchsia.kernel.MsiResource",
+                "fuchsia.kernel.PowerResource",
+                "fuchsia.kernel.SmcResource",
+            ],
+            from: "parent",
+            to: "#boot-drivers",
+        },
+        {
+            protocol: "fuchsia.kernel.InfoResource",
+            from: "parent",
+            to: "#boot-drivers",
+        },
+        {
+            protocol: [ "fuchsia.scheduler.RoleManager" ],
+            from: "#role_manager",
+            to: [
+                "#boot-drivers",
+                "#driver-hosts",
+            ],
+            source_availability: "unknown",
+        },
+        {
+            protocol: [
+                "fuchsia.driver.framework.CompositeNodeManager",
+                "fuchsia.firmware.crash.Reporter",
+            ],
+            from: "#driver_manager",
+            to: "#boot-drivers",
+        },
+        {
+            protocol: [ "fuchsia.device.fs.lifecycle.Lifecycle" ],
+            from: "#driver_manager",
+            to: [ "#devfs" ],
+        },
+        {
+            protocol: "fuchsia.device.fs.with.pkg.lifecycle.Lifecycle",
+            from: "#driver_manager",
+            as: "fuchsia.device.fs.lifecycle.Lifecycle",
+            to: [ "#devfs-with-pkg" ],
+        },
+        {
+            directory: "dev",
+            from: "#driver_manager",
+            to: [ "#devfs" ],
+        },
+        {
+            directory: "dev-topological",
+            from: "#devfs",
+            as: "dev",
+            to: [ "#devfs-with-pkg" ],
+        },
+        {
+            runner: "builtin_devfs",
+            from: "parent",
+            to: [
+                "#devfs",
+                "#devfs-with-pkg",
+            ],
+        },
+
+        // This is not a real service, and only serves to ensure the critical-services component
+        // which hosts crashsvc, never gets stopped early during system shutdown. Otherwise we can
+        // miss crashes that happen in late shutdown.
+        {
+            service: [ "bootstrap.critical-services" ],
+            from: "#critical-services",
+            to: "#driver_manager",
+        },
+
+        // These protocols are not actually used but exist to increase the lifetime
+        // of components. The capabilities are named after their place in the topology.
+        // We cannot use a single service due to the lack of service merging.
+        {
+            service: [ "bootstrap.driver-hosts" ],
+            from: "#driver-hosts",
+            to: [
+                "#devfs",
+                "#devfs-with-pkg",
+            ],
+        },
+        {
+            service: [ "bootstrap.boot-drivers" ],
+            from: "#boot-drivers",
+            to: [ "#devfs" ],
+        },
+        {
+            service: [ "bootstrap.base-drivers" ],
+            from: "#base-drivers",
+            to: [ "#devfs-with-pkg" ],
+            source_availability: "unknown",
+        },
+        {
+            service: [ "bootstrap.full-drivers" ],
+            from: "#full-drivers",
+            to: [ "#devfs-with-pkg" ],
+            source_availability: "unknown",
+        },
+        {
+            protocol: [ "fuchsia.scheduler.RoleManager" ],
+            from: "#role_manager",
+            to: "#driver_manager",
+            source_availability: "unknown",
+        },
+        {
+            protocol: [
+                "fuchsia.hardware.sysmem.Sysmem",
+                "fuchsia.sysmem.Allocator",
+                "fuchsia.sysmem2.Allocator",
+            ],
+            from: "#sysmem",
+            to: "#boot-drivers",
+            source_availability: "unknown",
+        },
+        {
+            protocol: "fuchsia.hardware.power.statecontrol.Admin",
+            from: "#shutdown_shim",
+            to: "#driver_manager",
+            source_availability: "unknown",
+        },
+        {
+            // TODO(https://fxbug.dev/42144438) This is only needed for an ordered shutdown.
+            // Console should outlive driver_manager so that logs at the end of the boot process
+            // can still be seen.
+            protocol: "fuchsia.hardware.pty.Device",
+            from: "#console",
+            to: "#driver_manager",
+            source_availability: "unknown",
+        },
+        {
+            protocol: [ "fuchsia.system.state.SystemStateTransition" ],
+            from: "#shutdown_shim",
+            to: [
+                "#boot-drivers",
+                "#driver-hosts",
+                "#driver_manager",
+            ],
+            source_availability: "unknown",
+        },
+        {
+            protocol: [ "fuchsia.hardware.power.statecontrol.ShutdownWatcherRegister" ],
+            from: "#shutdown_shim",
+            to: [ "#boot-drivers" ],
+            source_availability: "unknown",
+        },
+
+        // TODO(https://fxbug.dev/345827642): remove once OOT drivers are using these protocols from
+        // the diagnostics dictionary themselves.
+        {
+            protocol: [
+                "fuchsia.inspect.InspectSink",
+                "fuchsia.logger.LogSink",
+            ],
+            from: "#archivist",
+            to: [
+                "#boot-drivers",
+                "#driver-hosts",
+            ],
+        },
+
+        // TODO(https://fxbug.dev/369189827): Placeholders to keep sag and broker alive.
+        {
+            service: "sag.placeholder",
+            from: "#system-activity-governor",
+            to: "#boot-drivers",
+            source_availability: "unknown",
+        },
+        {
+            service: "powerbroker.placeholder",
+            from: "#power-broker",
+            to: "#boot-drivers",
+            source_availability: "unknown",
+        },
+
+        // TODO(https://fxbug.dev/369189827): Route these statically again when the dictionary
+        // can override them.
+        // {
+        //     protocol: [
+        //         "fuchsia.power.system.ActivityGovernor",
+        //         "fuchsia.power.system.CpuElementManager",
+        //     ],
+        //     from: "#system-activity-governor",
+        //     to: "#boot-drivers",
+        //     source_availability: "unknown",
+        // },
+        // {
+        //     protocol: [ "fuchsia.power.broker.Topology" ],
+        //     from: "#power-broker",
+        //     to: "#boot-drivers",
+        //     source_availability: "unknown",
+        // },
+        {
+            protocol: "fuchsia.power.system.CpuElementManager",
+            from: "#system-activity-governor",
+            to: "#driver_manager",
+            source_availability: "unknown",
+        },
+        {
+            config: [ "fuchsia.power.WaitForSuspendingToken" ],
+            from: "parent",
+            to: "#driver_manager",
+        },
+        {
+            protocol: "fuchsia.power.broker.Topology",
+            from: "#power-broker",
+            to: "#driver_manager",
+            availability: "optional",
+            source_availability: "unknown",
+        },
+        {
+            protocol: "fuchsia.driver.test.DriverLists",
+            from: "void",
+            to: "#driver_index",
+            availability: "optional",
+        },
+        {
+            service: [
+                "fuchsia.gpu.magma.Service",
+                "fuchsia.hardware.backlight.Service",
+                "fuchsia.hardware.bluetooth.Service",
+                "fuchsia.hardware.cpu.ctrl.Service",
+                "fuchsia.hardware.gnss.Service",
+                "fuchsia.hardware.haptics.Service",
+                "fuchsia.hardware.hrtimer.Service",
+                "fuchsia.hardware.light.LightService",
+                "fuchsia.hardware.nfc.Service",
+                "fuchsia.hardware.power.battery.Service",
+                "fuchsia.hardware.power.charger.Service",
+                "fuchsia.hardware.power.sensor.Service",
+                "fuchsia.hardware.power.source.Service",
+                "fuchsia.hardware.qualcomm.router.ClientService",
+                "fuchsia.hardware.radar.Service",
+                "fuchsia.hardware.temperature.Service",
+                "fuchsia.hardware.thermal.Service",
+                "fuchsia.hardware.trippoint.Service",
+                "fuchsia.input.report.Service",
+                "fuchsia.power.battery.ChargerService",
+                "fuchsia.power.battery.InfoService",
+                "google.powerstats.Service",
+            ],
+            from: "#boot-drivers",
+            to: "self/driver-services-for-session",
+        },
+        {
+            service: [
+                "fuchsia.hardware.adc.Service",
+                "fuchsia.hardware.backlight.Service",
+                "fuchsia.hardware.cpu.ctrl.Service",
+                "fuchsia.hardware.display.Service",
+                "fuchsia.hardware.nfc.Service",
+                "fuchsia.hardware.pci.BusService",
+                "fuchsia.hardware.power.battery.Service",
+                "fuchsia.hardware.power.charger.Service",
+                "fuchsia.hardware.power.source.Service",
+                "fuchsia.hardware.rtc.Service",
+                "fuchsia.hardware.spmi.DebugService",
+                "fuchsia.hardware.suspend.SuspendService",
+                "fuchsia.hardware.temperature.Service",
+                "fuchsia.hardware.trippoint.DebugService",
+                "fuchsia.hardware.trippoint.Service",
+                "fuchsia.hardware.usb.peripheral.Service",
+                "fuchsia.input.report.Service",
+                "fuchsia.power.battery.ChargerService",
+                "fuchsia.power.battery.InfoService",
+            ],
+            from: "#boot-drivers",
+            to: "self/toolbox",
+            target_availability: "unknown",
+        },
+        {
+            config: "fuchsia.driver.usb.peripheral",
+            from: "#kernel-args-forwarder/boot_args",
+            to: "#boot-drivers",
+            availability: "optional",
+            source_availability: "unknown",
+        },
+    ],
+    expose: [
+        {
+            dictionary: "driver-services-for-session",
+            from: "self",
+        },
+        {
+            protocol: [
+                "fuchsia.driver.crash.CrashIntrospect",
+                "fuchsia.driver.development.Manager",
+                "fuchsia.driver.token.Debug",
+                "fuchsia.driver.token.NodeBusTopology",
+                "fuchsia.firmware.crash.Reporter",
+                "fuchsia.firmware.crash.Watcher",
+            ],
+            from: "#driver_manager",
+        },
+        {
+            protocol: "fuchsia.driver.registrar.DriverRegistrar",
+            from: "#driver_index",
+        },
+        {
+            service: [
+                "fuchsia.gpu.magma.PowerService",
+                "fuchsia.gpu.magma.TestService",
+                "fuchsia.gpu.magma.TrustedService",
+                "fuchsia.hardware.clock.DebugService",
+                "fuchsia.hardware.gnss.Service",
+                "fuchsia.hardware.google.nanohub.DataChannelService",
+                "fuchsia.hardware.google.nanohub.DisplayService",
+                "fuchsia.hardware.google.nanohub.Service",
+                "fuchsia.hardware.google.nanohub.StarnixDataChannelService",
+                "fuchsia.hardware.haptics.Service",
+                "fuchsia.hardware.nfc.Service",
+                "fuchsia.hardware.pci.BusService",
+                "fuchsia.hardware.power.suspend.SuspendService",
+                "fuchsia.hardware.qcom.hvdcpopti.Service",
+                "fuchsia.hardware.qualcomm.fastrpc.SecureService",
+                "fuchsia.hardware.rpmb.Service",
+                "fuchsia.hardware.sockettunnel.Service",
+                "fuchsia.hardware.spi.TestService",
+                "fuchsia.hardware.spmi.DebugService",
+                "fuchsia.hardware.trippoint.DebugService",
+                "fuchsia.hardware.ufs.Service",
+                "fuchsia.hardware.vsock.Service",
+                "fuchsia.storage.ftl.Service",
+                "fuchsia.sysinfo.Service",
+
+                // These duplicate a service advertised by devfs, below.
+                // "fuchsia.gpu.magma.Service",
+                // "fuchsia.hardware.backlight.Service",
+                // "fuchsia.hardware.cpu.ctrl.Service",
+                // "fuchsia.hardware.rtc.Service",
+            ],
+            from: "#boot-drivers",
+        },
+        {
+            service: [ "fuchsia.hardware.platform.bus.ObservabilityService" ],
+            from: "#boot-drivers",
+            availability: "optional",
+        },
+        {
+            // All the services devfs will auto expose:
+            service: [
+                "fuchsia.gpu.magma.DependencyInjectionService",
+                "fuchsia.gpu.magma.PerformanceCounterService",
+                "fuchsia.gpu.magma.Service",
+                "fuchsia.hardware.adb.Service",
+                "fuchsia.hardware.adc.Service",
+                "fuchsia.hardware.audio.CodecConnectorService",
+                "fuchsia.hardware.audio.CompositeConnectorService",
+                "fuchsia.hardware.audio.DaiConnectorService",
+                "fuchsia.hardware.audio.Device",
+                "fuchsia.hardware.audio.StreamConfigConnectorInputService",
+                "fuchsia.hardware.audio.StreamConfigConnectorOutputService",
+                "fuchsia.hardware.ax88179.Service",
+                "fuchsia.hardware.backlight.Service",
+                "fuchsia.hardware.bluetooth.EmulatorService",
+                "fuchsia.hardware.bluetooth.Service",
+                "fuchsia.hardware.camera.Service",
+                "fuchsia.hardware.clock.measure.Service",
+                "fuchsia.hardware.cpu.ctrl.Service",
+                "fuchsia.hardware.display.Service",
+                "fuchsia.hardware.fan.Service",
+                "fuchsia.hardware.fastboot.Service",
+                "fuchsia.hardware.goldfish.AddressSpaceService",
+                "fuchsia.hardware.goldfish.ControllerService",
+                "fuchsia.hardware.goldfish.ControlService",
+                "fuchsia.hardware.goldfish.SyncService",
+                "fuchsia.hardware.gpu.mali.UtilsService",
+                "fuchsia.hardware.hrtimer.Service",
+                "fuchsia.hardware.i2c.Service",
+                "fuchsia.hardware.input.Service",
+                "fuchsia.hardware.light.LightService",
+                "fuchsia.hardware.mediacodec.Service",
+                "fuchsia.hardware.midi.Service",
+                "fuchsia.hardware.network.Service",
+                "fuchsia.hardware.pin.DebugService",
+                "fuchsia.hardware.power.battery.Service",
+                "fuchsia.hardware.power.charger.Service",
+                "fuchsia.hardware.power.sensor.Service",
+                "fuchsia.hardware.power.source.Service",
+                "fuchsia.hardware.powersource.Service",
+                "fuchsia.hardware.pty.Service",
+                "fuchsia.hardware.radar.Service",
+                "fuchsia.hardware.ram.metrics.Service",
+                "fuchsia.hardware.registers.Service",
+                "fuchsia.hardware.rtc.Service",
+                "fuchsia.hardware.sdio.DriverService",
+                "fuchsia.hardware.serial.Service",
+                "fuchsia.hardware.skipblock.Service",
+                "fuchsia.hardware.spi.ControllerService",
+                "fuchsia.hardware.tee.proprietary.Service",
+                "fuchsia.hardware.tee.Service",
+                "fuchsia.hardware.temperature.Service",
+                "fuchsia.hardware.thermal.Service",
+                "fuchsia.hardware.trippoint.Service",
+                "fuchsia.hardware.usb.device.Service",
+                "fuchsia.hardware.usb.peripheral.Service",
+                "fuchsia.hardware.usb.tester.Service",
+                "fuchsia.hardware.usb.virtualbustest.Service",
+                "fuchsia.input.report.Service",
+                "fuchsia.lowpan.spinel.Service",
+                "fuchsia.power.battery.ChargerService",
+                "fuchsia.power.battery.InfoService",
+                "fuchsia.services.test.Device",
+                "fuchsia.tpm.Service",
+                "google.powerstats.Service",
+            ],
+            from: "#boot-drivers",
+        },
+        {
+            directory: [
+                "dev-builtin",
+                "dev-class",
+                "dev-topological",
+            ],
+            from: "#devfs-with-pkg",
+        },
+    ],
+    environments: [
+        {
+            name: "driver_manager-env",
+            extends: "realm",
+
+            // 1 minute
+            __stop_timeout_ms: 60000,
+        },
+        {
+            name: "devfs-env",
+            extends: "realm",
+
+            // 1 minute
+            __stop_timeout_ms: 60000,
+        },
+        {
+            name: "driver-host-env",
+            extends: "realm",
+            runners: [
+                {
+                    runner: "driver-host2",
+                    from: "#driver_manager",
+                },
+            ],
+
+            // 2 seconds
+            __stop_timeout_ms: 2000,
+        },
+        {
+            name: "boot-driver-env",
+            extends: "none",
+            runners: [
+                {
+                    runner: "driver",
+                    from: "#driver_manager",
+                },
+            ],
+            resolvers: [
+                {
+                    resolver: "boot_resolver",
+                    from: "parent",
+                    scheme: "fuchsia-boot",
+                },
+            ],
+
+            // 1 second
+            __stop_timeout_ms: 1000,
+        },
+    ],
+}

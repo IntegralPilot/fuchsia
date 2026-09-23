@@ -1,0 +1,61 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_BRINGUP_BIN_CONSOLE_LAUNCHER_CONSOLE_LAUNCHER_H_
+#define SRC_BRINGUP_BIN_CONSOLE_LAUNCHER_CONSOLE_LAUNCHER_H_
+
+#include <fidl/fuchsia.hardware.pty/cpp/wire.h>
+#include <fidl/fuchsia.io/cpp/wire.h>
+#include <fidl/fuchsia.ldsvc/cpp/wire.h>
+#include <lib/zx/job.h>
+#include <lib/zx/process.h>
+#include <lib/zx/result.h>
+
+#include <optional>
+#include <string>
+
+#include <fbl/unique_fd.h>
+
+#include "src/bringup/bin/console-launcher/console_launcher_config.h"
+
+namespace console_launcher {
+
+struct Arguments {
+  bool run_shell = true;
+  bool virtcon_disabled = false;
+  std::string autorun_boot;
+  std::string autorun_system;
+
+  // If true, search for a PTY device in /svc/fuchsia.hardware.pty.Service
+  // Otherwise, connect to /svc/console.
+  bool use_virtio_console = false;
+  std::string term = "TERM=";
+  bool virtual_console_need_debuglog = false;
+};
+
+zx::result<Arguments> GetArguments(const console_launcher_config::Config& config);
+
+class ConsoleLauncher {
+ public:
+  static zx::result<ConsoleLauncher> Create();
+  zx::result<zx::process> LaunchShell(fidl::ClientEnd<fuchsia_io::Directory> root,
+                                      fidl::ClientEnd<fuchsia_ldsvc::Loader> loader,
+                                      fidl::ClientEnd<fuchsia_hardware_pty::Device> stdio,
+                                      const std::string& term,
+                                      const std::optional<std::string>& cmd) const;
+
+  const zx::job& shell_job() const { return shell_job_; }
+
+ private:
+  // WARNING: This job is created directly from the root job with no additional job policy
+  // restrictions. We only create it when 'console.shell' is enabled to help protect against
+  // accidental usage.
+  zx::job shell_job_;
+};
+
+zx_status_t WaitForExit(zx::process process);
+
+}  // namespace console_launcher
+
+#endif  // SRC_BRINGUP_BIN_CONSOLE_LAUNCHER_CONSOLE_LAUNCHER_H_

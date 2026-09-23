@@ -1,0 +1,108 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.vsock;
+
+using zx;
+
+const VMADDR_CID_ANY uint32 = 0xFFFFFFFF;
+const VMADDR_CID_HYPERVISOR uint32 = 0;
+const VMADDR_CID_LOCAL uint32 = 1;
+const VMADDR_CID_HOST uint32 = 2;
+
+// Vsock address where 'local' always means the driver and 'remote' always means
+// the device. As such there is no 'local_cid' as it can only ever be the driver cid
+// and so specifying is redundant and a source of errors.
+type Addr = struct {
+    local_port uint32;
+    remote_cid uint32;
+    remote_port uint32;
+};
+
+// Callbacks sent from the device to whomever registered them (typically a service)
+// in response to events from host.
+closed protocol Callbacks {
+    // Indicates a 'request' op was received from the host. One of Device.SendResponse
+    // or Device.SendRst should be done in response to this.
+    strict Request(struct {
+        addr Addr;
+    });
+    // Indicates a response was received for a connection that was trying to be
+    // established from Device.SendRequest.
+    strict Response(struct {
+        addr Addr;
+    });
+    // Indicates a 'rst' op was received from the host, and that the driver has
+    // has freed the resources for any potential connection relating to `addr`.
+    strict Rst(struct {
+        addr Addr;
+    });
+    // Indicates a 'shutdown' op was received from the host.
+    strict Shutdown(struct {
+        addr Addr;
+    });
+    // Indicates a 'transport reset' op was received from the host. Responding to
+    // this method indicates that you have processed all preceding Callbacks and
+    // dropped any active connections.
+    strict TransportReset(struct {
+        new_cid uint32;
+    }) -> ();
+};
+
+// Low level vsock device operations. Users of this interface are responsible for
+// adhering to the vsock protocol and must use ensure they do not reuse addresses
+// for active connections, perform SendRst and SendResponse only when it is correct
+// to do so, etc.
+@discoverable
+closed protocol Device {
+    // Causes the device to start and gives it Callbacks to use for forwarding messages
+    // from the host. The rest of the methods on this interface are only valid to use
+    // after calling Start and whilst the passed Callbacks remain valid. The device
+    // will stop if it detects the other end of the Callbacks channel has closed.
+    strict Start(resource struct {
+        cb client_end:Callbacks;
+    }) -> () error zx.Status;
+    // Will send a request to open a connection with the remote specified in the
+    // `addr`. The `data` socket is stored and will be used for data transmission
+    // should the connection get established successfully, otherwise it will close
+    // the handle. The `status` returned indicates whether the request was sent
+    // successfully. Callbacks.Response or Callbacks.Rst will be called to indicate
+    // if the connection was successfully established or not.
+    strict SendRequest(resource struct {
+        addr Addr;
+        data zx.Handle:SOCKET;
+    }) -> () error zx.Status;
+    // Request a shutdown to begin for the connection indicated by the given `addr`.
+    // This immediately stops any data from being sent on the connection, although
+    // data may still be received up until Callbacks.Rst is called to indicate the
+    // shutdown has complete. This is only valid on a connection established with
+    // SendRequest or SendResponse.
+    strict SendShutdown(struct {
+        addr Addr;
+    }) -> () error zx.Status;
+    // Request a rst be sent to the host. The device will also release the resources
+    // for any connection that may exist for `addr`.
+    strict SendRst(struct {
+        addr Addr;
+    }) -> () error zx.Status;
+    // Causes a 'response' to get sent to the host, gives the driver a `data` socket
+    // to use for sending and receiving data on the established connection. It is
+    // only correct to use this in response to a Callbacks.Request.
+    strict SendResponse(resource struct {
+        addr Addr;
+        data zx.Handle:SOCKET;
+    }) -> () error zx.Status;
+    // Query the current context id of the driver. The local CID is never needed
+    // in interactions with the same device, and retrieving it is only useful for
+    // debugging or if you have some other communication channel to a different host
+    // and you would like to send them your CID to then establish a vsock connection on.
+    strict GetCid() -> (struct {
+        local_cid uint32;
+    });
+};
+
+// Added to allow service connection to replace devfs
+service Service {
+    device client_end:Device;
+};

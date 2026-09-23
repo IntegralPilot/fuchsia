@@ -1,0 +1,164 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_UI_SCENIC_LIB_INPUT_TOUCH_SOURCE_BASE_H_
+#define SRC_UI_SCENIC_LIB_INPUT_TOUCH_SOURCE_BASE_H_
+
+#include <fidl/fuchsia.ui.pointer/cpp/fidl.h>
+#include <lib/fit/function.h>
+#include <lib/inspect/cpp/inspect.h>
+#include <zircon/status.h>
+
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+
+#include "src/lib/fxl/macros.h"
+#include "src/ui/scenic/lib/input/gesture_contender.h"
+#include "src/ui/scenic/lib/input/gesture_contender_inspector.h"
+#include "src/ui/scenic/lib/input/internal_pointer_event.h"
+#include "src/ui/scenic/lib/view_tree/snapshot_types.h"
+
+namespace scenic_impl::input {
+
+// Base class for implementations of fuchsia_ui_pointer::TouchSource and its augmentations.
+class TouchSourceBase : public GestureContender {
+ public:
+  ~TouchSourceBase() override = default;
+
+  // |GestureContender|
+  // For |view_bounds| and |event.viewport| new values are only sent to the client when they've
+  // changed from their last seen values.
+  void UpdateStream(const view_tree::Snapshot& snapshot, StreamId stream_id,
+                    InternalTouchEvent event, bool is_end_of_stream,
+                    view_tree::BoundingBox view_bounds) override;
+
+  // |GestureContender|
+  void EndContest(StreamId stream_id, bool awarded_win) override;
+
+  zx_koid_t channel_koid() const override { return channel_koid_; }
+
+  static fuchsia_ui_pointer::EventPhase ConvertToEventPhase(Phase phase);
+  static fuchsia_ui_pointer::TouchEvent NewTouchEvent(StreamId stream_id,
+                                                      const InternalTouchEvent& event);
+  static void AddInteractionResultsToEvent(fuchsia_ui_pointer::TouchEvent& event,
+                                           StreamId stream_id, uint32_t device_id,
+                                           uint32_t pointer_id, bool awarded_win);
+  static fuchsia_ui_pointer::TouchEvent NewEndEvent(StreamId stream_id, uint32_t device_id,
+                                                    uint32_t pointer_id, bool awarded_win);
+  static void AddViewParametersToEvent(fuchsia_ui_pointer::TouchEvent& event,
+                                       const Viewport& viewport,
+                                       view_tree::BoundingBox view_bounds);
+
+ protected:
+  // Augmentation data for fuchsia_ui_pointer_augment::TouchEventWithLocalHit.
+  struct LocalHit {
+    zx_koid_t local_viewref_koid;
+    std::array<float, 2> local_point;
+  };
+
+  // Struct for holding the touch event and any potential augmentations.
+  struct AugmentedTouchEvent {
+    // Base event.
+    fuchsia_ui_pointer::TouchEvent touch_event;
+
+    // Possible augmentation data.
+    std::optional<LocalHit> local_hit;
+  };
+
+  // |respond_| must not destroy the TouchSourceBase object.
+  TouchSourceBase(zx_koid_t channel_koid, zx_koid_t view_ref_koid,
+                  fit::function<void(StreamId, const std::vector<GestureResponse>&)> respond,
+                  GestureContenderInspector& inspector);
+
+  void WatchBase(std::vector<fuchsia_ui_pointer::TouchResponse> responses,
+                 fit::function<void(std::vector<AugmentedTouchEvent>)> callback);
+
+  void UpdateResponseBase(const fuchsia_ui_pointer::TouchInteractionId& stream,
+                          fuchsia_ui_pointer::TouchResponse response,
+                          fit::function<void()> callback);
+
+  // Pushes an event to be sent to the client. Default implementation queues the event for V1
+  // hanging-get Watch() calls. Subclasses can override this to implement other delivery mechanisms.
+  virtual void PushEvent(StreamId stream_id, AugmentedTouchEvent event);
+
+  // TODO(https://fxbug.dev/42159133): Implement ANR.
+
+  // Closes the FIDL channel. This triggers the destruction of the TouchSourceBase object through
+  // the error handler set in InputSystem. NOTE: No further method calls or member accesses should
+  // be made after CloseChannel(), since they might be made on a destroyed object.
+  virtual void CloseChannel(zx_status_t epitaph) = 0;
+
+  // Allows subtypes to add augmentations to each event.
+  virtual void Augment(const view_tree::Snapshot& snapshot, AugmentedTouchEvent& out_event,
+                       const InternalTouchEvent& in_event) {}
+
+  const zx_koid_t channel_koid_;
+  const fit::function<void(StreamId, const std::vector<GestureResponse>&)> respond_;
+  GestureContenderInspector& inspector_;
+
+ private:
+  struct StreamData {
+    uint32_t device_id = 0;
+    uint32_t pointer_id = 0;
+    bool stream_has_ended = false;
+    bool was_won = false;
+    GestureResponse last_response = GestureResponse::kUndefined;
+  };
+
+  // Used to track expected responses from the client for each sent event.
+  struct ReturnTicket {
+    StreamId stream_id = kInvalidStreamId;
+    bool expects_response = false;
+  };
+
+  // Used to track events awaiting Watch() calls.
+  struct PendingEvent {
+    StreamId stream_id = kInvalidStreamId;
+    AugmentedTouchEvent event;
+  };
+
+  void SendPendingIfWaiting();
+
+  // Checks that the input is valid for the current state. If not valid it returns the error string
+  // to print and the epitaph to send on the channel when closing.
+  static zx_status_t ValidateResponses(
+      const std::vector<fuchsia_ui_pointer::TouchResponse>& responses,
+      const std::vector<ReturnTicket>& last_messages, bool have_pending_callback);
+  static zx_status_t ValidateUpdateResponse(
+      const fuchsia_ui_pointer::TouchInteractionId& stream_identifier,
+      const fuchsia_ui_pointer::TouchResponse& response,
+      const std::unordered_map<StreamId, StreamData>& ongoing_streams);
+
+  bool is_first_event_ = true;
+  Viewport current_viewport_;
+  view_tree::BoundingBox current_view_bounds_;
+
+  // Events waiting to be sent to client. Sent in batches of up to
+  // fuchsia_ui_pointer::kTouchMaxEvent events on each call to Watch().
+  std::queue<PendingEvent> pending_events_;
+  // When a vector of events is sent out in response to a Watch() call, the next Watch() call must
+  // contain responses matching the previous set of events. |return_tickets_| tracks the expected
+  // responses for the previous set of events.
+  std::vector<ReturnTicket> return_tickets_;
+
+  // Tracks all streams that have had at least one event passed into UpdateStream(), and that
+  // haven't either "been won and has ended", or "haven't been lost".
+  std::unordered_map<StreamId, StreamData> ongoing_streams_;
+
+  // Tracks all the devices that have previously been seen, to determine when we need to provide
+  // a TouchInteractionId value.
+  std::unordered_set<uint32_t> seen_devices_;
+
+  // Streams can be declared as won before the first UpdateStream() call concerning the stream,
+  // this set tracks those streams. This set should never contain a stream that also exists in
+  // |ongoing_streams_|.
+  std::unordered_set<StreamId> won_streams_awaiting_first_message_;
+
+  fit::function<void(std::vector<AugmentedTouchEvent>)> pending_callback_ = nullptr;
+};
+
+}  // namespace scenic_impl::input
+
+#endif  // SRC_UI_SCENIC_LIB_INPUT_TOUCH_SOURCE_BASE_H_

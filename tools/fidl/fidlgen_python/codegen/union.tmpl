@@ -1,0 +1,176 @@
+{{/*
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{ define "UnionDeclaration" -}}
+class {{ .PythonName }}:
+    {{- if .DocComments }}
+    """
+    {{- range .DocComments }}
+{{ . | escapeQuotes | trimSpace | indentNonEmpty4 }}
+    {{- end }}
+    """
+    {{- end }}
+    {{- range .PythonMembers }}
+    {{- if .DocComments }}
+    """
+    {{- range .DocComments }}
+{{ . | escapeQuotes | trimSpace | indentNonEmpty4 }}
+    {{- end }}
+    """
+    {{- end }}
+    _{{ .PythonName }}: typing.Optional[{{ .PythonType.PythonName }}]
+    {{- end }}
+
+    __fidl_kind__ = "union"
+    __fidl_type__ = "{{ .PythonName }}"
+    __fidl_raw_type__ = "{{ .Name }}"
+    _is_result = {{ if .IsResult }}True{{ else }}False{{ end }}
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, type(self)):
+            return False
+        {{ range .PythonMembers -}}
+        if self.{{ .PythonName }} != other.{{ .PythonName }}:
+            return False
+        {{ end -}}
+        return True
+
+    def __repr__(self) -> str:
+        """Returns the union repr in the format <'foo.bar.baz/FooUnion' object({value})>
+
+        If {value} is not set, will write None."""
+        variant = ""
+        {{- range .PythonMembers }}
+        if self.{{ .PythonName }}:
+            variant = f"{{ .PythonName }}={self.{{ .PythonName }}!r}"
+        {{- end }}
+        return f"<'{self.__fidl_type__}' object({variant})>"
+
+    {{ if .PythonMembers -}}
+    def __init__(
+        self,
+        {{- range .PythonMembers }}
+        {{ .PythonName }}: typing.Optional[{{ .PythonType.PythonName }}] = _UNDEFINED,
+        {{- end }}
+        _empty: typing.Optional[tuple[()]]=None,
+    ):
+        object.__init__(self)
+        if _empty is not None:
+            return
+
+        number_of_variants = 0
+        variants = []
+
+        {{ range .PythonMembers -}}
+        if {{ .PythonName }} is not _UNDEFINED:
+            {{- if (eq .PythonType.PythonName "None") }}
+            self._{{ .PythonName }} = {{ .PythonName }}
+            variants.append('{{ .PythonName }}')
+            number_of_variants += 1
+            {{- else }}
+            if {{ .PythonName }} is not None:
+                self._{{ .PythonName }} = {{ .PythonName }}
+                variants.append('{{ .PythonName }}')
+                number_of_variants += 1
+            {{- end }}
+        {{ end -}}
+
+        if {{ if .IsResult }}number_of_variants > 1{{ else }}number_of_variants != 1{{ end }}:
+            raise TypeError(
+                f"Exactly one variant must be specified for {self.__fidl_raw_type__}: {variants}"
+            )
+    {{- end }}
+
+    {{ range .PythonMembers -}}
+    @property
+    def {{ .PythonName }}(self) -> {{ .PythonType.PythonName }} | None:
+        return getattr(self, "_{{ .PythonName }}", None)
+    {{ end -}}
+
+    # TODO(https://fxbug.dev/394421154): We should probably remove this method when we
+    # start making breaking changes.
+    def __getitem__(self, item: str): # type: ignore
+        if not isinstance(item, str):
+            raise TypeError("Subscripted item must be a string")
+        return getattr(self, item)
+
+    def encode(self) -> tuple[bytes, list[typing.Any]]:
+        return fidl.encode_struct(self, type(self)._encode, 16)
+
+    @classmethod
+    def decode(cls, data: bytes, handles: list[typing.Any]) -> typing.Self:
+        return fidl.decode_struct(data, handles, cls._decode, 16)
+
+    def _encode(self, encoder: fidl.Encoder, _offset: int) -> None:
+        {{- range .PythonMembers }}
+        if hasattr(self, "_{{ .PythonName }}"):
+            encoder.write_uint64({{ .Ordinal }}, _offset)
+            encoder.write_envelope(
+                getattr(self, "_{{ .PythonName }}"),
+                _offset + 8,
+                {{ .EncoderFn }},
+                {{ .TypeSize }},
+                {{ if .IsInline }}True{{ else }}False{{ end }},
+            )
+            return
+        {{- end }}
+        encoder.write_inline(_offset, b'\x00' * 16)
+
+    @classmethod
+    def _decode(cls, decoder: fidl.Decoder, _offset: int) -> typing.Self:
+        ordinal = decoder.read_uint64(_offset)
+        if ordinal == 0:
+            return cls({{ if .PythonMembers }}_empty=(){{ end }})
+
+        {{- range .PythonMembers }}
+        if ordinal == {{ .Ordinal }}:
+            val = decoder.read_envelope(
+                _offset + 8,
+                {{ .DecoderFn }},
+                {{ .TypeSize }},
+            )
+            return cls({{ .PythonName }}=val)
+        {{- end }}
+
+        # Skip unknown envelope
+        decoder.skip_envelope(_offset + 8)
+        raise ValueError(f"Unknown union ordinal {ordinal}")
+
+
+    {{ if .IsResult }}
+    def unwrap(self) -> {{ .PythonSuccessType.PythonName }}:
+        """Returns the response if result does not contain an error. Otherwise, raises an exception."""
+        try:
+            if hasattr(self, "_framework_err") and self._framework_err is not None:
+                raise AssertionError(
+                    f"{self.__fidl_raw_type__} framework error {self._framework_err}"
+                )
+        except AttributeError:
+            pass
+        try:
+            if hasattr(self, "_err") and self._err is not None:
+                raise AssertionError(f"{self.__fidl_raw_type__} error {self._err}")
+        except AttributeError:
+            pass
+
+        {{ if (eq .PythonSuccessType.PythonName "None") -}}
+        assert not hasattr(self, "_response") or self._response is None, f"Failed to unwrap {self.__fidl_raw_type__}. Response value present when it should be None: {self._response}"
+        {{ else -}}
+        assert self._response is not None, f"Failed to unwrap {self.__fidl_raw_type__}. Result does not contain an error or response."
+        return self._response
+        {{- end }}
+    {{ end }}
+
+    @classmethod
+    def make_default(cls) -> typing.Self:
+        {{ if .PythonMembers -}}
+        return cls(_empty=())
+        {{- else -}}
+        return cls()
+        {{- end }}
+
+
+{{ end }}

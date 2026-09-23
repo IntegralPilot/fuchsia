@@ -1,0 +1,205 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+/// A library of protocols for routing media between devices.
+///
+/// This library is based on "targets", which are devices or groups of devices
+/// which can render media sessions. See `fuchsia.media.sessions2` for media
+/// session details.
+///
+/// Through the `Discovery` protocol, clients can discover what media targets
+/// are available on the network, and select them to render media sessions.
+@available(added=7)
+library fuchsia.media.target;
+
+using fuchsia.media;
+using fuchsia.media.audio;
+using fuchsia.media.sessions2;
+
+/// A unique id for a target.
+alias Id = uint64;
+
+/// A user-visible name for a target to display in user interface or read
+/// in voice interfaces.
+alias DisplayName = string:200;
+
+/// A protocol for discovering media targets.
+@discoverable
+closed protocol Discovery {
+    compose Group;
+    compose Selector;
+
+    /// Watches for bindings of media sessions to targets.
+    ///
+    /// A media session is rendered on the target to which it is bound.
+    ///
+    /// Bindings are returned as deltas between the watch calls, leave a
+    /// request hanging to get the latest updates.
+    strict WatchSessionBindings() -> (struct {
+        event SessionBindingsWatchEvent;
+    });
+
+    /// Connects to a target by id. Drops the given channel if no such
+    /// target exists.
+    strict ConnectToTarget(resource struct {
+        target_id Id;
+        target_request server_end:Target;
+    });
+};
+
+/// A binding between a session and a target, indicating the media session
+/// is rendered on the target.
+type SessionBinding = struct {
+    session_id fuchsia.media.sessions2.SessionId;
+    target_id Id;
+};
+
+type SessionBindingsWatchEvent = table {
+    /// A list of active session bindings added or updated in the network
+    /// at any point in time.
+    1: updated vector<SessionBinding>:MAX;
+
+    /// A list of session bindings that are removed in the network since
+    /// notified.
+    2: removed vector<SessionBinding>:MAX;
+};
+
+/// A target is a device or group of devices on which media can be rendered,
+/// such as a speaker which renders audio.
+closed protocol Target {
+    compose GroupEditor;
+    compose Group;
+    compose VolumeControl;
+};
+
+type TargetChange = struct {
+    new_target_id Id;
+};
+
+/// A protocol for adding and removing members of a group target.
+closed protocol GroupEditor {
+    /// Adds a target to this group target.
+    ///
+    /// If the added target is a group of devices, all the devices in that group
+    /// are added to this group. A group itself cannot be a member of a group.
+    ///
+    /// Returns the id of the new target if a new group was created to fulfill this
+    /// request.
+    strict AddTarget(struct {
+        target_id Id;
+    }) -> (struct {
+        target_change box<TargetChange>;
+    }) error Error;
+
+    /// Removes a target from this group. Returns the id of the new target
+    /// if a new group was created to fulfill this request.
+    strict RemoveTarget(struct {
+        target_id Id;
+    }) -> (struct {
+        target_change box<TargetChange>;
+    }) error Error;
+};
+
+/// A protocol for watching the members of a group.
+closed protocol Group {
+    /// Watches for changes to the set of registered targets. Leave a request
+    /// hanging to get replies when changes occur. New clients will be caught
+    /// up with the state of the world.
+    ///
+    /// Targets are returned as deltas between the watch calls.
+    strict WatchTargets() -> (struct {
+        targets_watch_event TargetsWatchEvent;
+    });
+};
+
+type TargetsWatchEvent = table {
+    /// Targets added or updated on the network at any point in time.
+    1: updated vector<Description>:MAX;
+
+    /// Targets that are removed since last notified.
+    2: removed vector<Id>:MAX;
+};
+
+/// A protocol to control the volume of target.
+closed protocol VolumeControl {
+    /// Binds to the target's volume control. If this target is a group,
+    /// all member volumes are influenced. These settings persist
+    /// for the lifetime of the target.
+    strict BindVolumeControl(resource struct {
+        volume_control_request server_end:fuchsia.media.audio.VolumeControl;
+    });
+
+    /// Binds to the target's volume control as a member of the given group.
+    /// The request channel is dropped if the target is not a member of the group.
+    ///
+    /// This volume control influences the volume of this target only when it is
+    /// participating as a member of the group. This is used to adjust the balance
+    /// of volume among members of a group. These settings persist for the lifetime
+    /// of the target
+    strict BindMemberVolumeControl(resource struct {
+        group Id;
+        volume_control_request server_end:fuchsia.media.audio.VolumeControl;
+    });
+};
+
+/// A description of a target.
+type Description = table {
+    /// Identifies the target.
+    1: target_id Id;
+    /// Enumerates of the interoperability features the device supports.
+    2: capability_flags CapabilityFlags;
+    3: display_name DisplayName;
+    4: metadata fuchsia.media.Metadata;
+};
+
+/// Capabilities of the target.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type CapabilityFlags = strict bits : uint64 {
+    /// Indicates the target can receive a transfer of a
+    /// media session from another target.
+    TRANSFER_TO = 0x01;
+    /// Indicates the target can transfer a media session
+    /// to another target.
+    TRANSFER_FROM = 0x02;
+    /// Indicates the target can participate in rendering
+    /// media with other devices.
+    MULTI_TARGET_PLAYBACK = 0x04;
+    /// Indicates the target can render video.
+    VIDEO = 0x08;
+};
+
+/// A protocol for selecting a media target. Commands on this protocol can
+/// change the target on which a media session is rendered.
+closed protocol Selector {
+    /// Renders the media session specified by `session_id` on the target
+    /// specified by `target_id`.
+    strict BindTarget(struct {
+        session_id fuchsia.media.sessions2.SessionId;
+        target_id Id;
+    }) -> () error Error;
+
+    /// Renders the media session specified by `session_id` on the set of
+    /// targets specified by `target_ids`.
+    ///
+    /// This may create a new group target which contains all the specified
+    /// targets as members, if one does not exist. The group target may be
+    /// temporary, only existing for the lifetime of playback, and not
+    /// discoverable through `Discovery`.
+    strict BindGroupTarget(struct {
+        session_id fuchsia.media.sessions2.SessionId;
+        target_ids vector<Id>:100;
+    }) -> (struct {
+        target_id Id;
+    }) error Error;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type Error = strict enum {
+    NOT_A_GROUP = 0;
+    UNKNOWN_ON_DOMAIN = 1;
+    CANNOT_BE_GROUPED = 2;
+    NOT_MEMBER_OF_GROUP = 3;
+    TRANSFER_FROM_TARGET_UNSUPPORTED = 4;
+    TRANSFER_TO_TARGET_UNSUPPORTED = 5;
+    MULTI_TARGET_PLAYBACK_UNSUPPORTED = 6;
+};

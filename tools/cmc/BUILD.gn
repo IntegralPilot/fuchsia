@@ -1,0 +1,158 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_inputs.gni")
+import("//build/components.gni")
+import("//build/host.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/rust/rustc_test.gni")
+import("//build/sdk/sdk_host_tool.gni")
+
+rustc_library("cmc_lib") {
+  name = "cmc"
+  with_unit_tests = true
+  edition = "2024"
+
+  # We want to limit using cmc as a library to
+  # just the ffx orchestration commands, the `do` tool.
+  visibility = [
+    ":*",
+    "//src/developer/ffx/tools/do/*",
+  ]
+  sources = [
+    "src/compile.rs",
+    "src/debug_print_cm.rs",
+    "src/format.rs",
+    "src/include.rs",
+    "src/lib.rs",
+    "src/merge.rs",
+    "src/opts.rs",
+    "src/reference.rs",
+    "src/util.rs",
+  ]
+  deps = [
+    "//sdk/fidl/fuchsia.component.decl:fuchsia.component.decl_rust",
+    "//sdk/fidl/fuchsia.data:fuchsia.data_rust",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/tempfile-ext",
+    "//src/sys/lib/cm_rust",
+    "//src/sys/lib/cm_types",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:clap",
+    "//third_party/rust_crates:serde_json",
+    "//third_party/rust_crates:serde_json5",
+    "//third_party/rust_crates:strsim",
+    "//third_party/rust_crates:tempfile",
+    "//tools/lib/cml",
+    "//tools/lib/reference_doc",
+  ]
+  test_deps = [
+    "//third_party/rust_crates:assert_matches",
+    "//third_party/rust_crates:difference",
+    "//third_party/rust_crates:tempfile",
+    "//third_party/rust_crates:test-case",
+  ]
+}
+
+rustc_binary("cmc") {
+  name = "cmc"
+  with_unit_tests = false
+  edition = "2024"
+
+  deps = [
+    ":cmc_lib",
+    "//third_party/rust_crates:clap",
+  ]
+
+  sources = [ "src/main.rs" ]
+}
+
+if (is_host) {
+  sdk_host_tool("cmc_sdk") {
+    category = "partner"
+    output_name = "cmc"
+    deps = [ ":cmc" ]
+  }
+
+  bazel_input_file("bazel_input") {
+    generator = ":cmc"
+    outputs = [ "${root_out_dir}/cmc" ]
+  }
+}
+
+rustc_test("cmc_integration_test_bin") {
+  name = "cmc_integration_test"
+  edition = "2024"
+  source_root = "tests/integration_test.rs"
+  deps = [
+    "//sdk/fidl/fuchsia.component.decl:fuchsia.component.decl_rust",
+    "//sdk/fidl/fuchsia.data:fuchsia.data_rust",
+    "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+    "//src/lib/fidl/rust/fidl",
+    "//src/lib/fuchsia",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:difference",
+  ]
+
+  sources = [ "tests/integration_test.rs" ]
+}
+
+fuchsia_component_manifest("example_component_manifest") {
+  testonly = true
+  restricted_features = [ "allow_long_names" ]
+  component_name = "example"
+  manifest = "meta/example.cml"
+}
+
+fuchsia_component("example_component") {
+  cm_label = ":example_component_manifest"
+  deps = [ ":example_component_config_values" ]
+  testonly = true
+  check_references = false
+}
+
+fuchsia_unittest_package("cmc_integration_test") {
+  deps = [
+    ":cmc_integration_test_bin",
+    ":example_component",
+  ]
+}
+
+install_host_tools("install") {
+  # cmc is a group that contains a clippy target. cmc.actual is the actual
+  # executable target. Depending on the executable target lets GN correctly
+  # apply assert_no_deps logic.
+  deps = [ ":cmc.actual" ]
+
+  outputs = [ "cmc" ]
+}
+
+fuchsia_structured_config_values("example_component_config_values") {
+  testonly = true
+  cm_label = ":example_component_manifest"
+  values = {
+    my_flag = true
+    my_uint8 = 42
+    my_string = "test_string"
+    my_vector_of_string = [
+      "hello, world!",
+      "hello, again!",
+    ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [ ":cmc_lib_test($host_toolchain)" ]
+
+  # Ensure that cmc_integration_test does not run when profile variant is
+  # selected. This test adds a use for fuchsia.debugdata.Publisher capability
+  # via debug for coverage variant, and profile variant adds a use for this
+  # capability via diagnostics dictionary, which results in duplicate use
+  # target protocol error.
+  if (!is_profile) {
+    deps += [ ":cmc_integration_test" ]
+  }
+}

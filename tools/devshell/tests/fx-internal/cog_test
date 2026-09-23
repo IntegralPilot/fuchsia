@@ -1,0 +1,477 @@
+#!/bin/bash
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test the Cog integration in fx
+
+BT_FILE_DEPS=(
+  "scripts/fx"
+  "scripts/fx-help.awk"
+  "tools/devshell/vendor"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/platform.sh"
+)
+
+BT_SET_UP() {
+  base_dir="${BT_TEMP_DIR}"
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+  FUCHSIA_DIR="${BT_TEMP_DIR}"
+}
+
+# Tests that `fx` can be run in non-cog environments.
+TEST_fx-non-cog-env() {
+  export _FX_COG_PATH_PREFIX="${BT_TEMP_DIR}/google/cog/cloud/"
+
+  # Ensure we are NOT in a cog path
+  BT_ASSERT_STRING_NOT_CONTAINS_SUBSTRING "${PWD}" "${_FX_COG_PATH_PREFIX}"
+
+  mkdir -p "scripts/cog"
+  cat >"scripts/cog/sync_workspace.py" <<EOF
+#!/bin/bash
+echo "Running sync_workspace.py"
+exit 1
+EOF
+  chmod u+x "scripts/cog/sync_workspace.py"
+
+  output="$(${fx} help)"
+  BT_EXPECT_STRING_NOT_CONTAINS_SUBSTRING "${output}" "Running sync_workspace.py"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "usage: fx"
+}
+
+# Tests `fx` execution in a cog environment:
+# 1. Detects when PWD is in a cog workspace
+# 2. Calls sync_workspace.py --from-cog-to-cartfs
+# 3. Calls fx in CartFS
+# 4. Calls sync_workspace.py --from-cartfs-to-cog
+TEST_fx-cog-env-trigger() {
+  # Mock Cog path using the prefix override
+  export _FX_COG_PATH_PREFIX="${BT_TEMP_DIR}/google/cog/cloud/"
+
+  cog_path="${_FX_COG_PATH_PREFIX}user/workspace/fuchsia"
+  mkdir -p "${cog_path}"
+  touch "${cog_path}/.fx-root"
+
+  # Place fx in the mock Cog checkout
+  mkdir -p "${cog_path}/scripts"
+  cp "${fx}" "${cog_path}/scripts/fx"
+  fx="${cog_path}/scripts/fx"
+
+  cd "${cog_path}"
+
+  # Mock mktemp to return a predictable path
+  mkdir -p "${BT_TEMP_DIR}/bin"
+  cat >"${BT_TEMP_DIR}/bin/mktemp" <<EOF
+#!/bin/bash
+touch "${BT_TEMP_DIR}/mock_sync_result"
+echo "${BT_TEMP_DIR}/mock_sync_result"
+EOF
+  chmod u+x "${BT_TEMP_DIR}/bin/mktemp"
+  local old_path="$PATH"
+  export PATH="${BT_TEMP_DIR}/bin:${PATH}"
+
+  # Mock sync_workspace.py
+  mkdir -p "${cog_path}/scripts/cog"
+  cat >"${cog_path}/scripts/cog/sync_workspace.py" <<EOF
+#!/bin/bash
+if [[ "\$(pwd)" != "${cog_path}" ]]; then
+  echo "Unexpected PWD in sync_workspace: \$(pwd)"
+  exit 1
+fi
+if [[ "\$1" == "--from-cog-to-cartfs" ]]; then
+  report_file="\$3"
+  echo "export CARTFS_CWD=\"${BT_TEMP_DIR}/cartfs/cwd\"" > "\${report_file}"
+  echo "export CARTFS_FUCHSIA_DIR=\"${BT_TEMP_DIR}/cartfs/fuchsia\"" >> "\${report_file}"
+  exit 0
+elif [[ "\$1" == "--from-cartfs-to-cog" ]]; then
+  echo "Syncing back to Cog"
+  exit 0
+fi
+exit 0
+EOF
+  chmod u+x "${cog_path}/scripts/cog/sync_workspace.py"
+
+  # Mock CartFS directory
+  mkdir -p "${BT_TEMP_DIR}/cartfs/cwd"
+  mkdir -p "${BT_TEMP_DIR}/cartfs/fuchsia/scripts"
+
+  # Mock fx-env.sh in CartFS
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx-env.sh" <<EOF
+fx-update-path() { return 0; }
+export FUCHSIA_DIR="\${CARTFS_FUCHSIA_DIR}"
+EOF
+  # Mock fx in CartFS
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx" <<EOF
+#!/bin/bash
+echo "Running in CartFS"
+echo "PWD: \$(pwd)"
+echo "FUCHSIA_DIR: \${FUCHSIA_DIR}"
+EOF
+  chmod u+x "${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx"
+
+  output="$(${fx} help 2>&1)"
+
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Running in CartFS"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "PWD: ${BT_TEMP_DIR}/cartfs/cwd"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "FUCHSIA_DIR: ${BT_TEMP_DIR}/cartfs/fuchsia"
+
+  # Verify reverse sync happened
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Syncing back to Cog"
+
+  # Verify file cleanup
+  [[ ! -f "${BT_TEMP_DIR}/mock_sync_result" ]]
+  BT_EXPECT_GOOD_STATUS $? "Sync result file was not cleaned up"
+
+  # Restore PATH
+  export PATH="$old_path"
+}
+
+# Tests `fx` execution when PWD is `@cog//fuchsia/out`, a symlink to `@cartfs//fuchsia/out`.
+TEST_fx-cog-out-symlink() {
+  export _FX_COG_PATH_PREFIX="${BT_TEMP_DIR}/google/cog/cloud/"
+
+  cog_path="${_FX_COG_PATH_PREFIX}user/workspace/fuchsia"
+  cartfs_out="${BT_TEMP_DIR}/cartfs/out"
+
+  mkdir -p "${cog_path}"
+  touch "${cog_path}/.fx-root"
+  mkdir -p "${cartfs_out}"
+
+  # Create symlink out -> cartfs_out
+  ln -s "${cartfs_out}" "${cog_path}/out"
+
+  # Place fx in the mock Cog checkout
+  mkdir -p "${cog_path}/scripts"
+  cp "${fx}" "${cog_path}/scripts/fx"
+  fx="${cog_path}/scripts/fx"
+
+  # CD into the symlink directory (logical path)
+  cd "${cog_path}/out"
+
+  # Mock sync_workspace.py
+  mkdir -p "${cog_path}/scripts/cog"
+  cat >"${cog_path}/scripts/cog/sync_workspace.py" <<EOF
+#!/bin/bash
+if [[ "\$(pwd)" != "${cog_path}/out" ]]; then
+  echo "Unexpected PWD in sync_workspace: \$(pwd)"
+  exit 1
+fi
+if [[ "\$1" == "--from-cog-to-cartfs" ]]; then
+  report_file="\$3"
+  echo "export CARTFS_CWD=\"${BT_TEMP_DIR}/cartfs/cwd\"" > "\${report_file}"
+  echo "export CARTFS_FUCHSIA_DIR=\"${BT_TEMP_DIR}/cartfs/fuchsia\"" >> "\${report_file}"
+  exit 0
+fi
+exit 0
+EOF
+  chmod u+x "${cog_path}/scripts/cog/sync_workspace.py"
+
+  # Mock CartFS directory
+  mkdir -p "${BT_TEMP_DIR}/cartfs/cwd"
+  mkdir -p "${BT_TEMP_DIR}/cartfs/fuchsia/scripts"
+
+  # Mock fx-env.sh in CartFS
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx-env.sh" <<EOF
+fx-update-path() { return 0; }
+export FUCHSIA_DIR="\${CARTFS_FUCHSIA_DIR}"
+EOF
+  # Mock fx in CartFS
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx" <<EOF
+#!/bin/bash
+echo "Running in CartFS"
+echo "PWD: \$(pwd)"
+echo "FUCHSIA_DIR: \${FUCHSIA_DIR}"
+EOF
+  chmod u+x "${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx"
+
+  output="$(${fx} help 2>&1)"
+
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Running in CartFS"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "PWD: ${BT_TEMP_DIR}/cartfs/cwd"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "FUCHSIA_DIR: ${BT_TEMP_DIR}/cartfs/fuchsia"
+}
+
+# Tests `fx` execution when PWD is `@superproject//fuchsia/vendor/company`, a symlink to
+# `@superproject//vendor/company`.
+TEST_fx-cog-superproject-symlink() {
+  export _FX_COG_PATH_PREFIX="${BT_TEMP_DIR}/google/cog/cloud/"
+
+  fuchsia_dir="${_FX_COG_PATH_PREFIX}chandarren/superproject/fuchsia"
+  vendor_target="${_FX_COG_PATH_PREFIX}chandarren/superproject/vendor/company"
+
+  mkdir -p "${fuchsia_dir}"
+  mkdir -p "${vendor_target}"
+  touch "${fuchsia_dir}/.fx-root"
+
+  # Create symlink in fuchsia_dir pointing to vendor_target
+  mkdir -p "${fuchsia_dir}/vendor"
+  ln -s "${vendor_target}" "${fuchsia_dir}/vendor/company"
+
+  # Place fx in the mock Cog checkout
+  mkdir -p "${fuchsia_dir}/scripts"
+  cp "${fx}" "${fuchsia_dir}/scripts/fx"
+  fx="${fuchsia_dir}/scripts/fx"
+
+  # CD into the symlink directory
+  cd "${fuchsia_dir}/vendor/company"
+
+  mkdir -p "${fuchsia_dir}/scripts/cog"
+  cat >"${fuchsia_dir}/scripts/cog/sync_workspace.py" <<EOF
+#!/bin/bash
+if [[ "\$(pwd)" != "${fuchsia_dir}/vendor/company" ]]; then
+  echo "Unexpected PWD in sync_workspace: \$(pwd)"
+  exit 1
+fi
+if [[ "\$1" == "--from-cog-to-cartfs" ]]; then
+  report_file="\$3"
+  echo "export CARTFS_CWD=\"${BT_TEMP_DIR}/cartfs/cwd\"" > "\${report_file}"
+  echo "export CARTFS_FUCHSIA_DIR=\"${BT_TEMP_DIR}/cartfs/fuchsia\"" >> "\${report_file}"
+  exit 0
+fi
+exit 0
+EOF
+  chmod u+x "${fuchsia_dir}/scripts/cog/sync_workspace.py"
+
+  # Mock CartFS
+  mkdir -p "${BT_TEMP_DIR}/cartfs/cwd"
+  mkdir -p "${BT_TEMP_DIR}/cartfs/fuchsia/scripts"
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx-env.sh" <<EOF
+fx-update-path() { return 0; }
+export FUCHSIA_DIR="\${CARTFS_FUCHSIA_DIR}"
+EOF
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx" <<EOF
+#!/bin/bash
+echo "Running in CartFS"
+echo "PWD: \$(pwd)"
+echo "FUCHSIA_DIR: \${FUCHSIA_DIR}"
+EOF
+  chmod u+x "${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx"
+
+  output="$(${fx} help 2>&1)"
+
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Running in CartFS"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "PWD: ${BT_TEMP_DIR}/cartfs/cwd"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "FUCHSIA_DIR: ${BT_TEMP_DIR}/cartfs/fuchsia"
+}
+
+# Tests that `fx` fails if forward sync fails.
+TEST_fx-cog-sync-fail-on-forward() {
+  export _FX_COG_PATH_PREFIX="${BT_TEMP_DIR}/google/cog/cloud/"
+
+  cog_path="${_FX_COG_PATH_PREFIX}user/workspace/fuchsia"
+  mkdir -p "${cog_path}"
+  touch "${cog_path}/.fx-root"
+
+  # Place fx in the mock Cog checkout
+  mkdir -p "${cog_path}/scripts"
+  cp "${fx}" "${cog_path}/scripts/fx"
+  fx="${cog_path}/scripts/fx"
+
+  cd "${cog_path}"
+
+  # Mock mktemp to return a predictable path
+  mkdir -p "${BT_TEMP_DIR}/bin"
+  cat >"${BT_TEMP_DIR}/bin/mktemp" <<EOF
+#!/bin/bash
+touch "${BT_TEMP_DIR}/mock_sync_result"
+echo "${BT_TEMP_DIR}/mock_sync_result"
+EOF
+  chmod u+x "${BT_TEMP_DIR}/bin/mktemp"
+  local old_path="$PATH"
+  export PATH="${BT_TEMP_DIR}/bin:${PATH}"
+
+  # Mock sync_workspace.py to FAIL on forward sync
+  mkdir -p "${cog_path}/scripts/cog"
+  cat >"${cog_path}/scripts/cog/sync_workspace.py" <<EOF
+#!/bin/bash
+if [[ "\$1" == "--from-cog-to-cartfs" ]]; then
+  echo "Forward sync failed"
+  exit 1
+fi
+exit 0
+EOF
+  chmod u+x "${cog_path}/scripts/cog/sync_workspace.py"
+
+  # Run fx and expect failure
+  BT_EXPECT_FAIL ${fx} help 2>&1 > /dev/null
+
+  # Verify file cleanup
+  [[ ! -f "${BT_TEMP_DIR}/mock_sync_result" ]]
+  BT_EXPECT_GOOD_STATUS $? "Sync result file was not cleaned up"
+
+  # Restore PATH
+  export PATH="$old_path"
+}
+
+# Tests that `fx` succeeds even if reverse sync fails (handled by || true),
+# and that the trap is cleared to prevent re-triggering.
+TEST_fx-cog-sync-fail-on-reverse() {
+  export _FX_COG_PATH_PREFIX="${BT_TEMP_DIR}/google/cog/cloud/"
+
+  cog_path="${_FX_COG_PATH_PREFIX}user/workspace/fuchsia"
+  mkdir -p "${cog_path}"
+  touch "${cog_path}/.fx-root"
+
+  # Place fx in the mock Cog checkout
+  mkdir -p "${cog_path}/scripts"
+  cp "${fx}" "${cog_path}/scripts/fx"
+  fx="${cog_path}/scripts/fx"
+
+  cd "${cog_path}"
+
+  # Mock sync_workspace.py to FAIL on reverse sync
+  mkdir -p "${cog_path}/scripts/cog"
+  cat >"${cog_path}/scripts/cog/sync_workspace.py" <<EOF
+#!/bin/bash
+if [[ "\$1" == "--from-cog-to-cartfs" ]]; then
+  report_file="\$3"
+  echo "export CARTFS_CWD=\"${BT_TEMP_DIR}/cartfs/cwd\"" > "\${report_file}"
+  echo "export CARTFS_FUCHSIA_DIR=\"${BT_TEMP_DIR}/cartfs/fuchsia\"" >> "\${report_file}"
+  exit 0
+elif [[ "\$1" == "--from-cartfs-to-cog" ]]; then
+  echo "Syncing back to Cog (failing)"
+  exit 1
+fi
+exit 0
+EOF
+  chmod u+x "${cog_path}/scripts/cog/sync_workspace.py"
+
+  # Mock CartFS directory
+  mkdir -p "${BT_TEMP_DIR}/cartfs/cwd"
+  mkdir -p "${BT_TEMP_DIR}/cartfs/fuchsia/scripts"
+
+  # Mock fx-env.sh in CartFS
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx-env.sh" <<EOF
+fx-update-path() { return 0; }
+export FUCHSIA_DIR="\${CARTFS_FUCHSIA_DIR}"
+EOF
+  # Mock fx in CartFS
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx" <<EOF
+#!/bin/bash
+echo "Running in CartFS"
+echo "PWD: \$(pwd)"
+echo "FUCHSIA_DIR: \${FUCHSIA_DIR}"
+EOF
+  chmod u+x "${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx"
+
+  output="$(${fx} help 2>&1)"
+
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Running in CartFS"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Syncing back to Cog (failing)"
+
+  # Count occurrences of "Syncing back to Cog" in output
+  count=$(echo "${output}" | grep -c "Syncing back to Cog (failing)" || true)
+  BT_EXPECT_EQ "${count}" "1" "Reverse sync should be triggered exactly once"
+}
+
+# Tests that `fx` fails if CartFS fx is missing.
+TEST_fx-cog-missing-cartfs-fx() {
+  export _FX_COG_PATH_PREFIX="${BT_TEMP_DIR}/google/cog/cloud/"
+
+  cog_path="${_FX_COG_PATH_PREFIX}user/workspace/fuchsia"
+  mkdir -p "${cog_path}"
+  touch "${cog_path}/.fx-root"
+
+  # Place fx in the mock Cog checkout
+  mkdir -p "${cog_path}/scripts"
+  cp "${fx}" "${cog_path}/scripts/fx"
+  fx="${cog_path}/scripts/fx"
+
+  cd "${cog_path}"
+
+  # Mock sync_workspace.py
+  mkdir -p "${cog_path}/scripts/cog"
+  cat >"${cog_path}/scripts/cog/sync_workspace.py" <<EOF
+#!/bin/bash
+if [[ "\$1" == "--from-cog-to-cartfs" ]]; then
+  report_file="\$3"
+  echo "export CARTFS_CWD=\"${BT_TEMP_DIR}/cartfs/cwd\"" > "\${report_file}"
+  echo "export CARTFS_FUCHSIA_DIR=\"${BT_TEMP_DIR}/cartfs/fuchsia\"" >> "\${report_file}"
+  exit 0
+fi
+exit 0
+EOF
+  chmod u+x "${cog_path}/scripts/cog/sync_workspace.py"
+
+  # Mock CartFS directory BUT DO NOT CREATE fx
+  mkdir -p "${BT_TEMP_DIR}/cartfs/cwd"
+  mkdir -p "${BT_TEMP_DIR}/cartfs/fuchsia/scripts"
+
+  # Mock fx-env.sh in CartFS
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx-env.sh" <<EOF
+fx-update-path() { return 0; }
+EOF
+
+  # Run fx and expect failure
+  BT_EXPECT_FAIL ${fx} help 2>&1 > /dev/null
+}
+
+# executes a simple fx command from foreign fuchsia checkout using
+# .jiri_root/bin/fx, which we expect to be in the `$PATH`.
+# Since we redirect the `fx` commandline invocation to the foreign
+# fuchsia checkout's `fx`, this is allowed.
+TEST_fx-cog-run_from_foreign_checkout_from_path() {
+  local output
+
+  # Create a fake Cog checkout OUTSIDE of the primary checkout directory.
+  local cog_prefix="$(mktemp -d)"
+  export _FX_COG_PATH_PREFIX="${cog_prefix}/"
+
+  local cog_path="${_FX_COG_PATH_PREFIX}user/workspace/fuchsia"
+  mkdir -p "${cog_path}"
+  touch "${cog_path}/.fx-root"
+
+  # Place fx in the mock Cog checkout
+  mkdir -p "${cog_path}/scripts"
+  cp "${fx}" "${cog_path}/scripts/fx"
+
+  # cd into the Cog checkout.
+  cd "${cog_path}"
+
+  # Mock sync_workspace.py
+  mkdir -p "${cog_path}/scripts/cog"
+  cat >"${cog_path}/scripts/cog/sync_workspace.py" <<EOF
+#!/bin/bash
+if [[ "\$1" == "--from-cog-to-cartfs" ]]; then
+  echo "Syncing from Cog"
+  report_file="\$3"
+  echo "export CARTFS_CWD=\"${BT_TEMP_DIR}/cartfs/cwd\"" > "\${report_file}"
+  echo "export CARTFS_FUCHSIA_DIR=\"${BT_TEMP_DIR}/cartfs/fuchsia\"" >> "\${report_file}"
+  exit 0
+fi
+exit 0
+EOF
+  chmod u+x "${cog_path}/scripts/cog/sync_workspace.py"
+
+  # Mock CartFS directory and fx
+  mkdir -p "${BT_TEMP_DIR}/cartfs/cwd"
+  mkdir -p "${BT_TEMP_DIR}/cartfs/fuchsia/scripts"
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx-env.sh" <<EOF
+fx-update-path() { return 0; }
+export FUCHSIA_DIR="\${CARTFS_FUCHSIA_DIR}"
+EOF
+  cat >"${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx" <<EOF
+#!/bin/bash
+echo "Running in CartFS"
+EOF
+  chmod u+x "${BT_TEMP_DIR}/cartfs/fuchsia/scripts/fx"
+
+  # Invoke the fx script from $PATH (pointing to primary checkout).
+  # Primary checkout is BT_TEMP_DIR, which has .jiri_root/bin/fx created by btf::setup_fx.
+  output="$(PATH="${BT_TEMP_DIR}/.jiri_root/bin:${PATH}" fx help 2>&1)"
+
+  BT_EXPECT_EQ $? 0
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Syncing from Cog"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Running in CartFS"
+
+  # Clean up the separate temp directory.
+  rm -rf "${cog_prefix}"
+}
+
+BT_RUN_TESTS "$@"

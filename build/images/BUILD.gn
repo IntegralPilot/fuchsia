@@ -1,0 +1,103 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/images/paths.gni")
+
+assert(current_toolchain == default_toolchain,
+       "//build/images/* are only valid in the Fuchsia toolchain")
+
+# This is a group that contains the main product bundle.
+group("main_assembly") {
+  testonly = true
+  if (defined(labels.images)) {
+    public_deps = [ labels.images ]
+  }
+}
+
+# The images target is a dependency of the top level default
+# target when appropriate, and contains the minimum set of images that
+# are typical given the requested build configuration.
+group("images") {
+  testonly = true
+
+  deps = [
+    # perhaps redundant, but for completeness.
+    ":main_assembly",
+
+    # If the board specifies board tools, compile them.
+    "//build/images/tools:board_tools",
+
+    # Always include the qemu kernel so we can use the emulator.
+    labels.qemu_kernel,
+
+    # updates always needs to be included so that universe/discoverable can be
+    # published, even when there isn't a _single_ product bundle, but a
+    # multi-product build that includes test packages.
+    "//build/images/updates",
+  ]
+
+  if (defined(labels.images)) {
+    deps += [
+      labels.images,
+
+      # Needed so that 'gerrit_size_reports' and 'detailed_size_checker_data'
+      # metadata can be properly collected form the default-images target. These
+      # are empty groups for bazel product bundles that don't provide them.
+      "${bazel_product_bundle_target}_elf_sizes",
+      "${bazel_product_bundle_target}_size_targets",
+    ]
+    deps += extra_bazel_assembly_targets
+  }
+
+  if (check_vtables_in_rodata) {
+    deps += [ ":check_vtables_in_rodata" ]
+  }
+
+  if (bazel_product_bundle_target != "") {
+    deps += [ "//build/assembly/overrides:build_zbi_developer_overrides.json" ]
+  }
+}
+
+if (defined(labels.images) && check_vtables_in_rodata) {
+  # This action runs a script that checks all vtables in fuchsia binaries are
+  # in readonly data.
+  action("check_vtables_in_rodata") {
+    testonly = true
+    hermetic_deps = false
+    script = "//scripts/clang/check_vtable_rodata.py"
+    outputs = [ "$root_build_dir/$target_name" ]
+    depfile = "$root_build_dir/$target_name.d"
+
+    # Ensure that all fuchsia binaries listed in `binaries.json` are created
+    # first.
+    deps = [ labels.images ]
+
+    args = [
+      # Ignore these specific libunwind symbols for now because these are from
+      # the libwundind prebuilts used by rust which we do not currently build
+      # with relative vtables.
+      "--exclude",
+      "vtable for libunwind::UnwindCursor<libunwind::LocalAddressSpace, libunwind::Registers_x86_64>",
+      "--exclude",
+      "vtable for libunwind::UnwindCursor<libunwind::LocalAddressSpace, libunwind::Registers_arm64>",
+
+      "--readelf",
+      "$rebased_clang_prefix/llvm-readelf",
+
+      # Write to a file.
+      "-o",
+      rebase_path(outputs[0], root_build_dir),
+
+      # Run in `fuchsia` mode, which looks for `binaries.json` in the provided
+      # output directory.
+      "fuchsia",
+
+      # Point to the output directory.
+      rebase_path("$root_build_dir", root_build_dir),
+
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+  }
+}

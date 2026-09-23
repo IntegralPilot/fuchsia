@@ -1,0 +1,266 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/fidl/fidl.gni")
+import("//build/testing/cc_test_executable.gni")
+import("//src/virtualization/buildtools/linux_paths.gni")
+import("//src/virtualization/buildtools/romfs_image.gni")
+import("//third_party/protobuf/proto_library.gni")
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":guest_interaction_operation_tests",
+    ":guest_interaction_tests",
+  ]
+}
+
+group("guest_interaction") {
+  testonly = true
+  deps = [ ":debian_guest_interaction_daemon" ]
+}
+
+proto_library("proto") {
+  sources = [ "proto/guest_interaction.proto" ]
+
+  generate_python = false
+  cc_generator_options = "lite"
+  generator_plugin_suffix = ".grpc.pb"
+  generator_plugin_label = "//third_party/grpc:grpc_cpp_plugin"
+  import_protobuf_full = true
+
+  deps = [ "//third_party/grpc:grpc++" ]
+}
+
+source_set("common") {
+  sources = [ "common.h" ]
+  public_deps = [
+    ":proto",
+    "//third_party/grpc:grpc++",
+  ]
+}
+
+source_set("platform_interface_posix") {
+  sources = [
+    "platform_interface/platform_interface.h",
+    "platform_interface/posix_platform.cc",
+  ]
+  deps = [ ":common" ]
+}
+
+source_set("client_lib") {
+  sources = [
+    "client/client_operation_state.h",
+    "platform_interface/platform_interface.h",
+  ]
+  public_deps = [
+    ":common",
+    ":fuchsia.virtualization.guest.interaction_cpp",
+    "//sdk/lib/fit",
+    "//sdk/lib/sys/cpp",
+    "//sdk/lib/syslog/cpp",
+    "//third_party/grpc:grpc++",
+  ]
+}
+
+source_set("server_lib") {
+  sources = [
+    "platform_interface/platform_interface.h",
+    "server/server_operation_state.h",
+  ]
+  deps = [ ":common" ]
+}
+
+source_set("operation_test_lib") {
+  testonly = true
+  sources = [ "test/operation_test_lib.h" ]
+  deps = [
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//src/lib/fxl/test:gtest_main",
+  ]
+  public_deps = [
+    ":proto",
+    "//third_party/grpc:grpc++",
+  ]
+}
+
+source_set("integration_test_lib") {
+  testonly = true
+  sources = [
+    "test/integration_test_lib.cc",
+    "test/integration_test_lib.h",
+  ]
+  public_deps = [
+    "//sdk/fidl/fuchsia.logger:fuchsia.logger_hlcpp",
+    "//sdk/fidl/fuchsia.net.virtualization:fuchsia.net.virtualization_hlcpp",
+    "//sdk/fidl/fuchsia.scheduler:fuchsia.scheduler_hlcpp",
+    "//sdk/fidl/fuchsia.sysmem:fuchsia.sysmem_hlcpp",
+    "//sdk/fidl/fuchsia.tracing.provider:fuchsia.tracing.provider_hlcpp",
+    "//sdk/fidl/fuchsia.virtualization:fuchsia.virtualization_hlcpp",
+    "//sdk/lib/sys/component/cpp/testing:cpp",
+    "//src/lib/testing/loop_fixture",
+    "//src/virtualization/tests/lib:fake_netstack",
+  ]
+  deps = [
+    ":fuchsia.virtualization.guest.interaction_cpp",
+    "//sdk/fidl/fuchsia.kernel:fuchsia.kernel_hlcpp",
+    "//sdk/fidl/fuchsia.net.stack:fuchsia.net.stack_hlcpp",
+    "//sdk/fidl/fuchsia.sysinfo:fuchsia.sysinfo_hlcpp",
+    "//sdk/lib/syslog/cpp",
+    "//src/lib/testing/predicates",
+    "//src/virtualization/tests/lib:guest_console",
+  ]
+}
+
+cc_test_executable("client_operation_test") {
+  testonly = true
+  sources = [ "test/client_operation_test.cc" ]
+  deps = [
+    ":client_lib",
+    ":fuchsia.virtualization.guest.interaction_cpp",
+    ":operation_test_lib",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/sys/cpp",
+    "//src/lib/fxl",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/predicates",
+    "//src/virtualization/lib/grpc",
+  ]
+}
+
+cc_test_executable("server_operation_test") {
+  testonly = true
+  sources = [ "test/server_operation_test.cc" ]
+  deps = [
+    ":operation_test_lib",
+    ":proto",
+    ":server_lib",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/sys/cpp",
+    "//sdk/lib/syslog/cpp",
+    "//src/lib/fxl/test:gtest_main",
+    "//third_party/grpc:grpc++",
+  ]
+}
+
+fuchsia_test_component("client_operation_test_cmp") {
+  deps = [ ":client_operation_test" ]
+  manifest = "meta/client_operation_test.cml"
+}
+
+fuchsia_test_component("server_operation_test_cmp") {
+  deps = [ ":server_operation_test" ]
+  manifest = "meta/server_operation_test.cml"
+}
+
+fuchsia_test_package("guest_interaction_operation_tests") {
+  test_components = [
+    ":client_operation_test_cmp",
+    ":server_operation_test_cmp",
+  ]
+}
+
+resource("test_script") {
+  sources = [ "test/test_script.sh" ]
+  outputs = [ "data/{{source_file_part}}" ]
+}
+
+fuchsia_test_component("server_daemon_test_cmp") {
+  deps = [
+    ":server_daemon_test",
+    ":test_script",
+  ]
+  component_name = "server_daemon_test"
+  manifest = "meta/server_daemon_test.cml"
+  test_type = "system"
+}
+
+fuchsia_test_package("guest_interaction_tests") {
+  test_components = [ ":server_daemon_test_cmp" ]
+  subpackages =
+      [ "//src/virtualization/bin/guest_manager:debian_guest_manager" ]
+  test_specs = {
+    environments = guest_envs
+    log_settings = {
+      max_severity = "ERROR"
+    }
+  }
+}
+
+executable("debian_guest_interaction_daemon") {
+  output_name = "guest_interaction_daemon"
+  sources = [ "server/debian_server.cc" ]
+  deps = [
+    ":platform_interface_posix",
+    ":proto",
+    ":server_lib",
+    "//sdk/lib/syslog/cpp",
+    "//third_party/grpc:grpc++",
+  ]
+}
+
+source_set("guest_interaction_client") {
+  testonly = true
+
+  sources = [
+    "client/client_impl.h",
+    "client/client_operation_state.h",
+  ]
+
+  public_deps = [
+    ":common",
+    ":fuchsia.virtualization.guest.interaction_cpp",
+    ":platform_interface_posix",
+    "//sdk/lib/fdio",
+    "//sdk/lib/fit",
+    "//sdk/lib/sys/cpp",
+    "//sdk/lib/syslog/cpp",
+    "//src/lib/fxl",
+    "//src/virtualization/lib/grpc",
+    "//src/virtualization/tests/lib:guest_console",
+  ]
+
+  # Enables thrd_create_with_name in <threads.h>.
+  public_configs = [ "//build/config:all_source" ]
+}
+
+cc_test_executable("server_daemon_test") {
+  testonly = true
+
+  sources = [ "test/server_integration_test.cc" ]
+
+  deps = [
+    ":common",
+    ":fuchsia.virtualization.guest.interaction_cpp",
+    ":guest_interaction_client",
+    ":integration_test_lib",
+    "//src/lib/fxl",
+    "//src/lib/fxl/test:gtest_main",
+    "//src/lib/testing/predicates",
+    "//src/virtualization/lib/grpc",
+  ]
+
+  # Enables thrd_create_with_name in <threads.h>.
+  configs += [ "//build/config:all_source" ]
+}
+
+fidl("fuchsia.virtualization.guest.interaction") {
+  sources = [ "fidl/guest_interaction.fidl" ]
+  public_deps = [
+    "//sdk/fidl/fuchsia.io",
+    "//sdk/fidl/fuchsia.virtualization",
+  ]
+}
+
+extras_image = "$target_out_dir/linux/extras.img"
+
+romfs_image("extras") {
+  deps = [ ":debian_guest_interaction_daemon(${linux_exe_toolchain})" ]
+
+  inputs = [ "${linux_exe_path}/guest_interaction_daemon" ]
+
+  output = extras_image
+}

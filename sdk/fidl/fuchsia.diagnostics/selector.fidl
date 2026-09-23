@@ -1,0 +1,179 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.diagnostics;
+
+//  The size bound of 100 is a reasonably low limit chosen based on observed
+//  strings used as identifiers.
+@available(replaced=27)
+const MAX_STRING_SELECTOR_LENGTH uint16 = 100;
+
+// Max string selector length. Must be kept in-sync
+// with sdk/fidl/fuchsia.component/constants.fidl.
+// TODO(https://fxbug.dev/400782257): just use `fuchsia.component.MAX_CHILD_NAME_LENGTH`
+// when `fuchsia.logger` doesn't depend on `fuchsia.diagnsotics`.
+@available(added=27)
+const MAX_STRING_SELECTOR_LENGTH uint16 = 1024;
+
+//  The size bound of 25 is a reasonably low limit chosen based on observed
+//  component hierarchy depths, and awareness of maximum zircon message sizes.
+const MAX_MONIKER_SEGMENTS uint16 = 25;
+
+//  The size bound of 100 is a reasonably low limit chosen based on observed Inspect
+//  hierarchy use cases.
+const MAX_DATA_HIERARCHY_DEPTH uint16 = 100;
+
+/// StringSelector is an union defining different ways to describe a pattern to match
+/// strings against.
+type StringSelector = flexible union {
+    ///   This is a provided string that defines a pattern to
+    ///   match against. The parser treats asterisks (*), colons (:) and backslashes
+    ///   (\) as special characters.
+    ///
+    ///   If you wish to match against literal asterisks (*), they must be escaped.
+    ///   If you wish to match against literal backslashes (\), they must be escaped.
+    ///   If you wish to match against literal colons (:), they must be escaped.
+    ///
+    ///   eg: abc will match any string with the exact name "abc".
+    ///   eg: a\* will match any string with the exact name "a*".
+    ///   eg: a\\* will match any that starts with exactly "a\".
+    ///   eg: a* will match any string that starts with "a".
+    ///   eg: a*b will match any string that starts with a and ends with b.
+    ///   eg: a*b*c will match any string that starts with a and ends with c, with `b`
+    ///       in the middle.
+    ///
+    ///   In addition, the "**" literal is treated as a special sequence that may match
+    ///   multiple levels in a component selector only. See |ComponentSelector| for
+    ///   details.
+    1: string_pattern string:MAX_STRING_SELECTOR_LENGTH;
+    2: exact_match string:MAX_STRING_SELECTOR_LENGTH;
+};
+
+/// Specifies a pattern of component monikers which
+/// identify components being selected for.
+///
+/// Component selectors support wildcarding, which will glob a single "level" of a
+/// component moniker. eg:
+///    core/*/echo
+/// will match all echo instances running only in realms directly under core, but none
+/// nested further.
+///
+/// Component selectors also support a recursive wildcard, which will glob multiple
+/// "levels" of a component moniker. eg:
+///    core/**
+/// will match all component instances running under core/ and all descendants of it.
+/// Note that the wildcard does not select core itself. Clients that wish to choose a
+/// subtree including the root should pass two selectors, eg:
+///    core
+///    core/**
+/// The recursive wildcard is only allowed as the final segment of the selector.
+type ComponentSelector = table {
+    /// Vector encoding the a pattern for monikers of components being selected for.
+    /// These monikers are child-monikers relative to a "root" hierarchy that the archivist
+    /// is aware of.
+    ///
+    /// There must be at least one StringSelector provided, which
+    /// specifies the component names that are matched by
+    /// the current selector.
+    1: moniker_segments vector<StringSelector>:MAX_MONIKER_SEGMENTS;
+};
+
+/// A selector defining a set of nodes to match, for which the entire subtree including
+/// those nodes are selected.
+type SubtreeSelector = struct {
+    /// A vector of StringSelectors which serve as a pattern matcher
+    ///   for paths through a hierarchy of named nodes. Each entry in the vector
+    ///   is a selector for a single named node in a data hierarchy. The vector
+    ///   of selectors for named nodes, then, defines a selector on paths through the
+    ///   data hierarchy.
+    ///
+    /// Node paths support wildcarding, which will glob a single level of a
+    /// node hierarchy. eg:
+    ///    root/a/b/*/d
+    /// will match all nodes named d which are below some child of node b.
+    ///    root/a/b/c*
+    /// will match all nodes below b which start with the character "c".
+    node_path vector<StringSelector>:MAX_DATA_HIERARCHY_DEPTH;
+};
+
+/// A selector defining a set of nodes to match, and on those matched nodes a set of named
+/// properties to match.
+type PropertySelector = struct {
+    /// A vector of StringSelectors which serve as a pattern matcher
+    ///   for paths through a hierarchy of named nodes. Each entry in the vector
+    ///   is a selector for a single named node in a data hierarchy. The vector
+    ///   of selectors for named nodes, then, defines a selector on paths through the
+    ///   data hierarchy.
+    ///
+    /// Node paths support wildcarding, which will glob a single level of a
+    /// node hierarchy. eg:
+    ///    root/a/b/*/d
+    /// will match all nodes named d which are below some child of node b.
+    ///    root/a/b/c*
+    /// will match all nodes below b which start with the character "c".
+    node_path vector<StringSelector>:MAX_DATA_HIERARCHY_DEPTH;
+
+    /// A StringSelector which serves as a pattern matcher for
+    ///   string-named properties on a node in a data hierarchy.
+    ///
+    /// target_properties supports wildcarding, which will match against all properties
+    /// on any node matched by node_path.
+    target_properties StringSelector;
+};
+
+/// TreeSelector represents a selection request on a hierarchy of named nodes, with
+/// named properties on those nodes.
+type TreeSelector = flexible union {
+    /// A selector defining a set of nodes to match, for which the entire subtree including
+    /// those nodes are selected.
+    1: subtree_selector SubtreeSelector;
+
+    /// A selector defining a set of nodes to match, and on those matched nodes a set of named
+    /// propperties to match.
+    2: property_selector PropertySelector;
+};
+
+/// TreeNames are the set of names of fuchsia.inspect.Trees for a component that
+/// were parsed out of a selector. The hierarchy and property selector portions
+/// will only be applied to trees that match this set.
+@available(added=22)
+type TreeNames = flexible union {
+    /// A specified subset of tree names.
+    1: some vector<string:MAX_STRING_SELECTOR_LENGTH>:MAX;
+
+    /// All of the available trees. Equivalent to listing all of the names of
+    /// trees.
+    2: all struct {};
+};
+
+/// Structured selector containing all required information for pattern-matching onto
+/// string-named properties owned by nodes in a data hierarchy, where data hierarchies belong
+/// to specific components.
+///
+/// These selectors are represented in text form as three segments, colon delimited,
+/// specifying:
+///         <component_moniker>:<node_selector>:<property_selector>
+/// Examples:
+///    Property selection:
+///         realm1/realm2/echo:root/active_users:user_count
+///
+///    Subtree selection:
+///         realm1/realm2/echo:root/active_users
+type Selector = table {
+    /// The selector defining a pattern of component monikers to match
+    /// against.
+    1: component_selector ComponentSelector;
+
+    /// The selector defining data hierarchy properties to match against
+    /// within the data hierarchies owned by components matched by
+    /// `component_selector`.
+    2: tree_selector TreeSelector;
+
+    /// A set of fuchsia.inspect.Tree names to filter with before applying
+    /// hierarchy/property selectors.
+    ///
+    /// Omitting a name-filter is equivalent to TreeNames::some(["root"]).
+    /// Note that "root" is the default tree name.
+    @available(added=22)
+    3: tree_names TreeNames;
+};

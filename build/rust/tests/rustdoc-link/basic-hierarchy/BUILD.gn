@@ -1,0 +1,134 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_host_test.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/testing/host_test_data.gni")
+
+# These rustdoc-link tests have the goal of making sure that fx rustdoc-link
+# runs, generates separate directories for the host and fuchisa toolchains, and
+# contains basic things from the docs (index.html, item docs, source files). We
+# should not include any tests here that are expected to fail with a new
+# version of rustdoc.
+
+#  This code was duplicated and modified from //build/rust/tests:clippy_test.
+#  These tests are different from the clippy tests in that they do not call the
+#  rust compiler. The targets defined as dependencies of the clippy_test like
+#  .deps, .transdeps, etc. are not included here. In addition, the intentional
+#  clippy lint failures are also not reproduced in this file. In the the
+#  future, these tests may further diverge from clippy_test in order to
+#  exercise the essential features of rustdoc.
+
+group("basic-hierarchy") {
+  testonly = true
+  deps = [ ":host_test($host_toolchain)" ]
+}
+
+# The dep chain A->B->C will exercise the functionality of both direct and
+# transitive deps for A
+rustc_binary("a") {
+  edition = "2024"
+  output_name = "basic-hierarchy-a"
+  with_unit_tests = true
+  deps = [ ":b" ]
+  source_root = "crates/a/main.rs"
+  define_rustdoc_test_override = true
+  sources = [
+    "crates/a/main.rs",
+    "crates/a/other.rs",
+  ]
+}
+
+rustc_library("b") {
+  edition = "2024"
+  deps = [ ":c" ]
+  define_rustdoc_test_override = true
+  source_root = "crates/b/lib.rs"
+  sources = [ "crates/b/lib.rs" ]
+}
+
+rustc_library("c") {
+  edition = "2024"
+  define_rustdoc_test_override = true
+  source_root = "crates/c/lib.rs"
+  sources = [ "crates/c/lib.rs" ]
+}
+
+if (is_host) {
+  rustc_library("d") {
+    edition = "2024"
+    define_rustdoc_test_override = true
+    source_root = "crates/d/lib.rs"
+    sources = [ "crates/d/lib.rs" ]
+  }
+
+  _rust_target_mapping = "${target_gen_dir}/rust_target_mapping.json"
+
+  # Create a version of //${build_dir}/rust_target_mapping.json which has
+  # this test's "universe", which consists of only the crates defined here.
+  generated_file("gen_rust_target_mapping") {
+    outputs = [ _rust_target_mapping ]
+    output_conversion = "json"
+    testonly = true
+    data_keys = [ "rust_target_mapping" ]
+    walk_keys = [ "rust_test_barrier" ]
+    deps = [
+      ":a($default_toolchain)",
+      ":b($default_toolchain)",
+      ":c($default_toolchain)",
+      ":d($host_toolchain)",
+    ]
+  }
+
+  _rustdoc_link_output = "${target_gen_dir}/doc.zip"
+  action("rustdoc-link") {
+    testonly = true
+    deps = [
+      ":a.rustdoc($default_toolchain)",
+      ":b.rustdoc($default_toolchain)",
+      ":c.rustdoc($default_toolchain)",
+      ":d.rustdoc($host_toolchain)",
+      ":gen_rust_target_mapping",
+    ]
+    hermetic_deps = false
+
+    script = "//tools/devshell/contrib/lib/rust/rustdoc-link.py"
+    inputs = [
+      "${rustc_prefix}/bin/rustdoc",
+      "//tools/devshell/contrib/lib/rust/rustdoc_link_verify.py",
+    ]
+    outputs = [ _rustdoc_link_output ]
+    args = [
+      "--quiet",
+      "--no-build",
+      "--rustdoc-executable",
+      "${rebased_rustc_prefix}/bin/rustdoc",
+      "--output-base",
+      rebase_path("${target_gen_dir}/output_base", root_build_dir),
+      "--zip-to",
+      rebase_path("${_rustdoc_link_output}", root_build_dir),
+      "--rust-target-mapping",
+      rebase_path("${_rust_target_mapping}", root_build_dir),
+      "--fuchsia-dir",  # typically provided by devshell
+      rebase_path("//", root_build_dir),
+      "--build-dir",  # typically provided by devshell
+      rebase_path(root_build_dir, root_build_dir),
+    ]
+  }
+
+  _copy_doc_zip = "$target_gen_dir/doc.copy.zip"
+  host_test_data("copy-doc-zip") {
+    testonly = true
+    sources = [ _rustdoc_link_output ]
+    outputs = [ _copy_doc_zip ]
+    deps = [ ":rustdoc-link" ]
+  }
+
+  python_host_test("host_test") {
+    main_source = "host_test.py"
+    deps = [ ":copy-doc-zip" ]
+    extra_args = [ rebase_path("$_copy_doc_zip", root_build_dir) ]
+  }
+}

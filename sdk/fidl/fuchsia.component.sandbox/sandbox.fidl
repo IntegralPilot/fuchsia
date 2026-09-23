@@ -1,0 +1,666 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.component.sandbox;
+
+using zx;
+using fuchsia.io;
+using fuchsia.component.decl;
+
+/// Maximum number of bytes in a [Data].
+@available(added=HEAD)
+const MAX_DATA_LENGTH uint32 = 8192;
+
+/// A token represents a bedrock object. Tokens are reference counted, dropping
+/// all counts of the token removes the object.
+@available(added=HEAD)
+alias Token = zx.Handle:EVENTPAIR;
+
+/// Maximum number of items returned by dictionary iterator.
+@available(added=HEAD)
+const MAX_DICTIONARY_ITERATOR_CHUNK uint32 = 128;
+
+@available(added=HEAD)
+type Data = flexible union {
+    1: bytes vector<byte>:MAX_DATA_LENGTH;
+    2: string string:MAX_DATA_LENGTH;
+    3: int64 int64;
+    4: uint64 uint64;
+};
+
+@available(added=HEAD)
+type Connector = resource struct {
+    token Token;
+};
+
+@available(added=HEAD)
+type DirConnector = resource struct {
+    token Token;
+};
+
+@available(added=HEAD)
+type DirEntry = resource struct {
+    token Token;
+};
+
+@available(added=HEAD)
+type DictionaryRef = resource struct {
+    token Token;
+};
+
+@available(added=HEAD)
+type Unit = struct {};
+
+@available(added=HEAD)
+type Capability = flexible resource union {
+    1: unit Unit;
+    2: handle zx.Handle;
+    3: data Data;
+    4: dictionary DictionaryRef;
+    5: connector Connector;
+    6: dir_connector DirConnector;
+    7: directory client_end:fuchsia.io.Directory;
+    8: dir_entry DirEntry;
+    9: connector_router client_end:ConnectorRouter;
+    10: dictionary_router client_end:DictionaryRouter;
+    11: dir_entry_router client_end:DirEntryRouter;
+    12: data_router client_end:DataRouter;
+    13: dir_connector_router client_end:DirConnectorRouter;
+};
+
+/// The maximum length of a dictionary key. This should coincide with
+/// fuchsia.component.MAX_NAME_LENGTH.
+@available(added=HEAD)
+const MAX_NAME_LENGTH uint64 = fuchsia.io.MAX_NAME_LENGTH;
+
+/// The key of a [`DictionaryItem`]. The constraints for valid keys are documented at
+/// https://fuchsia.dev/reference/cml#names.
+@available(added=HEAD)
+alias DictionaryKey = string:MAX_NAME_LENGTH;
+
+/// A key-value pair in a [`DictionaryRef`].
+@available(added=HEAD)
+type DictionaryItem = struct {
+    key DictionaryKey;
+    value CapabilityId;
+};
+
+/// A key-value pair in a [`DictionaryRef`], where the value may be elided.
+/// This is useful for APIs that may wish to omit the value, for example if it could not be
+/// duplicated.
+@available(added=HEAD)
+type DictionaryOptionalItem = resource struct {
+    key DictionaryKey;
+    value box<WrappedCapabilityId>;
+};
+
+/// Error returned from [CapabilityStore/Dictionary*] methods.
+@available(added=HEAD)
+type DictionaryError = flexible enum {
+    /// The Dictionary does not contain an item with the given key.
+    NOT_FOUND = 1;
+
+    /// The Dictionary already contains an item with the given key.
+    ALREADY_EXISTS = 2;
+
+    /// The Capability is invalid.
+    ///
+    /// Capabilities must be created by sandbox, via
+    /// `fuchsia.component.sandbox/CapabilityStore` or returned from other
+    /// Component Framework APIs.
+    BAD_CAPABILITY = 3;
+
+    /// The key is invalid. The constraints for valid keys are documented at
+    /// https://fuchsia.dev/reference/cml#names.
+    INVALID_KEY = 4;
+
+    /// A capability that needed to be cloned to perform this operation could
+    /// not be cloned.
+    NOT_CLONEABLE = 5;
+};
+
+@discoverable(server="platform")
+@available(added=20)
+open protocol Dictionary {};
+
+/// A client-assigned id of a [Capability] in a [CapabilityStore].
+///
+/// The id is relative to the [CapabilityStore]. In the case where two
+/// [CapabilityStore]s have a capability / assigned to the same id, there is
+/// no relation between them
+@available(added=HEAD)
+alias CapabilityId = uint64;
+
+/// A client-assigned id of a new [Capability] in a [CapabilityStore]. Same as [CapabilityId],
+/// but used to distinguish output parameters in [CapabilityStore] methods.
+@available(added=HEAD)
+alias NewCapabilityId = CapabilityId;
+
+/// A [CapabilityId] wrapped in a struct. This is useful for putting a [CapabilityId] in a `box<>`,
+/// which FIDL does not allow for pure integral types.
+@available(added=HEAD)
+type WrappedCapabilityId = struct {
+    id CapabilityId;
+};
+
+@available(added=HEAD)
+alias WrappedNewCapabilityId = WrappedCapabilityId;
+
+/// Protocol that represents the concept of a "capability store", a repository
+/// for [Capability]s that are held by the component framework runtime.
+///
+/// [CapabilityStore] serves as the main bridge between the component runtime and clients
+/// that enables them to operate on and exchange [Capability]s. A [CapabilityStore] instance
+/// contains a set of [Capability]s, each of which has a [CapabilityId] assigned by the client.
+///
+/// Normally, a program would not exchange a [CapabilityStore] or [CapabilityId] with other
+/// programs -- a [CapabilityStore] connection and its enclosed capabilities are intended to
+/// be "local" to a program. Instead, if a program wishes to exchange a [Capability] with other
+/// programs, it should [Export] the [Capability] out of the store, send the [Capability] to the
+/// target program, which can then [Import] the capability into its own store.
+///
+/// [CapabilityStore] is also used to manage capability lifetimes. The lifetime of a capability is
+/// scoped to the [CapabilityStore] in which it resides; i.e. to drop the [CapabilityStore]
+/// connections to release the capabilities instead it. In addition, [CapabilityStore] supports a
+/// [Drop] API to drop an individual [Capability] reference. (Note that it is possible for a
+/// some capabilities, like [DictionaryRef], to have multiple references, in which case all of
+/// the references must be dropped for the underlying resource to be released.)
+///
+/// A note about semantics: the [CapabilityStore] APIs do not return [CapabilityId]s, because
+/// [CapabilityId]s are assigned by the client. Instead, when a method would semantically return
+/// a capability, this is expressed by taking the destination [CapabilityId] as an output parameter.
+@discoverable(server="platform")
+@available(added=HEAD)
+open protocol CapabilityStore {
+    /// Duplicates the capability with `id` to `dest_id`.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `ID_ALREADY_EXISTS` if a capability with `dest_id` already exists in this store.
+    /// - `NOT_DUPLICATABLE` if `id` could not be duplicated.
+    flexible Duplicate(struct {
+        id CapabilityId;
+        dest_id NewCapabilityId;
+    }) -> () error CapabilityStoreError;
+
+    /// Drops the capability with `id` from this [`CapabilityStore`].
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    flexible Drop(struct {
+        id CapabilityId;
+    }) -> () error CapabilityStoreError;
+
+    /// Exports the capability with the client-assigned identifier `id` to
+    /// `capability`. This operation removes the capability from the store. If
+    /// this is not desired, [Duplicate] the capability first.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    flexible Export(struct {
+        id CapabilityId;
+    }) -> (resource struct {
+        capability Capability;
+    }) error CapabilityStoreError;
+
+    /// Imports `capability` into this store with the client-assigned `id`.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_ALREADY_EXISTS` if a capability with `id` already exists in this store.
+    /// - `BAD_CAPABILITY` if `capability` was not a valid [Capability].
+    flexible Import(resource struct {
+        id NewCapabilityId;
+        capability Capability;
+    }) -> () error CapabilityStoreError;
+
+    /// Creates a [Connector] from a [Receiver]. Incoming connections to the [Connector] will be
+    /// dispatched to this [Receiver].
+    ///
+    /// Errors:
+    ///
+    /// - `ID_ALREADY_EXISTS` if a capability with `id` already exists in this store.
+    flexible ConnectorCreate(resource struct {
+        id NewCapabilityId;
+        receiver client_end:Receiver;
+    }) -> () error CapabilityStoreError;
+
+    /// Open a connection from the provided [Connector] capability that will be dispatched to
+    /// the [Receiver] on the other end.
+    ///
+    /// If there is an error, it will be reported as a zx.Status epitaph on `server_end`.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `WRONG_TYPE` if `id` was not a connector capability.
+    flexible ConnectorOpen(resource struct {
+        id CapabilityId;
+        server_end zx.Handle:CHANNEL;
+    }) -> () error CapabilityStoreError;
+
+    /// Creates a [DirConnector] from a [DirReceiver]. Incoming connections to the [DirConnector]
+    /// will be dispatched to this [DirReceiver].
+    ///
+    /// Errors:
+    ///
+    /// - `ID_ALREADY_EXISTS` if a capability with `id` already exists in this store.
+    flexible DirConnectorCreate(resource struct {
+        id NewCapabilityId;
+        receiver client_end:DirReceiver;
+    }) -> () error CapabilityStoreError;
+
+    /// Open a connection from the provided [DirConnector] capability that will
+    /// be dispatched to the [DirReceiver] on the other end. The `id` and
+    /// `server_end` arguments are required, and the `flags` and `path`
+    /// arguments are optional (a path of `.` will be used if one is not
+    /// otherwise set).
+    ///
+    /// If there was an error making the connection, it will be reported as a zx.Status
+    /// epitaph on `server_end`.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `WRONG_TYPE` if `id` was not a connector capability.
+    flexible DirConnectorOpen(resource table {
+        1: id CapabilityId;
+        2: server_end server_end:fuchsia.io.Directory;
+        3: flags fuchsia.io.Flags;
+        4: path fuchsia.io.Path;
+    }) -> () error CapabilityStoreError;
+
+    /// Creates a new empty dictionary in this [`CapabilityStore`] with client-assigned `id`.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_ALREADY_EXISTS` if a capability with `id` already exists in this store.
+    flexible DictionaryCreate(struct {
+        id CapabilityId;
+    }) -> () error CapabilityStoreError;
+
+    /// Imports a dictionary in the form of a channel.
+    ///
+    /// This is a legacy API to support backward compatibility with APIs that take a [Dictionary]
+    /// channel.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_ALREADY_EXISTS` if a capability with `id` already exists in this store.
+    /// - `BAD_CAPABILITY` if `client_end` was not a valid dictionary channel.
+    flexible DictionaryLegacyImport(resource struct {
+        id NewCapabilityId;
+        client_end zx.Handle:CHANNEL;
+    }) -> () error CapabilityStoreError;
+
+    /// Binds a channel to the dictionary with `id`. The channel can
+    /// be re-imported into a [CapabilityStore] with [DictionaryImportLegacy].
+    ///
+    /// This is a legacy API to support backward compatibility with APIs that take a [Dictionary]
+    /// channel.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    flexible DictionaryLegacyExport(resource struct {
+        id CapabilityId;
+        server_end zx.Handle:CHANNEL;
+    }) -> () error CapabilityStoreError;
+
+    /// Inserts `item` into the dictionary with `id`. `item.value` is moved into the dictionary and
+    /// its id is released if this call succeeds.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `WRONG_TYPE` if `id` was not a dictionary.
+    /// - `INVALID_KEY` if `item.key` was invalid.
+    /// - `ITEM_ALREADY_EXISTS` if the dictionary already contains an item with `item.key`.
+    flexible DictionaryInsert(struct {
+        id CapabilityId;
+        item DictionaryItem;
+    }) -> () error CapabilityStoreError;
+
+    /// Get a duplicate of a capability from the dictionary with `id`, which is
+    /// loaded into `dest_id`.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a recognized capability id in this store.
+    /// - `ID_ALREADY_EXISTS` if a capability with `dest_id` already exists in this store.
+    /// - `WRONG_TYPE` if `id` was not a dictionary.
+    /// - `INVALID_KEY` if `item.key` was invalid.
+    /// - `ITEM_NOT_FOUND` if the dictionary does not contain `key`.
+    /// - `NOT_DUPLICATABLE` if the capability could not be duplicated.
+    flexible DictionaryGet(struct {
+        id CapabilityId;
+        key DictionaryKey;
+        dest_id NewCapabilityId;
+    }) -> () error CapabilityStoreError;
+
+    /// Removes a key from the dictionary with `id`. If `dest_id` is present, loads the value
+    /// into it, otherwise discards the value.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `ID_ALREADY_EXISTS` if a capability with `dest_id` already exists in this store.
+    /// - `WRONG_TYPE` if `id` was not a dictionary.
+    /// - `INVALID_KEY` if `key` was invalid.
+    /// - `ITEM_NOT_FOUND` if the dictionary does not contain the key.
+    flexible DictionaryRemove(struct {
+        id CapabilityId;
+        key DictionaryKey;
+        dest_id box<WrappedNewCapabilityId>;
+    }) -> () error CapabilityStoreError;
+
+    /// Create a new dictionary that contains a duplicate of all the entries in
+    /// the dictionary with `id`, assigning `dest_id` to the new dictionary.
+    /// The runtime of this method is linear in the number of top-level entries
+    /// in the dictionary.
+    ///
+    /// For example, if the dictionary contains nested dictionaries, the newly
+    /// created dictionary will contain references to those same nested
+    /// dictionaries because the entries are duplicated rather than deep-copied.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `ID_ALREADY_EXISTS` if a capability with `dest_id` already exists in this store.
+    /// - `WRONG_TYPE` if `id` was not a dictionary.
+    /// - `NOT_DUPLICATABLE` if one of the capabilities in `id` could not be duplicated.
+    flexible DictionaryCopy(struct {
+        id CapabilityId;
+        dest_id NewCapabilityId;
+    }) -> () error CapabilityStoreError;
+
+    /// Enumerates the keys in the dictionary with `id`.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `WRONG_TYPE` if `id` was not a dictionary.
+    flexible DictionaryKeys(resource struct {
+        id CapabilityId;
+        iterator server_end:DictionaryKeysIterator;
+    }) -> () error CapabilityStoreError;
+
+    /// Enumerates the items (keys and values) in the dictionary with `id`.
+    ///
+    /// Creates a duplicate of each value (capability). If a value could not be duplicated,
+    /// the value will be null.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `WRONG_TYPE` if `id` was not a dictionary.
+    flexible DictionaryEnumerate(resource struct {
+        id CapabilityId;
+        iterator server_end:DictionaryEnumerateIterator;
+    }) -> () error CapabilityStoreError;
+
+    /// Removes all the entries in this dictionary, returning them in `contents` if provided.
+    /// If `contents` is not provided, all the items are discarded without enumerating them.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_NOT_FOUND` if `id` was not a valid capability id in this store.
+    /// - `WRONG_TYPE` if `id` was not a dictionary.
+    flexible DictionaryDrain(resource struct {
+        id CapabilityId;
+        iterator server_end:<DictionaryDrainIterator, optional>;
+    }) -> () error CapabilityStoreError;
+
+    /// Creates a new DirConnector that forwards open requests to a set of
+    /// sources.
+    flexible CreateServiceAggregate(resource struct {
+        sources vector<AggregateSource>:MAX;
+    }) -> (resource struct {
+        aggregate_dir_connector DirConnector;
+    }) error CapabilityStoreError;
+};
+
+/// Error returned from methods in [CapabilityStore].
+@available(added=HEAD)
+type CapabilityStoreError = flexible enum {
+    /// A capability was not found matching the given key or [CapabilityId].
+    ID_NOT_FOUND = 1;
+
+    /// A capability already exists matching the given key or [CapabilityId].
+    ID_ALREADY_EXISTS = 2;
+
+    /// A [Capability] was not valid. For example, a `Capability.Dictionary`
+    /// contained an invalid [DictionaryRef].
+    BAD_CAPABILITY = 3;
+
+    /// A [CapabilityId] had the wrong type for the requested operation.
+    WRONG_TYPE = 4;
+
+    /// A capability that needed to be duplicated to perform this operation could
+    /// not be.
+    NOT_DUPLICATABLE = 5;
+
+    /// An item in a dictionary was not found matching the given key.
+    ITEM_NOT_FOUND = 6;
+
+    /// An item in a dictionary already exists with the given key.
+    ITEM_ALREADY_EXISTS = 7;
+
+    /// The key is invalid. The constraints for valid keys are documented at
+    /// https://fuchsia.dev/reference/cml#names.
+    INVALID_KEY = 8;
+
+    /// One or more arguments were invalid.
+    INVALID_ARGS = 9;
+};
+
+@available(added=HEAD)
+type AggregateSource = resource table {
+    1: dir_connector DirConnector;
+
+    /// (Optional) The list of allowlisted instances to be offered. Instances
+    /// of the service not in this list will not be accessible by the target
+    /// component. If this is not set that means all instances from the source
+    /// service are offered.
+    2: source_instance_filter vector<string:MAX_NAME_LENGTH>:MAX;
+
+    /// (Optional) The list of allowlisted instances to be offered, with
+    /// renames.
+    ///
+    /// If this is set and nonempty, the set of instances in the target service
+    /// will be restricted to the instances in this list, renaming `source_name`
+    /// to `target_name`.
+    ///
+    /// If it is set and nonempty, `source_instance_filter` will further
+    /// restrict the set of instances to those whose `target_name` appears in
+    /// that list. There is generally no reason to set both, but we support it
+    /// for compatibility.
+    3: renamed_instances vector<fuchsia.component.decl.NameMapping>:MAX;
+};
+
+@available(added=HEAD)
+open protocol DictionaryKeysIterator {
+    flexible GetNext() -> (resource struct {
+        keys vector<DictionaryKey>:MAX_DICTIONARY_ITERATOR_CHUNK;
+    });
+};
+
+@available(added=HEAD)
+open protocol DictionaryEnumerateIterator {
+    /// Returns the next batch of results for a [Dictionary.Enumerate] call, returning up to
+    /// `limit` results. `limit` can be at most [MAX_DICTIONARY_ITERATOR_CHUNK].
+    ///
+    /// The value of each of `items` is a duplicate of the original capability
+    /// ([CapabilityStore.Duplicate]), unless it could not be duplicated, it which case it will
+    /// be null.
+    ///
+    /// Each returned capability will be assigned a monotonically increasing [CapabilityId] starting
+    /// from `start_id`.
+    ///
+    /// In addition to the `items`, returns `end_id`, which is one more than the highest id reserved
+    /// by [GetNext]. `end_id` can be used as the `start_id` for the next call to [GetNext].
+    ///
+    /// If [GetNext] returns an error, the server will also close the channel.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_ALREADY_EXISTS` if some id in the range `[start_id, limit)` already exists in this
+    ///   store.
+    /// - `INVALID_ARGS` if `limit` was `0` or greater than `MAX_DICTIONARY_ITERATOR_CHUNK`.
+    flexible GetNext(struct {
+        start_id CapabilityId;
+        limit uint32;
+    }) -> (resource struct {
+        items vector<DictionaryOptionalItem>:MAX_DICTIONARY_ITERATOR_CHUNK;
+        end_id CapabilityId;
+    }) error CapabilityStoreError;
+};
+
+@available(added=HEAD)
+open protocol DictionaryDrainIterator {
+    /// Returns the next batch of results for a [Dictionary.Drain] call, returning up to
+    /// `limit` results. `limit` can be at most [MAX_DICTIONARY_ITERATOR_CHUNK].
+    ///
+    /// Each returned capability will be assigned a monotonically increasing [CapabilityId] starting
+    /// from `start_id`.
+    ///
+    /// In addition to the `items`, returns `end_id`, which is one more than the highest id reserved
+    /// by [GetNext]. `end_id` can be used as the `start_id` for the next call to [GetNext].
+    ///
+    /// If [GetNext] returns an error, the server will also close the channel.
+    ///
+    /// Errors:
+    ///
+    /// - `ID_ALREADY_EXISTS` if some id in the range `[start_id, limit)` already exists in this
+    ///   store.
+    /// - `INVALID_ARGS` if `limit` was `0` or greater than `MAX_DICTIONARY_ITERATOR_CHUNK`.
+    flexible GetNext(struct {
+        start_id CapabilityId;
+        limit uint32;
+    }) -> (resource struct {
+        items vector<DictionaryItem>:MAX_DICTIONARY_ITERATOR_CHUNK;
+        end_id CapabilityId;
+    }) error CapabilityStoreError;
+};
+
+/// Represents an instance in the component tree, either a component
+/// instance or component manager's instance.
+@available(added=HEAD)
+type InstanceToken = resource struct {
+    token Token;
+};
+
+/// A request for a route.
+@available(added=HEAD)
+type RouteRequest = resource table {
+    /// The component that is requesting the capability. May be omitted for a default request
+    /// (see `*Router.Route`).
+    1: requesting InstanceToken;
+};
+
+@available(added=HEAD)
+type RouterError = flexible enum : uint32 {
+    /// The router failed to find the capability.
+    NOT_FOUND = 1;
+
+    /// The arguments provided to the function are invalid.
+    INVALID_ARGS = 2;
+
+    /// The operation is not supported.
+    NOT_SUPPORTED = 3;
+
+    /// An internal error occurred.
+    INTERNAL = 4;
+};
+
+@available(added=HEAD)
+type Unavailable = struct {};
+
+@discoverable
+@available(added=HEAD)
+open protocol ConnectorRouter {
+    flexible Route(RouteRequest) -> (@strict_audit(bug="https://fxbug.dev/467128242", state="PENDING_REVIEW") strict resource union {
+        1: connector Connector;
+        2: unavailable Unit;
+    }) error RouterError;
+};
+
+@discoverable
+@available(added=HEAD)
+open protocol DictionaryRouter {
+    flexible Route(RouteRequest) -> (@strict_audit(bug="https://fxbug.dev/467128242", state="PENDING_REVIEW") strict resource union {
+        1: dictionary DictionaryRef;
+        2: unavailable Unit;
+    }) error RouterError;
+};
+
+
+@discoverable
+@available(added=HEAD)
+open protocol DirectoryRouter {
+    flexible Route(RouteRequest) -> (@strict_audit(bug="https://fxbug.dev/467128242", state="PENDING_REVIEW") strict resource union {
+        1: directory client_end:fuchsia.io.Directory;
+        2: unavailable Unit;
+    }) error RouterError;
+};
+
+@discoverable
+@available(added=HEAD)
+open protocol DirEntryRouter {
+    flexible Route(RouteRequest) -> (@strict_audit(bug="https://fxbug.dev/467128242", state="PENDING_REVIEW") strict resource union {
+        1: dir_entry DirEntry;
+        2: unavailable Unit;
+    }) error RouterError;
+};
+
+@discoverable
+@available(added=HEAD)
+open protocol DataRouter {
+    flexible Route(RouteRequest) -> (@strict_audit(bug="https://fxbug.dev/467128242", state="PENDING_REVIEW") strict resource union {
+        1: data Data;
+        2: unavailable Unit;
+    }) error RouterError;
+};
+
+@discoverable
+@available(added=HEAD)
+open protocol DirConnectorRouter {
+    flexible Route(RouteRequest) -> (@strict_audit(bug="https://fxbug.dev/467128242", state="PENDING_REVIEW") strict resource union {
+        1: dir_connector DirConnector;
+        2: unavailable Unit;
+    }) error RouterError;
+};
+
+/// A receiver is served by components and allows them to receive channels
+/// from the framework.
+@discoverable(client="platform")
+@available(added=HEAD)
+open protocol Receiver {
+    /// Sends a channel to this receiver.
+    flexible Receive(ProtocolPayload);
+};
+
+/// A receiver is served by components and allows them to receive directory channels
+/// framework.
+@discoverable(client="platform")
+@available(added=HEAD)
+open protocol DirReceiver {
+    /// Sends a directory channel to this receiver.
+    ///
+    /// The server should implement this method by forwarding `channel` to a vfs instance
+    /// of the language appropriate `vfs` library.
+    flexible Receive(resource table {
+        1: channel zx.Handle:CHANNEL;
+        2: flags fuchsia.io.Flags;
+        3: subdir string:fuchsia.io.MAX_PATH_LENGTH;
+    });
+};
+
+/// Contains a protocol open request.
+@available(added=HEAD)
+type ProtocolPayload = resource struct {
+    channel zx.Handle:CHANNEL;
+};

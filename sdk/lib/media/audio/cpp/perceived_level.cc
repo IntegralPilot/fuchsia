@@ -1,0 +1,77 @@
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "lib/media/audio/cpp/perceived_level.h"
+
+#include <fuchsia/media/cpp/fidl.h>
+#include <lib/syslog/cpp/macros.h>
+
+#include <algorithm>
+#include <cmath>
+
+namespace media {
+namespace {
+
+static constexpr float kUnityGainDb = 0.0f;
+static constexpr float kMinLevelGainDb = -60.0f;
+
+}  // namespace
+
+// static
+float PerceivedLevel::GainToLevel(float gain_db) {
+  if (gain_db <= kMinLevelGainDb) {
+    return 0.0f;
+  }
+
+  if (gain_db >= kUnityGainDb) {
+    return 1.0f;
+  }
+
+  return 1.0f - gain_db / kMinLevelGainDb;
+}
+
+// static
+float PerceivedLevel::LevelToGain(float level) {
+  if (level <= 0.0f) {
+    return fuchsia::media::audio::MUTED_GAIN_DB;
+  }
+
+  if (level >= 1.0f) {
+    return kUnityGainDb;
+  }
+
+  return (1.0f - level) * kMinLevelGainDb;
+}
+
+// static
+int PerceivedLevel::GainToLevel(float gain_db, int max_level) {
+  FX_DCHECK(max_level > 0);
+
+  if (gain_db <= kMinLevelGainDb) {
+    return 0;
+  }
+
+  if (gain_db >= kUnityGainDb) {
+    return max_level;
+  }
+
+  return static_cast<int>(std::round(static_cast<float>(max_level) * GainToLevel(gain_db)));
+}
+
+// static
+float PerceivedLevel::LevelToGain(int level, int max_level) {
+  FX_DCHECK(max_level > 0);
+
+  if (level <= 0) {
+    return fuchsia::media::audio::MUTED_GAIN_DB;
+  }
+
+  if (level >= max_level) {
+    return kUnityGainDb;
+  }
+
+  return LevelToGain(static_cast<float>(level) / static_cast<float>(max_level));
+}
+
+}  // namespace media

@@ -1,0 +1,380 @@
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test the common fx execution flows, namely fx help and fx <subcommand>
+BT_FILE_DEPS=(
+  "scripts/fx"
+  "scripts/fx-help.awk"
+  "tools/devshell/vendor"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/lib/platform.sh"
+)
+
+BT_SET_UP() {
+  base_dir="${BT_TEMP_DIR}"
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+  FUCHSIA_DIR="${BT_TEMP_DIR}"
+}
+
+_create_subcommand() {
+  local subcommand="$1"
+  local subcommand_file="${base_dir}/$2/${subcommand}"
+  local subcommand_output="$3"
+  local summary="$4"
+  local long_description_1="$5"
+  local long_description_2="$6"
+  local category="Testing"
+  if [[ $# -gt 6 ]]; then
+    category="$7"
+  fi
+  mkdir -p "$(dirname "${subcommand_file}")"
+  cat >"${subcommand_file}" <<EOF
+#!/bin/bash
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### ${summary}
+#### CATEGORY=${category}
+
+## ${long_description_1}
+## ${long_description_2}
+
+source "${FUCHSIA_DIR}/tools/devshell/lib/vars.sh" || exit $?
+
+echo "${subcommand_output}"
+EOF
+  chmod u+x "${subcommand_file}"
+  BT_ASSERT_FILE_EXISTS "${subcommand_file}"
+  [[ -x "${subcommand_file}" ]]
+  BT_ASSERT_GOOD_STATUS $? "File ${subcommand_file} must be executable"
+}
+
+# test for `fx help`
+TEST_fx-help() {
+  # check that the usage and --full lines are present
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} help | grep "Run Fuchsia")" "Run Fuchsia development commands"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} help | grep "usage:")" "usage: fx"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} help | grep "\-\-full")" "--full"
+}
+
+# test for `fx help --full`
+TEST_fx-help-full() {
+  local subcommand="mycommand1"
+  local summary="Simple mock script used to test help extraction"
+  _create_subcommand "${subcommand}" "tools/devshell" "howdy!" "${summary}" "line1" "line2"
+  # check the sections are included, and the command name and summary
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} help --full | grep "Run Fuchsia")" "Run Fuchsia development commands"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} help --full | grep "${subcommand}")" "${subcommand}"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} help --full | grep "${subcommand}")" "${summary}"
+}
+
+# ensure that categories are normalized
+TEST_fx-normalized-category() {
+  local subcommand="mycommand1"
+  local category="Category UpperCASE 1"
+  local norm_category_header="Category uppercase 1:"
+  _create_subcommand "${subcommand}" "tools/devshell" "howdy!" "summary1" "line1" "line2" "${category}"
+  # check that the normalized category shows up in fx help
+  BT_EXPECT_EQ "$(${fx} help --full | grep -B 1 "${subcommand}" | head -n 1)" "${norm_category_header}"
+}
+
+# test for `fx help <subcommand>`
+TEST_fx-help-subcommand() {
+  local subcommand="mycommand1"
+  local line1="Usage:"
+  local line2="  fx mysubcommand bla bla"
+  _create_subcommand "${subcommand}" "tools/devshell" "howdy!" "summary" "${line1}" "${line2}"
+  # check the long description
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} help "${subcommand}")" "${line1}"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} help "${subcommand}")" "${line2}"
+}
+
+# executes a simple subcommand and checks its output
+TEST_fx-subcommand-run() {
+  local subcommand="mycommand1"
+  local output="Howdy!"
+  _create_subcommand "${subcommand}" "tools/devshell" "${output}" "summary" "line1" "line2"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} "${subcommand}")" "${output}"
+}
+
+# executes a simple subcommand in contrib and checks its output
+TEST_fx-contrib-subcommand-run() {
+  local subcommand="mycommand-contrib"
+  local output="Hello contrib!"
+  _create_subcommand "${subcommand}" "tools/devshell/contrib" "${output}" "summary" "line1" "line2"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} "${subcommand}")" "${output}"
+}
+
+# executes a simple subcommand in vendor/mycompany and checks its output
+TEST_fx-vendor-subcommand-run() {
+  local subcommand="mycommand-vendor"
+  local output="Hello vendor!"
+  local vendor="mycompany"
+  _create_subcommand "${subcommand}" "vendor/${vendor}/scripts/devshell" "${output}" "summary" "line1" "line2"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} vendor "${vendor}" "${subcommand}")" "${output}"
+}
+
+# executes a host tool subcommand
+# if this test fails, check if the directory that host tools are installed has
+# changed. There are at least two places that use this path hard coded:
+#  //build/host.gni  (template install_host_tools)
+#  //scripts/fx      (method get_host_tools_dir)
+# This test will fail if fx is changed to look for host tools in a different
+# directory. It will NOT fail if the install_host_tools template changes.
+TEST_fx-hosttools-subcommand-run() {
+  # create build directory in a subshell to not pollute the test
+  build_dir="out/default"
+  (
+      source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/../../lib/vars.sh || exit $?
+      mkdir -p "${BT_TEMP_DIR}/${build_dir}"
+      fx-change-build-dir "${build_dir}"
+  )
+  local host_tools_dir="${build_dir}/host-tools"
+  local subcommand="myhosttool"
+  local output="Hello host tool!"
+  _create_subcommand "${subcommand}" "${host_tools_dir}" "${output}" "summary" "line1" "line2"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "$(${fx} "${subcommand}")" "${output}"
+}
+
+# executes a simple fx command from different fuchsia checkout,
+# while the two fuchsia checkouts have the same version of fx. This is
+# not allowed, as while the callers API may be the same, the callee's
+# expectations may not be met.
+TEST_fx-run_from_same_version() {
+  # creates a temp fuchsia checkout directory.
+  BT_TEMP_DIR_1="$(mktemp -d)"
+  cp -RL "${BT_TEMP_DIR}/." "${BT_TEMP_DIR_1}"
+  cd "${BT_TEMP_DIR_1}"
+  # check whether fx command executed successfully, since the two fuchsia checkouts
+  # have the same versions of fx code.
+  output="$(${fx} help 2>&1)"
+  BT_EXPECT_EQ $? 1
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "ERROR: You are executing fx from outside of the current source tree"
+}
+
+# executes fx command from different fuchsia checkout to detect the
+# inconsistencies in fx versions.
+TEST_fx-run_from_different_version() {
+  local output
+
+  local line1="ERROR: You are executing fx from outside of the current source tree"
+  local line2="    'fx' was executed from:"
+
+  # creates a temp fuchsia checkout directory and run fx command.
+  BT_TEMP_DIR_1="$(mktemp -d)"
+  cp -RL "${BT_TEMP_DIR}/." "${BT_TEMP_DIR_1}"
+  cd "${BT_TEMP_DIR_1}"
+  # Modify the fx script of the new fuchsia source code tree, so the content
+  # comparsion of fx script fails between the two versions of source code.
+  echo "# test" >>  "${BT_TEMP_DIR}/scripts/fx"
+
+  output="$(${fx} help 2>&1)"
+  BT_EXPECT_EQ $? 1
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "${line1}"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "${line2} ${BT_TEMP_DIR}"
+}
+
+# executes a simple fx command from foreign fuchsia checkout using
+# .jiri_root/bin/fx, which we expect to be in the `$PATH`.
+# Since we redirect the `fx` commandline invocation to the foreign
+# fuchsia checkout's `fx`, this is allowed.
+TEST_fx-run_from_foreign_checkout_from_path() {
+  local output
+
+  # Initialize the fake primary checkout with ".jiri_root/bin/fx".
+  local primary_checkout="${BT_TEMP_DIR}"
+  mkdir -p "${primary_checkout}/.jiri_root/bin"
+  ln -sf "../../scripts/fx" "${primary_checkout}/.jiri_root/bin/fx"
+
+  # Create a fake foreign checkout directory.
+  local foreign_checkout="$(mktemp -d)"
+  mkdir -p "${foreign_checkout}/scripts"
+  mkdir -p "${foreign_checkout}/some_dir"
+  touch "${foreign_checkout}/.fx-root"
+
+  # Create a mock fx script in the foreign checkout that we expect to be executed.
+  cat > "${foreign_checkout}/scripts/fx" <<'EOF'
+#!/bin/bash
+echo "Running from foreign checkout"
+echo "Args: $@"
+echo "Cwd: $(pwd)"
+EOF
+  chmod +x "${foreign_checkout}/scripts/fx"
+
+  # cd into some subdirectory of the foreign checkout.
+  cd "${foreign_checkout}/some_dir"
+
+  # Invoke the fx script from $PATH.
+  output="$(PATH="${primary_checkout}/.jiri_root/bin:${PATH}" fx help arg1 arg2 2>&1)"
+
+  BT_EXPECT_EQ $? 0
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Running from foreign checkout"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Args: help arg1 arg2"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "Cwd: ${foreign_checkout}/some_dir"
+
+  # Invoke the fx script directly.
+  output="$(${primary_checkout}/scripts/fx help arg1 arg2 2>&1)"
+  BT_EXPECT_EQ $? 1
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "ERROR: You are executing fx from outside of the current source tree"
+  BT_EXPECT_STRING_CONTAINS_SUBSTRING "${output}" "    'fx' was executed from:"
+
+  # Clean up the separate temp directory.
+  rm -rf "${foreign_checkout}"
+}
+
+# Tests that `fx -d` errors out with an appropariate error message.
+TEST_fx-deprecated-target-flag-test() {
+  local subcommand="mycommand1"
+  _create_subcommand "${subcommand}" "tools/devshell" "Tool should not run."
+  local out="${BT_TEMP_DIR}/_fx_stdout"
+
+  BT_EXPECT_FAIL "${fx}" "-d" "foo" "${subcommand}" >"$out" 2>&1
+
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${out}" "Unknown global argument -d"
+  BT_EXPECT_FILE_DOES_NOT_CONTAIN_SUBSTRING "${out}" "Tool should not run."
+}
+
+# Tests that $FUCHSIA_NODENAME and $FUCHSIA_DEVICE_ADDR are set appropriately
+# when no default targets are set.
+TEST_fx-target-flag-unspecified-test() {
+  local subcommand="mycommand1"
+  _create_subcommand "${subcommand}" "tools/devshell" "<\${FUCHSIA_NODENAME},\${FUCHSIA_DEVICE_ADDR}>"
+  local out="${BT_TEMP_DIR}/_fx_stdout"
+
+  echo "fx-default-target" > "${FUCHSIA_DIR}/out/default.device"
+  BT_EXPECT "${fx}" "${subcommand}" >"$out" 2>&1
+
+  BT_EXPECT_FILE_CONTAINS "${out}" "<,>"
+}
+
+# Tests that $FUCHSIA_NODENAME and $FUCHSIA_DEVICE_ADDR are set appropriately
+# when a default target is set via `fx set-device`.
+TEST_fx-target-flag-unspecified-default-device-test() {
+  local subcommand="mycommand1"
+  _create_subcommand "${subcommand}" "tools/devshell" "<\${FUCHSIA_NODENAME},\${FUCHSIA_DEVICE_ADDR}>"
+  local out="${BT_TEMP_DIR}/_fx_stdout"
+
+  echo "fx-default-target" > "${FUCHSIA_DIR}/out/default.device"
+  BT_EXPECT "${fx}" "${subcommand}" >"$out" 2>&1
+
+  BT_EXPECT_FILE_CONTAINS "${out}" "<,>"
+}
+
+# Tests that $FUCHSIA_NODENAME and $FUCHSIA_DEVICE_ADDR are set appropriately
+# when `fx -t` is specified.
+TEST_fx-target-short-flag-specified-test() {
+  local subcommand="mycommand1"
+  _create_subcommand "${subcommand}" "tools/devshell" "<\${FUCHSIA_NODENAME},\${FUCHSIA_DEVICE_ADDR}>"
+  local out="${BT_TEMP_DIR}/_fx_stdout"
+
+  BT_EXPECT "${fx}" -t foo "${subcommand}" >"$out" 2>&1
+
+  BT_EXPECT_FILE_CONTAINS "${out}" "<foo,>"
+}
+
+# Tests that $FUCHSIA_NODENAME is set appropriately when `fx -t` is specified
+# with serial: or id: target specifiers.
+TEST_fx-target-serial-and-id-flag-specified-test() {
+  local subcommand="mycommand1"
+  _create_subcommand "${subcommand}" "tools/devshell" "<\${FUCHSIA_NODENAME},\${FUCHSIA_DEVICE_ADDR}>"
+  local out="${BT_TEMP_DIR}/_fx_stdout"
+
+  BT_EXPECT "${fx}" -t serial:EM-C0B2F2D96 "${subcommand}" >"$out" 2>&1
+  BT_EXPECT_FILE_CONTAINS "${out}" "<serial:EM-C0B2F2D96,>"
+
+  BT_EXPECT "${fx}" -t id:EM-C0B2F2D96 "${subcommand}" >"$out" 2>&1
+  BT_EXPECT_FILE_CONTAINS "${out}" "<id:EM-C0B2F2D96,>"
+}
+
+# Tests that $FUCHSIA_NODENAME and $FUCHSIA_DEVICE_ADDR are overridden when
+# `fx --target` is specified and a fx-level default target is set.
+TEST_fx-target-long-flag-specified-with-env-test() {
+  local subcommand="mycommand1"
+  _create_subcommand "${subcommand}" "tools/devshell" "<\${FUCHSIA_NODENAME},\${FUCHSIA_DEVICE_ADDR}>"
+  local out="${BT_TEMP_DIR}/_fx_stdout"
+
+  echo "fx-default-target" > "${FUCHSIA_DIR}/out/default.device"
+  BT_EXPECT FUCHSIA_NODENAME=bar FUCHSIA_DEVICE_ADDR=baz "${fx}" --target=foo "${subcommand}" >"$out" 2>&1
+
+  BT_EXPECT_FILE_CONTAINS "${out}" "<foo,>"
+}
+
+TEST_fx-antigravity-quiet-build() {
+  local subcommand="mycommand1"
+  _create_subcommand "${subcommand}" "tools/devshell" "FX_BUILD_QUIET=\${FX_BUILD_QUIET}"
+
+  # Case 1: Running in antigravity, no verbose flags -> FX_BUILD_QUIET should be 1
+  local out
+  out=$(ANTIGRAVITY_AGENT=1 "${fx}" "${subcommand}")
+  BT_EXPECT_EQ "${out}" "FX_BUILD_QUIET=1"
+
+  # Case 2: Running in antigravity, with FUCHSIA_DEVSHELL_VERBOSITY=1 -> FX_BUILD_QUIET should not be 1
+  out=$(ANTIGRAVITY_AGENT=1 FUCHSIA_DEVSHELL_VERBOSITY=1 "${fx}" "${subcommand}")
+  BT_EXPECT_EQ "${out}" "FX_BUILD_QUIET="
+
+  # Case 3: Running in antigravity, with -x flag -> FX_BUILD_QUIET should not be 1
+  out=$(ANTIGRAVITY_AGENT=1 "${fx}" -x "${subcommand}")
+  BT_EXPECT_EQ "${out}" "FX_BUILD_QUIET="
+}
+
+TEST_fx-antigravity-sandbox-check() {
+  local subcommand="mycommand1"
+  _create_subcommand "${subcommand}" "tools/devshell" "success"
+
+  local mock_status_sandboxed="${BT_TEMP_DIR}/mock_proc_status_sandboxed"
+  cat >"${mock_status_sandboxed}" <<EOF
+Name:	bash
+State:	S (sleeping)
+Seccomp:	2
+Seccomp_filters:	2
+EOF
+
+  local mock_status_unsandboxed="${BT_TEMP_DIR}/mock_proc_status_unsandboxed"
+  cat >"${mock_status_unsandboxed}" <<EOF
+Name:	bash
+State:	S (sleeping)
+Seccomp:	0
+Seccomp_filters:	0
+EOF
+
+  local mock_status_no_seccomp="${BT_TEMP_DIR}/mock_proc_status_no_seccomp"
+  cat >"${mock_status_no_seccomp}" <<EOF
+Name:	bash
+State:	S (sleeping)
+EOF
+
+  local out="${BT_TEMP_DIR}/out.txt"
+
+  # Case 1: In agent sandbox (ANTIGRAVITY_AGENT=1, Seccomp=2) -> should fail with error message
+  BT_EXPECT_FAIL _FX_PROC_STATUS="${mock_status_sandboxed}" ANTIGRAVITY_AGENT=1 "${fx}" "${subcommand}" >"${out}" 2>&1
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${out}" "Running fx in a sandboxed environment is not supported."
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${out}" "BypassSandbox: true"
+
+  # Case 2: In agent unsandboxed (ANTIGRAVITY_AGENT=1, Seccomp=0) -> should succeed
+  local res
+  res=$(_FX_PROC_STATUS="${mock_status_unsandboxed}" ANTIGRAVITY_AGENT=1 "${fx}" "${subcommand}" 2>&1)
+  BT_EXPECT_EQ "${res}" "success"
+
+  # Case 3: Not in agent (ANTIGRAVITY_AGENT unset, Seccomp=2) -> should succeed (normal non-agent env)
+  res=$(_FX_PROC_STATUS="${mock_status_sandboxed}" ANTIGRAVITY_AGENT= "${fx}" "${subcommand}" 2>&1)
+  BT_EXPECT_EQ "${res}" "success"
+
+  # Case 4: Status file has no Seccomp line (ANTIGRAVITY_AGENT=1) -> should succeed
+  res=$(_FX_PROC_STATUS="${mock_status_no_seccomp}" ANTIGRAVITY_AGENT=1 "${fx}" "${subcommand}" 2>&1)
+  BT_EXPECT_EQ "${res}" "success"
+
+  # Case 5: Status file does not exist (ANTIGRAVITY_AGENT=1) -> should succeed
+  res=$(_FX_PROC_STATUS="${BT_TEMP_DIR}/nonexistent" ANTIGRAVITY_AGENT=1 "${fx}" "${subcommand}" 2>&1)
+  BT_EXPECT_EQ "${res}" "success"
+}
+
+BT_RUN_TESTS "$@"

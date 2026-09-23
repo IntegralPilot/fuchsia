@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# Copyright 2026 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+# grind - An opinionated tool for running many instances of a command in parallel, each in its own
+# GNU screen session, with logging to per-session files.
+#
+# The primary use of this tool is for running many "QEMU loops" in order to flush out bugs due to
+# race conditions.
+#
+# For example,
+#
+# ```
+# $ grind -n 64 -d ./logs/ "cd $HOME/fuchsia; while true; do \
+# fx qemu --arch x64 -z out/core.x64-balanced/obj/zircon/system/utest/core/core-tests.eng.zbi \
+# -- -no-reboot; done"
+# ```
+#
+# will start 64 instances of a loop that runs the core-tests.  Each instance is automatically place
+# in its own GNU screen session so that if the instance locks up, you can attach and break-in using
+# the QEMU monitor.  GNU screen also provides logging for each instance (the -d argument).
+#
+# To list the names of the running sessions,
+#
+# ```
+# $ screen -ls
+#   There are screens on:
+#           1246089.grind.64        (03/04/2026 11:35:03 PM)        (Detached)
+#           1245882.grind.63        (03/04/2026 11:35:03 PM)        (Detached)
+#           1245302.grind.62        (03/04/2026 11:35:03 PM)        (Detached)
+#           1245129.grind.61        (03/04/2026 11:35:03 PM)        (Detached)
+#           ...
+# ```
+#
+# To attach to one of them,
+#
+# ```
+# $ screen -dr 1245882.grind.63
+# ```
+#
+# To quickly kill them all,
+#
+# ```
+# $ screen -ls | awk '/[0-9]+\.grind\.[0-9]+/ {print $1}' | xargs -I{} screen -XS {} quit
+# ```
+#
+
+set -e
+
+main () {
+    re_number='^[0-9]+$'
+    while getopts ":n:d:" opt; do
+        case "${opt}" in
+            n)
+                num_instances=${OPTARG}
+                re='^[0-9]+$'
+                if ! [[ $num_instances =~ $re_number ]] ; then
+                    echo "error: ${num_instances} is not a number"
+                    echo
+                    usage
+                fi
+                ;;
+            d)
+                log_dir=${OPTARG}
+                if [ ! -d "${log_dir}" ]; then
+                    echo "error: directory ${log_dir} does not exist"
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "error: unexpected arguments"
+                echo
+                usage
+                ;;
+        esac
+    done
+    shift $((OPTIND-1))
+    cmd="${*}"
+    if [ -z "${num_instances}" ] ||  [ -z "${log_dir}" ] || [ -z "${cmd}" ]; then
+        usage
+    fi
+
+    echo "running ${num_instances} instances, logging to ${log_dir}..."
+    for i in `seq -w 1 ${num_instances}`; do
+        log=${log_dir}/grind-${i}.log
+        screen -d -m -S grind.${i} -L -Logfile ${log} bash -c "${cmd}"
+    done
+}
+
+usage() {
+    >&2
+    echo "Runs multiple instances of a command in parallel under screen sessions."
+    echo
+    echo "Usage: $0 -n <NUM> -d <DIR> <COMMAND STRING>"
+    echo "  -n <NUM>  the number of instances to run in parallel"
+    echo "  -d <DIR>  the directory to which screen logs should be written"
+    echo "  <COMMAND STRING>  the bash command string (think \"-c foo\") to run"
+    echo
+    echo "Example:"
+    echo "  $0 -n 10 -d ./logs \"while true; do ./unit-test; done\""
+    echo
+    exit 1
+}
+
+main $@

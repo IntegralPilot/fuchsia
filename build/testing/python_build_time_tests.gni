@@ -1,0 +1,118 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_validator.gni")
+
+# Defines a target which runs one or more Python tests at build time.
+#
+# This should only be used to run small tests that verify the correctness
+# of Python scripts that are invoked *during* the build, and which use
+# explicit sys.path.insert() calls to import modules from other locations
+# in the Fuchsia source tree.
+#
+# Contrary to python_host_test(), this template does not generate a .pyz
+# file, nor adds an entry in tests.json.
+# Failing as soon as possible at build time is intentional.
+#
+# These tests can be run in parallel by Ninja, but should not last
+# very long to avoid impacting overall build time.
+#
+# Arguments:
+#   tests: List of Python test scripts to run.
+#
+#   inputs: Additional inputs used by the test scripts. All imported
+#      modules and other runtime dependencies should appear here.
+#      If deps are provided, their transitive sources are automatically
+#      tracked via a depfile, so they don't need to be listed here.
+#
+#   deps, data_deps: Usual GN meaning. python_library() targets in `deps`
+#      will have their transitive sources tracked automatically.
+#
+#   enable_mypy: Set to False to disable MyPy type checking on the tests.
+#      Default: true
+#
+template("python_build_time_tests") {
+  assert(is_host,
+         "python_build_time_tests can only be expanded in the host_toolchain")
+
+  _enable_mypy = !defined(invoker.enable_mypy) || invoker.enable_mypy
+  _has_deps = defined(invoker.deps) && invoker.deps != []
+  _need_library_infos = _has_deps || _enable_mypy
+
+  if (_need_library_infos) {
+    _library_infos_target = "${target_name}.library_infos"
+    _library_infos_json = "${target_gen_dir}/${target_name}.library_infos.json"
+    generated_file(_library_infos_target) {
+      testonly = true
+      visibility = [ ":*" ]
+      if (_has_deps) {
+        public_deps = invoker.deps
+      }
+      outputs = [ _library_infos_json ]
+      output_conversion = "json"
+      data_keys = [ "library_info" ]
+      walk_keys = [ "library_info_barrier" ]
+    }
+  }
+
+  if (_enable_mypy) {
+    _mypy_target = "${target_name}_mypy"
+    validate_python_binary(_mypy_target) {
+      testonly = true
+      visibility = [ ":*" ]
+      sources = invoker.tests
+      if (defined(invoker.inputs)) {
+        # Pass non-python_library() inputs as extra sources for mypy
+        sources += invoker.inputs
+      }
+      library_infos = ":${_library_infos_target}"
+      if (_has_deps) {
+        deps = invoker.deps
+      }
+    }
+  }
+
+  action(target_name) {
+    testonly = true
+    script = "//build/testing/python_build_time_tests.py"
+
+    inputs = invoker.tests
+    if (defined(invoker.inputs)) {
+      inputs += invoker.inputs
+    }
+
+    outputs = [ "$target_out_dir/$target_name.check" ]
+
+    args = [
+             "--quiet",
+             "--stamp",
+             rebase_path(outputs[0], root_build_dir),
+             "--test-files",
+           ] + rebase_path(invoker.tests, root_build_dir)
+
+    deps = []
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+    if (defined(invoker.data_deps)) {
+      data_deps = invoker.data_deps
+    }
+
+    if (_has_deps) {
+      inputs += [ _library_infos_json ]
+      deps += [ ":${_library_infos_target}" ]
+      depfile = "${target_out_dir}/${target_name}.d"
+      args += [
+        "--library-infos",
+        rebase_path(_library_infos_json, root_build_dir),
+        "--depfile",
+        rebase_path(depfile, root_build_dir),
+      ]
+    }
+
+    if (_enable_mypy) {
+      validations = [ ":${_mypy_target}" ]
+    }
+  }
+}

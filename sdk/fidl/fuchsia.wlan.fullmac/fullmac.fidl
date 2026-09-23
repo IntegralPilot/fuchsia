@@ -1,0 +1,623 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.wlan.fullmac;
+
+using fuchsia.wlan.common;
+using fuchsia.wlan.driver;
+using fuchsia.wlan.ieee80211 as ieee80211;
+using fuchsia.wlan.stats;
+using zx;
+
+type WlanScanType = flexible enum : uint8 {
+    ACTIVE = 1;
+    PASSIVE = 2;
+};
+
+/// Max length for vendor IEs to be added to the association request. This is currently
+/// used for WPA.
+const WLAN_VIE_MAX_LEN uint32 = 514;
+
+type WlanAuthType = flexible enum : uint8 {
+    OPEN_SYSTEM = 1;
+    SHARED_KEY = 2;
+    FAST_BSS_TRANSITION = 3;
+    SAE = 4;
+};
+
+const WLAN_MAX_KEYLIST_SIZE uint32 = 4;
+
+type WlanFullmacSetKeysResp = struct {
+    statuslist vector<zx.Status>:WLAN_MAX_KEYLIST_SIZE;
+};
+
+/// Contains the information of SAE authentication frames. Shared between transmit and receive
+/// directions, see WlanFullmacImplIfc::SaeFrameRx and WlanFullmacImpl::SaeFrameTx.
+type SaeFrame = table {
+    /// The peer's MAC address. Required.
+    1: peer_sta_address ieee80211.MacAddr;
+    /// The status code for this SAE frame. Required.
+    2: status_code ieee80211.StatusCode;
+    /// The sequence number. Required.
+    3: seq_num uint16;
+    /// Contains fields in the frame body relevant to SAE.
+    /// See IEEE Std 802.11-2016 table 9-35 and table 9-36 for more details.
+    /// Required.
+    4: sae_fields vector<uint8>:MAX;
+};
+
+type WlanFullmacOwePublicKey = table {
+    1: group uint16;
+    2: key vector<uint8>:MAX;
+};
+
+type WlanScanResult = flexible enum : uint8 {
+    SUCCESS = 0;
+    NOT_SUPPORTED = 1;
+    INVALID_ARGS = 2;
+    INTERNAL_ERROR = 3;
+    SHOULD_WAIT = 4;
+    CANCELED_BY_DRIVER_OR_FIRMWARE = 5;
+};
+
+type WlanAuthResult = flexible enum : uint8 {
+    SUCCESS = 0;
+    REFUSED = 1;
+    ANTI_CLOGGING_TOKEN_REQUIRED = 2;
+    FINITE_CYCLIC_GROUP_NOT_SUPPORTED = 3;
+    REJECTED = 4;
+    FAILURE_TIMEOUT = 5;
+};
+
+type WlanAssocResult = flexible enum : uint8 {
+    SUCCESS = 0;
+    REFUSED_REASON_UNSPECIFIED = 1;
+    REFUSED_NOT_AUTHENTICATED = 2;
+    REFUSED_CAPABILITIES_MISMATCH = 3;
+    REFUSED_EXTERNAL_REASON = 4;
+    REFUSED_AP_OUT_OF_MEMORY = 5;
+    REFUSED_BASIC_RATES_MISMATCH = 6;
+    REJECTED_EMERGENCY_SERVICES_NOT_SUPPORTED = 7;
+    REFUSED_TEMPORARILY = 8;
+};
+
+
+type StartResult = flexible enum : uint8 {
+    SUCCESS = 0;
+    BSS_ALREADY_STARTED_OR_JOINED = 1;
+    RESET_REQUIRED_BEFORE_START = 2;
+    NOT_SUPPORTED = 3;
+};
+
+type StopResult = flexible enum : uint8 {
+    SUCCESS = 0;
+    BSS_ALREADY_STOPPED = 1;
+    INTERNAL_ERROR = 2;
+};
+
+type EapolTxResult = flexible enum : uint8 {
+    SUCCESS = 0;
+    TRANSMISSION_FAILURE = 1;
+};
+
+type WlanFullmacSignalReportIndication = struct {
+    rssi_dbm int8;
+    snr_db int8;
+    /// Tx rate in units of 500 kbit/s, which are the units used for
+    /// Supported Rates in IEEE Std 802.11-2024 9.4.2.3
+    tx_rate_500kbps uint32;
+};
+
+/// Describes parameters and capabilities for a single WlanBand.
+type BandCapability = table {
+    /// The values of this table apply to the band indicated in this field.
+    ///
+    /// Required.
+    1: band ieee80211.WlanBand;
+
+    /// Basic rates supported in units of 500 kbit/s (as defined in
+    /// IEEE Std 802.11-2016, 9.4.2.3), e.g., 0x02 represents 1 Mbps.
+    /// The value returned by this type indicates all the non-HT rates
+    /// the device supports transmitting and receiving.
+    ///
+    /// Required.
+    // TODO(https://fxbug.dev/384771238): Determine if this field is needed.
+    2: basic_rates vector<uint8>:ieee80211.MAX_SUPPORTED_BASIC_RATES;
+
+    /// HT PHY mode capabilities.
+    ///
+    /// Optional. If this field is not present, then the device does not support HT PHY mode in this
+    /// band.
+    3: ht_caps ieee80211.HtCapabilities;
+
+    /// VHT PHY mode capabilities.
+    ///
+    /// Optional. If this field is not present, then the device does not support VHT PHY mode in
+    /// this band.
+    4: vht_caps ieee80211.VhtCapabilities;
+
+    /// A list of primary channels considered valid by hardware, in the context of
+    /// regulatory information known to the device driver, at the time of its
+    /// construction during iface creation. In this context, a primary channel
+    /// means a channel which APs may transmit Beacon frames on in the current
+    /// regulatory domain.
+    ///
+    /// This list should be used to determine efficacy of subsequent requests to
+    /// scan a subset of channels using the iface, or to determine which primary
+    /// channel to use when starting an AP.
+    ///
+    /// Required.
+    // TODO(https://fxbug.dev/384771716): Determine if this field is needed.
+    5: primary_channels vector<ieee80211.ChannelNumber>:ieee80211.MAX_UNIQUE_CHANNEL_NUMBERS;
+};
+
+type WlanFullmacRssiStats = struct {
+    hist vector<uint64>:MAX;
+};
+
+type WlanFullmacChannelSwitchInfo = struct {
+    new_primary_channel ieee80211.ChannelNumber;
+    bandwidth ieee80211.ChannelBandwidth;
+    vht_secondary_80_channel ieee80211.ChannelNumber;
+};
+
+/// Protocol definition for communication from the fullmac vendor driver to the platform.
+@discoverable
+closed protocol WlanFullmacImplIfc {
+    // MLME operations
+    strict OnScanResult(table {
+        1: txn_id uint64;
+        // Time of the scan result relative to when the system was powered on.
+        // See https://fuchsia.dev/fuchsia-src/concepts/time/language_support#monotonic_time
+        2: timestamp_nanos zx.Time;
+        3: bss ieee80211.BssDescription;
+    }) -> ();
+    strict OnScanEnd(table {
+        1: txn_id uint64;
+        2: code WlanScanResult;
+    }) -> ();
+    /// Indicates to MLME that an individual scan within the scheduled scan plan has been completed
+    /// and results are available.
+    strict OnScheduledScanMatchesAvailable(table {
+        1: txn_id uint64;
+    });
+    /// Indicates to MLME that scheduled scanning has been stopped by the firmware.
+    strict OnScheduledScanStoppedByFirmware(table {
+        1: txn_id uint64;
+    });
+    strict ConnectConf(table {
+        1: peer_sta_address ieee80211.MacAddr;
+        2: result_code ieee80211.StatusCode;
+
+        // These fields are only valid if the result is success.
+        3: association_id uint16;
+        4: association_ies vector<uint8>:MAX;
+    }) -> ();
+    /// Report the result of an MLME-initiated roam attempt.
+    strict RoamConf(table {
+        /// BSSID of the target BSS. Required.
+        1: selected_bssid ieee80211.MacAddr;
+        /// Result of the roam attempt. Required.
+        2: status_code ieee80211.StatusCode;
+        /// Whether the original BSS association has been maintained through the roam attempt. Required.
+        /// A successful roam always incurs disassociation from the original BSS, so if `status_code` is
+        /// success then this field must be set to false; a roam failure typically incurs disassociation
+        /// from the original BSS, but may not in some cases (e.g. in some Fast BSS Transition scenarios).
+        3: original_association_maintained bool;
+        /// Whether the client is authenticated with the target BSS. If `status_code` is success, then
+        /// this field must be set to true; if the roam attempt failed, this field may be true or false.
+        /// This allows higher layers to decide how to clean up connection state after a failed roam
+        /// attempt.
+        4: target_bss_authenticated bool;
+        /// Association ID for this association with the AP. Required if `status_code` is success.
+        5: association_id uint16;
+        /// IEs for this association with the AP. Required if `status_code` is success.
+        6: association_ies vector<uint8>:MAX;
+    }) -> ();
+    /// Report that a fullmac-initiated roam attempt is in progress.
+    /// Fullmac must send this start indication for all roam attempts.
+    strict RoamStartInd(table {
+        /// BSSID of the target BSS. Required.
+        1: selected_bssid ieee80211.MacAddr;
+        /// Full BSS description of the target BSS. Required.
+        /// If the data in BssDescription is incorrect or incomplete, the roam cannot succeed,
+        /// because higher layers will not be able to complete required actions (e.g. SAE).
+        2: selected_bss ieee80211.BssDescription;
+        /// Whether the original BSS association has been maintained at the start of a roam attempt.
+        /// Required. 802.11 dictates that a STA can only be associated with a single BSS, so a roam
+        /// attempt typically incurs disassociation at the start of the roam attempt. However,
+        /// 802.11 also provides a mechanism (i.e. Fast BSS Transition) that allows a device to
+        /// maintain association with the original BSS while establishing authentication with the
+        /// target BSS, in order to avoid losing the original association if authentication with the
+        /// target BSS fails.
+        3: original_association_maintained bool;
+    }) -> ();
+    /// Report the result of a fullmac-initiated roam attempt.
+    strict RoamResultInd(table {
+        /// BSSID of the target BSS. Required.
+        1: selected_bssid ieee80211.MacAddr;
+        /// Result of the roam attempt. Required.
+        2: status_code ieee80211.StatusCode;
+        /// Whether the original BSS association has been maintained through the roam attempt. Required.
+        /// A successful roam always incurs disassociation from the original BSS, so if `status_code` is
+        /// success then this field must be set to false; a roam failure typically incurs disassociation
+        /// from the original BSS, but may not in some cases (e.g. in some Fast BSS Transition scenarios).
+        3: original_association_maintained bool;
+        /// Whether the client is authenticated with the target BSS. If `status_code` is success, then
+        /// this field must be set to true; if the roam attempt failed, this field may be true or false.
+        /// This allows higher layers to decide how to clean up connection state after a failed roam
+        /// attempt.
+        4: target_bss_authenticated bool;
+        /// Association ID for this association with the AP. Required if `status_code` is success.
+        5: association_id uint16;
+        /// IEs for this association with the AP. Required if `status_code` is success.
+        6: association_ies vector<uint8>:MAX;
+    }) -> ();
+    strict AuthInd(table {
+        1: peer_sta_address ieee80211.MacAddr;
+        2: auth_type WlanAuthType;
+    }) -> ();
+    strict DeauthConf(table {
+        1: peer_sta_address ieee80211.MacAddr;
+    }) -> ();
+    /// Report that the driver deauthenticated.
+    strict DeauthInd(table {
+        /// MAC address of the peer. Required.
+        1: peer_sta_address ieee80211.MacAddr;
+        /// Reason code for deauthentication. Required.
+        2: reason_code ieee80211.ReasonCode;
+        /// locally_initiated is true if deauth is initiated from the device,
+        /// and is false if it's initiated remotely (e.g. due to deauth frame)
+        3: locally_initiated bool;
+    }) -> ();
+    strict AssocInd(table {
+        1: peer_sta_address ieee80211.MacAddr;
+        // Interval specified in time units.
+        2: listen_interval uint16;
+        3: ssid ieee80211.Ssid;
+        4: rsne vector<uint8>:ieee80211.WLAN_IE_MAX_LEN;
+        5: vendor_ie vector<uint8>:WLAN_VIE_MAX_LEN;
+    }) -> ();
+    /// Report the result of a previously-issued disassociate request. IEEE 802.11-2020 6.3.9.2.
+    strict DisassocConf(table {
+        /// ZX_OK indicates that the disassociate request was serviced and the peer was
+        /// disassociated. Other errors indicate that the request could not be serviced, for these
+        /// or other reasons:
+        ///   - ZX_ERR_BAD_STATE: association not possible in current state (e.g. disconnected)
+        ///   - ZX_ERR_INVALID_ARGS: no association exists with specified peer
+        ///   - ZX_ERR_SHOULD_WAIT: disassociate request could not be serviced because firmware or
+        ///     driver was busy
+        1: status zx.Status;
+    }) -> ();
+    /// Report that disassociation with the specified peer occurred (IEEE 802.11-2020 6.3.9.3).
+    strict DisassocInd(table {
+        /// Address of the peer that was disassociated. Required.
+        1: peer_sta_address ieee80211.MacAddr;
+        /// Reason for the disassociation. Required.
+        2: reason_code ieee80211.ReasonCode;
+        /// Whether the disassociation was initiated from the device. Required.
+        /// locally_initiated is true if disassociation was initiated from the device (e.g. firmware
+        /// or vendor driver started the disassociation); false if the disassociation was initiated
+        /// externally (e.g. due to receipt of a disassociate frame from an AP).
+        3: locally_initiated bool;
+    }) -> ();
+    /// Report the result of a WlanFullmacImpl::StartBss request.
+    strict StartConf(table {
+        /// The result of the StartBss request. Required.
+        1: result_code StartResult;
+    }) -> ();
+    /// Report the result of a WlanFullmacImpl::StopBss request.
+    strict StopConf(table {
+        /// The result of the StopBss request. Required.
+        1: result_code StopResult;
+    }) -> ();
+    /// Report the result of a EAPoL frame transmission (IEEE 802.11-2020 6.3.22.2).
+    /// EAPoL frames are transmitted by the platform via WlanFullmacImpl::EapolTx.
+    strict EapolConf(table {
+        /// The result of the transmission. Required.
+        1: result_code EapolTxResult;
+        /// This value corresponds to the dst_addr in the EapolTxRequest we're confirming.
+        /// IEEE 802.11-2020 does not include this field, but we need it to disambiguate
+        /// if multiple EAPoL handshakes are ongoing.
+        /// Required.
+        2: dst_addr ieee80211.MacAddr;
+    }) -> ();
+    strict OnChannelSwitch(struct {
+        ind WlanFullmacChannelSwitchInfo;
+    }) -> ();
+
+    // MLME extensions
+    strict SignalReport(struct {
+        ind WlanFullmacSignalReportIndication;
+    }) -> ();
+    /// Report that an EAPoL frame was received.
+    strict EapolInd(table {
+        /// The address of the sender. Required.
+        1: src_addr ieee80211.MacAddr;
+        /// The address of the intended destination. Required.
+        2: dst_addr ieee80211.MacAddr;
+        /// The bytes of the EAPoL frame data. Required.
+        3: data vector<uint8>:MAX;
+    }) -> ();
+    /// Inform the platform that the PMK is available after a driver-handled SAE handshake.
+    strict OnPmkAvailable(table {
+        /// The pairwise master key bytes. Required.
+        1: pmk vector<uint8>:MAX;
+        /// The PMK IDs. Required.
+        2: pmkid vector<uint8>:MAX;
+    }) -> ();
+    strict SaeHandshakeInd(table {
+        1: peer_sta_address ieee80211.MacAddr;
+    }) -> ();
+    /// Receive an SAE authentication frame.
+    strict SaeFrameRx(struct {
+        frame SaeFrame;
+    }) -> ();
+    strict OnWmmStatusResp(struct {
+        status zx.Status;
+        wmm_params fuchsia.wlan.driver.WlanWmmParameters;
+    }) -> ();
+};
+
+/// Protocol definition for communication from the platform to the fullmac
+/// vendor driver.
+@discoverable
+open protocol WlanFullmacImpl {
+
+    /// Initialize the FullMAC driver. This is the first request that the platform will make to the
+    /// FullMAC driver.
+    ///
+    /// On initialization, MLME provides the client end to the WlanFullmacImplIfc protocol. The
+    /// driver must return the SME server end channel, which is used internally by the platform.
+    /// Typically, the SME server end channel is given to the FullMAC driver by
+    /// fuchsia.wlan.phy/WlanPhy.CreateIface.
+    ///
+    /// If `Init` completes successfully, the platform will begin making other WlanFullmacImpl
+    /// requests to the FullMAC driver, and the FullMAC driver is free to make WlanFullmacImplIfc
+    /// requests to the platform. The platform may continue making WlanFullmacImpl requests until
+    /// the WlanFullmacImpl server unbinds.
+    ///
+    /// Common errors include:
+    ///   - `ZX_ERR_ALREADY_BOUND`: `Init` was already called on this FullMAC driver.
+    strict Init(resource table {
+        /// The WlanFullmacImplifc client end.
+        /// Required.
+        1: ifc client_end:WlanFullmacImplIfc;
+    }) -> (resource table {
+        /// The SME server end channel.
+        /// Required.
+        1: sme_channel zx.Handle:CHANNEL;
+    }) error zx.Status;
+
+    /// Returns high-level information describing the state of the FullMAC driver.
+    /// This is safe to call even before the call to WlanFullmacImpl::Start.
+    strict Query() -> (table {
+        /// Current station address. Required.
+        1: sta_addr ieee80211.MacAddr;
+
+        /// MAC role. Required.
+        2: role fuchsia.wlan.common.WlanMacRole;
+
+        /// Supported bands. Required.
+        3: band_caps vector<BandCapability>:fuchsia.wlan.common.MAX_BANDS;
+
+        /// Factory mac address. Required.
+        4: factory_addr ieee80211.MacAddr;
+    }) error zx.Status;
+
+    strict QuerySecuritySupport() -> (table {
+        1: resp fuchsia.wlan.common.SecuritySupport;
+    }) error zx.Status;
+    strict QuerySpectrumManagementSupport() -> (table {
+        1: resp fuchsia.wlan.common.SpectrumManagementSupport;
+    }) error zx.Status;
+    strict QueryTelemetrySupport() -> (table {
+        1: resp fuchsia.wlan.stats.TelemetrySupport;
+    }) error zx.Status;
+    flexible QueryApfPacketFilterSupport() -> (table {
+        1: resp fuchsia.wlan.common.ApfPacketFilterSupport;
+    }) error zx.Status;
+
+    // MLME operations
+    strict StartScan(table {
+        /// Unique transaction id (will be indicated in corresponding scan results).
+        1: txn_id uint64;
+        2: scan_type WlanScanType;
+        /// List of channels to scan on. An empty list of channels will cause a
+        /// scan request to immediately return a OnScanEnd with code INVALID_ARGS.
+        ///
+        /// Invalid channel numbers will be silently ignored. The validity of a channel
+        /// number depends on the current regulatory region, and a FullMAC driver cannot
+        /// always determine the region setting. This is especially the case when
+        /// firmware changes the region setting dynamically.
+        3: channels vector<ieee80211.ChannelNumber>:ieee80211.MAX_UNIQUE_CHANNEL_NUMBERS;
+        /// List of SSIDs to scan for. An empty list of ssids is the same as specifying
+        /// a list containing only the wildcard SSID.
+        ///
+        /// There is no limit on the number of SSIDs specified. A large number of
+        /// SSIDs may result in extended scan times because of hardware limitations on
+        /// the number of SSIDs permitted per scan request and the technical limitation
+        /// in IEEE 802.11-2016 that limits the number of SSIDs in a single Probe Request
+        /// frame to ieee80211.SSID_LIST_MAX SSIDs.
+        4: ssids vector<ieee80211.Ssid>:MAX;
+        /// Minimum amount of time in msecs spent on a channel during scan.
+        5: min_channel_time uint32;
+        /// Maximum amount of time in msecs spent on a channel during scan.
+        6: max_channel_time uint32;
+    }) -> ();
+    /// Starts scheduled scanning.
+    flexible StartScheduledScan(table {
+        1: txn_id uint64;
+        2: req fuchsia.wlan.common.ScheduledScanRequest;
+    }) -> () error zx.Status;
+    /// Stops scheduled scanning.
+    ///
+    /// The successful return value indicates that the scan has been stopped.
+    /// The driver will NOT send an `OnScheduledScanStoppedByFirmware` event in response to this call.
+    /// `OnScheduledScanStoppedByFirmware` is reserved for firmware-initiated stops or errors.
+    flexible StopScheduledScan(table {
+        1: txn_id uint64;
+    }) -> () error zx.Status;
+    /// Returns the transaction IDs of any currently active scheduled scans.
+    flexible GetScheduledScanEnabled() -> (table {
+        1: active_txn_ids vector<uint64>:MAX;
+    }) error zx.Status;
+    strict Connect(table {
+        1: selected_bss ieee80211.BssDescription;
+        /// Timeout specified in beacon interval.
+        2: connect_failure_timeout uint32;
+
+        /// Additional parameters specific to the authentication exchange.
+        3: auth_type WlanAuthType;
+        /// sae_password is ignored except when SAE_DRIVER_AUTH is enabled and the
+        /// auth_type is SAE.
+        4: sae_password vector<uint8>:MAX;
+
+        /// WEP key used in the authentication exchange.
+        /// This is only populated for the WEP security type, otherwise this field is empty.
+        // TODO(https://fxbug.dev/399839691): Will be removed after v/g is updated to use ieee80211.SetKeyDescriptor.
+        5: wep_key fuchsia.wlan.driver.WlanKeyConfig;
+
+        /// Additional parameters specific to the association exchange.
+        6: security_ie vector<uint8>:ieee80211.WLAN_IE_MAX_LEN;
+
+        /// WEP key used in the authentication exchange.
+        /// This is only populated for the WEP security type, otherwise this field is empty.
+        7: wep_key_desc ieee80211.SetKeyDescriptor;
+
+        /// OWE public key used for Diffie Hellman exchange during association.
+        /// This is only populated for the OWE security type, otherwise this field is empty.
+        8: owe_public_key WlanFullmacOwePublicKey;
+    }) -> ();
+    strict Reconnect(table {
+        1: peer_sta_address ieee80211.MacAddr;
+    }) -> ();
+    /// Initiate a roam attempt, which moves association to a different BSS within the ESS.
+    strict Roam(table {
+        /// Full BSS description of the target BSS. Required.
+        /// If the data in BssDescription is incorrect or incomplete, the roam cannot succeed,
+        /// because higher layers will not be able to complete required actions (e.g. SAE).
+        1: selected_bss ieee80211.BssDescription;
+    }) -> ();
+    strict AuthResp(table {
+        1: peer_sta_address ieee80211.MacAddr;
+        2: result_code WlanAuthResult;
+    }) -> ();
+    strict Deauth(table {
+        1: peer_sta_address ieee80211.MacAddr;
+        2: reason_code ieee80211.ReasonCode;
+    }) -> ();
+    strict AssocResp(table {
+        1: peer_sta_address ieee80211.MacAddr;
+        2: result_code WlanAssocResult;
+        3: association_id uint16;
+    }) -> ();
+    strict Disassoc(table {
+        1: peer_sta_address ieee80211.MacAddr;
+        2: reason_code ieee80211.ReasonCode;
+    }) -> ();
+    strict StartBss(table {
+        1: ssid ieee80211.Ssid;
+        2: bss_type ieee80211.BssType;
+        3: beacon_period uint32;
+        4: dtim_period uint32;
+        5: primary ieee80211.ChannelNumber;
+        6: rsne vector<uint8>:ieee80211.WLAN_IE_MAX_LEN;
+        7: vendor_ie vector<uint8>:WLAN_VIE_MAX_LEN;
+    }) -> ();
+    strict StopBss(table {
+        1: ssid ieee80211.Ssid;
+    }) -> ();
+    /// Sets security keys for a connection. This is typically called after a successful key
+    /// exchange.
+    ///
+    /// Note that the platform assumes that the driver will automatically delete keys on a
+    /// disconnect or key rotation.
+    strict SetKeys(table {
+        // TODO(https://fxbug.dev/399839691): keylist will be removed after v/g is updated to use ieee80211.SetKeyDescriptor.
+        1: keylist vector<fuchsia.wlan.driver.WlanKeyConfig>:WLAN_MAX_KEYLIST_SIZE;
+        2: key_descriptors vector<ieee80211.SetKeyDescriptor>:WLAN_MAX_KEYLIST_SIZE;
+    }) -> (struct {
+        resp WlanFullmacSetKeysResp;
+    });
+    strict EapolTx(table {
+        1: src_addr ieee80211.MacAddr;
+        2: dst_addr ieee80211.MacAddr;
+        3: data vector<uint8>:MAX;
+    }) -> ();
+
+    // MLME extensions
+    strict GetIfaceStats() -> (struct {
+        stats fuchsia.wlan.stats.IfaceStats;
+    }) error zx.Status;
+    strict GetIfaceHistogramStats() -> (struct {
+        stats fuchsia.wlan.stats.IfaceHistogramStats;
+    }) error zx.Status;
+    strict GetSignalReport() -> (fuchsia.wlan.stats.SignalReport) error zx.Status;
+    /// Informs the driver of the result of an SAE handshake.
+    strict SaeHandshakeResp(table {
+        /// The peer's MAC address. Required.
+        1: peer_sta_address ieee80211.MacAddr;
+        /// The status of the SAE handshake. Required.
+        2: status_code ieee80211.StatusCode;
+    }) -> ();
+    /// Transmit an SAE authentication frame.
+    strict SaeFrameTx(struct {
+        frame SaeFrame;
+    }) -> ();
+    strict WmmStatusReq() -> ();
+
+    // Notify the interface whether it's online or offline. For client interfaces the online status
+    // changes based on such things as being associated/disassociated with an AP. For encrypted
+    // connections, the interface is considered online after the key exchange completes successfully,
+    // for open connections the interface is considered online as soon as association is confirmed.
+    //
+    // A SoftAP interface is set to online when:
+    // 1) The driver confirms that a request to start a SoftAP succeeded.
+    // A SoftAP interface is set to offline when:
+    // 1) A request to stop a SoftAP is received.
+    // 2) The driver indicates that the SoftAP has stopped (possibly already offline because of 1).
+    //
+    // The call will ONLY be made when the state actually changes. For example in the situation
+    // above where a call to stop an AP has been made there will be a call to OnLinkStateChanged.
+    // However when the driver confirms this there will be no additional call to OnLinkStateChanged
+    // because it was already offline.
+    strict OnLinkStateChanged(table {
+        1: online bool;
+    }) -> ();
+
+    /// Sets the MAC address for the interface, which may be retrieved via the Query() method. To
+    /// reset to the default/factory MAC address, use the Query() method to retrieve the `factory_addr`,
+    /// and pass that value to this method.
+    strict SetMacAddress(struct {
+        mac_addr ieee80211.MacAddr;
+    }) -> () error zx.Status;
+
+    /// Installs an APF program, replacing an existing program if present. This method does not
+    /// enable the program.
+    flexible InstallApfPacketFilter(table {
+        1: program vector<uint8>:MAX;
+    }) -> () error zx.Status;
+    /// Fetches a consistent snapshot of the entire APF program and working
+    /// memory buffer and returns it to the host. The returned buffer contains
+    /// both code and data. Its length must match the most recently returned
+    /// QueryPacketFilterSupport().max_filter_length.
+    ///
+    /// While the snapshot is being fetched, the APF interpreter must not execute
+    /// and all incoming packets must be passed to the host as if there was no
+    /// APF program installed.
+    flexible ReadApfPacketFilterData() -> (table {
+        1: memory vector<uint8>:MAX;
+    }) error zx.Status;
+    flexible SetApfPacketFilterEnabled(table {
+        1: enabled bool;
+    }) -> () error zx.Status;
+    flexible GetApfPacketFilterEnabled() -> (table {
+        1: enabled bool;
+    }) error zx.Status;
+};
+
+service Service {
+    wlan_fullmac_impl client_end:WlanFullmacImpl;
+};

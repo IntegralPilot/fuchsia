@@ -1,0 +1,206 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/build_api_module.gni")
+import("//build/python/python_action.gni")
+import("//build/python/python_binary.gni")
+import("//build/subbuild.gni")
+import("//build/testing/golden_files.gni")
+import("//sdk/ctf/build/ctf.gni")
+import("//sdk/ctf/build/ctf_api_level.gni")
+import("//sdk/ctf/build/ctf_output_directory.gni")
+
+generated_file("ctf_artifacts_source_list") {
+  testonly = true
+  outputs = [ "$root_out_dir/ctf_artifacts_source_list.json" ]
+  output_conversion = "json"
+  data_keys = [ "ctf_artifacts" ]
+  walk_keys = [ "ctf_barrier" ]
+  deps = [
+    ":ctf_subbuild",
+    ":host_test_manifest",
+    "tests:e2e_tests",
+  ]
+
+  metadata = {
+    # Used by the //:ctf_artifacts_path build API module
+    ctf_artifacts_path =
+        [ rebase_path("$root_out_dir/ctf_release/ctf_artifacts.json",
+                      root_build_dir) ]
+  }
+}
+
+# A file that contains the path to the ctf_artifacts manifest, used
+# by infra scripts to locate the latter.
+build_api_module("ctf_artifacts_path") {
+  testonly = true
+  data_keys = [ "ctf_artifacts_path" ]
+  deps = [ ":ctf_artifacts" ]
+}
+
+# Generates a manifest of CTF release artifacts to upload to remote storage.
+action("ctf_artifacts") {
+  testonly = true
+  _output_json = "$root_out_dir/ctf_release/ctf_artifacts.json"
+  outputs = [ _output_json ]
+  deps = [ ":ctf_artifacts_source_list" ]
+  script = "copy_ctf_artifacts.py"
+  _dep_outputs = get_target_outputs(deps[0])
+  sources = _dep_outputs
+  depfile = "$target_out_dir/ctf_artifacts.json.d"
+  args = [
+    "--artifacts_json",
+    rebase_path(_dep_outputs[0], root_out_dir),
+    "--output_manifest",
+    rebase_path(outputs[0], root_out_dir),
+    "--depfile",
+    rebase_path(depfile, root_out_dir),
+  ]
+}
+
+group("ctf") {
+  testonly = true
+  deps = [
+    ":check_test_templates",
+    ":ctf_artifacts",
+    ":golden_files",
+    ":manifests",
+    ":summarize_ctf_fidl_methods($default_toolchain)",
+    ":tests",
+    "//src/testing/fidl_coverage:fidl_coverage_py_bin",
+  ]
+}
+
+group("manifests") {
+  testonly = true
+  deps = [
+    ":host_test_manifest",
+    ":package_archive_manifest",
+  ]
+}
+
+subbuild("ctf_subbuild") {
+  testonly = true
+
+  # TODO(https://fxbug.dev/42070336): Change this to build manifest when it builds cleanly
+  target = "//sdk/ctf:package_archive_manifest"
+  outputs = [ "/cts/package_archives.json" ]
+  api_level = ctf_api_level
+  target_cpu = target_cpu
+  subbuild_dir_name = ctf_output_directory
+  extra_deps = [
+    # Catch changes in source tests.
+    "//sdk/ctf/tests:ctf-tests",
+  ]
+  metadata = {
+    ctf_artifacts = [ "${ctf_output_directory}/cts/package_archives.json" ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":ctf_subbuild",
+    "tests",
+    "tests:e2e_tests",
+  ]
+}
+
+generated_file("package_archive_manifest") {
+  testonly = true
+  outputs = [ "$root_out_dir/cts/package_archives.json" ]
+  output_conversion = "json"
+  data_keys = [ "package_archives" ]
+  walk_keys = [ "ctf_barrier" ]
+  deps = [ "tests:ctf-tests" ]
+  metadata = {
+    ctf_artifacts = rebase_path(outputs, root_build_dir)
+  }
+}
+
+generated_file("host_test_manifest") {
+  testonly = true
+  outputs = [ "$root_out_dir/cts/host_test_manifest.json" ]
+  output_conversion = "json"
+  data_keys = [ "host_test_manifest" ]
+  deps = [ "tests/examples/host_tool:tests($host_toolchain)" ]
+
+  metadata = {
+    ctf_artifacts = [ "cts/host_test_manifest.json" ]
+  }
+}
+
+generate_ctf_tests("check_test_templates") {
+  api_level = "_in_development"
+  manifest = "//sdk/ctf/goldens/package_archives.json"
+  use_prebuilts_from_current_build = true
+  deps = [ ":package_archive_manifest" ]
+}
+
+if (!is_host) {
+  golden_files("golden_files") {
+    testonly = true
+    deps = [ ":package_archive_manifest($target_toolchain)" ]
+
+    comparisons = []
+    foreach(dep, deps) {
+      _outputs = []
+      _outputs = get_target_outputs(dep)
+      _candidate = _outputs[0]
+      comparisons += [
+        {
+          golden = "//sdk/ctf/goldens/" + get_path_info(_candidate, "file")
+          candidate = _candidate
+        },
+      ]
+    }
+  }
+
+  # Tests that we want to run in an FYI builder.
+  # We do not want failures from these tests to break the tree.
+  group("fyi") {
+    testonly = true
+    deps = []
+  }
+}
+
+python_binary("summarize_fidl_methods_bin") {
+  enable_mypy = true
+  main_source = "summarize_fidl_methods.py"
+  deps = [
+    "//build/python/modules/depfile",
+    "//scripts/lib/json_get",
+  ]
+}
+
+if (current_toolchain == default_toolchain) {
+  python_action("summarize_ctf_fidl_methods") {
+    binary_label = ":summarize_fidl_methods_bin"
+
+    sdk_fidl_json = "${root_build_dir}/sdk_fidl_json.json"
+    output_file = "${root_build_dir}/ctf_sdk_fidl_methods.json"
+    depfile = "${output_file}.d"
+
+    inputs = [ sdk_fidl_json ]
+    outputs = [ output_file ]
+
+    metadata = {
+      ctf_fidl_method_summary = [ rebase_path(output_file, root_build_dir) ]
+    }
+
+    args = [
+      "--sdk-fidl-json",
+      rebase_path(sdk_fidl_json, root_build_dir),
+      "--method-summary",
+      rebase_path(outputs[0], root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+
+    deps = [
+      # Generates `sdk_fidl_json.json` and the files it refers to.
+      "//build/fidl:sdk_fidl",
+    ]
+  }
+}

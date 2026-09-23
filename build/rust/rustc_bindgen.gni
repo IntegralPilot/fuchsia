@@ -1,0 +1,556 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang_prefix.gni")
+import("//build/config/clang/clang_target_toolchain_info.gni")
+import("//build/config/current_target_tuple.gni")
+import("//build/config/fuchsia_cxx_version.gni")
+import("//build/config/sysroot.gni")
+import("//build/rust/config.gni")
+import("//build/testing/config.gni")
+import("//build/testing/golden_files.gni")
+
+# Might as well always default to using the bleeding edge, just as we do with
+# our toolchain.
+default_bindgen_rust_version = "nightly"
+
+# Defines a target that runs rust bindgen on C header files.
+#
+# This target is sensitive to the current toolchain context: the C/C++ compiler
+# options specified by both the target-level configs of `deps` and the
+# toolchain-level configs of the current toolchain will be forwarded to the
+# invocation of bindgen. In the case of the GCC variant, the target redirects
+# to the base Clang toolchain.
+#
+# Parameters
+#
+#   * headers
+#     - Required: List of paths to the input C header files.
+#     - Type: list(path)
+#
+#   * output_name
+#     - Optional: Name of the output Rust file (relative to output_path).
+#     - Type: string
+#     - Default: "${target_name}.rs"
+#
+#   * deps
+#     - Optional: List of targets that compile `headers` in the desired way.
+#       The forwarded list is made to include `default_common_source_deps` by
+#       default.
+#     - Type: list(label)
+#
+#   * configs
+#     - Optional: Additional configs to apply to the Clang invocation when
+#       parsing `headers`. The forwarded list is made to include
+#       `default_common_binary_configs` by default.
+#     - Type: list(label)
+#
+#   * cpp
+#     - Optional: Whether to compile the headers as C++.
+#     - Type: bool
+#     - Default: false
+#
+#   * rust_version
+#     - Optional: The Rust compiler version to target.
+#     - Type: string
+#     - Default: default_bindgen_rust_version
+#
+#   * rust_edition
+#     - Optional: The Rust edition to target.
+#     - Type: string ("2018" | "2021" | "2024")
+#     - Default: Maximum supported edition of the targeted Rust version.
+#
+#   * expect_lints
+#     - Optional: List of lints to expect in the generated code (generates `#![expect(lint)]`).
+#     - Type: list(string)
+#
+#   * notice_year
+#     - Optional: The year to use in the copyright notice header.
+#     - Type: string
+#
+#   * generator_label
+#     - Optional: The label of the target that generated this target.
+#     - Type: label
+#     - Default: get_label_info(":$target_name", "label_no_toolchain")
+#
+#   * raw_lines
+#     - Optional: List of raw lines of code to prepend to the generated file.
+#     - Type: list(string)
+#
+#   * explicit_padding
+#     - Optional: Whether to emit explicit padding fields.
+#     - Type: bool
+#
+#   * layout_tests
+#     - Optional: Whether to generate layout tests.
+#     - Type: bool
+#
+#   * include_dirs
+#     - Optional: List of include directories to pass to clang.
+#     - Type: list(path)
+#
+#   * std_impls
+#     - Optional: List of non-derivable std traits to implement.
+#     - Type: list(string)
+#
+#   * std_derives
+#     - Optional: List of std traits to derive.
+#     - Type: list(string)
+#
+#   * auto_derive_traits
+#     - Optional: Rules for automatically deriving traits. Each element is a
+#       list of two strings: a regex used to match the type name, and a
+#       comma-separated list of traits to derive.
+#     - Type: list(list)
+#
+#   * replacements
+#     - Optional: Rules for replacing text. Each element is a list of two
+#       strings: a regex used to match the original text, and the text to
+#       replace it with. The replacement text can use backreferences for
+#       captured groups.
+#     - Type: list(list(string))
+#
+#   * function_allowlist
+#     - Optional: A list of regexes. Free-standing functions which do not
+#       match one of these regexes will not be generated.
+#     - Type: list(string)
+#
+#   * var_allowlist
+#     - Optional: A list of regexes. Free-standing variables which do not
+#       match any of these regexes will not be generated.
+#     - Type: list(string)
+#
+#   * type_allowlist
+#     - Optional: A list of regexes. Types which do not match any of
+#       these regexes will not be generated.
+#     - Type: list(string)
+#
+#   * function_blocklist
+#     - Optional: A list of regexes. Free-standing functions which match any
+#       of these regexes will not be generated.
+#     - Type: list(string)
+#
+#   * type_blocklist
+#     - Optional: A list of regexes. Types which match any of these regexes
+#       will not be generated.
+#     - Type: list(string)
+#
+#   * var_blocklist
+#     - Optional: A list of regexes. Free-standing variables and static members
+#       which match any of these regexes will not be generated.
+#     - Type: list(string)
+#
+#   * opaque_types
+#     - Optional: A list of regexes. Types which match any of these regexes
+#       will be marked as opaque layout blobs.
+#     - Type: list(string)
+#
+#   * no_debug_types
+#     - Optional: A list of regexes. Types which match any of these regexes
+#       will not derive `Debug`.
+#     - Type: list(string)
+#
+#   * rustified_enums
+#     - Optional: A list of regexes. Enums which match any of these regexes
+#       will be generated as Rust enums instead of constants.
+#     - Type: list(string)
+#
+#   * use_core
+#     - Optional: Whether to use `core` instead of `std`.
+#     - Type: bool
+#     - Default: true
+#
+#   * additional_bindgen_flags
+#     - Optional: List of additional flags to pass to bindgen.
+#     - Type: list(string)
+#
+#   * fuchsia_api_level
+#     - Optional: API level to pass to clang ("NEXT", "HEAD", "PLATFORM", or an integer string).
+#     - Type: string
+#
+#   * additional_clang_flags
+#     - Optional: List of additional flags to pass to clang.
+#     - Type: list(string)
+#
+#   * testonly, visibility
+#     - Optional: Usual GN meanings.
+#
+template("rustc_bindgen") {
+  assert(defined(invoker.headers), "Must specify headers")
+
+  if (defined(invoker.output_name)) {
+    _output_name = invoker.output_name
+  } else {
+    _output_name = "${target_name}.rs"
+  }
+
+  _output_path = "$target_gen_dir/${_output_name}"
+
+  # bindgen drives Clang, not GCC. To avoid forwarding GCC compiler flags to
+  # Clang, we redirect to the base Clang toolchain when we are evaluated under
+  # the GCC variant.
+  if (is_gcc) {
+    _clang_target = ":${target_name}(${toolchain_variant.base})"
+    _clang_gen_dir = get_label_info(_clang_target, "target_gen_dir")
+    _clang_output = "${_clang_gen_dir}/${_output_name}"
+
+    copy(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                             ])
+      sources = [ _clang_output ]
+      outputs = [ _output_path ]
+      deps = [ _clang_target ]
+    }
+    not_needed(invoker,
+               "*",
+               [
+                 "testonly",
+                 "visibility",
+               ])
+  } else {
+    _bindgen_bin = "//prebuilt/third_party/rust_bindgen/$host_platform/bindgen"
+    _rustfmt_bin = "$rustc_prefix/bin/rustfmt"
+    _rustfmt_config = "//rustfmt.toml"
+
+    action(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "testonly",
+                               "visibility",
+                               "configs",
+                             ])
+
+      script = "//build/rust/new-bindgen.py"
+
+      deps = default_common_source_deps
+      if (defined(invoker.deps)) {
+        deps += invoker.deps
+      }
+
+      inputs = invoker.headers + [
+                 _bindgen_bin,
+                 _rustfmt_bin,
+                 _rustfmt_config,
+               ]
+
+      outputs = [ _output_path ]
+
+      _depfile = "${_output_path}.d"
+      depfile = _depfile
+
+      args = []
+      foreach(header, invoker.headers) {
+        args += [
+          "--input",
+          rebase_path(header, root_build_dir),
+        ]
+      }
+      args += [
+        "--output",
+        rebase_path(_output_path, root_build_dir),
+        "--depfile",
+        rebase_path(_depfile, root_build_dir),
+        "--bindgen",
+        rebase_path(_bindgen_bin, root_build_dir),
+        "--rustfmt",
+        rebase_path(_rustfmt_bin, root_build_dir),
+        "--clang-target",
+        current_target_tuple,
+      ]
+
+      rust_version = default_bindgen_rust_version
+      if (defined(invoker.rust_version)) {
+        rust_version = invoker.rust_version
+      }
+      args += [ "--rust-version=${rust_version}" ]
+
+      if (defined(invoker.rust_edition)) {
+        args += [ "--rust-edition=" + invoker.rust_edition ]
+      }
+
+      if (defined(invoker.expect_lints)) {
+        foreach(x, invoker.expect_lints) {
+          args += [ "--expect-lint=${x}" ]
+        }
+      }
+      if (defined(invoker.notice_year)) {
+        args += [
+          "--notice-year",
+          "${invoker.notice_year}",
+        ]
+      }
+
+      _generator_label = ""
+      if (defined(invoker.generator_label)) {
+        _generator_label = invoker.generator_label
+      } else {
+        _generator_label = get_label_info(":$target_name", "label_no_toolchain")
+      }
+      args += [
+        "--generator-label",
+        _generator_label,
+      ]
+
+      if (defined(invoker.raw_lines)) {
+        foreach(x, invoker.raw_lines) {
+          args += [ "--raw-line=${x}" ]
+        }
+      }
+      if (defined(invoker.explicit_padding)) {
+        if (invoker.explicit_padding) {
+          args += [ "--explicit-padding" ]
+        } else {
+          args += [ "--no-explicit-padding" ]
+        }
+      }
+      if (defined(invoker.layout_tests)) {
+        if (invoker.layout_tests) {
+          args += [ "--layout-tests" ]
+        } else {
+          args += [ "--no-layout-tests" ]
+        }
+      }
+      if (defined(invoker.include_dirs)) {
+        foreach(x, invoker.include_dirs) {
+          args += [ "--include-dir=" + rebase_path(x, root_build_dir) ]
+        }
+      }
+      if (defined(invoker.std_impls)) {
+        foreach(x, invoker.std_impls) {
+          args += [ "--std-impl=${x}" ]
+        }
+      }
+      if (defined(invoker.std_derives)) {
+        foreach(x, invoker.std_derives) {
+          args += [ "--std-derive=${x}" ]
+        }
+      }
+      if (defined(invoker.auto_derive_traits)) {
+        foreach(x, invoker.auto_derive_traits) {
+          _traits = ""
+          foreach(t, x[1]) {
+            if (_traits != "") {
+              _traits += ","
+            }
+            _traits += t
+          }
+          args += [
+            "--auto-derive-trait",
+            "${x[0]}=${_traits}",
+          ]
+        }
+      }
+      if (defined(invoker.replacements)) {
+        foreach(x, invoker.replacements) {
+          if (x[1] == "") {
+            args += [
+              "--replacement",
+              x[0],
+            ]
+          } else {
+            args += [
+              "--replacement",
+              x[0],
+              x[1],
+            ]
+          }
+        }
+      }
+      if (defined(invoker.function_allowlist)) {
+        foreach(x, invoker.function_allowlist) {
+          args += [ "--allowlist-function=${x}" ]
+        }
+      }
+      if (defined(invoker.var_allowlist)) {
+        foreach(x, invoker.var_allowlist) {
+          args += [ "--allowlist-var=${x}" ]
+        }
+      }
+      if (defined(invoker.type_allowlist)) {
+        foreach(x, invoker.type_allowlist) {
+          args += [ "--allowlist-type=${x}" ]
+        }
+      }
+      if (defined(invoker.function_blocklist)) {
+        foreach(x, invoker.function_blocklist) {
+          args += [ "--blocklist-function=${x}" ]
+        }
+      }
+      if (defined(invoker.type_blocklist)) {
+        foreach(x, invoker.type_blocklist) {
+          args += [ "--blocklist-type=${x}" ]
+        }
+      }
+      if (defined(invoker.var_blocklist)) {
+        foreach(x, invoker.var_blocklist) {
+          args += [ "--blocklist-var=${x}" ]
+        }
+      }
+      if (defined(invoker.opaque_types)) {
+        foreach(x, invoker.opaque_types) {
+          args += [ "--opaque-type=${x}" ]
+        }
+      }
+      if (defined(invoker.no_debug_types)) {
+        foreach(x, invoker.no_debug_types) {
+          args += [ "--no-debug=${x}" ]
+        }
+      }
+      if (defined(invoker.rustified_enum)) {
+        foreach(x, invoker.rustified_enum) {
+          args += [ "--rustified-enum=${x}" ]
+        }
+      }
+
+      if (!defined(invoker.use_core) || invoker.use_core) {
+        args += [ "--use-core" ]
+      } else {
+        args += [ "--no-use-core" ]
+      }
+
+      if (defined(invoker.additional_bindgen_flags)) {
+        foreach(x, invoker.additional_bindgen_flags) {
+          args += [ "--bindgen-flag=${x}" ]
+        }
+      }
+
+      if (defined(invoker.fuchsia_api_level)) {
+        # TODO(joshuaseaton): Revisit exposing this knob at all. Now that the
+        # template inherits the toolchain-level configs, this is set by
+        # default as HEAD and it is difficult to override it at this level.
+        assert(invoker.fuchsia_api_level == "HEAD")
+      }
+
+      _clang_resource_dir =
+          "${rebased_clang_dir}/${clang_target_toolchain_info.resource_dir}"
+      args += [
+        "--clang-resource-dir",
+        _clang_resource_dir,
+      ]
+
+      # All flags after "--" go directly to clang.
+      args += [
+        "--",
+
+        "{{defines}}",
+        "{{include_dirs}}",
+        "{{cflags}}",
+      ]
+
+      if (defined(invoker.cpp) && invoker.cpp) {
+        args += [
+          "-x",
+          "c++",
+          "-std=c++${fuchsia_cxx_version}",
+          "-stdlib=libc++",
+          "-I${rebased_clang_dir}/include/c++/v1",
+          "-I${rebased_clang_dir}/include/${current_target_tuple}/c++/v1",
+          "{{cflags_cc}}",
+        ]
+      } else {
+        args += [ "{{cflags_c}}" ]
+      }
+
+      if (defined(sysroot) && sysroot != "") {
+        args += [ "--sysroot=" + rebase_path(sysroot, root_build_dir) ]
+      }
+
+      if (defined(invoker.additional_clang_flags)) {
+        args += invoker.additional_clang_flags
+      }
+
+      if (defined(invoker.defines)) {
+        foreach(d, invoker.defines) {
+          args += [ "-D${d}" ]
+        }
+      }
+    }
+  }
+}
+
+# Defines a target that compares generated bindgen with checked-in golden file.
+#
+# Parameters
+#
+#   * checked_in_source
+#     - Required: Path to the checked-in Rust file to compare against.
+#     - Type: path
+#
+#   * bindgen_toolchain
+#     - Optional: The GN toolchain under which to run bindgen. It is important
+#       that it be fixed so that the goldens are independent of the current
+#       target build configuration.
+#     - Type: label
+#     - Default: host_x64_toolchain
+#
+# See rustc_bindgen() for other parameters.
+#
+template("rustc_bindgen_golden") {
+  assert(defined(invoker.headers), "Must specify headers")
+  assert(defined(invoker.checked_in_source), "Must specify checked_in_source")
+
+  main_target = target_name
+  bindgen_target = "${target_name}_generated"
+
+  forward_variables_from(invoker, [ "bindgen_toolchain" ])
+  if (!defined(bindgen_toolchain)) {
+    bindgen_toolchain = host_x64_toolchain
+  }
+
+  generated_filename = "${target_name}_generated.rs"
+  generated_dir =
+      get_label_info(":${main_target}(${bindgen_toolchain})", "target_gen_dir")
+  generated_filepath = "${generated_dir}/${generated_filename}"
+  if (current_toolchain == bindgen_toolchain) {
+    rustc_bindgen(bindgen_target) {
+      visibility = [ ":*" ]
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "bindgen_toolchain",
+                               "checked_in_source",
+                               "output",
+                               "visibility",
+                             ])
+
+      output_name = generated_filename
+      generator_label = get_label_info(":$target_name", "label_no_toolchain")
+    }
+  } else {
+    not_needed(invoker,
+               "*",
+               [
+                 "deps",
+                 "testonly",
+                 "visibility",
+               ])
+  }
+
+  golden_files(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [ ":${bindgen_target}(${bindgen_toolchain})" ]
+
+    comparisons = [
+      {
+        golden = invoker.checked_in_source
+        candidate = generated_filepath
+      },
+    ]
+  }
+}
+
+set_defaults("rustc_bindgen") {
+  configs = default_common_binary_configs
+}

@@ -1,0 +1,106 @@
+#!/usr/bin/env fuchsia-vendored-python
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Code submission and review
+### Print the gerrit review URL and attempts to open it in the user's default browser.
+
+## Usage: fx cl
+
+import subprocess
+import sys
+import os
+import shlex
+import configparser
+
+def OpenInDefaultBrowser(url):
+    """
+    Attempts to open `url` in the default web browser.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return
+
+    # To open a browser we can't use python's webbrowser module or even `xdg-open`, because
+    # those requires certain environment variables to be set, and `fx` cleans up
+    # the environment variables before running this script.
+    # Instead, we look at the xdg-settings:
+    # xdg-settings returns the name of a .desktop file (e.g. "google-chrome.desktop"),
+    # that is located in "/usr/share/applications".
+    # By parsing that .desktop file, we are able to obtain a command that launches the
+    # default browser.
+    try:
+        # 1. Get the default browser's .desktop file name
+        result = subprocess.run(
+            ["xdg-settings", "get", "default-web-browser"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        desktop_file_name = result.stdout.strip()
+
+        # 2. Locate the .desktop file in standard XDG directory
+        desktop_file_path = f"/usr/share/applications/{desktop_file_name}"
+
+        # 3. Parse the .desktop file
+        parser = configparser.ConfigParser(interpolation=None)
+
+        # Read the file and get the 'Exec' command from the 'Desktop Entry' section
+        parser.read(desktop_file_path)
+
+        exec_command = None
+        if parser.has_option("Desktop Entry", "Exec"):
+            exec_command = parser.get("Desktop Entry", "Exec")
+        else:
+            print(f"Error: 'Exec' key not found in '{desktop_file_path}'")
+            return
+
+        # 4. Craft and execute the command to open the url in the browser
+        # As per the "Desktop Entry Spec" (https://specifications.freedesktop.org/desktop-entry-spec/latest/exec-variables.html)
+        # the exec command from the .desktop file can optionally contain %U or %u.
+        # For example: "/usr/bin/google-chrome-stable %U".
+        # Strip those optional arguments away to get the path to the executable.
+        command_parts = shlex.split(exec_command)
+        path_to_brower = command_parts[0]
+        subprocess.run(
+            [path_to_brower, url],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+
+def GetChangeId():
+    """
+    Attempts to obtain the change ID from the last commit.
+    Returns an empty string if it fails.
+    """
+    change_id = None
+    try:
+        # Gets the description of the last commit
+        commit_msg = subprocess.check_output(
+            ["git", "log", "-1", '--format="%B"', "HEAD"], text=True
+        )
+        prefix = "Change-Id:"
+        for l in commit_msg.splitlines():
+            if l.startswith(prefix):
+                change_id = l[len(prefix) :].strip()
+    except:
+        return None
+    return change_id
+
+# Opens the current CL in the web browser.
+change_id = GetChangeId()
+if change_id is None:
+    print("No change ID found", file=sys.stderr)
+    sys.exit(1)
+
+url = f"https://fxrev.dev/{change_id}"
+# If we can't manage to open the url at least we'll have printed the URL, which will
+# be clickable in some terminals.
+print(url)
+OpenInDefaultBrowser(url)

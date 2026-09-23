@@ -1,0 +1,257 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/dist/renamed_binary.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+
+# Defines a renamed binary based on network_unified_binary.
+#
+# network_unified_binary is a single binary that merges together multiple
+# networking Rust programs. The entry point to the combined program can identify
+# which sub-program the caller intends to run based on the filename of the
+# invocation (`argv[0]`).
+#
+# Takes the same arguments as rustc_binary. And:
+#
+# - bin_remove_configs: applies `configs -= bin_remove_configs` on the generated
+#   binary target.
+# - bin_add_configs: applies `configs += bin_add_configs` on the generated
+#   binary target.
+# - add_configs: applies `configs += add_configs` on the generated
+#   binary and library targets.
+# - build_job_vars: vars to set on the generated binary and library targets.
+template("network_unified_binary") {
+  _bin_remove_configs = []
+  if (defined(invoker.bin_remove_configs)) {
+    _bin_remove_configs += invoker.bin_remove_configs
+  }
+  _bin_add_configs = []
+  if (defined(invoker.bin_add_configs)) {
+    _bin_add_configs += invoker.bin_add_configs
+  }
+  _add_configs = []
+  if (defined(invoker.add_configs)) {
+    _add_configs += invoker.add_configs
+  }
+
+  # Always emit a rust binary with the incoming arguments. Because this is used
+  # for networking binaries, always remove allow unused results.
+  rustc_binary(target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "bin_remove_configs",
+                             "build_job_vars",
+                           ])
+    configs += [ "//build/config/rust/lints:deny_unused_results" ]
+    configs -= _bin_remove_configs
+    configs += _bin_add_configs
+    configs += _add_configs
+
+    if (defined(invoker.build_job_vars)) {
+      forward_variables_from(invoker.build_job_vars, "*")
+    }
+  }
+
+  output_name = target_name
+  if (defined(invoker.name)) {
+    output_name = invoker.name
+  }
+  _source_root = "src/main.rs"
+  if (defined(invoker.source_root)) {
+    _source_root = invoker.source_root
+  }
+
+  _library_deps = invoker.deps
+  if (defined(invoker.non_test_deps)) {
+    _library_deps += invoker.non_test_deps
+  }
+  library_target_name = target_name + "_gub_lib"
+  rustc_library(library_target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "name",
+                             "source_root",
+
+                             # Let only the binary unit tests be generated.
+                             # Because we force the unit tests to not build for
+                             # the library target, so we cannot pass down
+                             # `non_test_deps`. We instead calculate the
+                             # `_library_deps` and pass that as `deps` directly.
+                             "with_unit_tests",
+                             "non_test_deps",
+                             "deps",
+                           ])
+    deps = _library_deps
+    name = output_name
+    source_root = _source_root
+    configs += _add_configs
+    configs += [ "//build/config/rust/lints:deny_unused_results" ]
+
+    if (defined(invoker.build_job_vars)) {
+      forward_variables_from(invoker.build_job_vars, "*")
+    }
+  }
+
+  gub_target_name = target_name + "_gub"
+  bin_target_name = target_name
+  renamed_binary(gub_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    source_deps =
+        [ "//src/connectivity/network/unified_binary:network_unified_binary" ]
+
+    # Force a barrier on the binary target, which prevents includes from all
+    # the dependencies of the unified binary from causing check_includes to
+    # bubble up to dependent components. The standalone binary is also added as
+    # a data_dep for GN metadata walk, so the check includes logic work
+    # correctly.
+    #
+    # NOTE: It is necessary to go through the binary target instead of the
+    # library target to properly trigger variant selection logic.
+    data_deps = [ ":${bin_target_name}" ]
+    metadata = {
+      expect_includes_barrier = data_deps
+
+      # The unified binary is the actual binary that goes into packages, so
+      # walk this dep when generating distribution manifest.
+      distribution_entries_barrier = source_deps
+    }
+    source = "$root_out_dir/network_unified_binary"
+    dest = "bin/${output_name}"
+  }
+}
+
+# A handy rule to create regular and unified binary components. To be used in
+# conjunction with network_unified_binary and network_unified_binary_package.
+#
+# Takes the same arguments as fuchsia_component and creates two separate
+# component rules: one for the regular binary and one for the gub binary.
+#
+# For clarity, it does not take a `deps` argument, but splits it into gub and
+# non_gub dependencies.
+#
+# Extra arguments:
+#
+# - gub_deps: Dependencies that should be transformed for the GUB component.
+# - non_gub_deps: Dependencies that should not be transformed for the GUB
+#   component.
+template("network_unified_binary_regular_and_gub_components") {
+  _gub_deps = []
+  if (defined(invoker.gub_deps)) {
+    _gub_deps += invoker.gub_deps
+  }
+  _non_gub_deps = []
+  if (defined(invoker.non_gub_deps)) {
+    _non_gub_deps += invoker.non_gub_deps
+  }
+
+  # Declare the regular fuchsia component, which uses all the deps
+  # untransformed.
+  fuchsia_component(target_name) {
+    forward_variables_from(invoker, "*", [ "deps" ])
+    deps = _gub_deps + _non_gub_deps
+  }
+
+  # Transform all the gub deps appending the gub suffix.
+  _gub_target_name = target_name + "_gub"
+  _gub_transformed_deps = []
+  foreach(dep, _gub_deps) {
+    _gub_transformed_deps += [ dep + "_gub" ]
+  }
+
+  # Mimic what fuchsia_component does to ensure we get the same component name.
+  _gub_component_name = target_name
+  if (defined(invoker.component_name)) {
+    _gub_component_name = invoker.component_name
+  }
+
+  # Declare the gub fuchsia component, which uses the transformed gub deps and
+  # the passthrough non-gub deps.
+  fuchsia_component(_gub_target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "deps",
+                             "component_name",
+                           ])
+    component_name = _gub_component_name
+    deps = _gub_transformed_deps + _non_gub_deps
+  }
+}
+
+# A handy rule to create a regular and unified binary packages. To be used in
+# conjunction with network_unified_binary and network_unified_binary_package.
+#
+# Takes the same arguments as fuchsia_package and creates two separate package
+# rules: one for the regular package and one for the gub package.
+#
+# For clarity, it does not take a `deps` argument, but splits it into gub and
+# non_gub dependencies.
+#
+# Extra arguments:
+#
+# - gub_deps: Dependencies that should be transformed for the GUB package.
+# - non_gub_deps: Dependencies that should not be transformed for the GUB
+#   package.
+template("network_unified_binary_regular_and_gub_packages") {
+  _gub_deps = []
+  if (defined(invoker.gub_deps)) {
+    _gub_deps += invoker.gub_deps
+  }
+  _non_gub_deps = []
+  if (defined(invoker.non_gub_deps)) {
+    _non_gub_deps += invoker.non_gub_deps
+  }
+
+  # Declare the regular fuchsia package, which uses all the deps untransformed.
+  fuchsia_package(target_name) {
+    forward_variables_from(invoker, "*", [ "deps" ])
+    deps = _gub_deps + _non_gub_deps
+  }
+
+  # Transform all the gub deps appending the gub suffix.
+  _gub_target_name = target_name + "_gub"
+  _gub_transformed_deps = []
+  foreach(dep, _gub_deps) {
+    _gub_transformed_deps += [ dep + "_gub" ]
+  }
+
+  # Mimic what fuchsia_package does to ensure we get the same package name.
+  _gub_package_name = target_name
+  if (defined(invoker.package_name)) {
+    _gub_package_name = invoker.package_name
+  }
+
+  # Declare the gub fuchsia package, which uses the transformed gub deps and
+  # the passthrough non-gub deps.
+  fuchsia_package(_gub_target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "deps",
+                             "package_name",
+                           ])
+    package_name = _gub_package_name
+
+    # Historically, coverage builders have OOMed when building GUB binaries (see
+    # https://fxbug.dev/316891343). Setting the dependencies to an empty list
+    # ensures that GUB binaries aren't built on the coverage builders, which is
+    # fine given none of the tests run against coverage builders require the GUB
+    # binaries (the same is not true for profile builders, which are considered
+    # coverage). Should that change in the future, we'll see test failures and
+    # can re-evaluate this decision.
+    if (!is_coverage || is_profile) {
+      deps = _gub_transformed_deps + _non_gub_deps
+    } else {
+      deps = []
+    }
+  }
+}

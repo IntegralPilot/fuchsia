@@ -1,0 +1,443 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/rust/rustc_library.gni")
+import("//build/toolchain/concurrent_jobs.gni")
+import("//build/tools/json_merge/json_merge.gni")
+import("//sdk/categories/compatibility.gni")
+import("command.gni")
+import("plugins.gni")
+
+# Defines a FFX plugin
+#
+# Parameters
+#
+#   name
+#     Name of the crate as defined in its manifest file. If not specified, it is
+#     assumed to be the same as the target name. All dashes will be replaced
+#     with underscores in the library name: <name_underscored>. This
+#     target creates two libraries: one for the plugin callback method
+#     and one for the argh command struct needed for CLI params. The
+#     libraries creates will be <target>_lib and <target>_args_lib.
+#     If the `with_unit_tests` flag is used, additional test libraries
+#     will be created for a total of four libraries: <target>_lib,
+#     <target>_lib_test, <target>_args_lib, <target>_args_lib_test.
+#
+#   version
+#     Semver version of the crate as seen on crates.io.
+#
+#   edition (optional)
+#     Edition of the Rust language to be used.
+#     Options are "2015" and "2018". Defaults to "2018".
+#
+#   configs (optional)
+#     A list of config labels applying to this target.
+#
+#   deps (optional)
+#     List of rust_library GN targets on which this crate depends.
+#     Third party crates can be included through paths like
+#     "//third_party/rust_crates:<cratename>",
+#
+#   args_deps (optional)
+#     List of rust_library GN targets on which the args library depends. Default
+#     location of the args library is at `./src/args.rs`, see
+#     `args_source_root` here for more details.
+#
+#   args_sources (required)
+#     List of source files for the args library.
+#
+#   test_deps (optional)
+#     List of rust_library GN targets on which this crate's tests depend.
+#
+#   with_unit_tests (optional)
+#     Builds unit tests associated with the library. This will create a
+#     `<name>_lib_test` test file in the output directory. Equivalent
+#     to adding a `rustc_test` target with that name and the same source_root.
+#
+#   args_with_unit_tests (optional)
+#     Builds unit tests associated with the args library. This will create a
+#     `<name>_args_lib_test` test file in the output directory. Equivalent
+#     to adding a `rustc_test` target with that name and the same source_root.
+#
+#   args_test_deps (optional)
+#     If args_with_unit_tests is true then this is like test_deps but for
+#     args_source_root.
+#
+#   test_environments (optional)
+#     What environments unit tests, if provided, should target. Only used here
+#     for linux and mac tests, with a default value of a general linux/mac
+#     environment (as a function of $current_os).
+#     See environments parameter on //build/testing/test_spec.gni for more
+#     details.
+#
+#   source_root (optional)
+#     Location of the plugin root (e.g. `src/lib.rs`). This defaults to `./src/lib.rs`
+#     This should be the location of the method marked with the
+#     ffx_plugin attribute.
+#
+#   args_source_root (optional)
+#     Location of the plugin's argh command root (e.g. `src/args.rs`). This defaults
+#     to `./src/args.rs`. This should be the location of the struct marked with the
+#     ffx_command attribute. Due to internal dependencies this cannot
+#     be the same file as the source_root.
+#
+#   original_target_name (optional)
+#     The name of the target as it appears in the BUILD file. Enables tooling
+#     to find the template invocation in a BUILD file where this target was defined.
+#
+#   features (optional)
+#     A list of conditional compilation flags to enable. This can be used to set features for crates
+#     built in-tree which are also published to crates.io. This would be passed to rustc as
+#     '--cfg feature=XXX'
+#
+#   sdk_category (optional)
+#     Publication level of the plugin in SDKs. Defaults to not published.
+#     See //build/sdk/sdk_atom.gni.
+template("ffx_plugin") {
+  if (defined(invoker.name)) {
+    _crate_name = invoker.name
+  } else {
+    _crate_name = target_name
+  }
+
+  tests_deps = []
+  if (defined(invoker.test_deps)) {
+    tests_deps += invoker.test_deps
+  }
+
+  if (is_host) {
+    # The `args_*` parameters should not be passed to other sub-targets, and
+    # the args target handles each one individually. Exclude these parameter
+    # names when forwarding variables from invoker.
+    _args_parameter_names = [
+      "args_deps",
+      "args_source_root",
+      "args_sources",
+      "args_test_deps",
+      "args_with_unit_tests",
+    ]
+
+    _extra_configs = []
+    if (defined(invoker.configs)) {
+      _extra_configs = invoker.configs
+    }
+
+    # Ensure all FIDL dependencies meet the compatibility and stability
+    # requirements.
+    # Each target below must use these two variables for this to work.
+    # There are currently exceptions - see https://fxbug.dev/42081073.
+    #
+    # Plugins may specify an IDK category in which to be included. Otherwise,
+    # they are only used within the platform environment.
+    if (defined(invoker.sdk_category)) {
+      # Historically, plugins rarely specified a category and defaulted to
+      # "partner". The category for those plugins was set to "not-yet-specified"
+      # and the default was changed to not in an IDK. Continue to treat those
+      # as "partner", and use the "internal" marker for plugins not specifying
+      # a category.
+      # TODO(https://fxbug.dev/398052139): For all uses of "not-yet-specified",
+      # either replace them with "partner" or remove them as appropriate. Then
+      # use invoker.sdk_category` directly in the individual targets to avoid
+      # the reference here counting as a use for all of the targets.
+      sdk_category = invoker.sdk_category
+      if (sdk_category == "not-yet-specified") {
+        sdk_category = "partner"
+      }
+
+      assert(sdk_category == "partner",
+             "Unexpected SDK category '${sdk_category}'.")
+      category_marker = "//sdk/categories:marker-${sdk_category}"
+
+      # Host tools in the IDK can depend on up to "host_tool" regardless of
+      # category.
+      disallowed_category_markers =
+          markers_partner_idk_host_tools_must_not_depend_on
+    } else {
+      # The plugin is not in an IDK, so there are no restrictions.
+      disallowed_category_markers = []
+      category_marker = "//sdk/categories:marker-not-in-idk"
+    }
+
+    args_target_additional_deps = []
+    suite_target_additional_deps = []
+
+    json_merge_sources = []
+    json_merge_deps = []
+
+    if (defined(invoker.plugin_deps)) {
+      cmd_deps = []
+      foreach(d, invoker.plugin_deps) {
+        suite_target_additional_deps += [ d + "_suite" ]
+        cmd_deps += [ d + "_args" ]
+        json_merge_sources +=
+            [ get_label_info(d, "target_out_dir") + "/config.json" ]
+        json_merge_deps += [ get_label_info(d, "dir") + ":config.json" ]
+      }
+
+      sub_cmd_gen = _crate_name + "_sub_command_gen"
+      command(sub_cmd_gen) {
+        output_name = "cmd_args.rs"
+        plugin_deps = invoker.plugin_deps
+      }
+
+      sub_cmd = _crate_name + "_sub_command"
+      rustc_library(sub_cmd) {
+        edition = "2024"
+        source_root = "$target_gen_dir/cmd_args.rs"
+        with_unit_tests = false
+
+        sources = [ "$target_gen_dir/cmd_args.rs" ]
+        deps = cmd_deps + [
+                 ":" + sub_cmd_gen,
+                 "//third_party/rust_crates:argh",
+               ]
+        forward_variables_from(invoker,
+                               "*",
+                               _args_parameter_names + [
+                                     "configs",
+                                     "name",
+                                     "edition",
+                                     "deps",
+                                     "config_data",
+                                     "sdk_category",
+                                     "source_root",
+                                     "sources",
+                                     "enforce_source_listing",
+                                     "target_name",
+                                     "with_unit_tests",
+                                     "original_target_name",
+                                     "proc_macro_deps",
+                                   ])
+        assert_no_deps = disallowed_category_markers
+        deps += [ category_marker ]
+
+        # As these are large libraries that are slow to compile on RBE workers,
+        # switch them to the larger RBE workers.
+        _concurrent_jobs = concurrent_jobs.rust_highmem
+        configs += _concurrent_jobs.configs
+        configs += _extra_configs
+        forward_variables_from(_concurrent_jobs.vars, "*")
+      }
+
+      args_target_additional_deps += [ ":" + sub_cmd ]
+      suite_target_additional_deps += [ ":" + sub_cmd ]
+    }
+
+    args_target_name = _crate_name + "_args"
+
+    if (defined(invoker.config_data)) {
+      json_merge_sources += invoker.config_data
+    } else {
+      empty = "$target_out_dir/empty.json"
+      write_file(empty,
+                 {
+                 },
+                 "json")
+      json_merge_sources += [ empty ]
+    }
+
+    json_merge("config.json") {
+      sources = json_merge_sources
+      deps = json_merge_deps
+      minify = true
+    }
+
+    if (defined(invoker.original_target_name)) {
+      _original_target_name = invoker.original_target_name
+    } else {
+      _original_target_name = target_name
+    }
+
+    rustc_library(args_target_name) {
+      if (defined(invoker.args_source_root)) {
+        source_root = invoker.args_source_root
+      } else {
+        source_root = "src/args.rs"
+      }
+
+      deps = args_target_additional_deps
+      if (defined(invoker.args_deps)) {
+        deps += invoker.args_deps
+      }
+
+      assert(
+          defined(invoker.args_sources),
+          "`args_sources` is required to contain the sources files that provide argh structures for the plugin")
+      sources = invoker.args_sources
+
+      # If the args library has tests enabled, enable them in the library.
+      if (defined(invoker.args_with_unit_tests) &&
+          invoker.args_with_unit_tests) {
+        with_unit_tests = true
+        if (defined(invoker.args_test_deps)) {
+          test_deps = invoker.args_test_deps
+        }
+      }
+      original_target_name = _original_target_name
+      forward_variables_from(invoker,
+                             "*",
+                             _args_parameter_names + [
+                                   "name",
+                                   "configs",
+                                   "config_data",
+                                   "deps",
+                                   "sdk_category",
+                                   "source_root",
+                                   "sources",
+                                   "target_name",
+                                   "with_unit_tests",
+                                   "original_target_name",
+                                   "test_deps",
+                                   "proc_macro_deps",
+                                 ])
+      assert_no_deps = disallowed_category_markers
+      deps += [ category_marker ]
+      configs += _extra_configs
+
+      # As these are large libraries that are slow to compile on RBE workers,
+      # switch them to the larger RBE workers.
+      _concurrent_jobs = concurrent_jobs.rust_highmem
+      configs += _concurrent_jobs.configs
+      forward_variables_from(_concurrent_jobs.vars, "*")
+    }
+    if (defined(invoker.args_with_unit_tests) && invoker.args_with_unit_tests) {
+      tests_deps += [ ":" + args_target_name + "_test" ]
+    }
+
+    includes_execution = false
+    if (defined(invoker.sources)) {
+      if (defined(invoker.source_root)) {
+        plugin_source_root = invoker.source_root
+      } else {
+        plugin_source_root = "src/lib.rs"
+      }
+      foreach(i, invoker.sources) {
+        if (i == plugin_source_root) {
+          includes_execution = true
+        }
+      }
+    }
+    assert(
+        includes_execution || !defined(invoker.source_root),
+        "The path specified by `source_root` was not found in `sources`. Ensure it is included or do not specify `source_root`.")
+
+    # Adding `_plugins_rs_deps` as public_deps would not make the libraries in
+    # it available to the suite target, which depends on this library and
+    # compiles `plugins.rs`. Therefore, explicitly add the deps.
+    _plugins_rs_deps = [
+      ":${args_target_name}",
+      "//src/developer/ffx/lib/fho:lib",
+    ]
+    suite_target_additional_deps += _plugins_rs_deps
+
+    plugins_name = _crate_name + "_plugins"
+    plugins(plugins_name) {
+      visibility = [ ":*" ]
+      output_name = "plugins.rs"
+      args = args_target_name
+      if (defined(invoker.plugin_deps)) {
+        plugin_deps = invoker.plugin_deps
+        sub_command = sub_cmd
+      }
+      includes_execution = includes_execution
+      execution_lib = _crate_name
+
+      # The `plugins()` template does not use `assert_no_deps` or `deps`, so
+      # we cannot apply markers to these variables. The `visibility` above
+      # ensures this target is only depended on by another target in the
+      # directory using this template, and the other rules in this template do
+      # apply markers to those variables.
+    }
+
+    if (includes_execution) {
+      rustc_library(_crate_name) {
+        disable_rustdoc = true
+        forward_variables_from(invoker,
+                               "*",
+                               _args_parameter_names + [
+                                     "configs",
+                                     "config_data",
+                                     "name",
+                                     "original_target_name",
+                                     "sdk_category",
+                                     "target_name",
+                                   ])
+        original_target_name = _original_target_name
+        if (!defined(deps)) {
+          deps = []
+        }
+        deps += [
+          ":${args_target_name}",
+          category_marker,
+        ]
+        assert_no_deps = disallowed_category_markers
+        configs += _extra_configs
+      }
+
+      suite_target_additional_deps += [ ":${_crate_name}" ]
+
+      if (defined(invoker.with_unit_tests) && invoker.with_unit_tests) {
+        tests_deps += [ ":${_crate_name}_test" ]
+      }
+    } else {
+      # TODO(https://fxbug.dev/378585405): Address presenence of unused `deps`
+      # parameter when not building the execution library.
+    }
+
+    rustc_library("${_crate_name}_suite") {
+      source_root = "$target_gen_dir/plugins.rs"
+      edition = "2024"
+      with_unit_tests = false
+      disable_rustdoc = true
+      sources = [ "$target_gen_dir/plugins.rs" ]
+      deps = [
+               ":${plugins_name}",
+               category_marker,
+             ] + suite_target_additional_deps
+
+      forward_variables_from(invoker,
+                             "*",
+                             _args_parameter_names + [
+                                   "name",
+                                   "configs",
+                                   "config_data",
+                                   "deps",
+                                   "edition",
+                                   "sdk_category",
+                                   "target_name",
+                                   "sources",
+                                   "enforce_source_listing",
+                                   "with_unit_tests",
+                                   "original_target_name",
+                                   "proc_macro_deps",
+                                 ])
+
+      if (!defined(assert_no_deps)) {
+        assert_no_deps = []
+      }
+      assert_no_deps += disallowed_category_markers
+
+      # As these are large libraries that are slow to compile on RBE workers,
+      # switch them to the larger RBE workers.
+      _concurrent_jobs = concurrent_jobs.rust_highmem
+      configs += _concurrent_jobs.configs
+      forward_variables_from(_concurrent_jobs.vars, "*")
+    }
+  } else {
+    not_needed(invoker, "*")
+  }
+
+  if (defined(invoker.plugin_deps)) {
+    foreach(d, invoker.plugin_deps) {
+      test = get_label_info(d, "dir")
+      test_name = get_label_info(d, "name")
+      tests_deps += [ test + ":" + test_name + "_tests" ]
+    }
+  }
+
+  group("${_crate_name}_tests") {
+    testonly = true
+    deps = tests_deps
+  }
+}

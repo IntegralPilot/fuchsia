@@ -1,0 +1,144 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.virtualization;
+
+using zx;
+
+type GuestManagerError = strict enum {
+    /// The guest manager failed to parse the configuration from the guest package, or it was
+    /// otherwise invalid.
+    BAD_CONFIG = 1;
+
+    /// The guest is already running. Stop the guest before attempting to launch again.
+    ALREADY_RUNNING = 2;
+
+    /// Attempted to connect to a non-running guest.
+    NOT_RUNNING = 3;
+
+    /// Failed to start the guest. See VMM component logs for a more detailed reason.
+    START_FAILURE = 4;
+
+    /// The guest required allocating some persistant storage but was unable to
+    /// do so.
+    NO_STORAGE = 5;
+};
+
+type GuestStatus = strict enum {
+    /// Initial state when the guest manager is created but before the guest has ever been run.
+    NOT_STARTED = 1;
+
+    /// A client has instructed the guest manager to begin launching the guest.
+    STARTING = 2;
+
+    /// The guest's dispatch loops are running. This is the expected steady state.
+    RUNNING = 3;
+
+    /// A client has instructed the guest manager to begin stopping the guest. If a non-zero
+    /// has been provided, the guest manager may attempt to gracefully shutdown the guest.
+    STOPPING = 4;
+
+    /// The guest is no longer running. A stop reason may be present if the guest stopped due to
+    /// an error.
+    STOPPED = 5;
+
+    /// The VMM component terminated unexpectedly. Attempting to launch the guest again will
+    /// restart the component.
+    VMM_UNEXPECTED_TERMINATION = 6;
+};
+
+/// An informational only subset of the GuestConfig. If adding new non-handle entries to the
+/// GuestConfig, consider also adding them here.
+type GuestDescriptor = table {
+    /// Number of guest VCPUs.
+    1: num_cpus uint8;
+
+    /// Guest memory in bytes.
+    2: guest_memory uint64;
+
+    /// Whether the guest was started with the given virtual device.
+    /// "3: wayland bool" was removed
+    /// "4: magma bool" was removed
+    5: balloon bool;
+    6: console bool;
+    7: gpu bool;
+    8: rng bool;
+    9: vsock bool;
+    10: sound bool;
+
+    /// The configs for each net device the guest was started with. If empty, there is no
+    /// virtual net device (and the guest will have no networking).
+    11: networks vector<NetSpec>:MAX_NET_DEVICES;
+    12: mem bool;
+};
+
+type GuestInfo = table {
+    /// The current state of the guest.
+    1: guest_status GuestStatus;
+
+    /// Current uptime of the guest.
+    2: uptime zx.Duration;
+
+    /// A subset of the config used to start the guest.
+    3: guest_descriptor GuestDescriptor;
+
+    /// Contains the last value reported to the guest manager if stopped due to an error.
+    4: stop_error GuestError;
+
+    /// Possible problems with a running guest flagged by the guest manager. These are not fatal
+    /// errors, and should be actionable by a user.
+    ///
+    /// Note that these strings are for diagnostic purposes only. Consumers should not take any
+    /// action based on specific strings as they are subject to change without warning.
+    5: detected_problems vector<string:MAX>:8;
+};
+
+@discoverable
+closed protocol GuestManager {
+    /// Launch a new guest instance.
+    ///
+    /// Possible errors:
+    ///     - BAD_CONFIG: Failed to parse the config from the guest package, or other config
+    ///         problems detected by the guest manager.
+    ///     - ALREADY_RUNNING: The guest is already running. Stop the guest before launching again.
+    ///     - START_FAILURE: Failed to initialize the VMM and devices, and start the guest. See
+    ///         component logs for a more specific failure.
+    strict Launch(resource struct {
+        guest_config GuestConfig;
+        controller server_end:Guest;
+    }) -> () error GuestManagerError;
+
+    /// Forcibly shuts down a running guest. Immediately after ForceShutdown returns, Launch can
+    /// be used to launch another guest.
+    strict ForceShutdown() -> ();
+
+    /// Connect to a currently running guest.
+    ///
+    /// Possible errors:
+    ///     - NOT_RUNNING: Attempted to connect to a guest in a non-running state. Ensure the guest
+    ///         has launched before attempting to reconnect.
+    strict Connect(resource struct {
+        controller server_end:Guest;
+    }) -> () error GuestManagerError;
+
+    /// Query guest info
+    strict GetInfo() -> (resource struct {
+        guest_info GuestInfo;
+    });
+};
+
+// TODO(https://fxbug.dev/42051238): Reconsider the use of composition here
+@discoverable
+closed protocol ZirconGuestManager {
+    compose GuestManager;
+};
+
+@discoverable
+closed protocol DebianGuestManager {
+    compose GuestManager;
+};
+
+@discoverable
+closed protocol TerminaGuestManager {
+    compose GuestManager;
+};

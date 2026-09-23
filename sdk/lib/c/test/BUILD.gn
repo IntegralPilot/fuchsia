@@ -1,0 +1,430 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/fuzz.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/test.gni")
+import("//build/testing/boot_tests/kernel_zbi_test.gni")
+import("//build/testing/boot_tests/zbi_test_executable.gni")
+import("//build/testing/environments.gni")
+import("//zircon/kernel/params.gni")
+import("../libc.gni")
+
+group("test") {
+  testonly = true
+  deps = [ ":tests" ]
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":libc-fuzzers",
+    ":libc-tests",
+    "sanitizer:tests",
+
+    # TODO(https://fxbug.dev/407804528): This should be replaced in
+    # dlfcn/dl/test.
+    "dlsym-circular-deps",
+  ]
+}
+
+group("bootfs-tests") {
+  testonly = true
+  deps = [ "sanitizer:bootfs-tests" ]
+}
+
+group("boot_tests") {
+  testonly = true
+  deps = [ ":boot-libc-unittests" ]
+}
+
+# We want to run these tests on every kind of hardware as well as emulators.
+libc_test_specs = {
+  environments = all_fuchsia_envs
+}
+
+# This includes additional environments that other standalone tests that
+# depend on libc will run, but which cannot go in libc_test_specs because
+# they can't all run a full system for component tests.
+boot_test_specs = {
+  forward_variables_from(libc_test_specs, "*")
+
+  environments += kernel_test_environments
+  environments -= kernel_test_environments
+  environments += kernel_test_environments
+}
+
+libc_component_tests = [
+  "../dlfcn:dlfcn-abi-tests",
+  "../scudo:scudo-unittests",
+  "../setjmp:setjmp-tests",
+  "../rust:zx-libc_test",
+]
+libc_test_manifests = []
+
+source_set("safe-zero-construction") {
+  visibility = [ "../*" ]
+  testonly = true
+
+  public = [ "safe-zero-construction.h" ]
+  public_deps = [ "//zircon/system/ulib/zxtest:zxtest-streams" ]
+}
+
+fdio_config = [ "//build/config/fuchsia:fdio_config" ]
+
+# noop-test is a basic test that verifies that C library initialization
+# and process startup work correctly. Same as "hello world" without
+# a printed output.
+#
+# This is particularly useful to verify that a variant works correctly
+# (i.e. all runtime dependencies are installed and loaded properly).
+libc_component_tests += [ ":noop-test" ]
+test("noop-test") {
+  configs += fdio_config
+  configs -= fdio_config
+  deps = [ ":noop-test.common" ]
+}
+
+source_set("noop-test.common") {
+  visibility = [
+    ":*",
+    "//sdk/lib/ld/test/*",
+  ]
+  testonly = true
+  configs += fdio_config
+  configs -= fdio_config
+  sources = [ "noop-test.cc" ]
+  deps = [ "//src/sys/testing/elftest" ]
+}
+
+# The same code but built as a static PIE to exercise the static libc.a case.
+libc_component_tests += [ ":static-pie-noop-test" ]
+test("static-pie-noop-test") {
+  configs += fdio_config
+  configs -= fdio_config
+  configs += [ "//build/config:standalone" ]
+  ldflags = [ "-Wl,-z,stack-size=0x40000" ]
+  deps = [
+    ":noop-test.common",
+    "..:static",
+  ]
+
+  # The static libc.a doesn't handle the setup needed for things like ASan.
+  exclude_toolchain_tags = [ "uses-shadow" ]
+}
+
+libc_component_tests += [ ":rust-static-pie-noop-test" ]
+rustc_binary("rust-static-pie-noop-test") {
+  testonly = true
+  edition = "2024"
+  source_root = "src/main.rs"
+  sources = [ source_root ]
+  deps = [ "//src/sys/testing/elftest" ]
+
+  # Quite a lot that can't be propagated back to us from ..:static has to be
+  # done for Rust, even more than for C++ as in static-pie-noop-test.
+  configs += fdio_config
+  configs -= fdio_config
+  configs += [ "//build/config:standalone" ]
+  deps += [ "..:static" ]
+
+  # static_rust_standard_library is propagated, but this has to be removed too.
+  configs -= [ "//build/config/fuchsia:dynamic_rust_standard_library" ]
+
+  # The static libc.a doesn't handle the setup needed for things like ASan.
+  exclude_toolchain_tags = [ "uses-shadow" ]
+}
+
+default_stack_size_cases = [
+  {
+    # This uses the compiled-in default.
+    name = "default"
+  },
+  {
+    # This uses an arbitrary, non-default size.  It needs to be an even
+    # multiple of page size, since specified sizes are always rounded up.
+    name = "phdr"
+    size = 1114112  # 0x110000
+  },
+]
+
+foreach(case, default_stack_size_cases) {
+  libc_component_tests += [ ":default-stack-size-${case.name}" ]
+  test("default-stack-size-${case.name}") {
+    if (is_fuchsia) {
+      configs += fdio_config
+      configs -= fdio_config
+    }
+    sources = [ "default-stack-size-test.cc" ]
+    deps = [
+      "//sdk/lib/fdio",
+      "//zircon/system/ulib/zircon-internal",
+      "//zircon/system/ulib/zxtest:zxtest-streams",
+    ]
+    if (defined(case.size)) {
+      defines = [ "STACK_TEST_EXPECTED_SIZE=${case.size}" ]
+      ldflags = [ "-Wl,-z,stack-size=${case.size}" ]
+    }
+  }
+}
+
+# A static PIE using custom <zircon/startup.h> functions.  It expects a bespoke
+# bootstrap protocol sent by the test harness below.
+executable("static-pie-custom-startup-test") {
+  testonly = true
+
+  configs += fdio_config
+  configs -= fdio_config
+  configs += [
+    "//build/config:standalone",
+    "//build/config/sanitizers:no_sanitizers",
+  ]
+  ldflags = [ "-Wl,-z,stack-size=0x40000" ]
+
+  sources = [
+    "custom-startup-test.h",
+    "static-pie-custom-startup-test.cc",
+  ]
+  deps = [
+    "..:static",
+    "//zircon/system/ulib/zx",
+  ]
+  friend = [ ":custom-startup-test" ]
+
+  exclude_toolchain_tags = [ "uses-shadow" ]
+}
+
+# A gtest component that packs up that test static PIE and launches it via the
+# system program launcher, but interposing the test's bespoke protocol.
+libc_component_tests += [ ":custom-startup-test" ]
+libc_test_manifests += [ "custom-startup-test" ]
+test("custom-startup-test") {
+  sources = [ "custom-startup-test.cc" ]
+  deps = [
+    "//sdk/fidl/fuchsia.io:fuchsia.io_cpp",
+    "//sdk/fidl/fuchsia.process:fuchsia.process_cpp",
+    "//sdk/lib/fdio",
+    "//sdk/lib/fit",
+    "//src/lib/fxl/test:gtest_main",
+    "//third_party/googletest:gmock",
+    "//zircon/system/ulib/fbl",
+  ]
+
+  # This is really data_deps, but using deps lets the friend logic work.
+  deps += [ ":static-pie-custom-startup-test" ]
+}
+
+libc_component_tests += [ ":posix-clocks-test" ]
+test("posix-clocks-test") {
+  if (is_fuchsia) {
+    configs += fdio_config
+    configs -= fdio_config
+  }
+  sources = [ "posix-clocks.cc" ]
+  deps = [
+    "//sdk/lib/fdio",
+    "//zircon/system/ulib/fbl",
+    "//zircon/system/ulib/zx",
+    "//zircon/system/ulib/zxtest:zxtest-streams",
+  ]
+}
+
+libc_component_tests += [ ":pthread-detach-idempotent-test" ]
+test("pthread-detach-idempotent-test") {
+  if (is_fuchsia) {
+    configs += fdio_config
+    configs -= fdio_config
+  }
+  sources = [ "pthread_detach_idempotent.cc" ]
+  deps = [
+    "//sdk/lib/fdio",
+    "//zircon/system/ulib/sync",
+    "//zircon/system/ulib/zx",
+    "//zircon/system/ulib/zxtest:zxtest-streams",
+  ]
+}
+
+libc_component_tests += [ ":atexit-test" ]
+test("atexit-test") {
+  if (is_fuchsia) {
+    configs += [ "//build/config:all_source" ]
+  }
+  if (is_fuchsia) {
+    configs += fdio_config
+    configs -= fdio_config
+  }
+  sources = [ "atexit.cc" ]
+  deps = [
+    "//sdk/lib/fdio",
+    "//zircon/system/ulib/zxtest:zxtest-streams",
+  ]
+}
+
+libc_component_tests += [ ":gwp-asan-test" ]
+libc_test_manifests += [ "gwp-asan-test" ]
+test("gwp-asan-test") {
+  # Whether GWP-ASan is enabled.
+  has_gwp_asan = !variant_replaces_allocator
+
+  sources = [ "gwp-asan-test.cc" ]
+  defines = [ "HAS_GWP_ASAN=$has_gwp_asan" ]
+  deps = [
+    "//sdk/lib/c/scudo:gwp-asan-common",
+    "//sdk/lib/fdio",
+    "//sdk/lib/fit",
+    "//src/lib/elf-search",
+    "//zircon/system/ulib/zx",
+    "//zircon/system/ulib/zxtest:zxtest-streams",
+  ]
+  data_deps = [ ":gwp-asan-test-use-after-free" ]
+}
+
+if (current_cpu == "arm64") {
+  libc_component_tests += [ ":ldso-xom-test" ]
+  test("ldso-xom-test") {
+    sources = [ "ldso-xom-test.c" ]
+    deps = [
+      ":xom-test-lib",
+      "//zircon/system/ulib/zxtest:zxtest-streams",
+    ]
+    configs += [ ":execute-only" ]
+  }
+
+  shared_library("xom-test-lib") {
+    testonly = true
+    sources = [ "xom-test-lib.c" ]
+    configs += [ ":execute-only" ]
+  }
+
+  config("execute-only") {
+    ldflags = [ "-Wl,--execute-only" ]
+  }
+}
+
+libc_component_tests += [ ":last-thread-exit-test" ]
+libc_test_manifests += [ "last-thread-exit-test" ]
+test("last-thread-exit-test") {
+  sources = [ "last-thread-exit-test.cc" ]
+  deps = [ "//src/lib/fxl/test:gtest_main" ]
+}
+
+# This set of tests serve as a good smoke test for libc itself and essential
+# kernel support that affect the libc tests, before expecting any of the more
+# demanding core-tests to necessarily work when libc might be suspect.
+zbi_test_executable("libc-unittests-standalone") {
+  deps = [
+    "..:unittests",
+    "//src/zircon/testing/standalone-test",
+    "//zircon/system/ulib/zxtest:zxtest-streams",
+  ]
+}
+
+kernel_zbi_test("boot-libc-unittests") {
+  deps = [ ":libc-unittests-standalone" ]
+
+  forward_variables_from(boot_test_specs, "*")
+
+  # TODO(https://fxbug.dev/42076755) Remove timeout when llvm-libc functions are optimized.
+  if (target_cpu == "riscv64") {
+    timeout = 1200
+  }
+}
+
+test("libc-unittests") {
+  deps = [ "..:unittests" ]
+}
+
+libc_test_components = [ ":libc-unittests-test" ]
+fuchsia_unittest_component("libc-unittests-test") {
+  deps = [ ":libc-unittests" ]
+}
+
+foreach(test_label, libc_component_tests) {
+  test = get_label_info(test_label, "name")
+  libc_test_components += [ ":libc-$test" ]
+  fuchsia_unittest_component("libc-$test") {
+    deps = [ test_label ]
+    if (libc_test_manifests + [ test ] - [ test ] != libc_test_manifests) {
+      manifest = "$test.cml"
+    }
+  }
+}
+
+fuchsia_test_package("libc-tests") {
+  test_components = libc_test_components
+  test_specs = libc_test_specs
+}
+
+libc_cpp_fuzzer_targets = [ "../threads:thread-storage-fuzzer" ]
+
+libc_cpp_fuzzer_components = []
+foreach(fuzzer_label, libc_cpp_fuzzer_targets) {
+  fuzzer = get_label_info(fuzzer_label, "name")
+  libc_cpp_fuzzer_components += [ ":libc-$fuzzer" ]
+
+  fuchsia_fuzzer_component("libc-$fuzzer") {
+    deps = [
+      ":libc-$fuzzer.cml",
+      fuzzer_label,
+    ]
+    manifest = "$target_gen_dir/$target_name.cml"
+  }
+
+  generated_file("libc-$fuzzer.cml") {
+    visibility = [ ":*" ]
+    testonly = true
+    outputs = [ "$target_gen_dir/$target_name" ]
+    output_conversion = "json"
+    contents = {
+      include = [ "//src/sys/fuzzing/libfuzzer/default.shard.cml" ]
+      program = {
+        args = [ "test/$fuzzer" ]
+      }
+    }
+  }
+}
+
+fuchsia_fuzzer_package("libc-fuzzers") {
+  # Note we can add rust fuzzers here but we don't have any at the moment.
+  cpp_fuzzer_components = libc_cpp_fuzzer_components
+}
+
+template("executable_with_backtrace") {
+  executable(target_name) {
+    forward_variables_from(invoker, "*")
+
+    # Enable frame pointer for backtrace.
+    configs += [
+      "//build/config:frame_pointers",
+      "//build/config:default_frame_pointers",
+    ]
+    configs -= [ "//build/config:default_frame_pointers" ]
+  }
+}
+
+executable_with_backtrace("gwp-asan-test-use-after-free") {
+  testonly = true
+  sources = [ "gwp-asan-test-use-after-free.cc" ]
+}
+
+executable_with_backtrace("gwp-asan-test-double-free") {
+  testonly = true
+  sources = [ "gwp-asan-test-double-free.cc" ]
+}
+
+executable_with_backtrace("gwp-asan-test-invalid-free") {
+  testonly = true
+  sources = [ "gwp-asan-test-invalid-free.cc" ]
+}
+
+executable_with_backtrace("gwp-asan-test-buffer-overflow") {
+  testonly = true
+  sources = [ "gwp-asan-test-buffer-overflow.cc" ]
+}
+
+executable_with_backtrace("gwp-asan-test-buffer-underflow") {
+  testonly = true
+  sources = [ "gwp-asan-test-buffer-underflow.cc" ]
+}

@@ -1,0 +1,249 @@
+# Copyright 2023 The Chromium Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_action.gni")
+
+declare_args() {
+  # When true, generated_licenses_spdx template will generate stub SPDX files
+  # with placeholder license. License gathering will be skipped. Since license
+  # gathering is resource intensive, this is useful for non-production builds
+  # that would run faster. The global configuration can be overwritten in
+  # specific `generated_licenses_spdx` template invocation via the
+  # `generate_stub` parameter.
+  generate_licenses_spdx_stubs = true
+}
+
+# Generates a stub license SPDX json file. See `generate_licenses_spdx_stubs`
+# arg.
+#
+# Parameters:
+#
+#   spdx_root_package_name (required)
+#     Same as in the generated_licenses_spdx rule.
+#   output (required)
+#     The name of the output file. E.g. `foo.spdx.json`.
+template("_generated_licenses_spdx_stub") {
+  assert(defined(invoker.spdx_root_package_name),
+         "Must specify `spdx_root_package_name`")
+  assert(defined(invoker.output), "Must specify `output`")
+
+  generated_file(target_name) {
+    outputs = [ invoker.output ]
+    output_conversion = "json"
+
+    # Stub SPDX 2.3 content.
+    contents = {
+      spdxVersion = "SPDX-2.3"
+      SPDXID = "SPDXRef-DOCUMENT"
+      name = invoker.spdx_root_package_name
+      documentNamespace = ""
+      creationInfo = {
+        creators = [ "Tool: generated_licenses_spdx.gni" ]
+      }
+      dataLicense = "CC0-1.0"
+      documentDescribes = [ "SPDXRef-Package-main" ]
+      packages = [
+        {
+          name = invoker.spdx_root_package_name
+          SPDXID = "SPDXRef-Package-main"
+          licenseConcluded = "License-0"
+        },
+      ]
+      hasExtractedLicensingInfos = [
+        {
+          licenseId = "License-0"
+          extractedText = "This is not a license. This is a generated placeholder. \nPlease build with gn arg `generate_licenses_spdx_stubs=false`."
+          name = "License Placeholder"
+        },
+      ]
+    }
+  }
+}
+
+# Collects license metadata and generates a license SPDX json file for a given
+# target.
+#
+# When `generate_licenses_spdx_stubs=true`, will generate a stub spdx instead.
+#
+# Parameters:
+#
+#   target (required)
+#     The GN target to analyze and produce the SPDX for.
+#
+#   output (required)
+#     The name of the output file. E.g. `foo.spdx.json`.
+#
+#   spdx_root_package_name (required)
+#     The name to use for the main package in the SPDX document.
+#     This is used in debugging and license reviews, and should
+#     correspond with a stable, developer-friendly, short name of
+#     the target.
+#
+#   compare_with_legacy_spdx (resource, optional)
+#     Compares the output to reference spdx file.
+#
+#   ignore_comparison_errors (bool, optional)
+#     Ignores comparison errors when comparing with a legacy spdx file.
+#
+#   debug_hints (bool, optional)
+#     Will add "_hint" elements to output spdx for debugging purposes.
+#     Default is false.
+#
+#   log_level (str, optional)
+#     Tool logging level. Defaults to WARN.
+#
+#   include_host_tools (bool, optional)
+#     Include host tools' licenses. Defaults to false as these tools don't ship with most software.
+#     Set to true when generating spdx for the tools themselves.
+#
+#   ignore_collection_errors (bool, optional)
+#     When true, generation will ignore license collection errors
+#     and only log them as warnings.
+#
+#   additional_licenses (list of labels, optional)
+#     Labels of additional license.gni targets to include in the SPDX.
+#
+#   generate_stub (bool, optional)
+#     When true, will generate an SPDX placeholder. Defaults to the global
+#     `generate_licenses_spdx_stubs` gn arg.
+#
+template("generated_licenses_spdx") {
+  assert(defined(invoker.target), "Must specify `target`")
+  assert(defined(invoker.spdx_root_package_name),
+         "Must specify `spdx_root_package_name`")
+  assert(defined(invoker.output), "Must specify `output`")
+
+  _generate_stub = generate_licenses_spdx_stubs
+  if (defined(invoker.generate_stub)) {
+    _generate_stub = invoker.generate_stub
+  }
+
+  if (_generate_stub) {
+    _generated_licenses_spdx_stub(target_name) {
+      output = invoker.output
+      spdx_root_package_name = invoker.spdx_root_package_name
+    }
+    not_needed(invoker,
+               "*",
+               [
+                 "spdx_root_package_name",
+                 "output",
+               ])
+  } else {
+    _targets = {
+      main = target_name
+      generated_metadata = "${target_name}.licenses_metadata"
+      additional_licenses = "${target_name}.additional_licenses"
+    }
+
+    _files = {
+      generated_metadata =
+          "${target_out_dir}/${target_name}.licenses_metadata.json"
+      generated_spdx = invoker.output
+      generated_depfile = "${target_gen_dir}/${target_name}.d"
+    }
+
+    _include_host_tools = false
+    if (defined(invoker.include_host_tools)) {
+      _include_host_tools = invoker.include_host_tools
+    }
+
+    if (defined(invoker.additional_licenses)) {
+      group(_targets.additional_licenses) {
+        applicable_licenses = invoker.additional_licenses
+      }
+    }
+
+    generated_file(_targets.generated_metadata) {
+      forward_variables_from(invoker, [ "testonly" ])
+      outputs = [ _files.generated_metadata ]
+      data_keys = [
+        "license",
+        "applicable_licenses",
+      ]
+
+      if (!_include_host_tools) {
+        walk_keys = [ "applicable_licenses_host_barrier" ]
+      }
+
+      deps = [ invoker.target ]
+      if (defined(invoker.additional_licenses)) {
+        deps += [ ":${_targets.additional_licenses}" ]
+      }
+
+      # This generated_file()'s output does not need its own license.
+      applicable_licenses = [ "//build/licenses:no_license" ]
+
+      output_conversion = "json"
+    }
+
+    python_action(_targets.main) {
+      forward_variables_from(invoker,
+                             [
+                               "deps",
+                               "testonly",
+                               "visibility",
+                             ])
+      binary_label = "//build/licenses/python:generated_licenses_spdx_tool(${host_toolchain})"
+      inputs = [ _files.generated_metadata ]
+      outputs = [ _files.generated_spdx ]
+
+      # Depsfile is generated for all the read licenses files listed in
+      # generated_metadata_target.
+      depfile = _files.generated_depfile
+      args = [
+        "--generated-license-metadata",
+        rebase_path(_files.generated_metadata, root_build_dir),
+        "--fuchsia-source-path",
+        rebase_path("//", root_build_dir),
+        "--spdx-root-package-name",
+        invoker.spdx_root_package_name,
+        "--spdx-output",
+        rebase_path(_files.generated_spdx, root_build_dir),
+        "--dep-file",
+        rebase_path(_files.generated_depfile, root_build_dir),
+      ]
+
+      if (defined(invoker.compare_with_legacy_spdx)) {
+        args += [
+          "--compare-with-legacy-spdx",
+          rebase_path(invoker.compare_with_legacy_spdx, root_build_dir),
+        ]
+      }
+
+      if (defined(invoker.ignore_comparison_errors) &&
+          invoker.ignore_comparison_errors) {
+        args += [ "--ignore-comparison-errors" ]
+      }
+
+      if (defined(invoker.debug_hints) && invoker.debug_hints) {
+        args += [ "--debug-hints" ]
+      }
+
+      if (_include_host_tools) {
+        args += [ "--include-host-tools" ]
+      }
+
+      if (defined(invoker.ignore_collection_errors) &&
+          invoker.ignore_collection_errors) {
+        args += [ "--ignore-collection-errors" ]
+      }
+
+      if (defined(invoker.log_level)) {
+        args += [
+          "--log-level",
+          invoker.log_level,
+        ]
+      }
+
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += [ ":${_targets.generated_metadata}" ]
+
+      # This spdx.json file does not need its own license.
+      applicable_licenses = [ "//build/licenses:no_license" ]
+    }
+  }
+}

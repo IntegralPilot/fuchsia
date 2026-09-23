@@ -1,0 +1,140 @@
+# Copyright 2024 The Bazel Authors. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Implementation of the cc_toolchain rule."""
+
+load("//cc/common:cc_common.bzl", "cc_common")
+load(
+    "//cc/toolchains:cc_toolchain_info.bzl",
+    "ActionTypeSetInfo",
+    "ArgsListInfo",
+    "ArtifactNamePatternInfo",
+    "FeatureSetInfo",
+    "LegacyToolInfo",
+    "MakeVariableInfo",
+    "ToolConfigInfo",
+    "ToolchainConfigInfo",
+)
+load(":collect.bzl", "collect_action_types")
+load(":legacy_converter.bzl", "convert_toolchain")
+load(":toolchain_config_info.bzl", "toolchain_config_info")
+
+visibility([
+    "//cc/private/rules_impl/...",
+    "//cc/toolchains/...",
+    "//tests/rule_based_toolchain/...",
+])
+
+def _cc_legacy_file_group_impl(ctx):
+    files = ctx.attr.config[ToolchainConfigInfo].files
+
+    return [DefaultInfo(files = depset(transitive = [
+        files[action]
+        for action in collect_action_types(ctx.attr.actions).to_list()
+        if action in files
+    ]))]
+
+cc_legacy_file_group = rule(
+    implementation = _cc_legacy_file_group_impl,
+    attrs = {
+        "actions": attr.label_list(providers = [ActionTypeSetInfo], mandatory = True),
+        "config": attr.label(providers = [ToolchainConfigInfo], mandatory = True),
+    },
+)
+
+def cc_toolchain_config_impl_helper(ctx):
+    """Main implementation for _cc_toolchain_config_impl, reused for rules-based toolchains
+
+    Args:
+      ctx: Rule context
+    Returns:
+        toolchain_config_info and cc_toolchain_config_info providers"""
+
+    if ctx.attr.features:
+        fail("Features is a reserved attribute in bazel. Did you mean 'known_features' or 'enabled_features'?")
+
+    toolchain_config = toolchain_config_info(
+        label = ctx.label,
+        known_features = ctx.attr.known_features + [ctx.attr._builtin_features],
+        enabled_features = ctx.attr.enabled_features,
+        tool_map = ctx.attr.tool_map,
+        args = ctx.attr.args,
+        artifact_name_patterns = ctx.attr.artifact_name_patterns,
+        make_variables = ctx.attr.make_variables,
+        legacy_tools = ctx.attr.legacy_tools,
+    )
+
+    legacy = convert_toolchain(toolchain_config)
+
+    return (
+        toolchain_config,
+        cc_common.create_cc_toolchain_config_info(
+            ctx = ctx,
+            action_configs = legacy.action_configs,
+            artifact_name_patterns = legacy.artifact_name_patterns,
+            make_variables = legacy.make_variables,
+            features = legacy.features,
+            cxx_builtin_include_directories = legacy.cxx_builtin_include_directories,
+            tool_paths = legacy.tool_paths,
+            # toolchain_identifier is deprecated, but setting it to None results
+            # in an error that it expected a string, and for safety's sake, I'd
+            # prefer to provide something unique.
+            toolchain_identifier = str(ctx.label),
+            # This can be accessed by users through
+            # @rules_cc//cc/private/toolchain:compiler to select() on the current
+            # compiler
+            compiler = ctx.attr.compiler,
+            target_cpu = ctx.attr.cpu,
+            target_libc = ctx.attr.target_libc,  # Used by legacy features to determine if we're building for Apple platfroms or not
+            target_system_name = ctx.expand_make_variables("target_system_name", ctx.attr.target_system_name, {}),
+            # These fields are only relevant for legacy toolchain resolution.
+            abi_version = "",
+            abi_libc_version = "",
+        ),
+    )
+
+def _cc_toolchain_config_impl(ctx):
+    toolchain_config, cc_toolchain_config_info = cc_toolchain_config_impl_helper(ctx)
+    return [
+        toolchain_config,
+        cc_toolchain_config_info,
+        # This allows us to support all_files.
+        # If all_files was simply an alias to
+        # //cc/toolchains/actions:all_actions,
+        # then if a toolchain introduced a new type of action, it wouldn't get
+        # put in all_files.
+        DefaultInfo(files = depset(transitive = toolchain_config.files.values())),
+    ]
+
+CC_TOOLCHAIN_CONFIG_PUBLIC_ATTRS = {
+    # Attributes new to this rule.
+    "compiler": attr.string(default = ""),
+    "cpu": attr.string(default = ""),
+    "target_libc": attr.string(default = ""),
+    "target_system_name": attr.string(default = ""),
+    "tool_map": attr.label(providers = [ToolConfigInfo], mandatory = True),
+    "args": attr.label_list(providers = [ArgsListInfo]),
+    "known_features": attr.label_list(providers = [FeatureSetInfo]),
+    "enabled_features": attr.label_list(providers = [FeatureSetInfo]),
+    "artifact_name_patterns": attr.label_list(providers = [ArtifactNamePatternInfo]),
+    "make_variables": attr.label_list(providers = [MakeVariableInfo]),
+    "legacy_tools": attr.label_list(providers = [LegacyToolInfo]),
+}
+
+cc_toolchain_config = rule(
+    implementation = _cc_toolchain_config_impl,
+    attrs = CC_TOOLCHAIN_CONFIG_PUBLIC_ATTRS | {
+        "_builtin_features": attr.label(default = "//cc/toolchains/features:all_builtin_features"),
+    },
+    provides = [ToolchainConfigInfo],
+)

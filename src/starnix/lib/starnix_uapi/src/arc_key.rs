@@ -1,0 +1,157 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+use fuchsia_rcu::RcuDroppable;
+use ref_cast::RefCast;
+use std::borrow::Borrow;
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::sync::{Arc, Weak};
+
+/// A wrapper around Arc with Hash implemented based on Arc::as_ptr.
+#[derive(RefCast, RcuDroppable)]
+#[repr(transparent)]
+pub struct ArcKey<T>(pub Arc<T>);
+impl<T> PartialEq for ArcKey<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl<T> Eq for ArcKey<T> {}
+impl<T> PartialOrd for ArcKey<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for ArcKey<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        Arc::as_ptr(&self.0).cmp(&Arc::as_ptr(&other.0))
+    }
+}
+impl<T> Hash for ArcKey<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+impl<T> Clone for ArcKey<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+impl<T> Deref for ArcKey<T> {
+    type Target = Arc<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for ArcKey<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A wrapper around Weak with Hash implemented based on Weak::as_ptr.
+pub struct WeakKey<T>(pub Weak<T>, PtrKey<T>);
+impl<T> WeakKey<T> {
+    pub fn from(arc: &Arc<T>) -> Self {
+        Self(Arc::downgrade(arc), Arc::as_ptr(arc).into())
+    }
+}
+impl<T> Clone for WeakKey<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone(), self.1.clone())
+    }
+}
+impl<T> PartialEq<Weak<T>> for WeakKey<T> {
+    fn eq(&self, other: &Weak<T>) -> bool {
+        Weak::ptr_eq(&self.0, other)
+    }
+}
+impl<T> PartialEq for WeakKey<T> {
+    fn eq(&self, other: &Self) -> bool {
+        *self == other.0
+    }
+}
+impl<T> Eq for WeakKey<T> {}
+impl<T> PartialOrd for WeakKey<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for WeakKey<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        Weak::as_ptr(&self.0).cmp(&Weak::as_ptr(&other.0))
+    }
+}
+impl<T> Hash for WeakKey<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Weak::as_ptr(&self.0).hash(state);
+    }
+}
+impl<T> Borrow<PtrKey<T>> for WeakKey<T> {
+    fn borrow(&self) -> &PtrKey<T> {
+        &self.1
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for WeakKey<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+pub struct PtrKey<T>(*const T);
+impl<T> From<*const T> for PtrKey<T> {
+    fn from(ptr: *const T) -> Self {
+        Self(ptr)
+    }
+}
+impl<T> From<&T> for PtrKey<T> {
+    fn from(r: &T) -> Self {
+        Self(r as *const T)
+    }
+}
+impl<T> From<&Arc<T>> for PtrKey<T> {
+    fn from(arc: &Arc<T>) -> Self {
+        Self(Arc::as_ptr(arc))
+    }
+}
+impl<T> From<&ArcKey<T>> for PtrKey<T> {
+    fn from(arc_key: &ArcKey<T>) -> Self {
+        Self(Arc::as_ptr(&arc_key.0))
+    }
+}
+impl<T> Clone for PtrKey<T> {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+impl<T> PartialEq for PtrKey<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl<T> Eq for PtrKey<T> {}
+impl<T> Hash for PtrKey<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state)
+    }
+}
+#[allow(clippy::undocumented_unsafe_blocks, reason = "Force documented unsafe blocks in Starnix")]
+unsafe impl<T> Sync for PtrKey<T> {}
+#[allow(clippy::undocumented_unsafe_blocks, reason = "Force documented unsafe blocks in Starnix")]
+unsafe impl<T> Send for PtrKey<T> {}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for PtrKey<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+// SAFETY: WeakKey wraps Weak<T>, which only decrements the weak refcount on drop without dropping T.
+unsafe impl<T: Send + Sync + 'static> RcuDroppable for WeakKey<T> {}
+// SAFETY: PtrKey contains a raw pointer and has no drop side effects.
+unsafe impl<T: 'static> RcuDroppable for PtrKey<T> {}

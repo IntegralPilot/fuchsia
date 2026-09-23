@@ -1,0 +1,59 @@
+// Copyright 2020 The Fuchsia Authors
+//
+// Use of this source code is governed by a MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT
+
+#include <lib/arch/x86/descriptor.h>
+#include <lib/arch/x86/system.h>
+#include <zircon/compiler.h>
+
+#include <array>
+
+#ifndef GENERATE
+
+#include <phys/main.h>
+
+void ArchSetUpCpu() {}
+void ArchSetUpZbi(EarlyBootZbi zbi) {}
+
+#endif
+
+namespace {
+
+enum Segments { kNull, kCode32, kData32, kGs32, kCode64, kNumEntries };
+
+constexpr auto MakePhys32Gdt() {
+  std::array<arch::Desc32, kNumEntries> gdt{};
+
+  gdt[kCode32].MakeFlat().set_type(arch::Desc32::CODE_RX);
+  gdt[kCode64].MakeCode64();
+  gdt[kData32].MakeFlat().set_type(arch::Desc32::DATA_RW);
+  gdt[kGs32].MakeFlat().set_type(arch::Desc32::DATA_RW);
+
+  return gdt;
+}
+
+}  // namespace
+
+extern "C" __CONSTINIT const auto gPhys32Gdt = MakePhys32Gdt();
+
+#ifdef GENERATE
+#include <hwreg/asm.h>
+
+int main(int argc, char** argv) {
+  constexpr auto gs_offset = kGs32 * sizeof(arch::Desc32);
+
+  return hwreg::AsmHeader()
+      .Macro("PHYS32_GDT_SIZE", sizeof(gPhys32Gdt))
+      .Macro("PHYS32_GS_BASE_LO16_OFFSET", gs_offset + 2)
+      .Macro("PHYS32_GS_BASE_MID8_OFFSET", gs_offset + 4)
+      .Macro("PHYS32_GS_BASE_HI8_OFFSET", gs_offset + 7)
+      .Macro("PHYS32_CODE32_SEL", kCode32 << 3)
+      .Macro("PHYS32_DATA32_SEL", kData32 << 3)
+      .Macro("PHYS32_GS32_SEL", kGs32 << 3)
+      .Macro("PHYS32_CODE64_SEL", kCode64 << 3)
+      .Register<arch::X86Cr0>("X86_CR0_")
+      .Main(argc, argv);
+}
+#endif

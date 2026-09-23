@@ -1,0 +1,381 @@
+# Copyright 2023 The Fuchsia Authors
+#
+# Use of this source code is governed by a MIT-style
+# license that can be found in the LICENSE file or at
+# https://opensource.org/licenses/MIT
+
+import("//build/config/compiler_config.gni")
+import("//build/config/riscv64/riscv64.gni")
+import("//build/cpp/library_headers.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//zircon/kernel/kernel_bindgen_crate.gni")
+import("//zircon/kernel/kernel_rust_mod.gni")
+import("//zircon/kernel/params.gni")
+
+if (toolchain_base_environment == "kernel") {
+  # These set the ABI contract between C++ and assembly code.
+  # This is kept consistent between the kernel proper and phys
+  # so (pure PIC) assembly code should be callable from either.
+  compiler_config("abi") {
+    compiler_configs = [
+      ":arch-abi",
+      ":percpu-abi",
+    ]
+  }
+
+  # This defines the ISA that the compiler may generate.
+  riscv64_abi_config("arch-abi") {
+    # Override the default calling convention of lp64d: only integer registers.
+    abi = "lp64"
+
+    # Exclude all the kinds of non-integer registers from the ISA the compiler
+    # may generate.  Such registers usually still hold the user-mode values
+    # while running in kernel mode.
+    exclude_letters = [
+      "d",
+      "f",
+      "g",
+      "q",
+      "v",
+    ]
+
+    # This is G minus F and D.
+    extra_letters = [
+      "i",
+      "m",
+      "a",
+    ]
+
+    # These are implied by G, which we don't use because it implies F and D.
+    extra_features = [
+      "zicsr",
+      "zifencei",
+    ]
+
+    # It's only a subset of the userland ISA: avoiding any extension registers
+    # (D/F/Q/V), and not using any other extensions than what userland uses.
+    # extra_letters += and/or extra_features += here would add more.
+  }
+
+  # Reserve a register (s11 / x27) to be called percpu_ptr in <lib/arch/asm.h>.
+  # The compiler must never touch it except via our inline assembly.
+  compiler_config("percpu-abi") {
+    c_family_flags = [ "-ffixed-x27" ]
+    rust_target_features = [ "+reserve-x27" ]
+  }
+
+  # This is used pervasively throughout the kernel on riscv64.
+  config("kernel") {
+    # For #include <arch/foo.h>.
+    include_dirs = [ "include" ]
+  }
+
+  config("defines") {
+    defines = [ "SMP_MAX_CPUS=$smp_max_cpus" ]
+  }
+
+  library_headers("headers") {
+    headers = []
+    public_configs = [
+      ":defines",
+      "//zircon/kernel/switch:headers",
+    ]
+    public_deps = [
+      "//sdk/lib/zbi-format",
+      "//zircon/kernel/lib/arch:headers",
+      "//zircon/kernel/lib/ktl:headers",
+      "//zircon/kernel/lib/libc:headers",
+      "//zircon/kernel/lib/page:headers",
+      "//zircon/kernel/vm:headers",
+    ]
+  }
+
+  source_set("riscv64") {
+    public_deps = [ ":headers" ]
+    sources = [
+      "asid_allocator.cc",
+      "crashlog.cc",
+      "debugger.cc",
+      "exceptions.S",
+      "exceptions.cc",
+      "fpu_asm.S",
+      "handoff.cc",
+      "mexec-stub.S",
+      "mmu.cc",
+      "mp.cc",
+      "riscv64_context_switch.S",
+      "riscv64_ffi.cc",
+      "riscv64_user_copy.S",
+      "sbi.cc",
+      "spinlock.cc",
+      "stvec.S",
+      "timer.cc",
+      "user_copy_c.cc",
+      "vector_asm.S",
+    ]
+    deps = [
+      "//sdk/lib/zbi-format",
+      "//zircon/kernel/dev/iommu/stub",
+      "//zircon/kernel/dev/pdev/power",
+      "//zircon/kernel/dev/pdev/timer",
+      "//zircon/kernel/lib/arch",
+      "//zircon/kernel/lib/boot-options",
+      "//zircon/kernel/lib/code-patching",
+      "//zircon/kernel/lib/console",
+      "//zircon/kernel/lib/counters",
+      "//zircon/kernel/lib/crashlog",
+      "//zircon/kernel/lib/heap",
+      "//zircon/kernel/lib/init",
+      "//zircon/kernel/lib/ktl",
+      "//zircon/kernel/lib/page",
+      "//zircon/kernel/lib/syscalls",
+      "//zircon/kernel/lib/thread-stack",
+      "//zircon/kernel/object",
+      "//zircon/kernel/phys:handoff",
+      "//zircon/kernel/vm",
+      "//zircon/system/ulib/affine",
+      "//zircon/system/ulib/bitmap",
+      "//zircon/system/ulib/pretty",
+    ]
+  }
+
+  kernel_bindgen_crate("riscv-sbi-bindings") {
+    headers = [ "//zircon/kernel/lib/arch/include/lib/arch/riscv64/sbi.h" ]
+    cpp = true
+    non_rust_deps = [ "//zircon/kernel/lib/arch:headers" ]
+    notice_year = 2026
+    raw_lines = [ "#![no_std]" ]
+    type_allowlist = [
+      "arch::.*",
+      "RiscvSbi.*",
+      "Hart.*",
+    ]
+    rustified_enum = [ ".*" ]
+    explicit_padding = false
+    replacements = [
+      [
+        "\\barch_([A-Za-z0-9_]+)",
+        "\\1",
+      ],
+      [
+        "\\bk([A-Z0-9])",
+        "\\1",
+      ],
+    ]
+    std_derives = [
+      "default",
+      "eq",
+      "partialeq",
+    ]
+    expect_lints = []
+  }
+
+  kernel_bindgen_crate("riscv64-regs-bindings") {
+    headers = [ "include/arch/regs.h" ]
+    cpp = true
+    non_rust_deps = [ ":headers" ]
+    deps = [ "//sdk/rust/zx-types" ]
+    notice_year = 2026
+    raw_lines = [
+      "#![no_std]",
+      "pub type zx_riscv64_thread_state_general_regs_t = zx_types::zx_thread_state_general_regs_t;",
+    ]
+    type_blocklist = [ "zx_.*" ]
+    type_allowlist = [
+      "iframe_t",
+      "arch_exception_context",
+      "syscall_regs_t",
+    ]
+    var_allowlist = [ "RISCV64_IFRAME_.*" ]
+    explicit_padding = false
+    std_derives = [
+      "default",
+      "eq",
+      "partialeq",
+    ]
+    expect_lints = [ "non_camel_case_types" ]
+  }
+
+  kernel_bindgen_crate("riscv64-user-copy-bindings") {
+    headers = [ "include/arch/riscv64/user_copy.h" ]
+    cpp = true
+    non_rust_deps = [ ":headers" ]
+    deps = [ "//sdk/rust/zx-types" ]
+    notice_year = 2026
+    raw_lines = [
+      "#![no_std]",
+      "pub type zx_status_t = zx_types::zx_status_t;",
+    ]
+    type_blocklist = [ "zx_.*" ]
+    type_allowlist = [ "Riscv64UserCopyRet" ]
+    var_allowlist = [ "RISCV_CAPTURE_USER_COPY_FAULTS_BIT" ]
+    explicit_padding = false
+    std_derives = [
+      "default",
+      "eq",
+      "partialeq",
+    ]
+    expect_lints = [ "non_camel_case_types" ]
+  }
+
+  kernel_bindgen_crate("riscv64-crashlog-bindings") {
+    headers = [ "include/arch/crashlog_regs.h" ]
+    cpp = true
+    non_rust_deps = [ ":headers" ]
+    deps = [ ":riscv64-regs-bindings" ]
+    notice_year = 2026
+    raw_lines = [
+      "#![no_std]",
+      "use riscv64_regs_bindings::*;",
+    ]
+    type_blocklist = [
+      "zx_.*",
+      "iframe_t.*",
+      "arch_exception_context.*",
+      "syscall_regs_t.*",
+    ]
+    type_allowlist = [ "crashlog_regs_t" ]
+    explicit_padding = false
+    std_derives = [
+      "default",
+      "eq",
+      "partialeq",
+    ]
+    expect_lints = []
+  }
+
+  kernel_bindgen_crate("riscv64-thread-bindings") {
+    headers = [
+      "include/arch/arch_thread.h",
+      "include/arch/riscv64/fpu.h",
+      "include/arch/riscv64/vector.h",
+    ]
+    cpp = true
+    non_rust_deps = [ ":headers" ]
+    deps = [
+      ":riscv64-regs-bindings",
+      "//sdk/rust/zx-types",
+    ]
+    notice_year = 2026
+    raw_lines = [
+      "#![no_std]",
+      "pub type iframe_t = riscv64_regs_bindings::iframe_t;",
+      "pub type zx_riscv64_thread_state_general_regs_t = zx_types::zx_thread_state_general_regs_t;",
+    ]
+    type_blocklist = [
+      "zx_.*_general_regs_t.*",
+      "iframe_t.*",
+      "arch_exception_context.*",
+      "syscall_regs_t.*",
+    ]
+    type_allowlist = [
+      "arch_thread.*",
+      "riscv64_fpu_state",
+      "riscv64_vector_state",
+    ]
+    explicit_padding = false
+    std_derives = [
+      "default",
+      "eq",
+      "partialeq",
+    ]
+    expect_lints = [ "non_camel_case_types" ]
+  }
+
+  kernel_bindgen_crate("riscv64-mp-bindings") {
+    headers = [ "include/arch/riscv64/mp.h" ]
+    cpp = true
+    non_rust_deps = [ ":headers" ]
+    notice_year = 2026
+    raw_lines = [
+      "#![no_std]",
+      "use core::sync::atomic::AtomicU32;",
+    ]
+    explicit_padding = false
+    replacements = [
+      [
+        "#\\[derive\\(Debug, Copy, Clone\\)\\]\npub struct riscv64_percpu",
+        "#[derive(Debug)]\npub struct riscv64_percpu",
+      ],
+      [
+        "pub ipi_data: std_atomic,",
+        "pub ipi_data: AtomicU32,",
+      ],
+    ]
+    type_blocklist = [
+      "std_atomic.*",
+      "std___.*",
+      "zx_.*",
+    ]
+    type_allowlist = [
+      "riscv64_percpu",
+      "cpu_num_t",
+      "percpu",
+    ]
+    var_allowlist = [
+      "PERCPU_IN_RESTRICTED_MODE",
+      "SECONDARY_STACK_.*",
+    ]
+    expect_lints = [ "non_camel_case_types" ]
+  }
+
+  kernel_bindgen_crate("riscv64-restricted-bindings") {
+    headers = [ "include/arch/restricted.h" ]
+    cpp = true
+    non_rust_deps = [ ":headers" ]
+    notice_year = 2026
+    raw_lines = [ "#![no_std]" ]
+    type_allowlist = [ "ArchSavedNormalState" ]
+    explicit_padding = false
+    std_derives = [
+      "default",
+      "eq",
+      "partialeq",
+    ]
+    expect_lints = []
+  }
+
+  kernel_rust_mod("arch-riscv64-rs") {
+    output_name = "arch_riscv64"
+    source_root = "src/mod.rs"
+    sources = [
+      "src/arch.rs",
+      "src/cache.rs",
+      "src/crashlog.rs",
+      "src/debugger.rs",
+      "src/exceptions.rs",
+      "src/feature.rs",
+      "src/fpu.rs",
+      "src/mod.rs",
+      "src/mp.rs",
+      "src/restricted.rs",
+      "src/sbi.rs",
+      "src/spinlock.rs",
+      "src/thread.rs",
+      "src/timer.rs",
+      "src/user_copy.rs",
+      "src/vector.rs",
+    ]
+    deps = [
+      ":riscv-sbi-bindings",
+      ":riscv64-crashlog-bindings",
+      ":riscv64-mp-bindings",
+      ":riscv64-regs-bindings",
+      ":riscv64-restricted-bindings",
+      ":riscv64-thread-bindings",
+      ":riscv64-user-copy-bindings",
+      "//sdk/rust/zbi",
+      "//sdk/rust/zx-status",
+      "//sdk/rust/zx-types",
+      "//zircon/kernel/arch:arch-types-bindings",
+      "//zircon/kernel/lib/arch:arch-rs",
+      "//zircon/kernel/lib/debug",
+      "//zircon/system/ulib/pretty/rust:pretty",
+    ]
+    test_deps = [ "//zircon/kernel/lib/unittest:unittest-rs" ]
+  }
+
+  group("kernel-tests") {
+    testonly = true
+  }
+}

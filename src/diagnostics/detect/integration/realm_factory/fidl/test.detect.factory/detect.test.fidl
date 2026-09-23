@@ -1,0 +1,107 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library test.detect.factory;
+
+using fuchsia.testing.harness;
+using zx;
+
+const MAX_STRING_SIZE uint16 = 1024;
+const MAX_HANDLES_PER_CHANNEL_WRITE uint16 = 64;
+
+/// RealmOptions tells the RealmFactory protocol how to create the test realm.
+///
+/// Note that there is a limit of 64 handles in a single channel write.
+/// Keep in mind that when initializing these RealmOptions, 64 is the combined
+/// limit for all handles in the message.
+type RealmOptions = resource table {
+    /// The JSON configuration for the triage-detect component.
+    ///
+    /// Values in this config may override `enable_crash_reporting`.
+    /// This is exposed to allow the tests to see how the compnent behaves if e.g.
+    /// the config file is corrupted.
+    1: program_config zx.Handle:VMO;
+
+    /// Triage config contents.
+    ///
+    /// Triage configs are JSON objects that tell the component which diagnostic data
+    /// to fetch and what to do in response to that data. The schema of this JSON
+    /// can be found at //src/diagnostics/lib/triage/src/config.rs.
+    2: triage_configs vector<zx.Handle:VMO>:MAX_HANDLES_PER_CHANNEL_WRITE;
+
+    /// A list of a canned JSON responses to send when triage-detect fetches inspect data.
+    ///
+    /// The data are sent in the order they appear in this vector.
+    3: inspect_data vector<zx.Handle:VMO>:MAX_HANDLES_PER_CHANNEL_WRITE;
+};
+
+
+/// Events sent from the test realm.
+@discoverable
+open protocol TriageDetectEvents {
+    /// Sent when there is no more inspect data to fetch.
+    flexible -> OnDone();
+
+    /// Sent when the triage-detect component terminates early.
+    ///
+    /// The realm proxy connection will not be closed when this happens, because the other
+    /// components in the realm are still running. Tests that expect this event should close
+    /// their side of the connection when this event is received to avoid hanging.
+    flexible -> OnBail();
+
+    /// Sent when the component fetches diagnostic information.
+    flexible -> OnDiagnosticFetch();
+
+    /// Sent when a crash report is filed.
+    flexible -> OnCrashReport(struct {
+        crash_signature string:MAX_STRING_SIZE;
+        crash_program_name string:MAX_STRING_SIZE;
+    });
+
+    /// Sent when a crash reporting product registers itself.
+    flexible -> OnCrashReportingProductRegistration(struct {
+        product_name string:MAX_STRING_SIZE;
+        program_name string:MAX_STRING_SIZE;
+    });
+};
+
+/// This protocol is used to write integration tests for the triage-detect component.
+///
+/// Each test case should create a new connection to this protocol, and call
+/// CreateRealm only after all other methods have been called to setup the test realm.
+///
+/// # The triage-detect component
+///
+/// The triage-detect component's job is to file crash reports whenever inspect data
+/// reveals that some component in the system has produced an error.
+///
+/// # FIDL Interactions
+///
+/// At startup, the triage-detect component tells the CrashReportingProductRegister
+/// to file all crash reports sent by triage-detect under the "FuchsiaDetect" crash
+/// product.
+///
+/// Periodically, the triage-detect component will fetch inspect data and file
+/// crash reports for all of the data it receives. Tests can control how reports
+/// are filed by providing any number of *.triage configuration files using
+/// `AddConfigFile`.
+@discoverable
+open protocol RealmFactory {
+    /// Specifies the options to use when creating the realm.
+    ///
+    /// Returns OperationError.INVALID if called more than once.
+    flexible CreateRealm(resource struct {
+        options RealmOptions;
+        realm_server server_end:fuchsia.testing.harness.RealmProxy;
+    }) -> () error fuchsia.testing.harness.OperationError;
+
+    /// Returns a client end to the `Realm` protocol.
+    ///
+    /// The test can use this client end to listen for events.
+    /// It is a fatal error to call this more than once or before the test realm
+    /// is started.
+    strict GetTriageDetectEvents() -> (resource struct {
+        client_end client_end:TriageDetectEvents;
+    });
+};

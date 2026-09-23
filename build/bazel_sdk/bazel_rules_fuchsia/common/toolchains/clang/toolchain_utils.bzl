@@ -1,0 +1,784 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+"""Helper functions to define Clang toolchain related targets."""
+
+load("@bazel_tools//tools/build_defs/cc:action_names.bzl", "ACTION_NAMES")
+load(
+    "@bazel_tools//tools/cpp:cc_toolchain_config_lib.bzl",
+    "feature",
+    "flag_group",
+    "flag_set",
+    "tool_path",
+    "with_feature_set",
+)
+load(
+    "@fuchsia_rules_common//build_flags:cc.bzl",
+    "compute_cc_toolchain_feature_for_default_build_flags",
+)
+load("@rules_cc//cc/common:cc_common.bzl", "cc_common")
+load("@rules_cc//cc/toolchains:cc_toolchain.bzl", "cc_toolchain")
+load(
+    "//common:toolchains/clang/cc_features.bzl",
+    "action_names",
+    "get_default_compile_flags_feature",
+    "get_fuchsia_api_level_feature",
+)
+load(
+    "//common:toolchains/clang/clang_utils.bzl",
+    "format_labels_list_to_target_tag_native_glob_select",
+    "to_clang_target_tuple",
+)
+load("//common:toolchains/clang/providers.bzl", "ClangInfo", "FuchsiaApiLevelInfo")
+load("//common:toolchains/clang/sanitizer.bzl", "sanitizer_features")
+load("//common/platforms:utils.bzl", "to_fuchsia_cpu_name", "to_fuchsia_os_name")
+
+# buildifier: disable=unused-variable
+def compute_clang_features(
+        clang_info,
+        repo_name,
+        target_os,
+        target_cpu,
+        fuchsia_api_level,
+        sysroot = "",
+        default_flags_set = None):
+    """Compute list of C++ toolchain features required by Clang.
+
+    Args:
+      clang_info: A ClangInfo provider value.
+      repo_name: The canonical name of the toolchain repository.
+      target_os: Target OS, following Fuchsia conventions.
+      target_cpu: Target CPU, following Fuchsia conventions.
+      fuchsia_api_level: Optional target Fuchsia API level.
+      sysroot: Optional path to sysroot.
+      default_flags_set: Optional DefaultBuildFlagsSetInfo value.
+
+    Returns:
+      A list of feature() objects.
+    """
+    host_os = clang_info.fuchsia_host_os
+    host_cpu = clang_info.fuchsia_host_arch
+
+    is_linux = target_os == "linux"
+    is_fuchsia = target_os == "fuchsia"
+
+    clang_tuple = to_clang_target_tuple(target_os, target_cpu)
+
+    default_compile_flags_feature = get_default_compile_flags_feature(clang_info, target_os, sysroot = sysroot)
+
+    # A feature that adds a --target=<clang_tuple> to compiler and linker commands.
+    target_system_name_feature = feature(
+        # LINT.IfChange(target_system_name)
+        name = "target_system_name",
+        # LINT.ThenChange(cc_features.bzl)
+        flag_sets = [
+            flag_set(
+                actions = action_names.all_compile_actions + action_names.all_link_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = ["--target=" + clang_tuple],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # A hard-coded Bazel feature which indicates, when enabled, that the toolchain
+    # can produce PIC objects.
+    supports_pic_feature = feature(
+        name = "supports_pic",
+        enabled = is_linux or is_fuchsia,
+    )
+
+    # Redefine the dependency_files feature in order to use -MMD instead of -MD
+    # which ensures that system headers files are not listed in the dependency file.
+    # Doing this allows remote builds to work with our prebuilt toolchain. Otherwise
+    # the paths in cxx_builtin_include_directories will not match the ones that are
+    # generated in the remote builder, resulting in an error like:
+    #
+    # ```
+    # ERROR: ..../workspace/build/bazel/tests/hello_world/BUILD.bazel:5:10: Compiling build/bazel/tests/hello_world/main.cc failed: undeclared inclusion(s) in rule '//build/bazel/tests/hello_world:hello_world':
+    # this rule is missing dependency declarations for the following files included by 'build/bazel/tests/hello_world/main.cc':
+    # '/b/f/w/external/prebuilt_clang/include/c++/v1/stdio.h'
+    # '/b/f/w/external/prebuilt_clang/include/c++/v1/__config'
+    # '/b/f/w/external/prebuilt_clang/include/x86_64-unknown-linux-gnu/c++/v1/__config_site'
+    # '/b/f/w/external/prebuilt_clang/include/c++/v1/stddef.h'
+    # '/b/f/w/external/prebuilt_clang/lib/clang/16.0.0/include/stddef.h'
+    # '/b/f/w/external/prebuilt_clang/include/c++/v1/wchar.h'
+    # '/b/f/w/external/prebuilt_clang/lib/clang/16.0.0/include/stdarg.h'
+    # Target //build/bazel/tests/hello_world:hello_world failed to build
+    # ```
+    # Where `/b/f/w/` is the path of the execroot in the remote builder.
+    #
+    # Note that trying to set paths relative to the execroot in cxx_builtin_include_directories
+    # does not work (Bazel resolves them to absolute paths before recording them and trying to launch
+    # remote builds).
+    #
+    # Another benefit is that we can symlink the prebuilt clang directory
+    # in our @prebuilt_clang repository now. This does not work with -MD because
+    # the path generated by the compiler for dependencies are fully resolved
+    # and would not match the content of cxx_builtin_include_directories,
+    # resulting in errors like the one above, where the path listed in the
+    # dependency would be something like
+    # `/fuchsia/prebuilt/third_party/clang/linux-x64/include/c++/v1/wchar.h`
+    # instead of the expected `external/prebuilt_clang/include/c++/c1/wchar.h`
+
+    # See https://cs.opensource.google/bazel/bazel/+/master:tools/cpp/unix_cc_toolchain_config.bzl;drc=ed03d3edc3bab62942f2f9fab51f342fc8280930;l=1009
+    # for the original feature() definition.
+    dependency_file_feature = feature(
+        name = "dependency_file",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = action_names.all_compile_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = ["-MMD", "-MF", "%{dependency_file}"],
+                        expand_if_available = "dependency_file",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    opt_feature = feature(
+        name = "opt",
+    )
+
+    ml_inliner_feature = feature(
+        name = "ml_inliner",
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_module_compile,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-mllvm",
+                            "-enable-ml-inliner=release",
+                        ],
+                    ),
+                ],
+                with_features = [with_feature_set(
+                    features = ["opt"],
+                )],
+            ),
+        ],
+    )
+
+    # A feature used to enable assertions in ZX_DEBUG_ASSERT and ZX_DEBUG_ASSERT_MSG
+    # that are also used in Fuchsia and host build configurations, not only Zircon ones.
+    # Disabled by default, but //build/bazel/config/bazel_args.gni will enable that
+    # when it is also enabled in the top-level GN build.
+    enable_zircon_asserts_feature = feature(
+        # LINT.IfChange(enable_zircon_asserts_feature)
+        name = "enable_zircon_asserts",
+        # LINT.ThenChange(//build/bazel/config/bazel_args.gni:enable_zircon_asserts_feature)
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_module_compile,
+                ],
+                flag_groups = [
+                    flag_group(
+                        # LINT.IfChange(enable_zircon_asserts_flags)
+                        flags = ["-DZX_ASSERT_LEVEL=2"],
+                        # LINT.ThenChange(//build/config/fuchsia/BUILD.gn:enable_zircon_asserts_flags)
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    coverage_feature = feature(
+        name = "coverage",
+        flag_sets = [
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_link_dynamic_library,
+                    ACTION_NAMES.cpp_link_executable,
+                    ACTION_NAMES.cpp_link_nodeps_dynamic_library,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-fprofile-instr-generate",
+                            "-fcoverage-mapping",
+                        ],
+                    ),
+                ],
+            ),
+            flag_set(
+                actions = [
+                    ACTION_NAMES.c_compile,
+                    ACTION_NAMES.cpp_compile,
+                    ACTION_NAMES.cpp_module_compile,
+                ],
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            # This flag will get applied after the default
+                            # set of flags so we can think of this as an override
+                            "-O1",
+                            "-mllvm",
+                        ] + (
+                            [
+                                # Enable runtime counter relocation in Linux.
+                                "-runtime-counter-relocation",
+                            ] if is_linux else [
+                                # Enable coverage from system headers in Fuchsia.
+                                "-system-headers-coverage",
+                            ] if is_fuchsia else []
+                        ),
+                    ),
+                ],
+            ),
+        ] + (
+            [
+                flag_set(
+                    actions = action_names.all_link_actions,
+                    flag_groups = [
+                        flag_group(
+                            flags = [
+                                # The statically-linked profiling runtime depends on libzircon.
+                                "-lzircon",
+                                "-Wl",
+                                "-dynamic-linker=coverage/ld.so.1",
+                            ],
+                        ),
+                    ],
+                ),
+            ] if is_fuchsia else []
+        ),
+    )
+
+    generate_linkmap_feature = feature(
+        name = "generate_linkmap",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                actions = action_names.all_link_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-Wl,--Map=%{output_execpath}.map",
+                        ],
+                        expand_if_available = "output_execpath",
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    # Automatically turned on when we build with -c dbg
+    dbg_feature = feature(
+        name = "dbg",
+    )
+
+    # Ensure clang uses C++ mode when invoked for C++ compilation actions.
+    # This affects various search directories during compilation and linking.
+    # Moreover, this makes libc++ an implicit dependency at link-time.
+    # See https://fxbug.dev/400927814
+    clang_driver_mode_cxx_feature = feature(
+        name = "clang_driver_mode_cxx",
+        enabled = True,
+        flag_sets = [
+            flag_set(
+                # Regretably, Bazel does not differentiate C-only and C++ link
+                # actions, so this flag will be applied to both cases
+                # indiscriminately.
+                actions = action_names.all_cpp_compile_actions + action_names.all_link_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "--driver-mode=g++",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    static_cpp_standard_library_feature = feature(
+        name = "static_cpp_standard_library",
+        flag_sets = [
+            flag_set(
+                actions = action_names.all_link_actions,
+                flag_groups = [
+                    flag_group(
+                        flags = [
+                            "-unwindlib=libunwind",
+                            "-static-libstdc++",
+                            "-static-libgcc",
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+
+    features = [
+        default_compile_flags_feature,
+        target_system_name_feature,
+        supports_pic_feature,
+        coverage_feature,
+        dbg_feature,
+        dependency_file_feature,
+        enable_zircon_asserts_feature,
+        generate_linkmap_feature,
+        ml_inliner_feature,
+        opt_feature,
+        clang_driver_mode_cxx_feature,
+        static_cpp_standard_library_feature,
+    ] + sanitizer_features
+
+    # This feature adds an RPATH entry into the final binary. We do not want this
+    # because it is not valid for fuchsia since we install all of our libraries
+    # in /lib of our package. Enabling this just adds size to our binaries.
+    if is_fuchsia:
+        # https://cs.opensource.google/bazel/bazel/+/master:src/main/java/com/google/devtools/build/lib/rules/cpp/CppActionConfigs.java;drc=19019ac31f6ded3eecbcb73b1bc3c1e8961b75aa;l=528
+        features.append(
+            feature(
+                name = "runtime_library_search_directories",
+                enabled = False,
+            ),
+        )
+
+    if fuchsia_api_level:
+        if not is_fuchsia:
+            fail('`fuchsia_api_level` is only supported when `target_os` is "fuchsia".')
+        features.append(
+            get_fuchsia_api_level_feature(fuchsia_api_level),
+        )
+    else:
+        # This function is used by the SDK, which does not provide the API level this way.
+        # Thus, the parameter is not required when `is_fuchsia`.
+        pass
+
+    # TODO(https://fxbug.dev/356347441): Remove this once Bazel has been fixed.
+    #
+    # Adding this hard-coded feature to a C++ toolchain disables .d file processing.
+    # Surprisingly, this is currently required to avoid incremental Bazel build
+    # correctness issues that affect Bazel 7.2+ and 7.3.1, such as the one described
+    # in the associated bug.
+    features.append(
+        feature(
+            name = "no_dotd_file",
+            enabled = True,
+        ),
+    )
+
+    if default_flags_set:
+        features.append(
+            compute_cc_toolchain_feature_for_default_build_flags(
+                default_flags_set = default_flags_set,
+            ),
+        )
+
+    return features
+
+# buildifier: disable=unnamed-macro
+def define_clang_runtime_filegroups(clang_constants):
+    """Generate filegroups for Clang runtime headers and libraries.
+
+    Args:
+      clang_constants: A struct containing Clang configuration information.
+
+    Returns:
+      A struct giving the names of the filegroups for the headers and runtime
+      libraries for libc++ and other Clang runtimes.
+    """
+
+    # There is one arch-specific libc++ header file, access it through a select()
+    # statement that resolves to the right location based on the build
+    # configuration's target platform.
+    #
+    # For some tuples, there are also also multilib specific versions of that
+    # file under include/{clang_target_tuple}/<name>/c++/v1/__config_site.
+    #
+    __config_site_sources = format_labels_list_to_target_tag_native_glob_select(
+        [
+            "include/{clang_target_tuple}/c++/v1/__config_site",
+            "include/{clang_target_tuple}/*/c++/v1/__config_site",
+        ],
+        allow_empty = True,
+    )
+
+    native.filegroup(
+        name = "libcxx_headers",
+        srcs = native.glob([
+            # built-in headers, e.g. <builtins.h> or <xmmintrin.h>
+            "%s/include/**" % clang_constants.lib_clang_internal_dir,
+
+            # libc++ headers
+            "include/c++/v1/**",
+        ]) + __config_site_sources,
+    )
+
+    native.filegroup(
+        name = "libcxx_runtime_libs",
+        srcs =
+            # This contains the C++ runtime libraries, including libunwind,
+            # and all their variants. Because individual targets can select
+            # a different sanitizer mode than the default for the current build
+            # operation, all of them must be exposed at link time.
+            #
+            #   libc++.a
+            #   libc++abi.so --> libc++abi.so.1
+            #   libc++abi.so.1 --> libc++abi.so.1.0
+            #   libc++abi.so.1.0
+            #   libc++experimental.a
+            #   libc++.so   (linker script: INPUT(libc++.so.2 -c++abi -unwind)
+            #   libc++.so.2 --> libc++.so.2.0
+            #   libc++.so.2.0
+            #   libunwind.a
+            #   libunwind.so --> libunwind.so.1
+            #   libunwind.so.1 --> libuwind.so.1.0
+            #   libunwind.so.1.0
+            #   asan/
+            #     ...
+            #   asan-noexcept/
+            #     ...
+            #   compat/
+            #     ...
+            #   noexcept/
+            #     ...
+            #
+            format_labels_list_to_target_tag_native_glob_select([
+                "lib/{clang_target_tuple}/**",
+            ]) +
+            # This contains the Clang runtime libraries, including all
+            # their variants. Because individual targets can select a different
+            # sanitizer mode than the default for the current build operation,
+            # all of them must be exposed at link time. E.g.:
+            #
+            #  libclang_rt.asan.a
+            #  libclang_rt.asan_cxx.a
+            #  libclang_rt.asan_preinit.a
+            #  libclang_rt.asan.so
+            #  libclang_rt.asan_static.a
+            #  libclang_rt.builtins.a
+            #  libclang_rt.fuzzer.a
+            #  libclang_rt.fuzzer.interceptors.a
+            #  libclang_rt.fuzzer_no_main.a
+            #  libclang_rt.hwasan.a
+            #  libclang_rt.hwasan_aliases.a
+            #  libclang_rt.hwasan_aliases_cxx.a
+            #  libclang_rt.hwasan_aliases.so
+            #  libclang_rt.hwasan.a
+            #  libclang_rt.hwasan_cxx.a
+            #  libclang_rt.hwasan_preinit.a
+            #  libclang_rt.hwasan.so
+            #  ...
+            #
+            format_labels_list_to_target_tag_native_glob_select(
+                [
+                    "{internal_dir}/lib/{clang_target_tuple}/**",
+                ],
+                extra_dict = {
+                    "internal_dir": clang_constants.lib_clang_internal_dir,
+                },
+            ),
+    )
+
+def _prebuilt_clang_cc_toolchain_config_impl(ctx):
+    # See CppConfiguration.java class in Bazel sources for the list of
+    # all tool_path() names that must be defined and relative to the
+    # clang repository directory.
+    tool_paths = [
+        tool_path(name = "ar", path = "bin/llvm-ar"),
+        tool_path(name = "cpp", path = "bin/cpp"),
+        tool_path(name = "gcc", path = "bin/clang"),
+        tool_path(name = "gcov", path = "/usr/bin/false"),
+        tool_path(name = "gcov-tool", path = "/usr/bin/false"),
+        tool_path(name = "ld", path = "bin/llvm-ld"),
+        tool_path(name = "llvm-cov", path = "bin/llvm-cov"),
+        tool_path(name = "nm", path = "bin/llvm-nm"),
+        tool_path("objcopy", path = "bin/llvm-objcopy"),
+        tool_path("objdump", path = "bin/llvm-objdump"),
+        tool_path("strip", path = "bin/llvm-strip"),
+        tool_path(name = "dwp", path = "/usr/bin/false"),
+        tool_path(name = "llvm-profdata", path = "bin/llvm-profdata"),
+    ]
+
+    clang_info = ctx.attr.clang_info[ClangInfo]
+
+    if ctx.attr.sysroot_label:
+        if ctx.attr.sysroot_path:
+            fail("Only one of sysroot_label or sysroot_path can be set")
+        sysroot_path = ctx.file.sysroot_label.dirname
+    else:
+        sysroot_path = ctx.attr.sysroot_path
+
+    # Perform Fuchsia platform-specific checks here since `compute_clang_features()` is also used
+    # by the SDK and thus has more relaxed checks.
+    if ctx.attr.fuchsia_api_level:
+        if ctx.attr.target_os != "fuchsia":
+            # It is possible this will need to be permitted in the future.
+            # See https://fxbug.dev/42086088.
+            fail('`fuchsia_api_level` is only supported when `target_os` is "fuchsia".')
+        fuchsia_api_level = ctx.attr.fuchsia_api_level[FuchsiaApiLevelInfo].level
+    else:
+        # This branch handles both non-Fuchsia platforms (e.g. Linux) and the
+        # Fuchsia SDK one where the API level is not provided via a single
+        # build_setting() flag, but instead relies on a transition modifying
+        # `copts` directly. See https://fxbug.dev/548409875.
+        fuchsia_api_level = None
+
+    build_flags_toolchain = ctx.toolchains["@fuchsia_rules_common//build_flags:toolchain_type"]
+    default_flags_set = build_flags_toolchain.default_flags if build_flags_toolchain else None
+
+    features = compute_clang_features(
+        clang_info,
+        ctx.attr.toolchain_repo_name,
+        to_fuchsia_os_name(ctx.attr.target_os),
+        to_fuchsia_cpu_name(ctx.attr.target_arch),
+        fuchsia_api_level = fuchsia_api_level,
+        sysroot = sysroot_path,
+        default_flags_set = default_flags_set,
+    )
+
+    return cc_common.create_cc_toolchain_config_info(
+        ctx = ctx,
+        toolchain_identifier = "prebuilt_clang",
+        tool_paths = tool_paths,
+        features = features,
+        action_configs = [],
+        cxx_builtin_include_directories = clang_info.builtin_include_paths,
+        builtin_sysroot = sysroot_path,
+        target_cpu = "_".join([ctx.attr.target_os, ctx.attr.target_arch]),
+
+        # Required by constructor, but otherwise ignored by Bazel.
+        # These string values are arbitrary, but are easy to grep
+        # in our source tree if they ever happen to appear in
+        # build error messages.
+        host_system_name = "__bazel_host_system_name__",
+        target_system_name = "__bazel_target_system_name__",
+        target_libc = "__bazel_target_libc__",
+        abi_version = "__bazel_abi_version__",
+        abi_libc_version = "__bazel_abi_libc_version__",
+        compiler = "__bazel_compiler__",
+    )
+
+_prebuilt_clang_cc_toolchain_config = rule(
+    implementation = _prebuilt_clang_cc_toolchain_config_impl,
+    attrs = {
+        "host_os": attr.string(mandatory = True),
+        "host_arch": attr.string(mandatory = True),
+        "target_os": attr.string(mandatory = True),
+        "target_arch": attr.string(mandatory = True),
+        "sysroot_path": attr.string(default = ""),
+        "sysroot_label": attr.label(default = None, allow_single_file = True),
+        "clang_info": attr.label(
+            mandatory = True,
+            providers = [ClangInfo],
+        ),
+        "toolchain_repo_name": attr.string(mandatory = True),
+        "fuchsia_api_level": attr.label(
+            default = None,
+            providers = [FuchsiaApiLevelInfo],
+        ),
+    },
+    toolchains = [
+        # This toolchain type is optional to support out-of-tree workspaces
+        # which never register any instance of it.
+        config_common.toolchain_type(
+            "@fuchsia_rules_common//build_flags:toolchain_type",
+            mandatory = False,
+        ),
+    ],
+)
+
+def generate_clang_cc_toolchain(
+        name,
+        host_os,
+        host_arch,
+        target_os,
+        target_arch,
+        clang_info = "//:clang_info",
+        sysroot_header_files = [],
+        sysroot_library_files = [],
+        sysroot_path = "",
+        sysroot_label = None,
+        extra_target_compatible_with = [],
+        fuchsia_api_level = None):
+    """Define C++ toolchain related targets for a prebuilt Clang installation.
+
+    This defines cc_toolchain(), cc_toolchain_config() and toolchain() targets
+    for a given Clang prebuilt installation and target (os,arch) pair.
+
+    Args:
+       name: Name of the cc_toolchain() target. The corresponding
+         toolchain() target will use "${name}_cc_toolchain", and
+         the cc_toolchain_config() will use "${name}_cc_toolchain_config".
+
+       host_os: Host os string, using Bazel conventions.
+       host_arch: Host cpu architecture string, using Bazel conventions.
+       target_os: Target os string, using Bazel conventions.
+       target_arch: Target cpu architecture string, using Bazel conventions.
+
+       clang_info: (optional) Label to a target providing a ClangInfo provider
+           value. Default to //:clang_info.
+           See setup_clang_repository() in repository_utils.bzl.
+
+       sysroot_header_files: (optional) A label list for the sysroot
+           header files. These will be exposed to the sandbox for C++
+           compilation actions.
+
+       sysroot_library_files: (optional) A label list for the sysroot
+           libraries. These will be exposed to the sandbox for
+           C++ link actions.
+
+       sysroot_path: (optional) Path to the sysroot directory to be used.
+           Mutually exclusive with sysroot_label. One of them must be set if
+           sysroot_header_files or sysroot_library_files are used.
+
+       sysroot_label: (optional) The label to a file at the root of the sysroot.
+           Use this instead of sysroot_path if the path is not relative to the
+           workspace root. Mutually exclusive with sysroot_path. One of them
+           must be set if sysroot_header_files or sysroot_library_files are used.
+
+       extra_target_compatible_with: (optional) A list of extra target
+           constraint values for the toolchain() target definition.
+
+       fuchsia_api_level: (optional) Label to the target API level build setting.
+           Must be set if and only if `target_os` is "fuchsia".
+    """
+    _prebuilt_clang_cc_toolchain_config(
+        name = name + "_cc_toolchain_config",
+        host_os = host_os,
+        host_arch = host_arch,
+        target_os = target_os,
+        target_arch = target_arch,
+        sysroot_path = sysroot_path,
+        sysroot_label = sysroot_label,
+        clang_info = clang_info,
+        toolchain_repo_name = native.repo_name(),
+        fuchsia_api_level = fuchsia_api_level,
+    )
+
+    common_compiler_files = [
+        ":cc-compiler-prebuilts",
+        ":libcxx_headers",
+    ]
+
+    common_linker_files = [
+        ":cc-linker-prebuilts",
+        ":libcxx_runtime_libs",
+    ]
+
+    compiler_files = name + "_compiler_files"
+    native.filegroup(
+        name = compiler_files,
+        # Adding :libcxx_runtime_libs here is a workaround for b/360235447, b/354016617.
+        # The clang driver became sensitive to the existence of runtime
+        # libdirs for compiling -- there is now logic that probes for
+        # the existence of libdirs when computing the set of include dirs.
+        # Including the runtime libdirs allows the driver to select
+        # the correct multilib variant of include dirs.
+        # If when the toolchain reverts this behavior, this workaround
+        # can be removed.
+        srcs = common_compiler_files + sysroot_header_files + [":libcxx_runtime_libs"],
+    )
+
+    linker_files = name + "_linker_files"
+    native.filegroup(
+        name = linker_files,
+        srcs = common_linker_files + sysroot_library_files,
+    )
+
+    all_files = name + "_all_files"
+    native.filegroup(
+        name = all_files,
+        srcs = native.glob(["bin/**"]) + (
+            common_compiler_files +
+            common_linker_files +
+            sysroot_header_files +
+            sysroot_library_files
+        ),
+    )
+
+    cc_toolchain(
+        name = name,
+        all_files = ":" + all_files,
+        ar_files = ":ar",
+        as_files = ":empty",
+        compiler_files = ":" + compiler_files,
+        dwp_files = ":empty",
+        linker_files = ":" + linker_files,
+        objcopy_files = ":objcopy",
+        strip_files = ":strip",
+        # `supports_param_files = 1` means that the toolchain supports
+        # reading arguments from a response file (e.g. `@arguments.rsp`)
+        # but this is set here to 0 to help debug toolchain-related issues.
+        supports_param_files = 0,
+        toolchain_config = name + "_cc_toolchain_config",
+        toolchain_identifier = "prebuilt_clang",
+    )
+
+    native.toolchain(
+        name = name + "_cc_toolchain",
+        exec_compatible_with = [
+            "@platforms//os:" + host_os,
+            "@platforms//cpu:" + host_arch,
+        ],
+        target_compatible_with = [
+            "@platforms//os:" + target_os,
+            "@platforms//cpu:" + target_arch,
+        ] + extra_target_compatible_with,
+        toolchain = ":" + name,
+        toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
+    )
+
+def _empty_cc_toolchain_config_impl(ctx):
+    # See CppConfiguration.java class in Bazel sources for the list of
+    # all tool_path() names that must be defined and relative to the
+    # clang repository directory.
+    tool_paths = [
+        tool_path(name = "ar", path = "/usr/bin/false"),
+        tool_path(name = "cpp", path = "/usr/bin/false"),
+        tool_path(name = "gcc", path = "/usr/bin/false"),
+        tool_path(name = "gcov", path = "/usr/bin/false"),
+        tool_path(name = "gcov-tool", path = "/usr/bin/false"),
+        tool_path(name = "ld", path = "/usr/bin/false"),
+        tool_path(name = "llvm-cov", path = "/usr/bin/false"),
+        tool_path(name = "nm", path = "/usr/bin/false"),
+        tool_path("objcopy", path = "/usr/bin/false"),
+        tool_path("objdump", path = "/usr/bin/false"),
+        tool_path("strip", path = "/usr/bin/false"),
+        tool_path(name = "dwp", path = "/usr/bin/false"),
+        tool_path(name = "llvm-profdata", path = "/usr/bin/false"),
+    ]
+
+    features = []
+
+    return cc_common.create_cc_toolchain_config_info(
+        ctx = ctx,
+        toolchain_identifier = "empty_cpp",
+        tool_paths = tool_paths,
+        features = features,
+        target_cpu = "x86_64",
+        # Required by constructor, but otherwise ignored by Bazel.
+        # These string values are arbitrary, but are easy to grep
+        # in our source tree if they ever happen to appear in
+        # build error messages.
+        host_system_name = "__bazel_host_system_name__",
+        target_system_name = "__bazel_target_system_name__",
+        target_libc = "__bazel_target_libc__",
+        abi_version = "__bazel_abi_version__",
+        abi_libc_version = "__bazel_abi_libc_version__",
+        compiler = "__bazel_compiler__",
+    )
+
+empty_cc_toolchain_config = rule(
+    implementation = _empty_cc_toolchain_config_impl,
+    doc = "Define a cc_toolchain_config target for an empty C++ toolchain.",
+)

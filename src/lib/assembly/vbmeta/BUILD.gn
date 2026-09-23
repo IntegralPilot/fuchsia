@@ -1,0 +1,242 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/host.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/testing/host_test_data.gni")
+
+assert(is_host, "Assembly libraries are host-only")
+
+rustc_library("vbmeta") {
+  edition = "2024"
+  version = "0.1.0"
+  with_unit_tests = true
+
+  deps = [
+    "//src/lib/mundane",
+    "//third_party/modinv",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:camino",
+    "//third_party/rust_crates:hex",
+    "//third_party/rust_crates:num",
+    "//third_party/rust_crates:pem",
+    "//third_party/rust_crates:ring",
+    "//third_party/rust_crates:serde",
+    "//third_party/rust_crates:thiserror",
+    "//third_party/rust_crates:zerocopy",
+  ]
+
+  test_deps = [
+    "//src/lib/assembly/test_keys",
+    "//third_party/rust_crates:assert_matches",
+    "//third_party/rust_crates:tempfile",
+  ]
+
+  sources = [
+    "src/descriptor.rs",
+    "src/descriptor/chain_partition.rs",
+    "src/descriptor/hash.rs",
+    "src/descriptor/hash_builder.rs",
+    "src/descriptor/kernel_cmdline.rs",
+    "src/descriptor/property.rs",
+    "src/footer.rs",
+    "src/header.rs",
+    "src/key.rs",
+    "src/lib.rs",
+    "src/test.rs",
+    "src/vbmeta.rs",
+  ]
+}
+
+test_avb_key =
+    "//third_party/android/platform/external/avb/test/data/testkey_atx_psk.pem"
+test_avb_atx_metadata =
+    "//third_party/android/platform/external/avb/test/data/atx_metadata.bin"
+
+salt = "56ebac2038b220d37b9b27e91c9e7afb3d7b7910c03775812c7a16cc01a8b380"
+
+vbmeta_descriptor = "${target_out_dir}/expected_descriptor.vbmeta"
+test_image = "${target_out_dir}/test_image"
+action("expected_descriptor") {
+  testonly = true
+  script = "gen_expected_descriptor.py"
+
+  inputs = [ "//third_party/android/platform/external/avb/avbtool.py" ]
+  outputs = [
+    vbmeta_descriptor,
+    test_image,
+  ]
+
+  args = [
+    "--python_path",
+    rebase_path(python_exe_src, root_build_dir),
+    "--avbtool",
+    rebase_path("//third_party/android/platform/external/avb/avbtool.py",
+                root_build_dir),
+    "--image",
+    rebase_path(test_image, root_build_dir),
+    "--salt",
+    salt,
+    "--output_vbmeta_image",
+    rebase_path(vbmeta_descriptor, root_build_dir),
+  ]
+}
+
+action("expected_vbmeta") {
+  testonly = true
+  script = "//third_party/android/platform/external/avb/avbtool.py"
+  deps = [ ":expected_descriptor" ]
+
+  output_file = target_name + ".vbmeta"
+  output_file = "$target_out_dir/$output_file"
+  outputs = [ output_file ]
+
+  inputs = [
+    test_avb_key,
+    test_avb_atx_metadata,
+    vbmeta_descriptor,
+  ]
+
+  args = [
+    "make_vbmeta_image",
+    "--output",  # output of VBMETA image
+    rebase_path(outputs[0], root_build_dir),
+    "--key",  # a key for signing
+    rebase_path(test_avb_key, root_build_dir),
+    "--algorithm",  # an algorithm for signing
+    "SHA512_RSA4096",
+    "--public_key_metadata",  # avb metadata
+    rebase_path(test_avb_atx_metadata, root_build_dir),
+    "--include_descriptors_from_image",
+    rebase_path(vbmeta_descriptor, root_build_dir),
+  ]
+}
+
+action("extract_avb_public_key") {
+  testonly = true
+  script = "//third_party/android/platform/external/avb/avbtool.py"
+
+  output_file = "$target_out_dir/testkey_atx_psk.bin"
+  outputs = [ output_file ]
+  inputs = [ test_avb_key ]
+
+  args = [
+    "extract_public_key",
+    "--key",
+    rebase_path(test_avb_key, root_build_dir),
+    "--output",
+    rebase_path(output_file, root_build_dir),
+  ]
+}
+
+action("expected_vbmeta_chain") {
+  testonly = true
+  script = "//third_party/android/platform/external/avb/avbtool.py"
+  deps = [ ":extract_avb_public_key" ]
+
+  output_file = "$target_out_dir/expected_vbmeta_chain.vbmeta"
+  outputs = [ output_file ]
+
+  extracted_key_outputs = get_target_outputs(":extract_avb_public_key")
+  extracted_key_path = extracted_key_outputs[0]
+
+  inputs = [
+    test_avb_key,
+    test_avb_atx_metadata,
+    extracted_key_path,
+  ]
+
+  args = [
+    "make_vbmeta_image",
+    "--output",
+    rebase_path(output_file, root_build_dir),
+    "--key",
+    rebase_path(test_avb_key, root_build_dir),
+    "--algorithm",
+    "SHA512_RSA4096",
+    "--public_key_metadata",
+    rebase_path(test_avb_atx_metadata, root_build_dir),
+    "--chain_partition",
+    "system:1:" + rebase_path(extracted_key_path, root_build_dir),
+  ]
+}
+
+avb_key_path = rebase_path(test_avb_key, root_build_dir)
+avb_metadata_path = rebase_path(test_avb_atx_metadata, root_build_dir)
+test_image_path = rebase_path(test_image, root_build_dir)
+
+avb_outputs = get_target_outputs(":expected_vbmeta")
+expected_vbmeta = avb_outputs[0]
+expected_vbmeta_path = rebase_path(expected_vbmeta, root_build_dir)
+
+extracted_key_outputs = get_target_outputs(":extract_avb_public_key")
+extracted_key_path = extracted_key_outputs[0]
+extracted_key_rebased = rebase_path(extracted_key_path, root_build_dir)
+
+chain_outputs = get_target_outputs(":expected_vbmeta_chain")
+expected_vbmeta_chain = chain_outputs[0]
+expected_vbmeta_chain_path = rebase_path(expected_vbmeta_chain, root_build_dir)
+
+host_test_data("integration_test_data") {
+  sources = [
+    extracted_key_path,
+    test_avb_atx_metadata,
+    test_avb_key,
+    test_image,
+  ]
+  deps = [
+    ":expected_descriptor",
+    ":extract_avb_public_key",
+  ]
+}
+
+rustc_test("integration_test") {
+  edition = "2024"
+  source_root = "tests/integration_test.rs"
+  sources = [ "tests/integration_test.rs" ]
+  deps = [
+    ":vbmeta",
+    "//src/lib/include_bytes_from_working_dir",
+    "//third_party/rust_crates:camino",
+    "//third_party/rust_crates:tempfile",
+  ]
+  data_deps = [ ":integration_test_data" ]
+
+  # These are not host_test_data(), but are compiled-in files.
+  non_rust_deps = [
+    ":expected_descriptor",
+    ":expected_vbmeta",
+    ":expected_vbmeta_chain",
+    ":extract_avb_public_key",
+  ]
+  rustenv = [
+    "AVB_KEY=$avb_key_path",
+    "AVB_METADATA=$avb_metadata_path",
+    "EXPECTED_VBMETA=$expected_vbmeta_path",
+    "EXPECTED_VBMETA_CHAIN=$expected_vbmeta_chain_path",
+    "PUBLIC_KEY=$extracted_key_rebased",
+    "SALT=" + salt,
+    "IMAGE=$test_image_path",
+  ]
+
+  inputs = [
+    expected_vbmeta,
+    expected_vbmeta_chain,
+  ]
+}
+
+rustc_binary("bin") {
+  name = "vbmeta"
+  edition = "2024"
+
+  sources = [ "src/main.rs" ]
+
+  deps = [
+    ":vbmeta",
+    "//third_party/rust_crates:anyhow",
+    "//third_party/rust_crates:argh",
+    "//third_party/rust_crates:camino",
+  ]
+}

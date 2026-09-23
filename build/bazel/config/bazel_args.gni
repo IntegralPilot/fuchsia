@@ -1,0 +1,170 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/config/logging.gni")
+import("//build/bazel/remote_services.gni")
+import("//build/config/clang/clang.gni")
+import("//build/config/compiler.gni")
+import("//build/config/fuchsia/zircon_asserts.gni")
+import("//build/config/fuchsia_cxx_version.gni")
+
+# Compute the list of `bazel build` arguments corresponding to the current
+# GN build configuration.
+#
+# _common_args are the arguments used by all commands, including `query`
+# which does not accept configuration-related options.
+#
+# _build_args are the arguments used by all commands that require a build
+# configuration, this include "build", but also "cquery" and "aquery".
+#
+# _remote_build_args are arguments specifically related to remote builds.
+# They are separated from _build_args because they must always be passed
+# explicitly to our Bazel shell wrapper, which will detect them to setup
+# proxies for infra builds (see //build/bazel/template.bazel.sh).
+
+_common_args = []
+_build_args = []
+_remote_build_args = []
+
+if (bazel_execution_logs) {
+  _common_args += [ "--config=exec_log" ]
+}
+
+_optimize_to_dbg = [ "debug" ]
+_optimize_to_fastbuild = [
+  "none",
+  "minimal",
+  "coverage",
+  "sanitizer",
+  "profile",
+]
+_optimize_to_opt = []
+foreach(mode,
+        [
+          "moderate",
+          "speed",
+          "size",
+        ]) {
+  foreach(suffix,
+          [
+            "",
+            "_lto",
+            "_thinlto",
+          ]) {
+    _optimize_to_opt += [ mode + suffix ]
+  }
+}
+
+# TODO(https://fxbug.dev/517626589): remove this when default is changed
+_optimize_to_opt += [ "size_thinlto_clang" ]
+
+_is_compilation_mode_dbg =
+    _optimize_to_dbg + [ optimize ] - [ optimize ] != _optimize_to_dbg
+_is_compilation_mode_fastbuild = _optimize_to_fastbuild + [ optimize ] -
+                                 [ optimize ] != _optimize_to_fastbuild
+_is_compilation_mode_opt =
+    _optimize_to_opt + [ optimize ] - [ optimize ] != _optimize_to_opt
+
+# Forward GN sanitizer configuration to Bazel
+
+if (!is_host) {
+  _tags = fuchsia_toolchain_tags
+} else {
+  _tags = host_toolchain_tags
+}
+
+_has_asan = _tags + [ "asan" ] - [ "asan" ] != _tags
+_has_hwasan = _tags + [ "hwasan" ] - [ "hwasan" ] != _tags
+_has_ubsan = _tags + [ "ubsan" ] - [ "ubsan" ] != _tags
+_has_lsan = _tags + [ "lsan" ] - [ "lsan" ] != _tags
+_has_tsan = _tags + [ "tsan" ] - [ "tsan" ] != _tags
+_has_msan = _tags + [ "msan" ] - [ "msan" ] != _tags
+
+_has_coverage_clang =
+    _tags + [ "coverage_clang" ] - [ "coverage_clang" ] != _tags
+_has_host_coverage_rust =
+    is_host && _tags + [ "coverage_rust" ] - [ "coverage_rust" ] != _tags
+
+# The hwasan variants also set the 'asan' and 'lsan' tags, but using
+# both features result in Clang errors, which doesn't support both
+# -fsanitize=address and -fsanitize=hwaddress on the same command line.
+#
+# Also `lsan` is implemented by using `--features=leak` at compile time
+# but `--features=address` at link time because the asan runtime provides
+# the leak checking runtime support.
+#
+# Note that currently only C++ rules support all these features.
+# TODO(https://fxbug.dev/447095455): Support variant flags for Rust binaries.
+# TODO(https://fxbug.dev/447095534): Support variant flags for Go binaries.
+if (_has_hwasan) {
+  _build_args += [ "--features=hwasan" ]
+} else if (_has_asan) {
+  _build_args += [ "--features=asan" ]
+}
+if (_has_lsan) {
+  _build_args += [ "--features=lsan" ]
+}
+if (_has_msan) {
+  _build_args += [ "--features=msan" ]
+}
+if (_has_tsan) {
+  _build_args += [ "--features=tsan" ]
+}
+if (_has_ubsan) {
+  _build_args += [ "--features=ubsan" ]
+}
+if (_has_coverage_clang) {
+  _build_args += [ "--features=coverage" ]
+}
+if (_has_host_coverage_rust) {
+  _build_args += [ "--config=host_rust_coverage" ]
+}
+
+if (is_profile) {
+  _build_args += [ "--//build/bazel/config/variables:is_profile=True" ]
+} else {
+  _build_args += [ "--//build/bazel/config/variables:is_profile=False" ]
+}
+
+# Forward GN C/C++ compiler optimization configuration to Bazel
+if (_is_compilation_mode_dbg) {
+  _build_args += [ "--compilation_mode=dbg" ]
+} else if (_is_compilation_mode_fastbuild) {
+  _build_args += [ "--compilation_mode=fastbuild" ]
+} else if (_is_compilation_mode_opt) {
+  _build_args += [ "--compilation_mode=opt" ]
+  if (clang_ml_inliner) {
+    _build_args += [ "--features=ml_inliner" ]
+  }
+} else {
+  assert(false, "Unsupported mode optimize = $optimize")
+}
+
+if (zircon_asserts) {
+  # LINT.IfChange(enable_zircon_asserts_feature)
+  _build_args += [ "--features=enable_zircon_asserts" ]
+  # LINT.ThenChange(//build/bazel_sdk/bazel_rules_fuchsia/common/toolchains/clang/toolchain_utils.bzl:enable_zircon_asserts_feature)
+}
+
+# Forward GN C/C++ compiler optimization configuration to Bazel
+# If the c++ version is 20, we overwrite the copts to use
+# c++20 in Bazel too.
+if (fuchsia_cxx_version == 20) {
+  _build_args += [
+    "--cxxopt=-std=c++20",
+    "--cxxopt=-Wno-deprecated-this-capture",
+  ]
+} else if (fuchsia_cxx_version == 23) {
+  _build_args += [
+    "--cxxopt=-std=c++23",
+    "--cxxopt=-Wno-deprecated-this-capture",
+  ]
+}
+
+bazel_args = {
+  common = _common_args
+  build = _build_args
+  current_os = current_os
+  current_cpu = current_cpu
+}

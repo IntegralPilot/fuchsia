@@ -1,0 +1,13 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef LIB_DRIVER_DEVICETREE_VISITORS_DRIVERS_SERIAL_SERIAL_PORT_TEST_DTS_SERIAL_PORT_TEST_H_
+#define LIB_DRIVER_DEVICETREE_VISITORS_DRIVERS_SERIAL_SERIAL_PORT_TEST_DTS_SERIAL_PORT_TEST_H_
+
+#define TEST_CLASS 1
+#define TEST_VID 0x11
+#define TEST_PID 0x33
+#define TEST_NAME "bt-hci"
+
+#endif  // LIB_DRIVER_DEVICETREE_VISITORS_DRIVERS_SERIAL_SERIAL_PORT_TEST_DTS_SERIAL_PORT_TEST_H_

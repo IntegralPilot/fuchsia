@@ -1,0 +1,199 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//tools/cmc/build/cmc.gni")
+import("//tools/cmc/build/expect_includes.gni")
+import("//tools/cmc/build/restricted_features.gni")
+
+# Compiles a cml file into a cm file.
+#
+# Parameters
+#
+#   manifest (required)
+#     [file] The path to the cml file that is to be compiled.
+#
+#   output_name (optional)
+#     [path] Name for the output.
+#     If not specified, the target name is used.
+#
+#   required_offers (optional)
+#     {protocol:[string], dictionary:[string]} The set of protocols and dictionaries and that
+#     should be offered to every child.
+#
+#   required_uses (optional)
+#     [list of strings] The set of protocols that each child must use.
+#
+#   restricted_features (optional)
+#     [list of strings] The set of restricted CML features to allow.
+#     The set of features is allowlisted here: //tools/cmc/build/restricted/BUILD.gn
+#     where each feature name is represented by a group of the same name.
+#
+#   experimental_force_runner (optional)
+#     [string] Sets the --experimental-force-runner flag.
+#     This feature is experimental and may be removed without warning.
+#
+#   deps (optional)
+#   testonly (optional)
+#   visibility (optional)
+template("cm") {
+  input_manifest = invoker.manifest
+
+  # We need to inject a use clause for DebugData for the coverage and profile
+  # variants. is_coverage is true for profile and coverage variants.
+  needs_debugdata = is_coverage || is_profile
+
+  if (needs_debugdata) {
+    cmc_merge("${target_name}_merge") {
+      if (is_profile) {
+        sources = [
+          "//build/config/profile/instrumentation_data.cml",
+          invoker.manifest,
+        ]
+      } else {
+        sources = [
+          "//sdk/lib/sys/testing/coverage.shard.cml",
+          invoker.manifest,
+        ]
+      }
+      output_name = "${target_name}_merge.cml"
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "deps",
+                               "testonly",
+                             ])
+      visibility = [ ":*" ]
+    }
+    if (!defined(invoker.deps)) {
+      invoker.deps = []
+    }
+    invoker.deps += [ ":${target_name}_merge" ]
+    merged = get_target_outputs(":${target_name}_merge")
+    input_manifest = merged[0]
+  }
+
+  cmc(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "metadata",
+                             "output_name",
+                             "required_offers",
+                             "required_uses",
+                             "restricted_features",
+                             "testonly",
+                             "visibility",
+                           ])
+
+    if (!defined(output_name)) {
+      output_name = target_name
+    }
+
+    compiled_output = "${target_out_dir}/${output_name}"
+    inputs = [ input_manifest ]
+    outputs = [ compiled_output ]
+    depfile = "${target_out_dir}/${target_name}.d"
+
+    args = [
+      "compile",
+      rebase_path(inputs[0], root_build_dir),
+      "--output",
+      rebase_path(compiled_output, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+    if (defined(invoker.config_values_package_path)) {
+      args += [
+        "--config-package-path",
+        invoker.config_values_package_path,
+      ]
+    }
+    args += cmc_include_paths
+
+    if (!defined(restricted_features)) {
+      restricted_features = []
+    }
+
+    # Toggle restricted features that don't require an explicit opt-in.
+
+    # Enables feature allow_non_hermetic_packages. This allows us disable the
+    # feature in OOT builds.
+    restricted_features += [ "enable_allow_non_hermetic_packages_feature" ]
+
+    # Enable restriction on 'test_type' facet.
+    # Refer https://fuchsia.dev/fuchsia-src/development/testing/components/test_runner_framework?hl=en#non-hermetic_tests
+    restricted_features += [ "restrict_test_type_in_facets" ]
+
+    # Opt-in to the requested restricted_features.
+    args += [ "--features" ] + restricted_features
+
+    # Add required offer lint flags
+    if (!defined(required_offers)) {
+      # These offers are required in all CML that does not explicitly disable
+      # it.
+      # This behavior will eventually be the default everywhere: https://fxbug.dev/42175121
+      required_offers = {
+        protocol = []
+        dictionary = [ "diagnostics" ]
+      }
+    }
+
+    # Add required offer lint flags
+    if (!defined(required_offers.dictionary)) {
+      required_offers.dictionary = []
+    }
+
+    if (!defined(required_offers.protocol)) {
+      required_offers.protocol = []
+    }
+
+    foreach(offer, required_offers.dictionary) {
+      args += [
+        "--must-offer-dictionary",
+        offer,
+      ]
+    }
+
+    foreach(offer, required_offers.protocol) {
+      args += [
+        "--must-offer-protocol",
+        offer,
+      ]
+    }
+
+    if (!defined(required_uses)) {
+      required_uses = []
+    }
+
+    foreach(use_decl, required_uses) {
+      args += [
+        "--must-use-protocol",
+        use_decl,
+      ]
+    }
+
+    if (!defined(deps)) {
+      deps = []
+    }
+
+    # Add a dependency on the feature's allowlist.
+    foreach(feature, restricted_features) {
+      if (filter_include(cmc_security_owned_restricted_features, [ feature ]) !=
+          []) {
+        deps +=
+            [ "//tools/cmc/build/restricted_features/security_owned:$feature" ]
+      } else {
+        deps += [ "//tools/cmc/build/restricted_features:$feature" ]
+      }
+    }
+
+    if (defined(invoker.experimental_force_runner)) {
+      args += [
+        "--experimental-force-runner",
+        invoker.experimental_force_runner,
+      ]
+    }
+  }
+}

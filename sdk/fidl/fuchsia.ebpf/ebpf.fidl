@@ -1,0 +1,172 @@
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.ebpf;
+
+using zx;
+
+// LINT.IfChange(map_types)
+/// Type of an eBPF maps.
+type MapType = strict enum {
+    /// An array map. Equivalent to `BPF_MAP_TYPE_ARRAY`.
+    ARRAY = 1;
+
+    /// A hash map. Equivalent to `BPF_MAP_TYPE_HASH`.
+    HASH_MAP = 2;
+
+    /// A hash map. Equivalent to `BPF_MAP_TYPE_RINGBUF`.
+    RING_BUFFER = 3;
+
+    /// A per-CPU array. Equivalent to `BPF_MAP_TYPE_PERCPU_ARRAY`.
+    PERCPU_ARRAY = 4;
+
+    /// A per-CPU hash map. Equivalent to `BPF_MAP_TYPE_PERCPU_HASH`.
+    PERCPU_HASH = 5;
+
+    /// A device-map that holds references to network devices. Equivalent to
+    /// `BPF_MAP_TYPE_DEVMAP`.
+    DEVMAP_HASH = 6;
+
+    /// A longest prefix match trie. Equivalent to `BPF_MAP_TYPE_LPM_TRIE`.
+    LPM_TRIE = 7;
+
+    /// A LRU hash map. Equivalent to `BPF_MAP_TYPE_LRU_HASH`.
+    LRU_HASH = 8;
+
+    /// A socket storage map. Equivalent to `BPF_MAP_TYPE_SK_STORAGE`.
+    SK_STORAGE = 9;
+};
+// LINT.ThenChange(//src/starnix/lib/ebpf_api/src/maps/mod.rs:fidl_map_types)
+
+/// Map flags.
+type MapFlags = flexible bits : uint32 {
+    /// Memory is not pre-allocated.
+    NO_PREALLOC = 1;
+
+    /// `bpf()` syscall can read from the map, but can't write to it.
+    SYSCALL_READ_ONLY = 2;
+
+    /// `bpf()` syscall can write to the map, but can't read it.
+    SYSCALL_WRITE_ONLY = 4;
+
+    /// The map can be mapped in a Starnix process's address space.
+    MMAPABLE = 8;
+
+    /// Clones the storage when the parent socket is cloned. Equivalent to `BPF_F_CLONE`.
+    CLONE = 16;
+};
+
+/// Schema of an eBPF map.
+type MapSchema = struct {
+    /// Map type.
+    type MapType;
+
+    /// Key size in bytes.
+    key_size uint32;
+
+    /// Value size in bytes.
+    value_size uint32;
+
+    /// Maximum number of entries in the map.
+    max_entries uint32;
+
+    /// Map flags.
+    flags MapFlags;
+};
+
+/// A representation of eBPF map that can be shared between processes.
+type Map = resource table {
+    /// Map schema.
+    1: schema MapSchema;
+
+    /// VMO used to store the map data. The layout of the data stored in the
+    /// VMO depends on the `schema` as defined in the `ebpf_api` create.
+    // Must be synchronized with `SHARED_MAP_RIGHTS` in the `ebpf_api` crate.
+    // LINT.IfChange(map_rights)
+    2: vmo zx.Handle:<VMO, zx.Rights.READ | zx.Rights.WRITE | zx.Rights.MAP | zx.Rights.SIGNAL | zx.Rights.WAIT>;
+    // LINT.ThenChange(//src/starnix/lib/ebpf_api/src/maps/mod.rs:map_rights)
+};
+
+/// An identifier of a struct that may be passed to an eBPF program.
+type StructId = flexible enum {
+    // `struct __sk_buff`.
+    SK_BUFF = 1;
+
+    // `struct xdp_md`.
+    XDP_MD = 2;
+
+    // `struct bpf_user_pt_regs_t`.
+    BPF_USER_PT_REGS = 3;
+
+    // `struct bpf_sock`.
+    BPF_SOCK = 4;
+
+    // `struct bpf_sockopt`.
+    BPF_SOCK_OPT = 5;
+
+    // `struct bpf_sock_addr`.
+    BPF_SOCK_ADDR = 6;
+
+    // `struct bpf_fuse`.
+    BPF_FUSE = 7;
+};
+
+/// Describes location of an instruction that accesses a struct field.
+///
+/// This is used as auxiliary information passed from the verifier to the
+/// linker. The linker may update these instructions.
+type StructAccess = struct {
+    /// Index of the instruction in the program.
+    pc uint32;
+
+    /// Id of the struct being accessed.
+    struct_id StructId;
+
+    /// Offset of the field being accessed.
+    field_offset uint32;
+
+    /// Indicates that the instruction loads a 32-bit pointer field. These
+    /// loads must be remapped to 64-bit fields.
+    is_32_bit_ptr_load bool;
+};
+
+/// Maximum allowed number of instructions in an eBPF program.
+const MAX_PROGRAM_INSTRUCTIONS uint32 = 4096;
+
+/// Maximum number of maps an eBPF program can use.
+const MAX_PROGRAM_MAPS uint32 = 4096;
+
+/// A verified eBPF program.
+//
+// TODO(https://fxbug.dev/399946028): Currently a process that receives a
+// `VerifiedProgram` has to trust the sender that the program was actually
+// verified, i.e. it can be safe only if the receiver can make assumptions
+// about the client. A separate BPF service responsible for program
+// verification will allow to remove this restriction.
+type VerifiedProgram = resource table {
+    /// Program instructions.
+    1: code vector<uint64>:MAX_PROGRAM_INSTRUCTIONS;
+
+    /// List of instructions accessing struct fields.
+    2: struct_access_instructions vector<StructAccess>:MAX_PROGRAM_INSTRUCTIONS;
+
+    /// List of the maps used by the program. `code` may reference these maps
+    /// by their index in this array.
+    3: maps vector<Map>:MAX_PROGRAM_MAPS;
+};
+
+/// A handle of an eBPF program.
+type ProgramHandle = resource struct {
+    handle zx.Handle:<EVENTPAIR, zx.Rights.TRANSFER | zx.Rights.SIGNAL | zx.Rights.WAIT>;
+};
+
+/// The signal raised on a [`ProgramHandle`] to indicate that the program
+/// should be dropped.
+const PROGRAM_DEFUNCT_SIGNAL uint32 = 0x01000000; // ZX_USER_SIGNAL_0
+
+/// An ID used to uniquely identify an eBPF program. The ID is the KOID of the
+/// [`ProgramHandle`].
+type ProgramId = struct {
+    id zx.Koid;
+};

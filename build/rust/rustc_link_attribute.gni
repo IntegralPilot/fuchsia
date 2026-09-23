@@ -1,0 +1,114 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Generate a dependency to a static or shared library that is linked
+# to a Rust crate using a #[link(name = "foo")] attribute.
+#
+# Note that link attributes are strongly discouraged in Fuchsia sources,
+# Using GN, as a Rust crate target that depends directly on a static
+# or shared library will always link properly. Only use this template
+# when you must have a link attribute, e.g. to support third-party
+# crates that cannot be built otherwise.
+#
+# Such crates should always depend on a rustc_link_attribute() target
+# that points to the real binary.
+#
+# Either one of 'lib_static_target' or 'lib_shared_target' should be set,
+# and should match the 'kind' setting of the attribute, if any.
+#
+# Arguments:
+#   lib_static_target: (optional) GN label to the linked static_library() target.
+#   lib_shared_target: (optional) GN label to the linked shared_library() target.
+#   lib_path: (optional) Path to the linked library file.
+#   lib_name: (optional) Library name, as it appears in the link attribute,
+#       defaults to lib_target's name. This also accepts 'name:new_name'
+#       to ensure the dependents are linked with `-lnew_name` instead of `-lname`.
+#
+#   testonly, visibility: Usual GN meaning.
+#
+template("rustc_link_attribute") {
+  if (defined(invoker.lib_static_target)) {
+    assert(!defined(invoker.lib_shared_target),
+           "Only one of lib_static_target or lib_shared_target can be defined!")
+
+    _lib_kind = "static"
+    _lib_target = invoker.lib_static_target
+    if (defined(invoker.lib_path)) {
+      _lib_path = invoker.lib_path
+    } else {
+      if (target_os == "win") {
+        _lib_prefix = ""
+        _lib_suffix = ".lib"
+      } else {
+        _lib_prefix = "lib"
+        _lib_suffix = ".a"
+      }
+      _lib_path =
+          get_label_info(_lib_target, "target_out_dir") + "/${_lib_prefix}" +
+          get_label_info(_lib_target, "name") + _lib_suffix
+    }
+  } else if (defined(invoker.lib_shared_target)) {
+    _lib_kind = "dylib"
+    _lib_target = invoker.lib_shared_target
+    if (defined(invoker.lib_path)) {
+      _lib_path = invoker.lib_path
+    } else {
+      if (target_os == "win") {
+        _lib_prefix = ""
+        _lib_suffix = ".dll"
+      } else {
+        _lib_prefix = "lib"
+        _lib_suffix = ".so"
+      }
+      _lib_path = get_label_info("any($shlib_toolchain)", "root_out_dir") +
+                  "/link_stub/${_lib_prefix}" +
+                  get_label_info(_lib_target, "name") + _lib_suffix
+    }
+  } else {
+    assert(false,
+           "One of lib_static_target or lib_shared_target must be defined!")
+  }
+
+  if (defined(invoker.lib_name)) {
+    _lib_name = invoker.lib_name
+  } else {
+    _lib_name = get_label_info(_lib_target, "name")
+  }
+
+  _config_target = "${target_name}.config"
+
+  config(_config_target) {
+    # The Rust compiler translates a #[link(name = "foo")] attribute into an
+    # `-lfoo` flag when invoking the linker. There is no way to tell the Rust
+    # compiler to link to a specific library file path.
+    #
+    # To make this work semi-correctly, add the library's directory to
+    # `lib_dirs` and use `-ldylib=foo` or `-lstatic=foo` to ensure the right
+    # version of the library is picked up.
+    #
+    # lib_name can also be of the form 'foo:foo_renamed' to rename the linker
+    # library flag to `-lfoo_renamed`.
+    #
+    lib_dirs = [ get_path_info(_lib_path, "dir") ]
+    rustflags = [
+      "-l${_lib_kind}=${_lib_name}",
+
+      # This is necessary for the RBE wrapper to locate the file as an input.
+      # Without it, the remote build will fail with a linker error complaining
+      # about a missing library file for `-lfoo` even though the right `-L
+      # <dir>` option was passed to the linker to find it.
+      "-Clink-arg=" + rebase_path(_lib_path, root_build_dir),
+    ]
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    public_deps = [ _lib_target ]
+    public_configs = [ ":${_config_target}" ]
+  }
+}

@@ -1,0 +1,204 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components/fuchsia_test_component.gni")
+import("//build/components/fuchsia_test_package.gni")
+import("//build/rust/rustc_test.gni")
+import(
+    "//src/security/tests/pkg_test/assemblies/assemble_security_pkg_test_system.gni")
+
+# Defines an assembly for testing that ota blobs are properly handle w/r/t
+# executability
+#
+# Params:
+#
+#    tuf_repo_configs [required]
+#      List of GN file paths to tuf repo configuration files.
+#
+#
+template("access_ota_blob_as_executable") {
+  assert(defined(invoker.tuf_repo_configs),
+         "tuf_repo_configs must be defined for $target_name")
+  assert(defined(invoker.update_domain),
+         "update_domain must be defined for $target_name")
+  assert(defined(invoker.root_ssl_cert),
+         "root_ssl_cert must be defined for $target_name")
+  assert(defined(invoker.pkg_server_certchain),
+         "pkg_server_certchain must be defined for $target_name")
+  assert(defined(invoker.pkg_server_key),
+         "pkg_server_key must be defined for $target_name")
+
+  root_ssl_cert = invoker.root_ssl_cert
+  pkg_server_certchain = invoker.pkg_server_certchain
+  pkg_server_key = invoker.pkg_server_key
+
+  if (defined(invoker.use_fxfs_blob)) {
+    use_fxfs_blob = invoker.use_fxfs_blob
+  } else {
+    use_fxfs_blob = false
+  }
+
+  test_name = target_name
+
+  # System assembly for base system version at start of test.
+  assemble_security_pkg_test_system("${test_name}_v0") {
+    update_domain = invoker.update_domain
+    product_name = test_name
+    board_name = board_name
+    root_ssl_cert = root_ssl_cert
+    tuf_repo_configs = invoker.tuf_repo_configs
+    base_packages = [ "//src/security/tests/pkg_test/assemblies/hello_world_v0:hello_world-package" ]
+    packaged_assembly_directory = "hello_world_v0"
+    system_version_file =
+        "//src/security/tests/pkg_test/assemblies/v0_version.txt"
+
+    # Calculated on local build from 2023-07-05:
+    #
+    #   v0 blobs:
+    #     $ wc --bytes $(fx get-build-dir)/obj/src/security/tests/pkg_test/tests/core_access_ota_blob_as_executable_v0/blob.blk
+    #     3260416 [build-dir]/obj/src/security/tests/pkg_test/tests/core_access_ota_blob_as_executable_v0/blob.blk
+    #
+    #   v1 TUF repo assets:
+    #     $ wc --bytes $(find $(fx get-build-dir)/gen/src/security/tests/pkg_test/tests/core_access_ota_blob_as_executable_v1_tuf_repo_resources.unzipped -type f | grep '/\(targets\|blobs\)/')
+    #     [...]
+    #     104334214 total
+    #
+    #   minfs size: 8388608
+    #
+    #   Total: round_up(3260416 + 104334214 + 8388608, 4096) = 115986432
+    if (use_fxfs_blob) {
+      assembly_fxfs_image_size_bytes = 115986432
+    } else {
+      fvm_truncate_to_length = 115986432
+    }
+  }
+
+  # System assembly for system version to OTA from package server.
+  assemble_security_pkg_test_system("${test_name}_v1") {
+    update_domain = invoker.update_domain
+    product_name = test_name
+    board_name = board_name
+    root_ssl_cert = root_ssl_cert
+    tuf_repo_configs = invoker.tuf_repo_configs
+    base_packages = [ "//src/security/tests/pkg_test/assemblies/hello_world_v1:hello_world-package" ]
+    packaged_assembly_directory = "hello_world_v1"
+    system_version_file =
+        "//src/security/tests/pkg_test/assemblies/v1_version.txt"
+
+    # Note: v1 never instantiated as base system from FVM, hence no need to
+    # specify `fvm_truncate_to_length`.
+  }
+
+  # Resources and component for package server configured to serve "v1" OTA.
+  resource_group("${test_name}_v1-pkg_server-tls_resources") {
+    testonly = true
+    files = [
+      {
+        source = pkg_server_certchain
+        dest = "data/pkg_server/tls/pkg_server.certchain"
+      },
+      {
+        source = pkg_server_key
+        dest = "data/pkg_server/tls/pkg_server.rsa"
+      },
+    ]
+  }
+
+  # Generate the test config.
+  test_config = "${target_gen_dir}/${target_name}_test_config"
+  write_file(test_config, "{\"update_domain\":\"${invoker.update_domain}\"}")
+
+  # Resources that constitute inputs to the test component.
+  resource_group("${test_name}_test-resources") {
+    testonly = true
+    files = [
+      {
+        source = test_config
+        dest = "data/test_config.json5"
+      },
+    ]
+  }
+
+  # Specify production fshost component and config for test environment.
+  if (use_fxfs_blob) {
+    fshost_component = [ "//src/storage/fshost/testing:test-fshost" ]
+  } else {
+    fshost_component = [ "//src/storage/fshost/testing:test-fshost-minfs" ]
+  }
+
+  # Note: Despite being independent of template parameters, this target must
+  # be templated because `fuchsia_test_package` requires that all
+  # `test_components` be defined in the same build directory due to its use of
+  # `get_target_outputs()`. See
+  # https://gn.googlesource.com/gn/+/main/docs/reference.md#func_get_target_outputs
+  # for details.
+  fuchsia_test_component("${test_name}-component") {
+    # Note: Test package must include all files designated by cmdline args in
+    # component manifest. See cml and source for details. These files are not
+    # included as explicit deps here because they vary across different
+    # packagings/configurations of the test.
+    component_name = "access_ota_blob_as_executable"
+    manifest = "//src/security/tests/pkg_test/tests/access_ota_blob_as_executable/meta/access_ota_blob_as_executable.cml"
+    deps = [ "//src/security/tests/pkg_test/tests/access_ota_blob_as_executable:access_ota_blob_as_executable-test" ]
+
+    # For fuchsia.kernel.VmexResource.
+    test_type = "system"
+  }
+
+  fuchsia_test_package("${test_name}-package") {
+    package_name = test_name
+    test_components = [ ":${test_name}-component" ]
+    deps = fshost_component + [
+             # Package server configured to serve "v1" OTA update.
+             "//src/security/tests/pkg_test/tests:pkg_server-v1-component",
+
+             # Filesystem host dependency.
+             "//src/storage/testing:storage_driver_test_realm",
+
+             # Fake services for update flow.
+             "//src/security/tests/pkg_test/dns_resolver:security_pkg_dns_resolver-component",
+             "//src/security/tests/pkg_test/paver:security_pkg_paver-component",
+             "//src/security/tests/pkg_test/reboot:security_pkg_reboot-component",
+
+             # Production SWD components.
+             "//src/sys/pkg/bin/pkg-cache:production-component-and-config",
+             "//src/sys/pkg/bin/pkg-resolver:production-component-and-config",
+             "//src/sys/pkg/bin/system-update-committer:component",
+             "//src/sys/pkg/bin/system-updater:component",
+
+             # Production network components for OTA update.
+             "//src/connectivity/network/netstack:component",
+             "//src/connectivity/policy/http-client:component",
+
+             # Mock SWD component dependencies.
+             "//src/cobalt/bin/testing/fake_cobalt:component_v2",
+             "//src/security/tests/pkg_test/tests:fake_boot_arguments_v0-component",
+
+             #
+             # Test resources that depend on template parameters:
+             #
+
+             # General shared test resources.
+             ":${test_name}_test-resources",
+
+             # System resources for bringing up v0 system.
+             ":${test_name}_v0_system_resources",
+
+             # Package server/update resources for delivering v1 OTA update.
+             ":${test_name}_v1-pkg_server-tls_resources",
+             ":${test_name}_v1_tuf_repo_resources",
+             ":${test_name}_v1_update_package_resource",
+           ]
+
+    # TODO(https://fxbug.dev/42169686): Complete test dependency composition to eliminate
+    # error logs:
+    # - system-updater: "Failed to read vbmeta hash: while opening the file:
+    #   open failed with status: NOT_FOUND: NOT_FOUND".
+    test_specs = {
+      log_settings = {
+        max_severity = "FATAL"
+      }
+    }
+  }
+}

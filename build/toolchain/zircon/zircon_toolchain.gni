@@ -1,0 +1,1019 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/clang/clang.gni")
+import("//build/config/compiler.gni")
+import("//build/config/zircon/levels.gni")
+import("//build/rust/build.gni")
+import("//build/toolchain/breakpad.gni")
+import("//build/toolchain/buildidtool.gni")
+import("//build/toolchain/ccache.gni")
+import("//build/toolchain/concurrent_jobs.gni")
+import("//build/toolchain/default_tools.gni")
+import("//build/toolchain/rbe.gni")
+import("//build/toolchain/rbe_toolchain_vars.gni")
+import("//build/toolchain/rust_toolchain_vars.gni")
+import("//build/toolchain/zircon/clang.gni")
+import("//build/toolchain/zircon/gcc.gni")
+import("//build/zircon/build_args.gni")
+
+# IMPORTANT: The zircon_toolchain() template does not use clang_toolchain()
+# defined in //build/toolchain/clang_toolchain.gni, because there are several
+# important differences between their tool() commands. A few examples:
+#
+#  - clang_toolchain() does not support GCC builds.
+#
+#  - The response file paths slightly differ:
+#      GN: ${output_dir}/${target_output_name}${output_extension}.rsp
+#      ZN: ${output_dir}/${target_output_name}.rsp
+#
+#  - Stripping works differently as well, e.g. on host Linux:
+#      GN: .../llvm-objcopy --strip-all <src> <dst>
+#      ZN: .../llvm-strip -o <dst> <src>
+#
+#  - Many trivial differences, like the position of option like '-o <output>'
+#    or {{cflags}}, {{ldflags}} etc, escaping some paths with quotes in one
+#    build but not the other make comparing final build commands difficult.
+#
+#  - Static and shared libraries are ordered differently in link inputs:
+#      GN: -Wl,--start-group <inputs> {{solibs}} -Wl,--end-group {{libs}}
+#      ZN: -Wl,--start-group <inputs> {{libs}} -Wl,--end-group {{solibs}}
+#
+#  - Slightly different flags to specify the link map file:
+#      GN: -Wl,--Map=<file>
+#      ZN: -Wl,-Map=<file>
+#
+#  - Different naming conventions for debug binaries:
+#      GN: {{output_dir}}/exe.unstripped/{{target_output_name}}{{output_extension}}
+#      ZN: {{output_dir}}/{{target_output_name}}{{output_extension}}.debug
+#
+# IMPORTANT: The zircon_toolchain global variable is defined as a scope for
+# Zircon-specific toolchains, otherwise it is just 'false'. See below for the
+# detailed schema for this scope.
+
+# Defines a Zircon toolchain.
+#
+# Parameters:
+#
+#   * cpu, os
+#     - Required: $current_cpu and $current_os values for the toolchain.
+#     - Type: string
+#
+#   * strip
+#     - Optional: If not false, linked binaries will be stripped.
+#     If this is a string rather than true, it's a switch to the `objcopy`
+#     tool, e.g. "--strip-sections".
+#     - Type: bool or string
+#     - Default: false
+#
+#   * tool_dir
+#     - Optional: If provided, then $tool_prefix must also be provided.
+#     $tool_dir is the directory where compiler tools are found, or "" if they
+#     are found by searching `PATH`.
+#     - Type: path
+#     - Default: clang_tool_dir or gcc_tool_dir depending on "gcc" in $tags
+#
+#   * tool_prefix
+#     - Optional: If provided, then $tool_dir must also be provided.
+#     $tool_prefix is the prefix prepended to each tool's name.
+#     - Type: string
+#     - Default: "" or "<tuple>-" prefix for $cpu and $os if "gcc" in tags
+#
+#   * cxx_rbe_enable, link_rbe_enable, rust_rbe_enable
+#     - Optional: If defined, override the global value of the same name.
+#     - Type: bool
+#
+#   * use_ccache
+#     - Optional: If defined, overrides the $use_ccache build argument.
+#     If true, compilation commands are prefixed with "ccache".
+#     - Type: bool
+#     - Default: $use_ccache
+#
+#   * deps, toolchain_args
+#     - Optional: See toolchain().
+#
+#   * environment
+#     - Required: The `toolchain_environment` value to use.
+#     - Type: string
+#
+template("zircon_toolchain") {
+  # Translate GN cpu/os to GNU config tuple.
+  if (invoker.cpu == "arm64") {
+    tc_cpu = "aarch64"
+  } else if (invoker.cpu == "x64") {
+    tc_cpu = "x86_64"
+  } else {
+    tc_cpu = invoker.cpu
+  }
+  tc_target = "${tc_cpu}-"
+  if (invoker.os == "uefi") {
+    tc_target += "uefi"
+  } else if (invoker.os == "win") {
+    tc_target += "windows-msvc"
+  } else if (invoker.os == "linux") {
+    tc_target += "linux-gnu"
+  } else {
+    tc_target += invoker.os
+  }
+
+  is_pecoff = invoker.os == "win" || invoker.os == "uefi"
+
+  assert(defined(invoker.environment), "'environment' argument is required!")
+
+  if ((cxx_rbe_full_toolchain || link_rbe_full_toolchain) &&
+      clang_tool_dir != "") {
+    _tool_root_dir = get_path_info(clang_tool_dir, "dir")
+  }
+
+  if (defined(invoker.cxx_rbe_enable)) {
+    _cxx_rbe_enable = invoker.cxx_rbe_enable
+  } else {
+    _cxx_rbe_enable = cxx_rbe_enable
+  }
+  if (defined(invoker.link_rbe_enable)) {
+    _link_rbe_enable = invoker.link_rbe_enable
+  } else {
+    _link_rbe_enable = link_rbe_enable
+  }
+  if (defined(invoker.rust_rbe_enable)) {
+    _rust_rbe_enable = invoker.rust_rbe_enable
+  } else {
+    _rust_rbe_enable = rust_rbe_enable
+  }
+  _restat_link = _link_rbe_enable
+
+  # Cached and distributed wrappers just go on the front of compiler commands,
+  # but these are plumbed specially in tool() as $command_launcher, not just
+  # part of $command; and are elided from the compilation database.
+
+  _cxx_launcher = []
+  if (restat_cc) {
+    if (_cxx_rbe_enable) {
+      _cxx_launcher = restat_command_launcher.remote
+    } else {
+      _cxx_launcher = restat_command_launcher.local
+    }
+  }
+
+  _cxx_link_launcher = []
+  if (_restat_link) {
+    if (_link_rbe_enable) {
+      _cxx_link_launcher = restat_command_launcher.remote
+    } else {
+      _cxx_link_launcher = restat_command_launcher.local
+    }
+  }
+
+  if (_cxx_rbe_enable || _link_rbe_enable) {
+    _launcher_tail = []
+    if (cxx_rbe_full_toolchain && defined(_tool_root_dir)) {
+      # When debugging or working around unexpected differences between local
+      # and remote execution, upload the entire toolchain to see if differences
+      # are resolved.
+      _launcher_tail = [ "--inputs" ]
+      if (cxx_rbe_minimalist_wrapper) {
+        # rewrapper expects paths relative to exec_root, which is //.
+        _launcher_tail += [ rebase_path(_tool_root_dir, "//", root_build_dir) ]
+      } else {
+        # The python wrapper already adjusts paths accordingly.
+        _launcher_tail += [ _tool_root_dir ]
+      }
+    }
+    _launcher_tail += [ "--" ]
+  }
+
+  if (_cxx_rbe_enable) {
+    _cxx_launcher += rbe_toolchain_vars.cxx_launcher + _launcher_tail
+    _compile_concurrent_jobs = rbe_toolchain_vars.cxx_concurrent_jobs
+  } else {
+    if (defined(invoker.use_ccache) && invoker.use_ccache) {
+      _cxx_launcher += [ "ccache" ]
+    }
+    _compile_concurrent_jobs = concurrent_jobs.local
+  }
+
+  if (_link_rbe_enable) {
+    _cxx_link_launcher += rbe_toolchain_vars.cxx_link_launcher + _launcher_tail
+    _link_concurrent_jobs = rbe_toolchain_vars.cxx_link_concurrent_jobs
+  } else {
+    _link_concurrent_jobs = concurrent_jobs.local
+  }
+
+  # Compute what will be the value of `toolchain_variant` for this instance.
+  # This is invoker.toolchain_args.toolchain_variant, eventually augmented
+  # by default key values.
+  if (defined(invoker.toolchain_args)) {
+    _t_args = invoker.toolchain_args
+    if (defined(_t_args.toolchain_variant)) {
+      _tv_args = _t_args.toolchain_variant
+    }
+  }
+  _toolchain_variant = {
+    # Default non-list values
+    base = get_label_info(":$target_name", "label_no_toolchain")
+    name = ""
+    suffix = ""
+    is_pic_default = false
+    with_shared = false
+    instrumented = false
+
+    # Forward values from invoker.toolchain_args.toolchain_variant, if any.
+    if (defined(_tv_args)) {
+      forward_variables_from(_tv_args, "*")
+    }
+
+    # Create empty lists if they were not forwarded above.
+    if (!defined(configs)) {
+      configs = []
+    }
+    if (!defined(prefix_configs)) {
+      prefix_configs = []
+    }
+    if (!defined(executable_configs)) {
+      executable_configs = []
+    }
+    if (!defined(remove_common_configs)) {
+      remove_common_configs = []
+    }
+    if (!defined(remove_executable_configs)) {
+      remove_executable_configs = []
+    }
+    if (!defined(remove_shared_configs)) {
+      remove_shared_configs = []
+    }
+    if (!defined(tags)) {
+      tags = []
+    }
+    if (defined(invoker.tags)) {
+      tags += invoker.tags
+    }
+  }
+
+  use_gcc =
+      _toolchain_variant.tags + [ "gcc" ] - [ "gcc" ] != _toolchain_variant.tags
+
+  use_strip = defined(invoker.strip) && invoker.strip != false
+
+  # These are used in some, but not all, of the if branches below.
+  if (clang_tool_dir == "") {
+    clangxx_exec_inputs = []
+    clangxx_exec_command = "clang++"
+  } else {
+    clangxx_exec_inputs = [ "${clang_tool_dir}/clang++" ]
+    clangxx_exec_command = rebase_path(clangxx_exec_inputs[0], root_build_dir)
+  }
+  clangxx_args = [
+    clangxx_exec_command,
+    "--target=$tc_target",
+
+    # This affects the multilib selection so that we get the right
+    # libc++.a binary.  It's not really proper that we have to encode here
+    # the multilib-affecting switches we presume all configs actually will
+    # use in the toolchain being defined.  But since everything in this
+    # codebase (certainly everything we support being compiled by GCC) is
+    # definitely compiled with -fno-exceptions, we can live with it.  An
+    # alternative would be to add the lib_dirs in a config() instead and
+    # then somehow tie it to exceptions vs no-exceptions configs, but we
+    # have no present need for any such complexity.
+    "-fno-exceptions",
+  ]
+  not_needed([ "clangxx_args" ])
+
+  # If either $tool_dir or $tool_prefix is supplied then both must be supplied.
+  if (defined(invoker.tool_dir) || defined(invoker.tool_prefix)) {
+    tc = {
+      tool_dir = invoker.tool_dir
+      tool_prefix = invoker.tool_prefix
+    }
+  } else if (use_gcc) {
+    if (defined(invoker.host) && invoker.host) {
+      tc = {
+        tool_dir = ""
+        if (invoker.cpu == host_cpu && invoker.os == host_os) {
+          tool_prefix = ""
+        } else {
+          tool_prefix = "${tc_target}-"
+        }
+      }
+    } else {
+      tc = {
+        tool_dir = gcc_tool_dir
+        tool_prefix = "${tc_cpu}-elf-"
+        version_string = gcc_version_string
+        include_dirs_cc = rebase_path(
+                [
+                  exec_script(
+                      "/usr/bin/env",
+                      clangxx_args + [ "-print-file-name=include/${current_target_tuple}/c++/v1" ],
+                      "trim string",
+                      clangxx_exec_inputs),
+                  exec_script(
+                      "/usr/bin/env",
+                      clangxx_args + [ "-print-file-name=include/c++/v1" ],
+                      "trim string",
+                      clangxx_exec_inputs),
+                ],
+                "",
+                root_build_dir)
+        lib_dirs = [ rebase_path(
+                get_path_info(
+                    exec_script("/usr/bin/env",
+                                clangxx_args + [ "-print-file-name=libc++.a" ],
+                                "trim string",
+                                clangxx_exec_inputs),
+                    "dir"),
+                "",
+                root_build_dir) ]
+      }
+    }
+  } else {
+    tc = {
+      tool_dir = clang_tool_dir
+      tool_prefix = "llvm-"
+      version_string = clang_version_string
+
+      # TODO(https://fxbug.dev/42101845): The MSVC target in the clang driver never uses the
+      # -stdlib=libc++ switch or the toolchain's own libc++ include path.
+      if (is_pecoff) {
+        include_dirs_cc = rebase_path(
+                [
+                  exec_script(
+                      "/usr/bin/env",
+                      clangxx_args + [ "-print-file-name=include/${current_target_tuple}/c++/v1" ],
+                      "trim string",
+                      clangxx_exec_inputs),
+                  exec_script(
+                      "/usr/bin/env",
+                      clangxx_args + [ "-print-file-name=include/c++/v1" ],
+                      "trim string",
+                      clangxx_exec_inputs),
+                ],
+                "",
+                root_build_dir)
+      }
+    }
+  }
+
+  if (use_gcc) {
+    tc.cc = "${tc.tool_prefix}gcc"
+    tc.cxx = "${tc.tool_prefix}g++"
+  } else {
+    tc.cc = "clang"
+    tc.cxx = "clang++"
+  }
+
+  if (tc.tool_dir == "") {
+    dir_prefix = ""
+  } else {
+    dir_prefix = rebase_path(tc.tool_dir, root_build_dir) + "/"
+  }
+
+  cc = "$dir_prefix${tc.cc}"
+  cxx = "$dir_prefix${tc.cxx}"
+  ld = cxx
+  ar = "$dir_prefix${tc.tool_prefix}ar"
+
+  # All other OS possibilities are ELF and so might have ELF build IDs.
+  is_elf = !is_pecoff
+
+  # buildidtool supports ELF build IDs and PE-COFF PDB GUIDs.
+  # TODO(mcgrathr): broken for aarch64 PE-COFF
+  use_buildidtool = is_elf || (is_pecoff && invoker.cpu != "arm64")
+
+  # The prebuilt dump_syms tool is the one that only supports ELF.
+  # Breakpad has dump_syms tools for Mach-O (macOS) and PE-COFF
+  # (Windows/EFI) too, but the PE-COFF tool only runs on Windows.  The
+  # Mach-O tool can be cross compiled, though we can't cross compile to
+  # macOS anyway.  But we also don't have a prebuilt of the macOS
+  # self-targetting Breakpad dump_syms tool on hand.
+  use_breakpad = output_breakpad_syms && is_elf && use_buildidtool
+  if (use_breakpad) {
+    dump_syms = breakpad_dump_syms
+    dump_syms += " -r "
+    if (invoker.os == "fuchsia") {
+      dump_syms += " -n \"<_>\" -o Fuchsia"
+    } else {
+      # Use what's probably installation name, not the ".debug" name.
+      dump_syms +=
+          " -n \"{{output_dir}}/{{target_output_name}}{{output_extension}}\""
+    }
+  }
+
+  # TODO(https://fxbug.dev/42136235): enable for other targets and binary formats.
+  use_gsym = output_gsym && is_elf && invoker.os == "fuchsia"
+  if (use_gsym) {
+    gsymutil = rebase_path("$clang_tool_dir/llvm-gsymutil", root_build_dir)
+  }
+
+  _compile_common = {
+    forward_variables_from(_compile_concurrent_jobs, "*")
+
+    outputs =
+        [ "{{source_out_dir}}/{{target_output_name}}.{{source_file_part}}.o" ]
+    depfile = "{{output}}.d"
+    depsformat = "gcc"
+
+    command_launcher =
+        string_replace(string_join(" ", _cxx_launcher), "{{DEPFILE}}", depfile)
+
+    switches = [
+      "-MD",
+      "-MF",
+      depfile,
+      "-o",
+      "{{output}}",
+      "{{defines}}",
+      "{{include_dirs}}",
+    ]
+  }
+
+  _link_common = {
+    forward_variables_from(_link_concurrent_jobs, "*")
+
+    lib_switch = "-l"
+    lib_dir_switch = "-L"
+    default_output_dir = "{{target_out_dir}}"
+    outfile = "{{output_dir}}/{{target_output_name}}{{output_extension}}"
+    runtime_outputs = [ outfile ]
+    outputs = runtime_outputs
+
+    restat = _restat_link
+    command_launcher = string_join(" ", _cxx_link_launcher)
+
+    if (use_strip) {
+      unstripped_outfile = "${outfile}.debug"
+      outputs += [ unstripped_outfile ]
+      strip_command_prefix = [ "&&" ]
+
+      if (_link_rbe_enable) {
+        # TODO(https://fxbug.dev/42083070): disable remote stripping when config includes //build/config:no_remote_link.
+        strip_command_prefix += rbe_toolchain_vars.common_tool_prefix + [
+                                  "--inputs",
+                                  "\"$unstripped_outfile\"",
+                                  "--output_files",
+                                  "\"$outfile\"",
+                                  "--",
+                                ]
+      }
+
+      _plain_strip_command = strip_command_prefix + [
+                               "$dir_prefix${tc.tool_prefix}strip",
+                               "-o",
+                               "\"$outfile\"",
+                               "\"$unstripped_outfile\"",
+                             ]
+
+      if (invoker.strip == true ||
+          # GNU strip/objcopy doesn't support --strip-sections.
+          (use_gcc && invoker.strip == "--strip-sections")) {
+        strip_command = _plain_strip_command
+      } else {
+        strip_command = strip_command_prefix + [
+                          "$dir_prefix${tc.tool_prefix}objcopy",
+                          invoker.strip,
+                          "\"$unstripped_outfile\"",
+                          "\"$outfile\"",
+                        ]
+      }
+    } else {
+      unstripped_outfile = outfile
+      strip_command = []
+    }
+
+    rspfile = "${outfile}.rsp"
+    switches = [
+      "-o",
+      unstripped_outfile,
+    ]
+    linker_switches = []
+
+    rspfile_content = "{{inputs}}"
+    _rspfile_input = "'@$rspfile'"
+    if (is_pecoff) {
+      link_inputs = [
+        _rspfile_input,
+        "{{libs}}",
+        "{{solibs}}",
+      ]
+
+      # This assumes "-Wl,/debug" or suchlike is in ldflags.  If it's not
+      # but nothing depends on the .pdb file, then it should be OK that
+      # Ninja thinks it's an additional output but it doesn't get created.
+      debug_outfile = "{{output_dir}}/{{target_output_name}}.pdb"
+      link_outputs = [ debug_outfile ]
+    } else {
+      link_inputs = [
+        "-Wl,--start-group",
+        _rspfile_input,
+        "{{libs}}",
+        "-Wl,--end-group",
+        "{{solibs}}",
+      ]
+      depfile = "$outfile.d"
+      depsformat = "gcc"
+      switches += [ "-Wl,--dependency-file=$depfile" ]
+      mapfile = "${outfile}.map"
+      link_outputs = [ mapfile ]
+      linker_switches += [ "-Map=$mapfile" ]
+    }
+
+    post_strip_command = []
+    if (use_buildidtool) {
+      if (!defined(debug_outfile)) {
+        debug_outfile = unstripped_outfile
+      }
+      buildid_stampfile = "${outfile}.build-id.stamp"
+      post_strip_command += [
+        "&&",
+        buildidtool_invocation_path,
+        "-build-id-dir",
+        ".build-id",
+        "-stamp",
+        "\"$buildid_stampfile\"",
+        "-entry",
+        "\"=$outfile\"",
+        "-entry",
+        "\".debug=$debug_outfile\"",
+      ]
+      link_outputs += [ buildid_stampfile ]
+    }
+
+    if (use_breakpad) {
+      breakpad_outfile = "${outfile}.sym"
+      link_outputs += [ breakpad_outfile ]
+
+      assert(use_buildidtool)
+
+      # dump_syms will fail if there is no build ID.  buildidtool succeeds and
+      # writes an empty stamp file for that case, so use it to tell whether
+      # dump_syms should be run. In any case always create a .sym because we
+      # told ninja we would create one above.  The brace group is superfluous.
+      # But makes the control flow a little clearer.
+      post_strip_command += [
+        "&&",
+        "{",
+        "test",
+        "!",
+        "-s",
+        "\"$buildid_stampfile\"",
+        "&&",
+        "touch",
+        "\"$breakpad_outfile\"",
+        "||",
+      ]
+      if (_link_rbe_enable) {
+        # TODO(https://fxbug.dev/42083070): disable remote dump_syms when
+        # config includes //build/config:no_remote_link.
+        post_strip_command +=
+            rbe_toolchain_vars.common_tool_prefix + [
+              "--label_toolname=$breakpad_dump_syms",
+              "--inputs",  # specify executable, due to log_it wrapper
+              "$breakpad_dump_syms,\"$unstripped_outfile\"",
+              "--output_files",
+              "\"$breakpad_outfile\"",
+              "--",
+            ]
+      }
+      post_strip_command += [
+        rebase_path(log_it_script, root_build_dir),
+        "--log",
+        "\"$breakpad_outfile\"",
+        "--",
+        dump_syms,
+        "\"$unstripped_outfile\"",
+        ";",
+        "}",
+      ]
+    }
+
+    if (use_gsym) {
+      gsym_outfile = "${outfile}.gsym"
+      link_outputs += [ gsym_outfile ]
+      post_strip_command += [
+        "&&",
+        gsymutil,
+        "--convert=\"$unstripped_outfile\"",
+        "--out-file=\"$gsym_outfile.gsym\"",
+      ]
+    }
+
+    # Pass-through switches for the linker are plumbed via the compiler driver.
+    foreach(arg, linker_switches) {
+      switches += [ "-Wl,$arg" ]
+    }
+  }
+
+  _exe_link_common = {
+    forward_variables_from(_link_common, "*")
+    outputs += link_outputs
+    if (is_pecoff) {
+      default_output_extension = ".exe"
+    }
+  }
+
+  _rust_common = {
+    _exclude = [ "rspfile_content" ]
+    if (!rustc_use_response_files) {
+      _exclude += [ "rspfile" ]
+    }
+    forward_variables_from(_link_common, "*", _exclude)
+    depfile = "$outfile.d"
+
+    # Configure builds to be restat-friendly by preserving timestamps of
+    # unchanged outputs, for both local and remote builds.
+    restat = restat_rust
+    _launcher = []
+    if (restat_rust) {
+      if (_rust_rbe_enable) {
+        _launcher = restat_command_launcher.remote
+      } else {
+        _launcher = restat_command_launcher.local
+      }
+    }
+    command_launcher =
+        string_replace(string_join(" ", _launcher), "{{DEPFILE}}", depfile)
+
+    # Configure Rust remote builds.
+    if (_rust_rbe_enable) {
+      command_prefix = rbe_toolchain_vars.rust_command_prefix
+      forward_variables_from(rbe_toolchain_vars.rust_concurrent_jobs, "*")
+    } else {
+      command_prefix = []
+      forward_variables_from(concurrent_jobs.local, "*")
+    }
+
+    command_prefix += rust_toolchain_vars.rust_command_prefix
+    command_prefix += [
+      "{{rustflags}}",
+      "--emit=dep-info=$depfile",
+      "-Zdep-info-omit-d-target",
+      "--emit=link",
+      "-o",
+      unstripped_outfile,
+    ]
+
+    link_switches = []
+    foreach(arg, linker_switches) {
+      link_switches += [ "-Clink-arg=$arg" ]
+    }
+
+    # Even though rmeta is not always needed as an output, we always use
+    # emit=metadata to signal to the remote wrapper that rmetas should be used
+    # for dependency scanning, as opposed to complete rlibs.
+    rmeta = "{{output_dir}}/{{target_output_name}}.rmeta"
+    outputs += [ rmeta ]
+    command_prefix += [ "--emit=metadata=$rmeta" ]
+
+    rust_inputs = [
+      "{{rustdeps}}",
+      "{{externs}}",
+    ]
+    if (rustc_use_response_files) {
+      rspfile_content = string_join(" ", rust_inputs)
+      command_prefix += [
+        "-Zshell-argfiles",
+        "@shell:$rspfile",
+      ]
+    } else {
+      command_prefix += rust_inputs
+    }
+
+    if (verify_depfile) {
+      post_strip_command += [
+        "&&",
+        rebase_path(python_exe_src, root_build_dir),
+        "-S",
+        rebase_path("//build/toolchain/verify_depfile.py", root_build_dir),
+        "--label='{{label}}'",
+        "--ignore-prefix=$rebased_rustc_prefix",
+        "--ignore-rspfile=${rbe_toolchain_vars.rust_compilation_deps_path}",
+        "--depfile=$depfile",
+        "--sources-file",
+        "{{target_gen_dir}}/{{label_name}}.rust_sources",
+      ]
+    }
+  }
+
+  not_needed(invoker, [ "propagates_configs" ])
+
+  toolchain(target_name) {
+    propagates_configs = true
+
+    deps = buildidtool_toolchain_deps
+    if (defined(invoker.deps)) {
+      deps += invoker.deps
+    }
+
+    # Every toolchain needs the standard stamp and copy tools.
+    tool("stamp") {
+      command = stamp_command
+      description = stamp_description
+    }
+
+    tool("copy") {
+      # We use link instead of copy; the way the "copy" tool is used is
+      # compatible with links since Ninja tracks changes to the source.
+      command = copy_command
+      description = copy_description
+    }
+
+    tool("asm") {
+      description = "ASM {{output}}"
+      forward_variables_from(_compile_common, "*")
+      _command = [ cc ] + switches + [
+                   "{{asmflags}}",
+                   "-c",
+                   "{{source}}",
+                 ]
+      command = string_join(" ", _command)
+      restat = restat_cc
+    }
+
+    tool("cc") {
+      description = "CC {{output}}"
+      forward_variables_from(_compile_common, "*")
+      _command = [ cc ] + switches + [
+                   "{{cflags}}",
+                   "{{cflags_c}}",
+                   "-c",
+                   "{{source}}",
+                 ]
+      command = string_join(" ", _command)
+      restat = restat_cc
+    }
+
+    tool("cxx") {
+      description = "CXX {{output}}"
+      forward_variables_from(_compile_common, "*")
+      _command = [ cxx ] + switches + [
+                   "{{cflags}}",
+                   "{{cflags_cc}}",
+                   "-c",
+                   "{{source}}",
+                 ]
+      command = string_join(" ", _command)
+      restat = restat_cc
+    }
+
+    tool("alink") {
+      description = "AR {{output}}"
+      forward_variables_from(_link_concurrent_jobs, "*")
+      rspfile = "{{output}}.rsp"
+      rspfile_content = "{{inputs}}"
+      default_output_dir = "{{target_out_dir}}"
+      default_output_extension = ".a"
+      output_prefix = "lib"
+      outputs = [ "{{output_dir}}/{{target_output_name}}{{output_extension}}" ]
+      restat = _restat_link
+      _command = [
+        "rm",
+        "-f",
+        "{{output}}",
+        "&&",
+      ]
+      if (_link_rbe_enable) {
+        _input_args = [ "\"$rspfile\"" ]
+        if (link_rbe_full_toolchain && defined(_tool_root_dir)) {
+          _input_args += [ _tool_root_dir ]
+        }
+        _command += rbe_toolchain_vars.common_tool_prefix + [
+                      "--inputs",
+                      string_join(",", _input_args),
+                      "--input_list_paths",
+                      "\"$rspfile\"",
+                      "--output_files",
+                      "{{output}}",
+                      "--",
+                    ]
+      }
+      _command += [
+        ar,
+        "{{arflags}}",
+        "rcsD",
+        "{{output}}",
+        "\"@$rspfile\"",
+      ]
+      command = string_join(" ", _command)
+    }
+
+    tool("link") {
+      description = "LINK {{output}}"
+      forward_variables_from(_exe_link_common, "*")
+      _command = [ ld ] + switches + [ "{{ldflags}}" ] + link_inputs +
+                 strip_command + post_strip_command
+      command = string_join(" ", _command)
+    }
+
+    tool("rust_bin") {
+      description = "RUST {{output}}"
+      forward_variables_from(_exe_link_common, "*")
+      forward_variables_from(_rust_common, "*")
+      _command =
+          command_prefix + link_switches + strip_command + post_strip_command
+      command = string_join(" ", _command)
+    }
+
+    tool("rust_rlib") {
+      description = "RUST(RLIB) {{output}}"
+      forward_variables_from(_rust_common, "*", [ "runtime_outputs" ])
+      output_prefix = "lib"
+      default_output_extension = ".rlib"
+      _command = command_prefix
+      command = string_join(" ", _command)
+    }
+
+    tool("rust_staticlib") {
+      description = "RUST(AR) {{output}}"
+      forward_variables_from(_rust_common, "*", [ "runtime_outputs" ])
+      output_prefix = "lib"
+      default_output_extension = ".a"
+      _command = command_prefix
+      command = string_join(" ", _command)
+    }
+
+    tool("rust_macro") {
+      description = "RUST(MACRO) {{output}}"
+      forward_variables_from(_rust_common, "*")
+      outputs += link_outputs
+      default_output_extension = ".so"
+      _command = command_prefix + [ "--extern=proc_macro" ] + link_switches +
+                 strip_command + post_strip_command
+      command = string_join(" ", _command)
+    }
+
+    if (_toolchain_variant.with_shared || _toolchain_variant.is_pic_default) {
+      # We don't support building shared libraries for host tools.
+      assert(invoker.os == "fuchsia",
+             "shared library creation not supported for ${invoker.os}")
+
+      use_llvm_ifs = is_elf
+      if (use_llvm_ifs) {
+        llvm_ifs = rebase_path("$clang_tool_dir/llvm-ifs", root_build_dir)
+      }
+
+      _solink_common = {
+        forward_variables_from(_link_common, "*")
+
+        outputs += link_outputs
+
+        link_command = [ ld ] + switches
+
+        if (use_gcc && tc.tool_prefix == "${tc_cpu}-elf-") {
+          # The *-elf-gcc driver doesn't handle -shared properly.
+          # Just force it through to the linker.
+          link_command += [ "-Wl,-shared" ]
+        } else {
+          link_command += [ "-shared" ]
+        }
+
+        depend_output = outfile
+        link_output = unstripped_outfile
+
+        if (is_pecoff) {
+          default_output_extension = ".dll"
+        } else {
+          default_output_extension = ".so"
+        }
+      }
+
+      soname_linker_switch =
+          "-soname={{target_output_name}}{{output_extension}}"
+
+      tool("solink") {
+        description = "LINK_SHLIB {{output}}"
+        forward_variables_from(_solink_common, "*")
+
+        output_prefix = "lib"
+
+        _command =
+            link_command + [
+              # Put the automatic -soname first so ldflags can override it.
+              "-Wl,$soname_linker_switch",
+              "{{ldflags}}",
+            ] + link_inputs + strip_command + post_strip_command
+
+        if (use_llvm_ifs) {
+          # The Ninja dependency for linking in the shared library will be the
+          # .ifs file (depend_output), though the actual linking *input* will
+          # be the link stub (link_output).  Ninja will restat the output files
+          # after running the commands.  llvm-ifs will not touch the .ifs or
+          # stub file if its contents haven't changed.  Hence Ninja will only
+          # re-run any linking commands depending on this shared library if the
+          # .ifs file has actually changed, indicating that the linking ABI has
+          # actually changed.
+          restat = true
+          depend_output = "{{output_dir}}/{{target_output_name}}.ifs"
+          link_output = "{{output_dir}}/link_stub/{{target_output_name}}.so"
+          outputs += [
+            depend_output,
+            link_output,
+          ]
+          _command += [ "&&" ]
+          if (_link_rbe_enable) {
+            _command += rbe_toolchain_vars.common_tool_prefix + [
+                          "--inputs",
+                          "\"$unstripped_outfile\"",
+                          "--output_files",
+                          "\"$depend_output,$link_output\"",
+                          "--",
+                        ]
+          }
+          _command += [
+                        llvm_ifs,
+                        "--write-if-changed",
+                        "--output-ifs=\"$depend_output\"",
+                        "--output-elf=\"$link_output\"",
+                        "\"$unstripped_outfile\"",
+                      ] + ifs_extra_switches
+        }
+
+        command = string_join(" ", _command)
+      }
+
+      tool("solink_module") {
+        description = "LINK_MODULE {{output}}"
+        forward_variables_from(_solink_common, "*")
+        command = string_join(" ",
+                              link_command + [ "{{ldflags}}" ] + link_inputs +
+                                  strip_command + post_strip_command)
+      }
+    }
+
+    toolchain_args = {
+      current_cpu = invoker.cpu
+      current_os = invoker.os
+
+      # LINT.IfChange(in_default_toolchain)
+      in_default_toolchain = false
+
+      # LINT.ThenChange(//build/config/BUILDCONFIG.gn:in_default_toolchain)
+
+      if (defined(invoker.toolchain_args)) {
+        forward_variables_from(invoker.toolchain_args,
+                               "*",
+                               [
+                                 "cpu",
+                                 "os",
+                                 "toolchain_variant",
+                               ])
+      }
+
+      # toolchain_variant is specific to the Fuchsia build, and documented in
+      # //build/config/BUILDCONFIG.gn.
+      toolchain_variant = {
+      }
+      toolchain_variant = _toolchain_variant
+
+      # 'zircon_toolchain' is a scope that will only be defined for Zircon
+      # toolchains, as a scope holding various keys used by misc targets to
+      # select build settings. This corresponds to the Zircon build
+      # 'toolchain' global toolchain variable, as well as a few Zircon global
+      # variables that have been moved here:
+      #
+      #   cpu: [string] Target CPU using Clang conventions.
+      #   target_tuple: [string] Target tuple using Clang conventions.
+      #   environment: [string] The runtime environment that the binaries
+      #     generated by this toolchain instance will run in. Used by the
+      #     Zircon build rules in several places.
+      #   link_output_suffix: [string] Suffix to append to linkable binaries
+      #     with debug information.
+      #
+      #   include_dirs_cc: [list of paths]
+      #     Supported to add `-isystem <dir>` switches to C++ compilations.
+      #     This locates C++ toolchain headers when the compiler driver doesn't
+      #     use them by default (GCC and EFI).
+      #
+      #   lib_dirs: [list of paths]
+      #     Supported to add standard library search directories.  This locates
+      #     C++ toolchain libraries when the compiler driver doesn't use them
+      #     by default (GCC).
+      #
+      zircon_toolchain = {
+      }
+      zircon_toolchain = {
+        # This gets `tool_dir` et al as expected by c_utils.gni (set above).
+        forward_variables_from(tc, "*")
+
+        cpu = tc_cpu
+        target_tuple = tc_target
+        environment = invoker.environment
+
+        # This is used in setting metadata.link_output.
+        if (use_strip) {
+          link_output_suffix = ".debug"
+        } else {
+          link_output_suffix = ""
+        }
+
+        if (!defined(include_dirs_cc)) {
+          include_dirs_cc = []
+        }
+
+        if (!defined(lib_dirs)) {
+          lib_dirs = []
+        }
+      }
+    }
+  }
+}

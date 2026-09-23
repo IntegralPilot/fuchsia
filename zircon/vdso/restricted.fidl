@@ -1,0 +1,290 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library zx;
+
+/// ExceptionReport is a stand-in for zx_exception_report_t.
+type ExceptionReport = struct {};
+
+@transport("Syscall")
+closed protocol Restricted {
+    /// ## Summary
+    ///
+    /// Enter restricted mode
+    ///
+    /// ## Declaration
+    ///
+    /// ```c
+    /// #include <zircon/syscalls-next.h>
+    ///
+    /// zx_status_t zx_restricted_enter(uint32_t options,
+    ///                                 uintptr_t vector_table_ptr,
+    ///                                 uintptr_t context);
+    /// ```
+    ///
+    /// ## Description
+    ///
+    /// Enters restricted mode from normal thread state. If successful, the current
+    /// thread will return to normal mode via an entry point passed in
+    /// *vector_table_ptr*.
+    ///
+    /// *vector_table_ptr* must be within the current user address space.
+    /// *context* may be any value. It is used as a value to pass back to normal
+    /// mode when returning from restricted mode.
+    ///
+    /// *options* must be 0.
+    ///
+    /// Arguments to the function at *vector_table_ptr* are architecturally specific:
+    ///
+    /// On x64, *context* is placed in *rdi* and a reason code is placed in *rsi*.
+    /// All other registers are currently undefined, including the stack pointer.
+    ///
+    /// On arm64, *context* is placed in *x0* and a reason code is placed in *x1*.
+    /// All other registers are currently undefined, including the stack pointer.
+    ///
+    /// On riscv64, *context* is placed in *a0* and a reason code is placed in *a1*.
+    /// All other registers are currently undefined, including the stack pointer.
+    ///
+    /// The *reason code* specifies the reason that normal mode execution has resumed.
+    /// This *reason code* may be one of `ZX_RESTRICTED_REASON_SYSCALL`,
+    /// `ZX_RESTRICTED_REASON_EXCEPTION`.
+    ///
+    /// ### Shared process
+    ///
+    /// Processes created with the `ZX_PROCESS_SHARED` option, or via `zx_process_create_shared()`
+    /// have two distinct [address spaces]. One is shared between multiple processes, while the other
+    /// is restricted to the specific process. When a thread that is entering restrcited mode
+    /// belongs to such a process, the active address space for the thread is updated as follows:
+    ///
+    ///   - When entering restricted mode the active address space for the thread is set to the
+    ///     restricted address space of the process.
+    ///   - When exiting restricted mode the active address space for the thread is set to the
+    ///     shared address space of the process.
+    ///
+    /// ## Rights
+    ///
+    /// None (currently)
+    ///
+    /// ## Return value
+    ///
+    /// No return value on success, since the current thread indirectly returns via
+    /// *vector_table_ptr*. In the event of failure, a negative error value is returned.
+    ///
+    /// ## Errors
+    ///
+    /// `ZX_ERR_INVALID_ARGS` *vector_table_ptr* is not a valid user address or *options*
+    /// is non-zero.
+    ///
+    /// `ZX_ERR_BAD_STATE` restricted mode register state is invalid.
+    ///
+    /// ## See also
+    ///
+    /// - [`zx_restricted_bind_state()`]
+    /// - [`zx_restricted_unbind_state()`]
+    /// - [`zx_process_create_shared()`]
+    ///
+    /// [`zx_restricted_bind_state()`]: restricted_bind_state.md
+    /// [`zx_restricted_unbind_state()`]: restricted_unbind_state.md
+    /// [`zx_process_create_shared()`]: process_create_shared.md
+    /// [address spaces]: /docs/concepts/memory/address_spaces.md
+    @next
+    // TODO(https://fxbug.dev/42077468): This is not a blocking syscall in the
+    // normal sense of the word.  We've annotated this as blocking so that we
+    // can use ZX_ERR_INTERNAL_INTR_RETRY and the vDSO retry logic.  See
+    // https://fxbug.dev/42076957 for details.
+    @blocking
+    strict Enter(struct {
+        options uint32;
+        vector_table_ptr uintptr64;
+        context uintptr64;
+    }) -> () error Status;
+
+    /// ## Summary
+    ///
+    /// Create and bind a restricted state VMO to the current thread.
+    ///
+    /// ## Declaration
+    ///
+    /// ```c
+    /// #include <zircon/syscalls-next.h>
+    ///
+    /// zx_status_t zx_restricted_bind_state(uint32_t options,
+    ///                                      zx_handle_t* out_vmo,
+    ///                                      zx_exception_report_t* out_exception);
+    /// ```
+    ///
+    /// ## Description
+    ///
+    /// Create a VMO to hold a `zx_restricted_state_t`.  Bind the VMO to the current
+    /// thread so that subsequent calls to [`zx_restricted_enter()`] will use it to
+    /// restore/save the restricted mode state upon entering/leaving restricted mode.
+    ///
+    /// While the returned VMO, `out_vmo`, is similar to one created by
+    /// [`zx_vmo_create()`], some operations are unsupported and may fail with an error.
+    /// For example, resizing and creating a child VMO are unsupported.  Mapping,
+    /// unmapping, and reading/writing via [`zx_vmo_read()`]/[`zx_vmo_write()`] are
+    /// supported.
+    ///
+    /// Only one restricted state VMO may be bound to a thread at a time.  Attempting to
+    /// bind another one will replace the already bound VMO.
+    ///
+    /// A bound VMO will be destroyed only after the last user handle is closed, the
+    /// last user mapping is removed, and one of the following occur:
+    ///
+    ///   - It is replaced via `zx_restricted_bind_state()`.
+    ///
+    ///   - It is explicitly removed via [`zx_restricted_unbind_state()`].
+    ///
+    ///   - The thread is destroyed.
+    ///
+    /// Like any other VMO, once the VMO has been mapped it will be retained by its
+    /// mapping so the caller may close the handle and access the memory directly via
+    /// the mapping.
+    ///
+    /// Upon entering restricted mode `zx_restricted_state_t` at offset 0 of the VMO
+    /// will be loaded and execution will resume accordingly.  Upon leaving restricted
+    /// mode, the thread's restricted state will be saved at offset 0 of VMO.
+    ///
+    /// *out_exception* is an optional pointer to a `zx_exception_report_t`.
+    /// When `out_exception` is null, an exception return will result in
+    /// `ZX_RESTRICTED_REASON_EXCEPTION` and the mode state VMO will contain a
+    /// `zx_restricted_exception_t`. When `out_exception` is non-null, the return
+    /// code is the same, but the mode state will contain a `zx_restricted_state_t`
+    /// and the `zx_exception_report_t` will be copied to `out_exception`. If the
+    /// copy fails, the reason code will be `ZX_RESTRICTED_REASON_EXCEPTION_LOST` and
+    /// the exception report will be lost.
+    ///
+    /// *options* must be zero.
+    ///
+    /// Note: If a handle to the newly created VMO cannot be returned because `out_vmo`
+    /// is an invalid pointer, the VMO may still be bound to the thread even when the
+    /// call returns `ZX_ERR_INVALID_ARGS`.  A caller can recover from this state by
+    /// calling [`zx_restricted_unbind_state()`] or calling
+    /// [`zx_restricted_bind_state()`] again with a valid `out_vmo`.
+    ///
+    /// ## Rights
+    ///
+    /// Caller's job policy must allow `ZX_POL_NEW_VMO`.
+    ///
+    /// ## Errors
+    ///
+    /// `ZX_ERR_INVALID_ARGS`  *out_vmo* is an invalid pointer or NULL, or *options*
+    /// is any value other than 0.
+    ///
+    /// `ZX_ERR_NO_MEMORY`  Failure due to lack of memory.
+    /// There is no good way for userspace to handle this (unlikely) error.
+    /// In a future build this error will no longer occur.
+    ///
+    /// ## See also
+    ///
+    /// - [`zx_restricted_enter()`]
+    ///
+    /// - [`zx_restricted_unbind_state()`]
+    ///
+    /// [`zx_restricted_enter()`]: restricted_enter.md
+    /// [`zx_restricted_bind_state()`]: restricted_bind_state.md
+    /// [`zx_restricted_unbind_state()`]: restricted_unbind_state.md
+    /// [`zx_vmo_create()`]: vmo_create.md
+    /// [`zx_vmo_read()`]: vmo_read.md
+    /// [`zx_vmo_write()`]: vmo_write.md
+    @next
+    strict BindState(resource struct {
+        options uint32;
+    }) -> (resource struct {
+        out Handle:VMO;
+        out_exception ExceptionReport;
+    }) error Status;
+
+    /// ## Summary
+    ///
+    /// Unbind a restricted state VMO from the current thread.
+    ///
+    /// ## Declaration
+    ///
+    /// ```c
+    /// #include <zircon/syscalls-next.h>
+    ///
+    /// zx_status_t zx_restricted_unbind_state(uint32_t options);
+    /// ```
+    ///
+    /// ## Description
+    ///
+    /// Unbind any restricted state VMO that may be bound to the calling thread.
+    ///
+    /// See also [`zx_restricted_bind_state()`].
+    ///
+    /// It is not an error to call unbind on a thread that has no bound VMO.
+    ///
+    /// *options* must be zero.
+    ///
+    /// ## Rights
+    ///
+    /// None.
+    ///
+    /// ## Errors
+    ///
+    /// `ZX_ERR_INVALID_ARGS`  *options* is any value other than 0.
+    ///
+    /// ## See also
+    ///
+    /// - [`zx_restricted_enter()`]
+    ///
+    /// - [`zx_restricted_bind_state()`]
+    ///
+    /// [`zx_restricted_enter()`]: restricted_enter.md
+    /// [`zx_restricted_bind_state()`]: restricted_bind_state.md
+    @next
+    strict UnbindState(resource struct {
+        options uint32;
+    }) -> () error Status;
+
+    /// ## Summary
+    ///
+    /// Kick a thread out of restricted mode.
+    ///
+    /// ## Declaration
+    ///
+    /// ```c
+    /// #include <zircon/syscalls-next.h>
+    ///
+    /// zx_status_t zx_restricted_kick(zx_handle_t thread, uint32_t options);
+    /// ```
+    ///
+    /// ## Description
+    ///
+    /// Kicks a thread out of restricted mode if it is currently running in restricted
+    /// mode or saves a pending kick if it is not. If the target thread is running in
+    /// restricted mode, it will exit to normal mode through the entry point provided to
+    /// `zx_restricted_enter` with a reason code set to `ZX_RESTRICTED_REASON_KICK`.
+    /// Otherwise the next call to `zx_restricted_enter` will not enter restricted mode
+    /// and will instead dispatch to the provided entry point with reason
+    /// code `ZX_RESTRICTED_REASON_KICK`.
+    ///
+    /// Multiple kicks on the same thread object are collapsed together. Thus if
+    /// multiple threads call `zx_restricted_kick` on the same target while it is
+    /// running or entering restricted mode, at least one but possibly multiple
+    /// `ZX_RESTRICTED_REASON_KICK` returns will be observed. The recommended way to use
+    /// this syscall is to first record a reason for kicking in a synchronized data
+    /// structure and then call `zx_restricted_kick`. The thread calling
+    /// `zx_restricted_enter` should consult this data structure whenever it observes
+    /// `ZX_RESTRICTED_REASON_KICK` and process any pending state before reentering
+    /// restricted mode.
+    ///
+    /// *options* must be zero.
+    ///
+    /// ## Rights
+    ///
+    /// `ZX_RIGHT_MANAGE_THREAD` is required on *thread*.
+    ///
+    /// ## Errors
+    ///
+    /// `ZX_ERR_INVALID_ARGS` *options* is any value other than 0.
+    /// `ZX_ERR_WRONG_TYPE` *thread* is not a thread.
+    /// `ZX_ERR_ACCESS_DENIED` *thread* does not have ZX_RIGHT_MANAGE_THREAD.
+    /// `ZX_ERR_BAD_STATE` *thread* is dead.
+    @next
+    strict Kick(resource struct {
+        thread Handle:THREAD;
+        options uint32;
+    }) -> () error Status;
+};

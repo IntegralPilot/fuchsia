@@ -1,0 +1,124 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/test.gni")
+import("//build/testing/boot_tests/zbi_test.gni")
+import("//build/zbi/kernel_cmdline.gni")
+
+# Build an executable to run as the standalone test binary under Zircon.
+#
+# This wraps a test() with the metadata appropriate to have it launched by
+# userboot as the standalone.  This target should be included in deps of a
+# zbi_test() target, along with a kernel.  An auxiliary metadata target
+# "$target_name.cmdline" is defined and referenced in data_deps.
+#
+# Parameters: (see test for other parameters)
+#
+#   userboot_entry_type (optional, defaults to "test")
+#     [string] May be "test" or "boot". By setting this parameter, the
+#     executable will be launched by userboot as a test program or as boot
+#     program.
+#
+#   userboot_next_is_test (optional, defaults to `false`)
+#     [boolean] Whether the programs being launched constitude a single test.
+#     Setting this flag will force userboot to wait for `userboot.next` to exit,
+#     and use `userboot.next`'s result as the success criteria for the test.
+#
+#   prefix (optional, defaults to "zbi-test")
+#     [string] Same behavior as zbi_input() prefix.
+#
+# Note that defaults for `configs` exclude the implicit fdio dependency, and
+# defaults for `disable_syslog_backend` and `assert_no_deps` are injected to
+# avoid other implicit deps inappropriate for standalone test executables and
+# to ensure those haven't crept in from elsewhere in the deps graph.  These
+# parameters can be set explicitly to override this.
+template("zbi_test_executable") {
+  if (defined(invoker.output_name)) {
+    output_name = invoker.output_name
+  } else {
+    output_name = target_name
+  }
+  userboot_prefix = "zbi-test"
+  if (defined(invoker.prefix)) {
+    userboot_prefix = invoker.prefix
+  }
+
+  # Defined by 'test' template.
+  install_path = "test/${output_name}"
+  if (defined(invoker.userboot_entry_type)) {
+    userboot_entry_type = invoker.userboot_entry_type
+  } else {
+    userboot_entry_type = "test"
+  }
+
+  if (defined(invoker.userboot_next_is_test)) {
+    userboot_next_is_test = invoker.userboot_next_is_test
+  } else {
+    userboot_next_is_test = false
+  }
+
+  main_target = target_name
+  zbi_input_target = "$target_name.zbi_input"
+  test_target = "$target_name.bin"
+  cmdline_target = "$target_name.cmdline"
+
+  group(main_target) {
+    testonly = true
+    deps = [ ":$zbi_input_target" ]
+  }
+
+  test(test_target) {
+    data_deps = []
+    forward_variables_from(invoker, "*")
+    data_deps += [ ":$cmdline_target" ]
+  }
+
+  zbi_input(zbi_input_target) {
+    testonly = true
+    prefix = userboot_prefix
+    deps = [ ":$test_target" ]
+  }
+
+  kernel_cmdline(cmdline_target) {
+    testonly = true
+    forward_variables_from(invoker, [ "visibility" ])
+    if (defined(visibility)) {
+      visibility += [ ":$main_target" ]
+    }
+
+    if (userboot_entry_type == "test") {
+      args = [
+        "kernel.select.userboot=userboot-test-rust",
+        "userboot.test.root=$userboot_prefix",
+        "userboot.test.next=$install_path",
+      ]
+    } else {
+      args = [
+        "userboot.root=$userboot_prefix",
+        "userboot.next=$install_path",
+      ]
+    }
+
+    if (userboot_next_is_test) {
+      args += [ "userboot.next-is-test=true" ]
+      if (userboot_entry_type != "test") {
+        args += [ "kernel.select.userboot=userboot-test-rust" ]
+      }
+    }
+  }
+}
+
+set_defaults("zbi_test_executable") {
+  configs = default_executable_configs
+  if (is_fuchsia && !is_kernel) {
+    configs -= [ "//build/config/fuchsia:fdio_config" ]
+  }
+
+  assert_no_deps = [
+    "//sdk/lib/fdio",
+    "//sdk/lib/syslog/*",
+  ]
+
+  disable_syslog_backend = true
+}

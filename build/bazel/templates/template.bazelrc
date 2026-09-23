@@ -1,0 +1,179 @@
+# Copyright 2022 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# AUTO-GENERATED - DO NOT EDIT!
+
+# Ensure local build actions never inherit the user's LD_LIBRARY_PATH
+# to improve hermeticity and caching.
+build --incompatible_strict_action_env=true
+
+# Do not create runfiles symlink forests for external repositories
+# under .runfiles/_main/external/repo in addition to .runfiles/repo.
+#
+# This is the default behavior in Bazel 8.0 but not in Bazel 7.x,
+# though `bazel test` implicitly disables the behavior since  Bazel 7.1
+build --legacy_external_runfiles=false
+
+# Specify the default platforms.
+# The target platform is always set by the configuration specified via `--config`. To ensure there
+# are no situations where this is not the case, set the default platform to a nonexistent label,
+# which would cause an error rather than silently use the Bazel default.
+common --platforms=PLATFORM_SHOULD_BE_SPECIFIED_VIA_THE_CONFIG
+# TODO(https://fxbug.dev/520546777): Remove this once `compdb_for_labels()` specifies the platform.
+info --platforms=//build/bazel/platforms:default
+build --host_platform=//build/bazel/platforms:host
+
+# Note: Log file locations are now configured per-invocation in
+# the generated invocation.bazelrc (see //build/bazel/wrapper.bazel.sh).
+
+# Need the following to ensure the execution.log is actually uploaded to the RBE CAS.
+# Do not use =all, because that will attempt to upload locally built targets to CAS.
+common:exec_log --remote_build_event_upload=minimal
+# go/slipstream-bazel: detailed performance analysis and visualization
+common:exec_log --experimental_execution_graph_log_dep_type=all
+common:exec_log --experimental_enable_execution_graph_log
+
+# Disable verbose Bazel output with --config=quiet
+# Note that --show_result=0 is not supported by `bazel query`.
+common:quiet --noshow_loading_progress
+common:quiet --noshow_progress
+common:quiet --ui_event_filters=-info
+build:quiet --show_result=0
+
+# Enable verbose Bazel output with --config=verbose.
+common:verbose --ui_event_filters=+info
+common:verbose --show_loading_progress
+common:verbose --show_progress
+build:verbose --show_result=1
+
+# Ensure outputs are writable (umask 0755) instead of readonly (0555),
+# which prevent removing output directories with `rm -rf`.
+# See https://fxbug.dev/42072059
+build --experimental_writable_outputs
+
+# Ensure the embedded JDK that comes with Bazel is always used
+# This prevents Bazel from downloading extra host JDKs from the
+# network, even when a project never uses Java-related  rules
+# (for some still-very-mysterious reasons!)
+build --java_runtime_version=embedded_jdk
+build --tool_java_runtime_version=embedded_jdk
+
+# Profiling network usage can help find unexpected uploading/downloading by RBE, BES, etc.
+# As of Bazel 8, this will be enabled by default.
+build --experimental_collect_system_network_usage
+
+# Use --config=no_gn_targets to ensure that the @gn_targets repository is empty.
+# Bazel targets built with this option cannot depend on GN target outputs at all,
+# very intentionally.
+common:no_gn_targets \
+  --override_repository=gn_targets=build/bazel/local_repositories/empty_gn_targets
+
+# Globally assert no forbidden dependencies.
+# To specify the no-dep dependencies, use tag `assert_no_deps=<label>`:
+#
+#   some_target(
+#     ...
+#     tags = ["assert_no_deps=//some/label", ...],
+#   )
+#
+# See //build/bazel/aspects/tests/assert_no_deps_test.bzl for example usage.
+build --aspects=//build/bazel/aspects:assert_no_deps.bzl%assert_no_deps_aspect
+
+# Enable clippy for Rust targets specified on the build line.
+# See https://bazelbuild.github.io/rules_rust/rust_clippy.html.
+build --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build --output_groups=+clippy_checks
+# Fail on warnings to match the current implementation in the GN build.
+build --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+
+# TODO(https://fxbug.dev/540978591): Switch to build_flags() when it's available.
+#
+# Host Rust coverage flags based on GN's //build/config/profile:coverage-rust.
+#
+# `remap-path-prefix` is only set in Bazel. It instructs rustc to rewrite source file paths that
+# begin with . (the current working directory) so that they begin with ../.. in the coverage mapping
+# data. This changes source file paths to formats expected by downstream coverage pipeline.
+build:host_rust_coverage --@rules_rust//rust/settings:extra_rustc_flags=-Cinstrument-coverage,-Cllvm-args=-profile-correlate=binary,-Cllvm-args=-runtime-counter-relocation,--remap-path-prefix=.=../..
+
+# Restore the repository rule behavior of adding an implicit watch() for
+# any Label value passed to repository_ctx.path(), as this is heavily used
+# by @rules_fuchsia and our own custom repository rules to ensure proper
+# tracking. The alternative is to use repository_ctx.watch() and repository.watch_tree()
+# explicitly instead. See https://fxbug.dev/461759428.
+common --incompatible_no_implicit_watch_label=false
+
+# Pass local developer overrides for assembly to Bazel
+# For now, this needs to set the label_flag() in both @rules_fuchsia
+# and @fuchsia_sdk to ensure that all fuchsia_product() definitions
+# correctly support this feature. The @fuchsia_sdk one may be
+# removed when the fuchsia.git and vendor/*.git repositories no
+# longer include rules from @fuchsia_sdk.
+common --@rules_fuchsia//fuchsia:assembly_developer_overrides_list=@assembly_developer_overrides//:in-tree_developer_overrides_list
+
+# Set the release repository for assembly config artifacts to "fuchsia".
+# This is necessary so MOS knows where a given assembly artifact came from.
+common --@rules_fuchsia//fuchsia/flags:fuchsia_release_repository="fuchsia"
+
+# Set the xattr written by the RBE remote wrapper, which can be read by bazel to reduce the time
+# spent calculating hashes of inputs.
+startup --unix_digest_hash_attribute_name="user.fuchsia.bazel.digest.sha256"
+
+# Ensure that linked binaries are never stripped. See //build/bazel/debug_symbols/README.md for context.
+# Also ensure that Go binaries always contain debug symbols, even in non-dbg compilation mode.
+# LINT.IfChange(debug_symbols)
+common --strip=never
+common --@io_bazel_rules_go//go/config:debug=True
+# LINT.ThenChange(//build/bazel/debug_symbols/README.md)
+
+# Explicitly disable PIE to avoid `recompile with -fPIC` linking errors.
+# See https://fxbug.dev/489925970 for details.
+build --@io_bazel_rules_go//go/config:gc_linkopts="-extldflags,-no-pie"
+
+# Explicitly enable pure mode and disable CGO by default, for build consistency
+# across different build environments (e.g. differnt system libc).
+#
+# For Go targets that needs CGO, they should enable it explicitly and provide
+# Fuchsia's prebuilt sysroot if necessary.
+#
+# See https://fxbug.dev/489925970 for details.
+build --@io_bazel_rules_go//go/config:pure=True
+
+# Do not propagate Starlark flags to the exec config. This will be the default
+# behavior in Bazel 10 (https://github.com/bazelbuild/bazel/issues/26909).
+# Among other things, it avoids building host tools for each API level.
+# TODO(https://fxbug.dev/478896548): When migraating to Bazel 9, this will need
+# to be changed to `--incompatible_exclude_starlark_flags_from_exec_config`.
+common --experimental_exclude_starlark_flags_from_exec_config
+
+# Do not propagate defines to the exec config by default.
+# Explicitly propagate `EXECUTOR`, which is used in remote builds.
+common --experimental_exclude_defines_from_exec_config
+common --experimental_propagate_custom_flag=EXECUTOR
+
+# Name subdirectories of `bazel-out/` based on the associated platform.
+# For example, use `fuchsia_x64-opt` instead of `k8-opt`.
+# This also separates x64 `--config=fuchsia_platform` output from
+# `--config=host` because they no longer both use `k8-opt`.
+#
+# Warning: This can cause conflicts in C++ compile actions when using
+# `@local_config_platform//:host` - see
+# https://github.com/bazelbuild/bazel/issues/26228.
+common --experimental_platform_in_output_dir=True
+
+# Enable dynamic linking of C++ stdlib for drivers in-tree.
+common --@rules_fuchsia//fuchsia/flags:dynamic_cpp_standard_library_for_drivers=True
+
+# Turn off build-time venv generation to avoid creating dangling symlinks in bazel-out.
+# Without this, host_py_test targets would fail with `No such file or directory` when invoking the
+# interpreter. See https://fxbug.dev/527829442 for details.
+build --@rules_python//python/config_settings:venvs_use_declare_symlink=no
+
+# Suppress deprecation warnings when compiling re2, as we are unable to patch it
+# using single_version_override, which deletes older versions from local BCR,
+# without breaking bzlmod module resolution.
+#
+# TODO(https://fxbug.dev/537560103): Uprev third_party/re2 past upstream
+# absl-related fixes and remove these copts.
+build --per_file_copt=external/re2.*/.*@-Wno-deprecated-declarations
+build --host_per_file_copt=external/re2.*/.*@-Wno-deprecated-declarations

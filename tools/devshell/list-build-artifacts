@@ -1,0 +1,211 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+#### CATEGORY=Internal API
+### Builds and returns a list of a desired set of build artifacts
+
+## usage: fx list-build-artifacts [--build] [--allow-empty | --expect-one] [FILTERS...] MODE
+##
+## Builds and returns a list of paths to special sets of build artifacts within
+## the GN graph relative to the build directory.
+##
+##  --build       build the artifacts as well as returning a list of them
+##  --show-label  show the GN label rather than the path
+##  --allow-empty do not fail if no such artifacts are found
+##  --expect-one  fail if zero or more than one artifacts are found. This
+##                option is mutually exclusive from `--allow-empty`.
+##  --name        filter the set of artifacts to pick out the particular one of
+##                the same name
+##  --os          filter the set of artifacts by intended operating system: one
+##                of `fuchsia`, `linux`, or `mac`. Defaults to $HOST_OS when
+##                the mode is `tools.`
+##  --cpu         filter the set of artifacts by intended architecture: one of
+##                `x64` or `arm64`. Defaults to $HOST_CPU when the mode is
+##                `tools`.
+##  --type         filter the set of artifacts by type.
+##
+##  MODE          One of the following:
+##                `images` -- returns the list of images
+##                `flash`-- returns the list of images needed to flash
+##                `mkzedboot` -- returns the list of images needed to mkzedboot
+##                `tools` -- returns the list of host tools
+##                `boot-tests`-- returns the list of boot tests
+##                `generated-sources`-- returns the list of generated sources
+##                 (e.g., FIDL and Banjo bindings).
+##                `product-bundle` -- returns the root of the product bundle
+##
+
+set -o errexit
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"/lib/vars.sh
+fx-config-read
+
+readonly IMAGES_JSON="images.json"
+readonly TOOL_PATHS_JSON="tool_paths.json"
+readonly BOOT_TESTS_JSON="boot_tests.json"
+readonly GENERATED_SOURCES_JSON="generated_sources.json"
+readonly PRODUCT_BUNDLE_JSON="product_bundles.json"
+readonly BINARIES_JSON="binaries.json"
+
+build=false
+show_label=false
+allow_empty=false
+expect_one=false
+mode=""
+name=""
+os=""
+cpu=""
+type=""
+while [[ $# -ne 0 ]]; do
+  case "$1" in
+  --help|-h)
+      fx-command-help
+      exit 0
+      ;;
+  --build)
+    build=true
+    ;;
+  --allow-empty)
+    allow_empty=true
+    ;;
+  --expect-one)
+    expect_one=true
+    ;;
+  --show-label)
+    show_label=true
+    ;;
+  --name)
+    shift
+    name="$1"
+    ;;
+  --os)
+    shift
+    os="$1"
+    ;;
+  --cpu)
+    shift
+    cpu="$1"
+    ;;
+  --type)
+    shift
+    type="$1"
+    ;;
+  -*)
+    fx-error "Unknown flag: $1"
+    fx-command-help
+    exit 1
+    ;;
+  *)
+    if [[ -z "${mode}" ]]; then
+      mode="$1"
+    else
+      fx-error "unexpected argument: '$1'"
+      exit 1
+    fi
+    ;;
+  esac
+  shift
+done
+
+if [[ -z "${mode}" ]]; then
+  fx-error "MODE must be specified"
+  fx-command-help
+  exit 1
+fi
+
+if $allow_empty && $expect_one ; then
+  fx-error "cannot set both --allow-empty and --expect-one"
+  fx-command-help
+  exit 1
+fi
+
+# Some build API modules are just plain JSON lists; in that case, we should
+# not apply any filters.
+is_list_like=false
+manifest=""
+jq_filter=".[]"
+paths=()
+name_key="name"
+name_regex=false
+path_key="path"
+if [[ "${mode}" == images ]]; then
+  manifest="${IMAGES_JSON}"
+elif [[ "${mode}" == flash ]]; then
+  manifest="${IMAGES_JSON}"
+  paths+=("flash.sh")
+  jq_filter+=" | select(.fastboot_flash != null)"
+elif [[ "${mode}" == mkzedboot ]]; then
+  manifest="${IMAGES_JSON}"
+  jq_filter+=" |  select(.mkzedboot_mode != null)"
+elif [[ "${mode}" == tools ]]; then
+  manifest="${TOOL_PATHS_JSON}"
+  os="${os:-${HOST_OS}}"
+  cpu="${cpu:-${HOST_CPU}}"
+elif [[ "${mode}" == boot-tests ]]; then
+  manifest="${BOOT_TESTS_JSON}"
+elif [[ "${mode}" == generated-sources ]]; then
+  manifest="${GENERATED_SOURCES_JSON}"
+  is_list_like=true
+elif [[ "${mode}" == product-bundle ]]; then
+  manifest="${PRODUCT_BUNDLE_JSON}"
+  jq_filter+=" |  select(.path != null)"
+elif [[ "${mode}" == binaries ]]; then
+  manifest="${BINARIES_JSON}"
+  name_key="dist"
+  name_regex=true
+  path_key="debug"
+else
+  fx-error "unknown MODE: ${mode}"
+  fx-command-help
+  exit 1
+fi
+
+if $show_label; then
+  path_key="label"
+fi
+
+if [[ ! -z "${name}" ]]; then
+  if $name_regex; then
+    jq_filter+=" | select(.$name_key | test(\"${name}\"))"
+  else
+    jq_filter+=" | select(.$name_key == \"${name}\")"
+  fi
+  # Filter existing paths by the name as well.
+  if [[ "${paths[@]}" =~ "${name}" ]]; then
+    paths=("${name}")
+  else
+    paths=()
+  fi
+fi
+
+if ! $is_list_like ; then
+  if [[ ! -z "${os}" ]]; then
+    jq_filter+=" | select(.os == \"${os}\")"
+  fi
+  if [[ ! -z "${cpu}" ]]; then
+    jq_filter+=" | select(.cpu == \"${cpu}\")"
+  fi
+  if [[ ! -z "${type}" ]]; then
+    jq_filter+=" | select(.type == \"${type}\")"
+  fi
+  jq_filter+=" | .$path_key"
+fi
+
+paths+=($(fx-command-run jq --raw-output "${jq_filter}" "${FUCHSIA_BUILD_DIR}/${manifest}"))
+if $build && [[ ${#paths[@]} -ne 0 ]] ; then
+  fx-command-run build "${paths[@]}" >&2
+fi
+
+if [[ ${#paths[@]} -eq 0 ]] && (! $allow_empty || $expect_one) ; then
+  fx-error "found no artifacts in the GN graph of type \"${mode}\" with ($name_key, os, cpu, type) == (\"${name:-*}\", \"${os:-*}\", \"${cpu:-*}\", \"${type:-*}\")"
+  exit 1
+fi
+
+if [[ ${#paths[@]} -gt 1 ]] && $expect_one ; then
+  fx-error "expected one artifact; found multiple: ${paths[@]}"
+  exit 1
+fi
+
+echo "${paths[@]}"

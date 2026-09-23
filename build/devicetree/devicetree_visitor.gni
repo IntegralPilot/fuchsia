@@ -1,0 +1,200 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/cpp/sdk_source_set.gni")
+import("//build/sdk/sdk_atom.gni")
+import("//build/sdk/sdk_molecule.gni")
+
+# Defines a devicetree visitor target.
+#
+# Parameters
+#
+#   * sources
+#     - Required: Device tree visitor source files (.cc and .h) that will be
+#       used to parse the devicetree related to the schema.
+#       TODO(https://fxbug.dev/42083285) Generate the visitor from schema file.
+#     - Type: List(path).
+#
+#   * deps
+#     - Optional: Usual GN meaning.
+#
+template("devicetree_visitor") {
+  if (!defined(output_dir)) {
+    output_dir = root_out_dir
+  }
+  if (!defined(output_name)) {
+    output_name = target_name
+  }
+  if (!defined(output_extension)) {
+    output_extension = "so"
+  }
+
+  _output_file_name = output_name
+  if (output_extension != "") {
+    _output_file_name += ".$output_extension"
+  }
+  _output_file = "$output_dir/$_output_file_name"
+  _rebased_output_file = rebase_path(_output_file, root_build_dir)
+
+  _loadable_module_target_name = target_name
+  _sdk_target_name = "${target_name}_sdk"
+  _sdk_pkg_name = "devicetree-${target_name}"
+
+  # Define the loadable_module target, this target
+  # will later be used to define the sdk_atom target
+  loadable_module(_loadable_module_target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "non_sdk_deps",
+                             "category",
+                             "enable_sdk_source_set",
+                           ])
+    if (defined(invoker.non_sdk_deps)) {
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += invoker.non_sdk_deps
+    }
+    if (!defined(ldflags)) {
+      ldflags = []
+    }
+
+    _version_script =
+        "//build/bazel_sdk/bazel_rules_fuchsia/fuchsia/private/visitor.ld"
+    ldflags += [ "-Wl,--version-script=" +
+                 rebase_path(_version_script, root_build_dir) ]
+    metadata = {
+      devicetree_barrier = []
+
+      # Used by the distribution_manifest template.
+      distribution_entries = [
+        {
+          source = _rebased_output_file
+          destination = "lib/visitors/${_output_file_name}"
+          label = get_label_info(":$_loadable_module_target_name",
+                                 "label_with_toolchain")
+          elf_runtime_dir = "lib/${toolchain_variant.libprefix}"
+        },
+      ]
+    }
+  }
+
+  source_set("${target_name}.static") {
+    forward_variables_from(invoker,
+                           [
+                             "sources",
+                             "deps",
+                             "public_deps",
+                             "testonly",
+                           ])
+    if (defined(invoker.non_sdk_deps)) {
+      if (!defined(deps)) {
+        deps = []
+      }
+      deps += invoker.non_sdk_deps
+    }
+    configs += [ "//sdk/lib/driver/devicetree/visitors:static_visitor_config" ]
+  }
+
+  if (defined(invoker.enable_sdk_source_set) && invoker.enable_sdk_source_set) {
+    _visitor_sdk_name = "devicetree-${target_name}-static"
+
+    sdk_source_set("${target_name}_visitor") {
+      forward_variables_from(invoker,
+                             "*",
+                             [
+                               "category",
+                               "defines",
+                             ])
+      sdk_name = _visitor_sdk_name
+      include_base = "//sdk"
+      if (!defined(category)) {
+        category = "internal"
+      }
+      if (!defined(defines)) {
+        defines = []
+      }
+      defines += [ "FDF_DEVICETREE_STATIC_VISITOR" ]
+    }
+  }
+
+  sdk_atom(_sdk_target_name) {
+    id = "sdk://pkg/${_sdk_pkg_name}"
+    category = "internal"
+
+    files = [
+      {
+        source = _output_file
+        dest =
+            "arch/${target_cpu}/dist/devicetree-visitors-${_output_file_name}"
+      },
+    ]
+
+    non_sdk_deps = [ ":${_loadable_module_target_name}" ]
+    if (defined(invoker.deps)) {
+      non_sdk_deps += invoker.deps
+    }
+    if (defined(invoker.public_deps)) {
+      non_sdk_deps += invoker.public_deps
+    }
+
+    _sdk_binaries =
+        [ "arch/${target_cpu}/dist/devicetree-visitors-${_output_file_name}" ]
+
+    meta = {
+      dest = "pkg/${_sdk_pkg_name}/meta.json"
+      type = "loadable_module"
+      stable = false
+      value = {
+        type = "loadable_module"
+        name = "${_sdk_pkg_name}"
+        root = "pkg/${_sdk_pkg_name}"
+        binaries = {
+        }
+        resources = []
+        if (target_cpu == "arm64") {
+          binaries.arm64 = _sdk_binaries
+        } else if (target_cpu == "x64") {
+          binaries.x64 = _sdk_binaries
+        } else if (target_cpu == "riscv64") {
+          binaries.riscv64 = _sdk_binaries
+        } else {
+          assert(false, "Unknown CPU type: %target_cpu")
+        }
+      }
+    }
+  }
+}
+
+# Defines a collection of devicetree visitors.
+#
+# Creates a GN group target for use in GN builds as well as a sdk molecule
+# `${target_name}_sdk` that can be used to export the visitors to the SDK.
+#
+# Parameters
+#
+#   * deps
+#     - Required: List of device tree visitor targets that will be part of this collection.
+#     - Type: List(label). Must point to devicetree_visitor() or a devicetree_visitor_collection().
+#
+template("devicetree_visitor_collection") {
+  _sdk_target_name = "${target_name}_sdk"
+  group(target_name) {
+    deps = invoker.deps
+  }
+
+  sdk_molecule(_sdk_target_name) {
+    visibility = [
+      ":*",
+      "//sdk:*",
+    ]
+
+    deps = []
+    foreach(dep, invoker.deps) {
+      label = get_label_info(dep, "label_no_toolchain")
+      deps += [ "${label}_sdk" ]
+    }
+  }
+}

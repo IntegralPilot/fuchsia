@@ -1,0 +1,262 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+library fuchsia.net.filter;
+
+using fuchsia.ebpf;
+
+alias ControllerId = string:MAX_NAME_LEN;
+
+/// An arbitrary limit on the number of changes that can be applied in a single
+/// transactional update. Exists largely to prevent clients from being able to
+/// OOM the netstack.
+const MAX_COMMIT_SIZE uint16 = 1024;
+
+/// A unique identifier for a controller that is only visible to administrators
+/// of that controller. Useful for proving administrative access.
+type ControllerKey = struct {
+    /// The UUID bytes in little-endian order.
+    uuid array<uint8, 16>;
+};
+
+/// Provides mutable access to an isolated view of packet filtering
+/// configuration.
+///
+/// The handle to this protocol encodes the lifetime of the contained state.
+/// Closing the client end will remove filtering state owned by this controller,
+/// unless the client has previously called `Detach`.
+///
+/// Note that pending changes, on the other hand, will always be flushed when
+/// the client end of this protocol is closed (even if the client has detached).
+closed protocol NamespaceController {
+    /// The server will always emit this event on controller creation to inform
+    /// the client of the final ID assigned to the controller.
+    ///
+    /// Controller IDs must always be globally unique in order to distinguish
+    /// between events that occur in different controllers' scopes. If the
+    /// client provided an ID that collides with an existing controller, the
+    /// server will reassign the ID (e.g. by attaching a random suffix).
+    strict -> OnIdAssigned(struct {
+        id ControllerId;
+    });
+
+    /// Detaches the client end from the controller's lifetime.
+    ///
+    /// After calling `Detach`, closing this client end no longer causes the
+    /// filtering state owned by the controller to be removed. The key returned
+    /// by the method can be used *once* by a client to reconnect to a detached
+    /// controller. This allows clients to ensure the filtering state they
+    /// install is resilient to client-side crashes and disconnections. (Note,
+    /// however, that closing the client end of the channel *will* flush any
+    /// pending changes that have been pushed but not yet committed.)
+    ///
+    /// `Detach` can be called multiple times; the key returned by the most
+    /// recent call is valid to reconnect to the controller. Calling `Detach`
+    /// will always return a new key and invalidate any previous keys.
+    ///
+    /// Note that, once a client has called `Detach` on a controller, the
+    /// controller remains detached even after a reconnection. This means that,
+    /// for example, if a client detached, closed the client end, reconnected,
+    /// and then closed the client end again, the filtering state owned by the
+    /// controller would *not* be removed. After reconnection, the only reason a
+    /// client would call `Detach` is to be able to reconnect *again* in the
+    /// future, given the key is invalidated after use.
+    strict Detach() -> (ControllerKey);
+
+    /// Registers the specified eBPF program with the sevice.
+    ///
+    /// The program must be verified as a valid socket filter (i.e.
+    ///`BPF_PROG_TYPE_SOCKET_FILTER`).
+    ///
+    /// The registration is scoped to this controller. The server keeps the
+    /// program registered until the [`fuchsia.ebpf.PROGRAM_DEFUNCT_SIGNAL`]
+    /// signal is raised on the program handle or the peer handle is closed.
+    /// Matchers installed with this program remain functional even after the
+    /// program is unregistered. The caller should keep the peer handle and not
+    /// signal [`fuchsia.ebpf.PROGRAM_DEFUNCT_SIGNAL`] until the matchers that
+    /// rely on that registration are commited using `Commit()`.
+    ///
+    // TODO(https://fxbug.dev/399946028): The second argument should be removed
+    // once the BPF service is implemented. Netstack will fetch the program
+    // from the service.
+    strict RegisterEbpfProgram(resource struct {
+        handle fuchsia.ebpf.ProgramHandle;
+        program fuchsia.ebpf.VerifiedProgram;
+    }) -> () error @generated_name("RegisterEbpfProgramError") strict enum {
+        // Failed to link the program.
+        LINK_FAILED = 1;
+
+        /// Failed to initialize a map.
+        MAP_FAILED = 2;
+
+        /// The program is already registered.
+        ALREADY_REGISTERED = 3;
+
+        /// The request is missing a required field.
+        MISSING_REQUIRED_FIELD = 4;
+    };
+
+    /// Append a set of changes to a pending transactional update to the
+    /// filtering configuration.
+    ///
+    /// To apply these changes, a client must call `Commit`.
+    strict PushChanges(resource struct {
+        /// The changes to be applied.
+        changes vector<@generated_name("Change") flexible union {
+            /// Create the specified resource.
+            1: create Resource;
+            /// Remove the specified resource, along with all of its contents.
+            2: remove ResourceId;
+        }>:MAX_BATCH_SIZE;
+    }) -> (@generated_name("ChangeValidationResult") flexible resource union {
+        /// The changes are valid.
+        1: ok Empty;
+        /// More than [`MAX_COMMIT_SIZE`] pending changes were pushed before
+        /// being committed.
+        ///
+        /// The pending changes that were pushed to the server *before* this
+        /// call remain and can be committed by calling `Commit`.
+        2: too_many_changes Empty;
+        /// At least one of the changes provided was invalid. In order to be
+        /// maximally informative, a vector of results is returned where each
+        /// result corresponds to the change at the same index.
+        ///
+        /// NB: if any change in the batch pushed by the client is invalid,
+        /// *none* of the provided changes will be added to the server's set of
+        /// pending changes. In other words, this method is all-or-nothing:
+        /// either it succeeds and all changes in the batch are added to the
+        /// pending set, or it fails and none are.
+        3: error_on_change
+                vector<@generated_name("ChangeValidationError") flexible enum {
+            /// The change was not validated because an invalid change was
+            /// encountered before it.
+            NOT_REACHED = 1;
+            /// The change was valid.
+            OK = 2;
+            /// The change included a resource that was missing a field that is
+            /// required to be specified.
+            MISSING_REQUIRED_FIELD = 3;
+            /// The change included a rule with an invalid interface matcher.
+            INVALID_INTERFACE_MATCHER = 4;
+            /// The change included a rule with an invalid address matcher.
+            INVALID_ADDRESS_MATCHER = 5;
+            /// The change included a rule with an invalid port matcher.
+            INVALID_PORT_MATCHER = 6;
+            /// The change included a transparent proxy action with an invalid
+            /// configuration (e.g. a local port of 0).
+            INVALID_TRANSPARENT_PROXY_ACTION = 7;
+            /// The change included a NAT action with an invalid configuration
+            /// (e.g. a destination or source port of 0).
+            INVALID_NAT_ACTION = 8;
+            /// The change included an action with an invalid port range (e.g.
+            /// the range start was not <= range end).
+            INVALID_PORT_RANGE = 9;
+        }>:MAX_BATCH_SIZE;
+    });
+
+    /// Apply all pending changes. The set of changes will either be applied in
+    /// its entirety or, in case of an error, not applied at all.
+    strict Commit(@generated_name("CommitOptions") resource table {
+        /// Whether additions or removals should be idempotent.
+        ///
+        /// For example, an update to add a resource when the resource already
+        /// exists will fail with an `ALREADY_EXISTS` error if `idempotent` is
+        /// `false`, but will succeed if it is `true`. Likewise for removals and
+        /// `*_NOT_FOUND`.
+        ///
+        /// If not set, interpreted as false.
+        1: idempotent bool;
+    }) -> (@generated_name("CommitResult") flexible resource union {
+        /// The commit was successfully applied.
+        1: ok Empty;
+        /// One of the changes in the commit caused the specified rule's matcher
+        /// to be invalid for the context in which the rule will be evaluated.
+        ///
+        /// For example, this could be a matcher on the ingress interface on
+        /// a rule that is in a routine installed in the egress hook, or a
+        /// matcher on the source address specifying an IPv4 subnet that is
+        /// in an IPv6-only namespace.
+        2: rule_with_invalid_matcher RuleId;
+        /// One of the changes in the commit caused the specified rule's action
+        /// to be invalid for the context in which the rule will be evaluated.
+        ///
+        /// For example, this could be a NAT action in an IP routine.
+        3: rule_with_invalid_action RuleId;
+        /// The routine graph forms a cycle, including (at least) the specified
+        /// routine.
+        ///
+        /// Each uninstalled routine and all of the routines it directly or
+        /// transitively jumps to must form a DAG.
+        4: cyclical_routine_graph RoutineId;
+        /// At least one of the changes provided was invalid given the current
+        /// state when `Commit` was called. In order to be maximally
+        /// informative, a vector of results is returned where each result
+        /// corresponds to the change at the same index (across all batches of
+        /// pending changes).
+        5: error_on_change vector<@generated_name("CommitError") flexible enum {
+            /// The change was not validated because an invalid change was
+            /// encountered before it.
+            NOT_REACHED = 1;
+            /// The change was valid.
+            OK = 2;
+            /// The change referred to an unknown namespace.
+            NAMESPACE_NOT_FOUND = 3;
+            /// The change referred to an unknown routine.
+            ROUTINE_NOT_FOUND = 4;
+            /// The change referred to an unknown rule.
+            RULE_NOT_FOUND = 5;
+            /// One of the specified resources already exists.
+            ALREADY_EXISTS = 6;
+            /// The change includes a rule that jumps to an installed routine.
+            TARGET_ROUTINE_IS_INSTALLED = 7;
+            /// Invalid eBPF program Id.
+            INVALID_EBPF_PROGRAM_ID = 8;
+        }>:MAX_COMMIT_SIZE;
+        /// A rule has a TransparentProxy action without a corresponding valid
+        /// matcher: the rule must match on transport protocol to ensure that
+        /// the packet has either a TCP or UDP header.
+        6: transparent_proxy_with_invalid_matcher RuleId;
+        /// A rule has a Redirect action without a corresponding valid matcher:
+        /// if the action specifies a destination port, the rule must match on
+        /// transport protocol to ensure that the packet has either a TCP or UDP
+        /// header.
+        7: redirect_with_invalid_matcher RuleId;
+        /// A rule has a Masquerade action without a corresponding valid
+        /// matcher: if the action specifies a source port, the rule must match
+        /// on transport protocol to ensure that the packet has either a TCP or
+        /// UDP header.
+        8: masquerade_with_invalid_matcher RuleId;
+        /// A rule has a Reject action without a corresponding valid
+        /// configuration. Reject actions with the `TcpReset` reject type
+        /// must match TCP packets.
+        9: reject_with_invalid_matcher RuleId;
+    });
+};
+
+/// Provides control over packet filtering configuration.
+@discoverable
+closed protocol Control {
+    /// Open a new isolated namespace controller for filtering state.
+    strict OpenController(resource struct {
+        id ControllerId;
+        request server_end:NamespaceController;
+    });
+
+    /// Re-open an existing controller that was previously detached from.
+    ///
+    /// Note that if any administrative client connections exist to the
+    /// controller, this operation will fail. At most one client may be
+    /// connected to the controller at once (except for clients connected
+    /// through the [`fuchsia.net.root/Filter`] protocol).
+    ///
+    /// If reconnection fails, the provided server end will be closed with one
+    /// of the following epitaphs:
+    ///  * `ZX_ERR_INVALID_ARGS` if the provided key is invalid
+    ///  * `ZX_ERR_ALREADY_EXISTS` if another client is currently connected to
+    ///    the controller identified by the provided key
+    strict ReopenDetachedController(resource struct {
+        key ControllerKey;
+        request server_end:NamespaceController;
+    });
+};

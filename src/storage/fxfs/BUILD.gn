@@ -1,0 +1,443 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/components.gni")
+import("//build/components/fuchsia_unittest_component.gni")
+import("//build/fuzz.gni")
+import("//build/rust/config.gni")
+import("//build/rust/rustc_binary.gni")
+import("//build/rust/rustc_fuzzer.gni")
+import("//build/rust/rustc_library.gni")
+import("//build/rust/rustc_macro.gni")
+import("//build/testing/golden_files.gni")
+import("//build/toolchain/concurrent_jobs.gni")
+import("//src/storage/fs_test/suite.gni")
+import("//src/storage/testing/driver_test_realm.gni")
+import("//tools/cmc/build/expect_includes.gni")
+
+# Fxfs' internal libraries are only intended to be used by storage.
+FXFS_LIBS_VISIBILITY = [
+  "//src/storage/*",
+  "//vendor/google/storage/*",
+]
+
+fxfs_deps = [
+  ":fxfs_macros",
+  "//sdk/fidl/fuchsia.io:fuchsia.io_rust",
+  "//sdk/rust/zx-status",
+  "//src/lib/diagnostics/inspect/rust",
+  "//src/lib/fuchsia-async",
+  "//src/lib/fuchsia-sync",
+  "//src/storage/fxfs/crypto",
+  "//src/storage/fxfs/trace",
+  "//src/storage/fxfs/unicode",
+  "//src/storage/lib/blob_metadata",
+  "//src/storage/lib/fscrypt",
+  "//src/storage/lib/fsverity-merkle",
+  "//src/storage/lib/ptr_slice",
+  "//src/storage/lib/storage_device",
+  "//src/storage/lib/units",
+  "//src/storage/type-fprint:fprint",
+  "//src/sys/pkg/lib/fuchsia-merkle",
+  "//third_party/rust_crates:anyhow",
+  "//third_party/rust_crates:assert_matches",
+  "//third_party/rust_crates:async-trait",
+  "//third_party/rust_crates:bincode",
+  "//third_party/rust_crates:bit-vec",
+  "//third_party/rust_crates:byteorder",
+  "//third_party/rust_crates:either",
+  "//third_party/rust_crates:event-listener",
+  "//third_party/rust_crates:futures",
+  "//third_party/rust_crates:linked-hash-map",
+  "//third_party/rust_crates:log",
+  "//third_party/rust_crates:num-traits",
+  "//third_party/rust_crates:pin-project",
+  "//third_party/rust_crates:rand",
+  "//third_party/rust_crates:rapidhash",
+  "//third_party/rust_crates:rustc-hash",
+  "//third_party/rust_crates:scopeguard",
+  "//third_party/rust_crates:serde",
+  "//third_party/rust_crates:static_assertions",
+  "//third_party/rust_crates:thiserror",
+  "//third_party/rust_crates:uuid",
+  "//third_party/rust_crates:zerocopy",
+]
+
+fxfs_test_deps = [
+  "//src/lib/fuchsia",
+  "//src/lib/mundane",
+  "//src/storage/crypt/fxfs/common:lib",
+  "//src/storage/fxfs/crypto/insecure",
+  "//third_party/rust_crates:test-case",
+]
+
+fxfs_sources = [
+  "src/blob_metadata.rs",
+  "src/checksum.rs",
+  "src/debug_assert_not_too_long.rs",
+  "src/drop_event.rs",
+  "src/errors.rs",
+  "src/filesystem.rs",
+  "src/fsck.rs",
+  "src/fsck/errors.rs",
+  "src/fsck/store_scanner.rs",
+  "src/fsck/tests.rs",
+  "src/future_with_guard.rs",
+  "src/hooks.rs",
+  "src/lib.rs",
+  "src/log.rs",
+  "src/lsm_tree.rs",
+  "src/lsm_tree/bloom_filter.rs",
+  "src/lsm_tree/cache.rs",
+  "src/lsm_tree/merge.rs",
+  "src/lsm_tree/persistent_layer.rs",
+  "src/lsm_tree/skip_list_layer.rs",
+  "src/lsm_tree/testing.rs",
+  "src/lsm_tree/types.rs",
+  "src/metrics.rs",
+  "src/object_handle.rs",
+  "src/object_store.rs",
+  "src/object_store/allocator.rs",
+  "src/object_store/allocator/merge.rs",
+  "src/object_store/allocator/strategy.rs",
+  "src/object_store/caching_object_handle.rs",
+  "src/object_store/data_object_handle.rs",
+  "src/object_store/data_object_handle/allocated_ranges.rs",
+  "src/object_store/directory.rs",
+  "src/object_store/extent.rs",
+  "src/object_store/extent_mapping_iterator.rs",
+  "src/object_store/extent_record.rs",
+  "src/object_store/flush.rs",
+  "src/object_store/graveyard.rs",
+  "src/object_store/install.rs",
+  "src/object_store/journal.rs",
+  "src/object_store/journal/bootstrap_handle.rs",
+  "src/object_store/journal/checksum_list.rs",
+  "src/object_store/journal/reader.rs",
+  "src/object_store/journal/super_block.rs",
+  "src/object_store/journal/writer.rs",
+  "src/object_store/key_manager.rs",
+  "src/object_store/merge.rs",
+  "src/object_store/object_manager.rs",
+  "src/object_store/object_record.rs",
+  "src/object_store/object_record/legacy.rs",
+  "src/object_store/project_id.rs",
+  "src/object_store/store_object_handle.rs",
+  "src/object_store/transaction.rs",
+  "src/object_store/tree.rs",
+  "src/object_store/tree_cache.rs",
+  "src/object_store/volume.rs",
+  "src/range.rs",
+  "src/round.rs",
+  "src/serialized_types.rs",
+  "src/serialized_types/serialized_key.rs",
+  "src/serialized_types/test_traits.rs",
+  "src/serialized_types/tests.rs",
+  "src/serialized_types/traits.rs",
+  "src/serialized_types/types.rs",
+  "src/serialized_types/varint.rs",
+  "src/stable_hash.rs",
+  "src/testing.rs",
+  "src/testing/fake_object.rs",
+  "src/testing/writer.rs",
+  "src/virtual_device.rs",
+  "src/zerocopy_serialization.rs",
+]
+
+if (is_fuchsia) {
+  fxfs_deps += [
+    "//sdk/rust/zx",
+    "//third_party/rust_crates:scopeguard",
+  ]
+  if (rust_debug_assertions) {
+    fxfs_deps += [ "//src/lib/debug/rust" ]
+  }
+  fxfs_test_deps += [
+    "//src/storage/blobfs/bin:blobfs-component",
+    "//third_party/zstd",
+  ]
+}
+
+rustc_macro("fxfs_macros") {
+  edition = "2024"
+  name = "fxfs_macros"
+  deps = [
+    "//third_party/rust_crates:proc-macro2",
+    "//third_party/rust_crates:quote",
+    "//third_party/rust_crates:syn",
+  ]
+  source_root = "macros/macros.rs"
+  sources = [ "macros/macros.rs" ]
+}
+
+rustc_library("lib") {
+  edition = "2024"
+  with_unit_tests = true
+  name = "fxfs"
+  visibility = FXFS_LIBS_VISIBILITY
+
+  deps = fxfs_deps
+  sources = fxfs_sources
+  test_deps = fxfs_test_deps
+
+  # The test requires more than typical memory,
+  # so remote-build with a larger worker.
+  _concurrent_jobs = concurrent_jobs.rust_highmem
+  test_configs = _concurrent_jobs.configs
+  test_vars = _concurrent_jobs.vars
+}
+
+# This target includes additional hooks that are useful when
+# migrating file formats, but that shouldn't otherwise generally be exposed.
+rustc_library("migration") {
+  edition = "2024"
+  name = "fxfs"
+  features = [ "migration" ]
+  visibility = FXFS_LIBS_VISIBILITY
+
+  deps = fxfs_deps
+  sources = fxfs_sources
+}
+
+# This target is used to expose testing utilities to benchmarks.
+rustc_library("benchmark") {
+  edition = "2024"
+  name = "fxfs"
+  features = [ "benchmark" ]
+  visibility = [ "//src/storage/fxfs/*" ]
+
+  deps = fxfs_deps
+  sources = fxfs_sources
+}
+
+fuchsia_unittest_component("fxfs-test") {
+  deps = [ ":lib_test" ]
+}
+
+fuchsia_unittest_component("fxfs-crypto-test") {
+  deps = [ "crypto:crypto_test" ]
+}
+
+fuchsia_unittest_component("fxfs-make-blob-image-test") {
+  deps = [
+    "make-blob-image:make-blob-image_test",
+    "//src/sys/test_runners:tmp_storage",
+  ]
+}
+
+fuchsia_unittest_component("fxfs-platform-test") {
+  deps = [ "platform:platform_test" ]
+  manifest = "platform/meta/fxfs-platform-test.cml"
+}
+
+fuchsia_test_package("fxfs-tests") {
+  test_components = [
+    ":fxfs-test",
+    ":fxfs-crypto-test",
+    ":fxfs-make-blob-image-test",
+    ":fxfs-platform-test",
+  ]
+
+  test_specs = {
+    log_settings = {
+      # We expect some tests to produce ERROR logs
+      max_severity = "ERROR"
+    }
+  }
+}
+
+rustc_binary("fxfs") {
+  edition = "2024"
+  deps = [
+    ":lib",
+    "//sdk/rust/zx",
+    "//src/lib/diagnostics/inspect/runtime/rust",
+    "//src/lib/diagnostics/inspect/rust",
+    "//src/lib/fuchsia",
+    "//src/lib/fuchsia-runtime",
+    "//src/lib/trace/rust:trace-provider",
+    "//src/storage/fxfs/platform",
+    "//third_party/rust_crates:anyhow",
+  ]
+  sources = [ "src/main.rs" ]
+
+  configs += [
+    # Optimize for size
+    "//build/config/rust:bootfs",
+  ]
+
+  # As this is a large binary that uses many resources to compile (and takes
+  # minutes when LTO is enabled, shift it to the large RBE worker pool)
+  _concurrent_jobs = concurrent_jobs.link_highmem
+  configs += _concurrent_jobs.configs
+  forward_variables_from(_concurrent_jobs.vars, "*")
+
+  # Fxfs depends on the vfs rlib instead of the dylib for performance. If any
+  # dependency of fxfs depends on the vfs dylib then all of the vfs'
+  # dependencies will be dynamically linked in fxfs which degrades performance.
+  assert_no_deps = [ "//src/storage/lib/vfs/rust:vfs" ]
+}
+
+fuchsia_component("fxfs_component") {
+  component_name = "fxfs"
+  deps = [ ":fxfs" ]
+  manifest = "meta/fxfs.cml"
+}
+
+fuchsia_package("package") {
+  package_name = "fxfs"
+  deps = [ ":fxfs_component" ]
+}
+
+fuchsia_package("fxfs-bin") {
+  deps = [ ":fxfs" ]
+}
+
+fs_test_config("fxfs") {
+  is_multi_volume = true
+
+  # See MAX_FILE_SIZE in filesystem.rs.
+  max_file_size = 9223372036854771712
+  supports_fsck_after_every_transaction = true
+
+  # TODO(https://fxbug.dev/42063349) Add support for block sizes greater than the page size.
+  max_block_size = 4096
+  supports_hard_links = true
+  supports_symlinks = true
+  supports_inspect = true
+  supports_resize = true
+  supports_mmap = true
+  supports_mmap_shared_write = true
+  supports_shutdown_on_no_connections = true
+  timestamp_granularity = 1
+  disk_format = 12  # See //src/storage/lib/fs_management/cpp/format.h
+  uses_crypt = true
+  has_min_volume_size = true
+
+  options = [
+    {
+      description = "Fxfs"
+      use_fvm = false
+
+      device_block_count = 24576
+      device_block_size = 512
+    },
+  ]
+}
+
+expect_includes("test_fxfs_component_manifest_shard") {
+  testonly = true
+  includes = [ "meta/test_fxfs.shard.cml" ]
+}
+
+fs_test_suite("fxfs") {
+  deps = [
+    ":fxfs_component",
+    ":fxfs_fs_test_config",
+    "//src/storage/crypt/fxfs",
+    "//src/storage/fxfs",
+  ]
+  component_deps = [
+    ":test_fxfs_component_manifest_shard",
+    "//src/storage/fs_test:test_crypt_service",
+  ]
+}
+
+slow_fs_test_suite("fxfs") {
+  deps = [
+    ":fxfs_component",
+    ":fxfs_fs_test_config",
+    "//src/storage/crypt/fxfs",
+    "//src/storage/fxfs",
+  ]
+  component_deps = [
+    ":test_fxfs_component_manifest_shard",
+    "//src/storage/fs_test:test_crypt_service",
+  ]
+}
+
+compiled_action("generate_type_fingerprints") {
+  testonly = true
+  tool = "//src/storage/fxfs/tools:fxfs_tool"
+  tool_output_name = "fxfs"
+  outputs = [ "$target_gen_dir/type_fingerprints_golden_test.comparisons.json" ]
+  depfile = "$target_gen_dir/type_fingerprints.d"
+  args = [
+    "type_fprint",
+    "--output-dir",
+    rebase_path("$target_gen_dir/src/serialized_types", root_build_dir),
+    "--depfile",
+    rebase_path(depfile, root_build_dir),
+    "--comparisons-file",
+    rebase_path(outputs[0], root_build_dir),
+    "--golden-dir",
+    "src/storage/fxfs/src/serialized_types/golden",
+  ]
+}
+
+golden_files("type_fingerprints_golden_test") {
+  testonly = true
+  deps = [ ":generate_type_fingerprints" ]
+  comparisons = "$target_gen_dir/type_fingerprints_golden_test.comparisons.json"
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":fxfs-fs-tests",
+    ":fxfs-fuzzers",
+    ":fxfs-slow-fs-tests",
+    ":fxfs-tests",
+    ":fxfs_component",
+    ":lib_test($host_toolchain)",
+    "//src/storage/fxfs:type_fingerprints_golden_test",
+    "//src/storage/fxfs/benches:tests",
+    "//src/storage/fxfs/test:tests",
+    "//src/storage/fxfs/tools:tests",
+    "//src/storage/fxfs/trace:tests",
+    "//src/storage/fxfs/unicode:tests",
+  ]
+}
+
+#################
+## Fuzzers
+#################
+
+_fuzzers = [
+  "fuzz_lsm_tree_actions",
+  "fuzz_journal",
+  "fuzz_journal_bytes",
+  "fuzz_object_key_compare",
+  "fuzz_allocator_key_compare",
+]
+
+foreach(fuzzer, _fuzzers) {
+  rustc_fuzzer(fuzzer) {
+    edition = "2024"
+    deps = fxfs_deps + [
+             "//src/lib/fuzzing/rust:fuzz",
+             "//third_party/rust_crates:arbitrary",
+             "//third_party/rust_crates:futures",
+           ]
+    sources = fxfs_sources
+  }
+
+  fuchsia_fuzzer_component("${fuzzer}_component") {
+    manifest = "meta/${fuzzer}.cml"
+    deps = [ ":$fuzzer" ]
+  }
+}
+
+fuchsia_fuzzer_package("fxfs-fuzzers") {
+  rust_fuzzer_components = []
+  foreach(fuzzer, _fuzzers) {
+    rust_fuzzer_components += [ ":${fuzzer}_component" ]
+  }
+}
+
+group("fuzzers") {
+  testonly = true
+  deps = [ ":fxfs-fuzzers" ]
+}

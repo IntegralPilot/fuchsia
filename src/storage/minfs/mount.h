@@ -1,0 +1,77 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_STORAGE_MINFS_MOUNT_H_
+#define SRC_STORAGE_MINFS_MOUNT_H_
+
+#include <memory>
+
+#ifdef __Fuchsia__
+#include <fidl/fuchsia.process.lifecycle/cpp/wire.h>
+
+#include "src/storage/lib/vfs/cpp/managed_vfs.h"
+#include "src/storage/minfs/bcache.h"
+#endif
+
+namespace minfs {
+
+enum class Writability {
+  // Do not write to persistent storage under any circumstances whatsoever.
+  ReadOnlyDisk,
+  // Do not allow users of the filesystem to mutate filesystem state. This state allows the journal
+  // to replay while initializing writeback.
+  ReadOnlyFilesystem,
+  // Permit all operations.
+  Writable,
+};
+
+struct MountOptions {
+  Writability writability = Writability::Writable;
+  bool verbose = false;
+  // Determines if the filesystem performs actions like replaying the journal, repairing the
+  // superblock, etc.
+  bool repair_filesystem = true;
+  // For testing only: if true, run fsck after every transaction.
+  bool fsck_after_every_transaction = false;
+
+  // Die if a mutating transaction to the device fails. Sometimes turned off in tests to not crash
+  // when simulating I/O failures.
+  bool die_on_mutation_failure = true;
+
+  // Number of slices to preallocate for data when the filesystem is created.
+  uint32_t fvm_data_slices = 1;
+
+  // If true, don't log messages except for errors.
+  bool quiet = false;
+
+  // Should only use for testing to adjust inode counts if we run out of inodes.
+  // TODO(https://fxbug.dev/375550868): should not be overriding inode count.
+  uint32_t inode_count = 0;
+};
+
+#ifdef __Fuchsia__
+struct CreateBcacheResult {
+  std::unique_ptr<minfs::Bcache> bcache;
+  bool is_read_only;
+};
+
+// Creates a Bcache using |device|.
+//
+// Returns the bcache and a boolean indicating if the underlying device is read-only.
+zx::result<CreateBcacheResult> CreateBcache(std::unique_ptr<block_client::BlockDevice> device);
+
+// Start the filesystem on the block device backed by |bcache|, and serve it on |root|. Blocks
+// until the filesystem terminates.
+zx::result<> Mount(std::unique_ptr<minfs::Bcache> bcache, const MountOptions& options,
+                   fidl::ServerEnd<fuchsia_io::Directory> root);
+
+zx::result<> StartComponent(fidl::ServerEnd<fuchsia_io::Directory> root,
+                            fidl::ServerEnd<fuchsia_process_lifecycle::Lifecycle> lifecycle,
+                            bool die_on_mutation_failure = true);
+
+#endif  // __Fuchsia__
+
+}  // namespace minfs
+
+#endif  // SRC_STORAGE_MINFS_MOUNT_H_

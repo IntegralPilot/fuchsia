@@ -1,0 +1,354 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include <lib/fit/function.h>
+#include <lib/zx/job.h>
+#include <lib/zx/process.h>
+#include <lib/zx/thread.h>
+#include <lib/zx/vmar.h>
+#include <lib/zx/vmo.h>
+#include <zircon/syscalls/object.h>
+
+#include <string_view>
+#include <utility>
+
+#include <fbl/vector.h>
+#include <zxtest/zxtest.h>
+
+#include "helper.h"
+
+namespace object_info_test {
+namespace {
+
+// ZX_INFO_JOB_PROCESS/ZX_INFO_JOB_CHILDREN tests
+constexpr size_t kChildProcs = 3;
+constexpr size_t kChildJobs = 2;
+constexpr std::string_view kChildrenName = "child";
+constexpr std::string_view kGrandChildrenName = "grandchild";
+
+// Sets out_job to point towards the singleton instance of a job:
+// - returned job
+//   - child process 1
+//   - child process 2
+//   - child process 3 (kChildProcs)
+//   - child job 1
+//     - grandchild process 1.1
+//     - grandchild job 1.1
+//   - child job 2 (kChildJobs)
+//     - grandchild process 2.1
+//     - grandchild job 2.1
+class JobFixture : public zxtest::Test {
+ public:
+  static void SetUpTestSuite() {
+    ASSERT_OK(zx::job::create(*zx::job::default_job(), 0, &root_), "Failed to create job.");
+
+    for (size_t i = 0; i < kChildProcs; ++i) {
+      zx::process process;
+      zx::vmar vmar;
+      ASSERT_OK(zx::process::create(root_, kChildrenName.data(), kChildrenName.size(), 0, &process,
+                                    &vmar),
+                "Failed to create %zu child", i);
+      child_processes_.push_back(std::move(process));
+      vmar_.push_back(std::move(vmar));
+    }
+
+    for (size_t i = 0; i < kChildJobs; ++i) {
+      zx::job job;
+      ASSERT_OK(zx::job::create(root_, 0, &job), "Failed to create %zu job", i);
+
+      zx::process process;
+      zx::vmar vmar;
+
+      ASSERT_OK(zx::process::create(job, kGrandChildrenName.data(), kGrandChildrenName.size(), 0,
+                                    &process, &vmar),
+                "Failed to create %zu process grandchild", i);
+
+      zx::job subjob;
+      ASSERT_OK(zx::job::create(job, 0, &subjob), "Failed to create grandchild %zu job", i);
+      child_jobs_.push_back(std::move(job));
+      child_processes_.push_back(std::move(process));
+      vmar_.push_back(std::move(vmar));
+      child_jobs_.push_back(std::move(subjob));
+    }
+    ASSERT_TRUE(root_.is_valid());
+  }
+
+  // Clean up job handles.
+  static void TearDownTestSuite() {
+    vmar_.reset();
+    for (auto& vmar : vmar_) {
+      vmar.destroy();
+    }
+
+    child_processes_.reset();
+    for (auto& proc : child_processes_) {
+      proc.kill();
+    }
+
+    for (auto& job : child_jobs_) {
+      job.kill();
+    }
+
+    child_jobs_.reset();
+
+    root_.kill();
+    root_.reset();
+  }
+
+  const zx::job& GetJob() { return root_; }
+
+  const auto& GetHandleProvider() const { return handle_provider; }
+
+ private:
+  static zx::job root_;
+
+  static fbl::Vector<zx::vmar> vmar_;
+  static fbl::Vector<zx::process> child_processes_;
+  static fbl::Vector<zx::job> child_jobs_;
+
+  fit::function<const zx::job&()> handle_provider = [this]() -> const zx::job& { return GetJob(); };
+};
+
+zx::job JobFixture::root_;
+fbl::Vector<zx::vmar> JobFixture::vmar_;
+fbl::Vector<zx::process> JobFixture::child_processes_;
+fbl::Vector<zx::job> JobFixture::child_jobs_;
+
+constexpr int kChildCount = 32;
+
+// The jobch_helper_* (job child helper) functions allow testing both
+// ZX_INFO_JOB_PROCESS and ZX_INFO_JOB_CHILDREN.
+void CheckJobGetChild(const zx::job* job, uint32_t topic, size_t expected_count) {
+  zx_koid_t koids[kChildCount];
+  size_t actual;
+  size_t available;
+
+  ASSERT_OK(job->get_info(topic, koids, sizeof(koids), &actual, &available));
+
+  EXPECT_EQ(expected_count, actual);
+  EXPECT_EQ(expected_count, available);
+
+  // All returned koids should produce a valid handle when passed to
+  // zx_object_get_child.
+  for (size_t i = 0; i < actual; i++) {
+    zx::job child;
+    EXPECT_OK(job->get_child(koids[i], ZX_RIGHT_SAME_RIGHTS, &child), "koid %zu", koids[i]);
+  }
+}
+
+using JobGetInfoTest = JobFixture;
+
+constexpr auto process_provider = []() -> const zx::process& {
+  static const zx::unowned_process process = zx::process::self();
+  return *process;
+};
+
+constexpr auto job_provider = []() -> const zx::job& {
+  const static zx::unowned_job job = zx::job::default_job();
+  return *job;
+};
+
+constexpr auto thread_provider = []() -> const zx::thread& {
+  const static zx::unowned_thread thread = zx::thread::self();
+  return *thread;
+};
+
+TEST_F(JobGetInfoTest, InfoJobProcessesGetChild) {
+  ASSERT_NO_FATAL_FAILURE(CheckJobGetChild(&GetJob(), ZX_INFO_JOB_PROCESSES, kChildProcs));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildJobsGetChild) {
+  ASSERT_NO_FATAL_FAILURE(CheckJobGetChild(&GetJob(), ZX_INFO_JOB_CHILDREN, kChildJobs));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesOnSelfSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckSelfInfoSucceeds<zx_koid_t>(ZX_INFO_JOB_PROCESSES, job_provider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesInvalidHandleFails) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckInvalidHandleFails<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesNullAvailSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckNullAvailSucceeds<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesNullActualSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckNullActualSucceeds<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesNullActualAndAvailSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckNullActualAndAvailSucceeds<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesInvalidBufferPointerFails) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckInvalidBufferPointerFails<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesBadActualIsInvalidArg) {
+  ASSERT_NO_FATAL_FAILURE(
+      (BadActualIsInvalidArgs<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesBadAvailIsInvalidArg) {
+  ASSERT_NO_FATAL_FAILURE(
+      (BadAvailIsInvalidArgs<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesZeroSizedBufferIsOk) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckZeroSizeBufferSucceeds<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesSmallBufferIsOk) {
+  // We use only one entry count, because we know that the process created at the fixture has more
+  // mappings.
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckSmallBufferSucceeds<zx_koid_t>(ZX_INFO_JOB_PROCESSES, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesPartiallyUnmappedBufferIsInvalidArgs) {
+  ASSERT_NO_FATAL_FAILURE((CheckPartiallyUnmappedBufferIsError<zx_koid_t>(
+      ZX_INFO_JOB_PROCESSES, GetHandleProvider(), ZX_ERR_INVALID_ARGS)));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesRequiresEnumerateRights) {
+  ASSERT_NO_FATAL_FAILURE((CheckMissingRightsFail<zx_koid_t, 32>(
+      ZX_INFO_JOB_PROCESSES, ZX_RIGHT_ENUMERATE, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesProcessbHandleIsBadHandle) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckWrongHandleTypeFails<zx_koid_t, 32>(ZX_INFO_JOB_PROCESSES, process_provider)));
+}
+
+TEST_F(JobGetInfoTest, InfoJobProcessesThreadHandleIsBadHandle) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckWrongHandleTypeFails<zx_koid_t, 32>(ZX_INFO_JOB_PROCESSES, thread_provider)));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenOnSelfSucceeds) {
+  ASSERT_NO_FATAL_FAILURE((CheckSelfInfoSucceeds<zx_koid_t>(ZX_INFO_JOB_CHILDREN, job_provider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenInvalidHandleFails) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckInvalidHandleFails<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenNullAvailSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckNullAvailSucceeds<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenNullActualSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckNullActualSucceeds<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenNullActualAndAvailSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckNullActualAndAvailSucceeds<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenInvalidBufferPointerFails) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckInvalidBufferPointerFails<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenBadActualIsInvalidArg) {
+  ASSERT_NO_FATAL_FAILURE(
+      (BadActualIsInvalidArgs<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenBadAvailIsInvalidArg) {
+  ASSERT_NO_FATAL_FAILURE(
+      (BadAvailIsInvalidArgs<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenZeroSizedBufferIsOk) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckZeroSizeBufferSucceeds<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenSmallBufferIsOk) {
+  // We use only one entry count, because we know that the process created at the fixture has more
+  // mappings.
+  ASSERT_NO_FATAL_FAILURE(
+      CheckSmallBufferSucceeds<zx_koid_t>(ZX_INFO_JOB_CHILDREN, GetHandleProvider()));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenPartiallyUnmappedBufferIsInvalidArgs) {
+  ASSERT_NO_FATAL_FAILURE((CheckPartiallyUnmappedBufferIsError<zx_koid_t>(
+      ZX_INFO_JOB_CHILDREN, GetHandleProvider(), ZX_ERR_INVALID_ARGS)));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenRequiresEnumerateRights) {
+  ASSERT_NO_FATAL_FAILURE((CheckMissingRightsFail<zx_koid_t, 32>(
+      ZX_INFO_JOB_CHILDREN, ZX_RIGHT_ENUMERATE, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenJobHandleIsBadHandle) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckWrongHandleTypeFails<zx_koid_t, 32>(ZX_INFO_JOB_CHILDREN, process_provider)));
+}
+
+TEST_F(JobGetInfoTest, InfoJobChildrenThreadHandleIsBadHandle) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckWrongHandleTypeFails<zx_koid_t, 32>(ZX_INFO_JOB_CHILDREN, thread_provider)));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicOnSelfSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckSelfInfoSucceeds<zx_info_handle_basic_t>(ZX_INFO_HANDLE_BASIC, job_provider())));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicInvalidHandleFails) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckInvalidHandleFails<zx_info_handle_basic_t>(ZX_INFO_HANDLE_BASIC, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicNullAvailSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckNullAvailSucceeds<zx_info_handle_basic_t>(ZX_INFO_HANDLE_BASIC, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicNullActualSucceeds) {
+  ASSERT_NO_FATAL_FAILURE(
+      (CheckNullActualSucceeds<zx_info_handle_basic_t>(ZX_INFO_HANDLE_BASIC, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicNullActualAndAvailSucceeds) {
+  ASSERT_NO_FATAL_FAILURE((CheckNullActualAndAvailSucceeds<zx_info_handle_basic_t>(
+      ZX_INFO_HANDLE_BASIC, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicInvalidBufferPointerFails) {
+  ASSERT_NO_FATAL_FAILURE((CheckInvalidBufferPointerFails<zx_info_handle_basic_t>(
+      ZX_INFO_HANDLE_BASIC, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicBadActualIsInvalidArg) {
+  ASSERT_NO_FATAL_FAILURE(
+      (BadActualIsInvalidArgs<zx_info_handle_basic_t>(ZX_INFO_HANDLE_BASIC, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicBadAvailIsInvalidArg) {
+  ASSERT_NO_FATAL_FAILURE(
+      (BadAvailIsInvalidArgs<zx_info_handle_basic_t>(ZX_INFO_HANDLE_BASIC, GetHandleProvider())));
+}
+
+TEST_F(JobGetInfoTest, InfoHandleBasicZeroSizedBufferFails) {
+  ASSERT_NO_FATAL_FAILURE((
+      CheckZeroSizeBufferFails<zx_info_handle_basic_t>(ZX_INFO_HANDLE_BASIC, GetHandleProvider())));
+}
+
+}  // namespace
+}  // namespace object_info_test

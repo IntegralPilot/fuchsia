@@ -1,0 +1,142 @@
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.qualcomm.fastrpc;
+
+using zx;
+
+/// See this header for error definitions:
+/// https://github.com/quic/fastrpc/blob/main/inc/AEEStdErr.h
+alias Error = int32;
+
+alias Capability = uint32;
+
+alias PayloadBufferId = uint32;
+
+const MAX_CAPABILITIES_COUNT uint32 = 256;
+
+const MAX_PAYLOAD_BUFFER_SET uint8 = 100;
+
+/// These buffers are allocated in the driver, and provided to the client for use by their id when
+/// communicating with the driver through the |payload_buffer_id|.
+/// The ids will be non-zero, as 0 will imply no buffer.
+type SharedPayloadBuffer = resource struct {
+    id PayloadBufferId;
+    vmo zx.Handle:VMO;
+};
+
+/// A FastRPC argument that lives in a standalone vmo.
+type VmoArgument = resource struct {
+    /// The vmo that this argument lives in.
+    vmo zx.Handle:VMO;
+
+    /// The start offset of the argument within the vmo.
+    offset uint64;
+
+    /// Length of the argument.
+    length uint64;
+};
+
+/// A FastRPC argument that lives in the shared |payload_buffer|.
+type Argument = struct {
+    /// The start offset of the argument within the |payload_buffer|.
+    offset uint64;
+
+    /// Length of the argument.
+    length uint64;
+};
+
+/// A single FastRPC argument.
+type ArgumentEntry = strict resource union {
+    1: argument Argument;
+    2: vmo_argument VmoArgument;
+};
+
+/// This is a secure fastrpc protocol and provides certain privileged operations like attaching
+/// to the root protection domain in a remote processor. Currently starnix is the only direct user
+/// of this protocol, therefore we don't need an unsecure variant. If in the future we want to
+/// provide this to client applications directly, we will need to make sure there is also an
+/// UnsecureFastRpc protocol.
+@discoverable(client="platform", server="external")
+open protocol SecureFastRpc {
+    /// Used to identify the channel id that this device instance talks to.
+    /// The channel id is associated with the remote processor target.
+    flexible GetChannelId() -> (struct {
+        channel_id uint32;
+    }) error zx.Status;
+
+    /// Allocate a contiguous region of memory of at least |size|. This memory is meant to be used
+    /// in |VmoArgument| typed arguments in an |InvokeParameters|. This vmo is owned exclusively
+    /// by the caller.
+    flexible Allocate(struct {
+        size uint64;
+    }) -> (resource struct {
+        vmo zx.Handle:VMO;
+    }) error zx.Status;
+
+    /// Get the vector of capabilities from the remote processor.
+    flexible GetCapabilities() -> (struct {
+        capabilities vector<Capability>:MAX_CAPABILITIES_COUNT;
+    }) error Error;
+
+    /// Attaches to the root (Guest OS) protection domain in the remote processor.
+    /// This domain can access to the memory of its own protection domain,
+    /// the memory of the user protection domains, and some system registers.
+    flexible AttachRootDomain(resource struct {
+        server server_end:RemoteDomain;
+    }) -> () error Error;
+
+    /// Creates the static (user) protection domain identified by |name| on the remote processor.
+    /// This is provided with a memory of size |memory_size|. This protection domain can access
+    /// only its own memory. Static domains are created for specific use cases like audio.
+    flexible CreateStaticDomain(resource struct {
+        name string:MAX;
+        memory_size uint32;
+        server server_end:RemoteDomain;
+    }) -> () error Error;
+};
+
+open protocol RemoteDomain {
+    /// Closes down the domain. This will release all resources associated with this domain.
+    /// The server end will close the channel when this is completed.
+    flexible Close();
+
+    /// Requests |count| payload buffers from the driver. The returned vector of buffers should be
+    /// managed by the client entirely. When making an |Invoke| request, the client can provide
+    /// the |id| of the buffer of their chosing inside the |payload_buffer_id|. The client should
+    /// ensure only 1 invoke is active for each of these buffers.
+    flexible GetPayloadBufferSet(struct {
+        count uint8;
+    }) -> (resource struct {
+        buffers vector<SharedPayloadBuffer>:MAX_PAYLOAD_BUFFER_SET;
+    }) error zx.Status;
+
+    /// A user invocation on the remote domain.
+    flexible Invoke(resource struct {
+        /// The remote processor thread that should handle this invocation.
+        remote_thread_id int32;
+
+        /// The target handle of the invocation.
+        handle uint32;
+
+        /// The method id of the invocation.
+        method_id uint32;
+
+        /// A shared buffer that all |Argument| type entries live in.
+        /// This can be 0 if there is no payload that needs it, which is the case if all
+        /// the arguments are type |VmoArgument| or if there are no input or output arguments.
+        /// This id comes from the |RequestPayloadBufferSet| result.
+        payload_buffer_id PayloadBufferId;
+
+        /// The list of input arguments for this invocation.
+        input_arguments vector<ArgumentEntry>:MAX;
+
+        /// The list of output arguments for this invocation.
+        output_arguments vector<ArgumentEntry>:MAX;
+    }) -> () error Error;
+};
+
+service SecureService {
+    device client_end:SecureFastRpc;
+};

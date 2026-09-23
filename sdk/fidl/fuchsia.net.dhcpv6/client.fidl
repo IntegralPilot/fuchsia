@@ -1,0 +1,403 @@
+// Copyright 2020 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.net.dhcpv6;
+
+using fuchsia.net.interfaces.admin;
+using fuchsia.net.name;
+using fuchsia.net;
+using zx;
+
+/// Default port a DHCPv6 client should listen to according to
+/// [RFC 8415, Section 7.2](https://tools.ietf.org/html/rfc8415#section-7.2).
+const DEFAULT_CLIENT_PORT uint16 = 546;
+
+type Empty = struct {};
+
+/// An IPv6 prefix and its lifetimes.
+type Prefix = struct {
+    /// The IPv6 prefix.
+    ///
+    /// The host bits of the address must be all zeroes.
+    prefix fuchsia.net.Ipv6AddressWithPrefix;
+
+    /// The prefix lifetimes.
+    lifetimes struct {
+        /// The time after which the prefix will no longer be valid.
+        ///
+        /// Its value must be greater than 0. A value of
+        /// `ZX_TIME_INFINITE` indicates that the prefix will always
+        /// be valid. If the value indicates a time in the past,
+        /// the prefix is invalid and should not be used.
+        ///
+        /// As a `zx.Time`, the value has
+        /// [monotonic clock semantics][monotonic], which implies
+        /// that it has no meaning outside of the host on which it
+        /// was generated and no meaning across host restarts.
+        ///
+        /// [monotonic]: https://fuchsia.dev/fuchsia-src/concepts/time/monotonic
+        valid_until zx.Time;
+
+        /// The time after which the prefix will no longer be preferred.
+        ///
+        /// Its value must be greater than 0. A value of
+        /// `ZX_TIME_INFINITE` indicates that the prefix will always
+        /// be preferred. If the value indicates a time in the past,
+        /// the prefix should be considered deprecated. The value must not
+        /// refer to a time after [`valid_until`].
+        ///
+        /// As a `zx.Time`, the value has
+        /// [monotonic clock semantics][monotonic],
+        /// which implies that it has no meaning outside of the host on
+        /// which it was generated and no meaning across host restarts.
+        ///
+        /// [monotonic]: https://fuchsia.dev/fuchsia-src/concepts/time/monotonic
+        preferred_until zx.Time;
+    };
+};
+
+/// Link layer address used to generate a DUID as defined in
+/// [RFC 8415, Section 11].
+///
+/// [RFC 8415, Section 11]: https://datatracker.ietf.org/doc/html/rfc8415#section-11
+type LinkLayerAddress = flexible union {
+    1: ethernet fuchsia.net.MacAddress;
+};
+
+/// Parameters to start a new DHCPv6 client with.
+type NewClientParams = table {
+    /// The ID of the interface the client will run on.
+    ///
+    /// Required.
+    1: interface_id fuchsia.net.InterfaceId;
+
+    /// The socket address to use when communicating with servers.
+    ///
+    /// DHCPv6 servers listen for link-local multicasts, so not using a
+    /// link-local address here may cause interoperability issues.
+    ///
+    /// Client creation will fail with `INVALID_ARGS` if:
+    ///
+    /// * a multicast address is provided;
+    /// * or a link-local address is provided, and its zone index
+    ///     doesn't match `interface_id` (Fuchsia has a 1:1 mapping from
+    ///     zone index to interface ID).
+    ///
+    /// Client creation will fail if it fails to bind a socket to this
+    /// address.
+    ///
+    /// Required.
+    2: address fuchsia.net.Ipv6SocketAddress;
+
+    /// Configuration for starting the DHCPv6 client.
+    ///
+    /// If the configuration requests both addresses and other
+    /// configuration parameters, all information is requested in the
+    /// same message exchange, running in stateful mode. If only
+    /// configuration parameters are requested (no addresses or prefixes), the
+    /// client runs in stateless mode, as described in
+    /// [RFC 8415, Section 6.1](https://tools.ietf.org/html/rfc8415#section-6.1).
+    ///
+    /// Client creation will fail if `config` is not requesting any
+    /// information (all fields are empty), or if it contains invalid
+    /// fields.
+    ///
+    /// Required.
+    3: config @generated_name("ClientConfig") table {
+        /// Configuration for requesting configuration information.
+        ///
+        /// If not set, interpreted as empty (no configuration
+        /// information will be requested).
+        1: information_config @generated_name("InformationConfig") table {
+            /// Request a list of available DNS servers
+            /// [RFC 3646](https://tools.ietf.org/html/rfc3646).
+            ///
+            /// If not set, interpreted as false;
+            1: dns_servers bool;
+        };
+
+        /// Non-temporary address configuration.
+        ///
+        /// Configures the client to negotiate non-temporary
+        /// addresses (IA_NA), as defined in
+        /// [RFC 8415, section 6.2](https://tools.ietf.org/html/rfc8415#section-6.2).
+        ///
+        /// If not set, interpreted as a configuration with an address count
+        /// of 0 (non-temporary addresses will not be negotiated). If invalid,
+        /// client creation will fail and the pipelined channel will be closed.
+        2: non_temporary_address_config @generated_name("AddressConfig") table {
+            /// Number of addresses.
+            ///
+            /// If the value is 0, the client will not negotiate
+            /// non-temporary addresses, i.e. its messages to the
+            /// server will not contain the IA_NA option.
+            ///
+            /// Required.
+            1: address_count uint8;
+
+            /// Preferred addresses.
+            ///
+            /// The addresses are used as hints by DHCPv6 servers,
+            /// but may be ignored.
+            ///
+            /// The size of `preferred_addresses` must be less than
+            /// or equal to `address_count`, otherwise the
+            /// `AddressConfig` is invalid.
+            ///
+            /// Optional field. If not set, or if
+            /// `preferred_addresses` is empty, no address hints are
+            /// provided.
+            2: preferred_addresses vector<fuchsia.net.Ipv6Address>:MAX;
+        };
+
+        /// Prefix delegation configuration.
+        ///
+        /// Configures the client to negotiate a delegated prefix
+        /// (IA_PD), as defined in [RFC 8415, section 6.3][RFC 8415 6.3].
+        ///
+        /// Optional. If not set, delegated prefixes will not be
+        /// requested. If invalid, client creation will fail and
+        /// the pipelined channel will be closed.
+        ///
+        /// [RFC 8415 6.3]: https://datatracker.ietf.org/doc/html/rfc8415#section-6.3
+        3: prefix_delegation_config strict union {
+            /// Request a prefix of any length.
+            1: empty Empty;
+            /// Request a prefix of a specific length.
+            ///
+            /// Must be in the range [1, 128]; otherwise client creation will fail.
+            2: prefix_length uint8;
+            /// Request a specific prefix.
+            ///
+            /// The prefix length must be in the range [1, 128], and the host bits of
+            /// the address must be all zeroes; otherwise client creation will fail.
+            3: prefix fuchsia.net.Ipv6AddressWithPrefix;
+        };
+    };
+
+    /// DHCP Unique Identifier (DUID) configuration.
+    ///
+    /// The DUID is used by the client to identify itself to servers as
+    /// defined in [RFC 8415, section 11]. The field must be present if and
+    /// only if the client is started in stateful mode, otherwise client
+    /// creation will fail and the pipelined channel will be closed.
+    ///
+    /// [RFC 8415, section 11]: https://datatracker.ietf.org/doc/html/rfc8415#section-11
+    4: duid flexible union {
+        /// Configure DUID based on link-layer address plus time (DUID-LLT),
+        /// as defined in [RFC 8415, section 11.2].
+        ///
+        /// [RFC 8415, section 11.2]: https://datatracker.ietf.org/doc/html/rfc8415#section-11.2
+        1: link_layer_address_plus_time struct {
+            /// Timestamp when the DUID is generated. According to
+            /// [RFC 8415, section 11.2]:
+            ///
+            ///   The time value is the time that the DUID is generated,
+            ///   represented in seconds since midnight (UTC), January 1,
+            ///   2000, modulo 2^32.
+            ///
+            /// [RFC 8415, section 11.2]: https://datatracker.ietf.org/doc/html/rfc8415#section-11.2
+            time uint32;
+            /// The link layer address.
+            link_layer_address LinkLayerAddress;
+        };
+        /// Configure DUID based on link-layer address (DUID-LL), as defined in
+        /// [RFC 8415, section 11.4].
+        ///
+        /// [RFC 8415, section 11.4]: https://datatracker.ietf.org/doc/html/rfc8415#section-11.4
+        2: link_layer_address LinkLayerAddress;
+        /// Configure DUID with a UUID, as defined in [RFC 8415, section 11.5].
+        ///
+        /// [RFC 8415, section 11.5]: https://datatracker.ietf.org/doc/html/rfc8415#section-11.5
+        3: uuid array<byte, 16>;
+    };
+};
+
+/// Provides a method to create new clients.
+@discoverable
+closed protocol ClientProvider {
+    /// Provides a DHCPv6 client.
+    ///
+    /// + request `params` the parameters to create the client with.
+    /// + request `request` grants control over the client. Closed with an
+    ///     epitaph if the client cannot be created.
+    strict NewClient(resource struct {
+        params NewClientParams;
+        request server_end:Client;
+    });
+};
+
+/// Provides methods to watch for discovered network configurations.
+///
+/// This protocol encodes the underlying object's lifetime in both directions;
+/// the underlying object is alive iff both ends of the protocol are open. That
+/// is:
+///
+/// - Closing the client end causes the object to be destroyed.
+/// - Observing a closure of the server end indicates the object no longer
+///   exists.
+closed protocol Client {
+    compose fuchsia.net.name.DnsServerWatcher;
+
+    /// Returns an address and its parameters.
+    ///
+    /// Yields a value for every address acquired by the client.
+    ///
+    /// It is invalid to call this method while a previous call is pending.
+    /// Doing so will cause the server end of the protocol to be closed.
+    ///
+    /// - response `address` the assigned address.
+    /// - response `address_parameters` the parameters of the address.
+    /// - response `address_state_provider` provides address assignment state
+    ///     and enables updating address properties; client end is closed if
+    ///     the address becomes invalid (its valid lifetime expires and Renew
+    ///     and Rebind fail).
+    strict WatchAddress() -> (resource struct {
+        address fuchsia.net.Subnet;
+        address_parameters fuchsia.net.interfaces.admin.AddressParameters;
+        address_state_provider server_end:fuchsia.net.interfaces.admin.AddressStateProvider;
+    });
+
+    /// Hanging get for prefix leases.
+    ///
+    /// The first call to this method will return when there is at least
+    /// one lease to report (the first call is guaranteed to return with a
+    /// non-empty vector). Subsequent calls will return immediately if there
+    /// is a change to report, or block until a change occurs.
+    ///
+    /// It is invalid to call this method while a previous call is pending.
+    /// Doing so will cause the server end of the protocol to be closed.
+    ///
+    /// - response `prefixes` the assigned prefixes and their lifetimes.
+    strict WatchPrefixes() -> (struct {
+        /// Prefixes must be unique on [`Prefix.prefix`].
+        ///
+        /// Prefixes with a `Prefix.prefix` value that did not appear in
+        /// a previous value returned via this method are new; conversely
+        /// prefixes previously present may have been removed, and usage
+        /// should stop immediately. The same prefix may appear with updated
+        /// lifetime values.
+        ///
+        /// Note that any prefix's valid lifetime expiring will cause the
+        /// method to return with said prefix removed; but preferred lifetime
+        /// elapsing does not cause this method to return.
+        prefixes vector<Prefix>:MAX;
+    });
+
+    /// Gracefully tears down the underlying object.
+    ///
+    /// Blocks until any held addresses are gracefully released, as described in
+    /// [RFC 8415, Section 18.2.7](https://tools.ietf.org/html/rfc8415#section-18.2.7).
+    ///
+    /// The server end of the protocol is closed after this method returns.
+    ///
+    /// * error a `zx.Status` if any of the addresses were not gracefully
+    ///     released, e.g. the client times out waiting for Reply to Release,
+    ///     or the interface is down and sending Release fails.
+    strict Shutdown() -> () error zx.Status;
+};
+
+/// Provides IPv6 prefixes acquired via Prefix delegation.
+@discoverable
+closed protocol PrefixProvider {
+    /// Acquire an IPv6 prefix via Prefix Delegation.
+    ///
+    /// If this method is called with invalid parameters, a terminal event
+    /// containing a reason detailing why will be sent via
+    /// [`PrefixControl.OnExit`] and the server end of [`PrefixControl`]
+    /// will be closed.
+    ///
+    /// + request `config` prefix acquisition configuration.
+    /// + request `prefix` provides control over prefix acquisition.
+    strict AcquirePrefix(resource struct {
+        config @generated_name("AcquirePrefixConfig") table {
+            /// Optional. If specified, PD will only be performed on the
+            /// interface identified. If absent, the interface(s) to perform PD
+            /// on will be chosen by the server.
+            1: interface_id fuchsia.net.InterfaceId;
+            /// The preferred prefix length.
+            ///
+            /// Note that the server will make a best effort to return a prefix
+            /// of the preferred length, but may return a shorter one.
+            ///
+            /// Optional; if absent, interpreted as no preference for prefix
+            /// length.
+            ///
+            /// Must be in the range [0, 128].
+            2: preferred_prefix_len uint8;
+        };
+        prefix server_end:PrefixControl;
+    });
+};
+
+/// Provides control over prefix acquisition.
+///
+/// If the client end is closed, prefix acquisition will stop. This means that
+/// a best effort will be made to release leases back to the server, and no
+/// further attempt will be made to acquire any of the prefixes this protocol
+/// was configured to acquire.
+closed protocol PrefixControl {
+    /// Hanging get for the prefix and its lifetimes.
+    ///
+    /// The first call to this method is guaranteed to return
+    /// [`PrefixEvent.assigned`], and will occur when there is a prefix
+    /// to report. Subsequent calls will return immediately if there is a
+    /// change to report, or block until a change occurs.
+    ///
+    /// It is invalid to call this method while a previous call is pending.
+    /// Doing so will cause the server end of the protocol to be closed with
+    /// the terminal event [`PrefixControlExitReason.DOUBLE_WATCH`].
+    ///
+    /// - response `event` an optional prefix.
+    strict WatchPrefix() -> (struct {
+        event @generated_name("PrefixEvent") strict union {
+            /// No prefix is assigned.
+            ///
+            /// If a previously-assigned prefix was received, usage must stop
+            /// immediately.
+            1: unassigned Empty;
+            /// The assigned prefix and lifetimes.
+            ///
+            /// May receive consecutive updates with an assigned prefix -
+            /// callers must use the latest prefix subnet and drop the
+            /// older prefix if the prefix is different. If the prefix is
+            /// the same, the lifetimes must be updated to what is held in
+            /// the latest update.
+            2: assigned Prefix;
+        };
+    });
+
+    /// Requests prefix acquisition to stop.
+    ///
+    /// When called, the server tears down active DHCPv6 client PD on the
+    /// upstream interface, cleans up internal state, emits [`OnExit`] with
+    /// [`PrefixControlExitReason.STOPPED`], and closes the server channel.
+    strict Stop();
+
+    /// Terminal event yielded by the server before the server end is closed.
+    ///
+    /// - response `reason` the reason this prefix acquisition stopped.
+    strict -> OnExit(struct {
+        reason @generated_name("PrefixControlExitReason") flexible enum {
+            /// The interface identified is invalid for acquiring a prefix on.
+            INVALID_INTERFACE = 1;
+            /// The preferred prefix length is invalid.
+            INVALID_PREFIX_LENGTH = 2;
+            // TODO(https://fxbug.dev/42065403): Support multiple clients
+            // requesting prefixes.
+            /// An existing [`PrefixControl`] channel has already been
+            /// established to acquire a prefix.
+            ALREADY_ACQUIRING = 3;
+            /// The interface to acquire the prefix on was removed. Can only
+            /// be returned if a specific interface ID was named when
+            /// initializing the protocol.
+            INTERFACE_REMOVED = 4;
+            /// More than one concurrent call to a watch method was made.
+            DOUBLE_WATCH = 5;
+            /// Acquiring prefixes is not supported.
+            NOT_SUPPORTED = 6;
+            /// Prefix acquisition was stopped by client request.
+            STOPPED = 7;
+        };
+    });
+};

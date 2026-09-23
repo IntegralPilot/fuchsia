@@ -1,0 +1,128 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/rust/rustc_staticlib.gni")
+import("//build/zircon/c_utils.gni")
+
+source_set("unwind") {
+  visibility = [ ":*" ]
+  sources = [ "src/unwind.cc" ]
+  deps = [ "//zircon/kernel/lib/arch" ]
+}
+
+rustc_staticlib("core") {
+  output_name = "stacktrack_instrumentation_core"
+  visibility = [ ":*" ]
+  with_unit_tests = true
+
+  edition = "2024"
+  sources = [
+    "src/lib.rs",
+    "src/profiler.rs",
+    "src/recursion_guard.rs",
+    "src/unwind.rs",
+  ]
+
+  deps = [
+    ":unwind",
+    "//sdk/fidl/fuchsia.memory.stacktrack.process:fuchsia.memory.stacktrack.process_rust",
+    "//sdk/rust/zx",
+    "//src/lib/fuchsia-runtime",
+    "//src/performance/memory/stacktrack/lib/stacktrack_vmo",
+  ]
+
+  test_deps = [ "//sdk/lib/c/rust" ]
+
+  dynamic_libstd = false
+}
+
+static_library("hooks") {
+  visibility = [ ":*" ]
+  sources = [ "src/hooks.c" ]
+  deps = [ ":core" ]
+}
+
+toolchain_utils_action("linker_directives") {
+  utils = [ "nm" ]
+  script = "generate_linker_directives.py"
+
+  # The script generates a file with directives for each symbol that we want to
+  # export, telling the linker that:
+  #  - It must not be hidden (--retain-symbols-file)
+  #  - It must be included in the shared library (--undefined)
+  outputs = [
+    "${target_gen_dir}/linker_directives.retain",
+    "${target_gen_dir}/linker_directives.undefined",
+  ]
+  args = [
+    rebase_path(outputs[0], root_build_dir),
+    rebase_path(outputs[1], root_build_dir),
+  ]
+
+  # All the symbols defined by the hooks library must be exported.
+  hooks_lib = get_label_info(":hooks", "target_out_dir") + "/libhooks.a"
+  deps = [ ":hooks" ]
+  inputs = [ hooks_lib ]
+  args += [ rebase_path(hooks_lib, root_build_dir) ]
+
+  # In addition, export these symbols too:
+  args += [
+    "stacktrack_bind_with_channel",
+    "stacktrack_bind_with_fdio",
+  ]
+}
+
+shared_library("instrumentation") {
+  output_name = "stacktrack_instrumentation"
+
+  sources = [ "src/bind_with_fdio.cc" ]
+
+  deps = [
+    ":core",
+    ":hooks",
+    ":linker_directives",
+    "//sdk/fidl/fuchsia.memory.stacktrack.process:fuchsia.memory.stacktrack.process_cpp",
+    "//sdk/lib/fdio",
+    "//zircon/system/ulib/zx",
+  ]
+
+  public_deps = [ ":instrumentation.headers" ]
+
+  ldflags = [
+    # File containing symbols to be exported, one per line.
+    "-Wl,--retain-symbols-file=" +
+        rebase_path("${target_gen_dir}/linker_directives.retain",
+                    root_build_dir),
+
+    # Response file containing --undefined=SYMBOL directives.
+    "-Wl,@" + rebase_path("${target_gen_dir}/linker_directives.undefined",
+                          root_build_dir),
+  ]
+}
+
+library_headers("instrumentation.headers") {
+  visibility = [ ":*" ]
+
+  include_dir = "include"
+  headers = [ "stacktrack/bind.h" ]
+}
+
+fuchsia_unittest_package("tests") {
+  package_name = "stacktrack-instrumentation-tests"
+  deps = [ ":core_test" ]
+}
+
+rustc_library("rust") {
+  crate_name = "stacktrack"
+  edition = "2024"
+
+  source_root = "bindings.rs"
+  sources = [ "bindings.rs" ]
+
+  deps = [
+    ":instrumentation",
+    "//sdk/rust/zx",
+  ]
+}

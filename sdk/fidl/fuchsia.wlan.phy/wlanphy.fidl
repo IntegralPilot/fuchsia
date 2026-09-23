@@ -1,0 +1,186 @@
+// Copyright 2026 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.wlan.phy;
+
+using fuchsia.power.broker;
+using fuchsia.wlan.common;
+using fuchsia.wlan.ieee80211 as ieee80211;
+using fuchsia.wlan.internal;
+using zx;
+
+type WlanPhyNotifyError = flexible enum {
+    /// An unspecified internal error occurred.
+    INTERNAL = 1;
+    /// Receiver does not have support for handling the event.
+    NOT_SUPPORTED = 2;
+    /// Receiver not ready to handle event yet.
+    SHOULD_WAIT = 3;
+    /// Invalid arguments.
+    INVALID_ARGS = 4;
+};
+
+/// This protocol is specifically meant for passing events/notifications from the WlanPhy server
+/// to its client.
+@discoverable
+open protocol WlanPhyNotify {
+    /// Indicate to the receiver that the PHY has encountered a critical
+    /// error specifying a reason code.
+    flexible OnCriticalError(table {
+        1: reason_code fuchsia.wlan.internal.CriticalErrorReason;
+    }) -> () error WlanPhyNotifyError;
+
+    /// Indicate to the receiver that the firmware running on wlan hardware
+    /// has detected a change in country code.
+    flexible OnCountryCodeChange(table {
+        1: phy_country array<uint8, fuchsia.wlan.internal.COUNTRY_CODE_LEN>;
+    }) -> () error WlanPhyNotifyError;
+};
+
+@discoverable
+open protocol WlanPhy {
+    /// This method can be used by the WlanPhy client to send the client end of the
+    /// WlanPhyNotify endpoint for the WlanPhy server to use. If the WlanPhy client
+    /// never invokes this method that is an indirect implication that the WlanPhyNotify is not
+    /// supported. Some possible error codes are:
+    /// ZX_ERR_NOT_SUPPORTED: The WlanPhy server does not support the WlanPhyNotify protocol.
+    flexible Init(resource table {
+        /// Client end of a channel that notifies the WlanPhy client of events
+        /// that occur on the server, e.g., a critical error with the PHY itself.
+        ///
+        /// This field is required.
+        1: notify_client client_end:WlanPhyNotify;
+    }) -> (resource table {
+        /// If power control is supported by the driver and hardware, a dependency token will
+        /// be returned to allow the upper layers to express a dependency on specified power
+        /// states (e.g. "on").
+        1: power_dependency_token fuchsia.power.broker.DependencyToken;
+    }) error zx.Status;
+
+    /// MAC roles supported for ifaces on the physical device.
+    flexible GetSupportedMacRoles() -> (table {
+        1: supported_mac_roles
+                vector<fuchsia.wlan.common.WlanMacRole>:fuchsia.wlan.common.MAX_SUPPORTED_MAC_ROLES;
+    }) error zx.Status;
+
+    /// Create a new interface with the specified role, returning the interface id. \
+    /// Some common error codes are: \
+    /// ZX_ERR_NO_RESOURCES: maximum number of interfaces have already been created. \
+    /// ZX_ERR_NOT_SUPPORTED: device does not support the specified role.
+    flexible CreateIface(resource table {
+        /// The station role for this interface. A device may support multiple roles,
+        /// but an interface is instantiated with a single role. This field is required.
+        1: role fuchsia.wlan.common.WlanMacRole;
+        /// A handle to the direct MLME channel, if supported by the driver. This
+        /// channel should be used by SME to communicate with MLME via the MLME
+        /// protocol. This field is required.
+        2: mlme_channel zx.Handle:CHANNEL;
+        /// The initial station address set from configuration layer.
+        ///
+        /// Excluding this field or providing a MAC address with all zeroes
+        /// will result in the driver assigning a MAC address that may
+        /// or may not be randomized.
+        3: init_sta_addr ieee80211.MacAddr;
+    }) -> (table {
+        /// This field is always present.
+        1: iface_id uint16;
+    }) error zx.Status;
+
+    /// Destroy the interface with the matching id. \
+    /// Some common error codes are: \
+    /// ZX_ERR_NOT_FOUND: Specified iface does not exist or has already been removed. \
+    /// ZX_ERR_SHOULD_WAIT: Device is busy and cannot be removed, try again later.
+    flexible DestroyIface(table {
+        /// This field is required.
+        1: iface_id uint16;
+    }) -> () error zx.Status;
+
+    /// Set country with a 2-byte country code. \
+    /// Some common error codes are: \
+    /// ZX_ERR_NOT_FOUND: Specified country code not supported. PHY state is left unchanged.
+    flexible SetCountry(struct {
+        country array<uint8, fuchsia.wlan.internal.COUNTRY_CODE_LEN>;
+    }) -> () error zx.Status;
+
+    /// Set device to a world-safe country, i.e. a mode that conforms to all
+    /// regulatory constraints globally. \
+    /// Generally expected to succeed if the device is in a functional state.
+    flexible ClearCountry() -> () error zx.Status;
+
+    /// Read currently configured country. Implementations are advised to read the
+    /// country directly from the firmware, where possible. \
+    /// Generally expected to succeed if the device is in a functional state.
+    flexible GetCountry() -> (struct {
+        country array<uint8, fuchsia.wlan.internal.COUNTRY_CODE_LEN>;
+    }) error zx.Status;
+
+    /// Set Power Save mode on device. In most implementations this
+    /// likely to be set in Firmware. \
+    /// Some common error codes are: \
+    /// ZX_ERR_NOT_SUPPORTED: Specified Power Save mode not supported.
+    flexible SetPowerSaveMode(table {
+        /// This field is required.
+        1: ps_mode fuchsia.wlan.common.PowerSaveType;
+    }) -> () error zx.Status;
+
+    /// Get current Power Save mode from device. In most implementation this
+    /// likely to be retrieved from Firmware.
+    flexible GetPowerSaveMode() -> (table {
+        /// This field is required.
+        1: ps_mode fuchsia.wlan.common.PowerSaveType;
+    }) error zx.Status;
+
+    /// Power up/down/reset the wlan chip.
+    /// If supported, PowerDown will power down the wlan chip if it is currently powered on.
+    /// Any existing interfaces should have already been deleted before making this call or else the
+    /// driver will fail the call with error code ZX_ERR_INTERNAL.
+    /// Other possible error codes are: \
+    /// ZX_ERR_NOT_SUPPORTED: the feature is not supported by the driver.
+    /// ZX_ERR_BAD_STATE: the wlan chip is already powered down.
+    flexible PowerDown() -> () error zx.Status;
+
+    /// If supported, PowerUp will power up the wlan chip if it is currently powered down.
+    /// Possible error codes are: \
+    /// ZX_ERR_NOT_SUPPORTED: the feature is not supported by the driver.
+    /// ZX_ERR_BAD_STATE: the wlan chip is already powered up.
+    flexible PowerUp() -> () error zx.Status;
+
+    /// If supported, Reset functionality implements PowerDown then PowerUp in an attempt to
+    /// recover from an error state. For example, if an interface gets into a bad state or if
+    /// firmware crashes, the firmware/chip may be unable to perform some actions and Reset
+    /// may be able to clear the bad state.
+    /// Possible error codes are: \
+    /// ZX_ERR_NOT_SUPPORTED: the feature is not supported by the driver.
+    /// ZX_ERR_BAD_STATE: the wlan chip is already powered down.
+    flexible Reset() -> () error zx.Status;
+
+    /// Returns the current power state of the wlan chip. After successful initialization
+    /// of the wlan driver, the state is set to true (power on) by default. power_on set to
+    /// true indicates that the wlan chip is powered on and false indicates the wlan chip
+    /// is powered off.
+    flexible GetPowerState() -> (table {
+        1: power_on bool;
+    }) error zx.Status;
+
+    /// Set the Bluetooth coexistence mode.
+    /// Possible error codes are: \
+    /// ZX_ERR_NOT_SUPPORTED: device does not support the specified BT coexistence mode.
+    flexible SetBtCoexistenceMode(table {
+        1: mode fuchsia.wlan.internal.BtCoexistenceMode;
+    }) -> () error zx.Status;
+
+    flexible SetTxPowerScenario(table {
+        1: scenario fuchsia.wlan.internal.TxPowerScenario;
+    }) -> () error zx.Status;
+
+    flexible ResetTxPowerScenario() -> () error zx.Status;
+
+    flexible GetTxPowerScenario() -> (struct {
+        scenario fuchsia.wlan.internal.TxPowerScenario;
+    }) error zx.Status;
+};
+
+service Service {
+    device client_end:WlanPhy;
+};

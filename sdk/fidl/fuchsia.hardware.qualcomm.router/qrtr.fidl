@@ -1,0 +1,195 @@
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// QRTR related APIs for QRTR clients and servers.
+///
+/// Provides APIs for drivers wishing to communicate to the remote QRTR nodes
+/// as clients.
+/// Provides APIs for QRTR transport layer driver to connect to QRTR driver.
+@available(added=HEAD)
+library fuchsia.hardware.qualcomm.router;
+
+using zx;
+
+alias PortId = uint32;
+alias NodeId = uint32;
+/// Network Cluster Id, used for QRTR frame forwarding among transports.
+alias NetId = uint32;
+
+const NET_ID_DEFAULT_VALUE NetId = 0;
+
+/// Signal asserted on event handle when the [`QrtrClientConnection.Read`] method
+/// can return data.
+const SIGNAL_READABLE uint32 = 0x01000000; // ZX_USER_SIGNAL_0
+
+/// Signal asserted on event handle when the [`QrtrClientConnection.Write`] method
+/// can accept data.
+const SIGNAL_WRITABLE uint32 = 0x02000000; // ZX_USER_SIGNAL_1
+
+/// Error codes for QRTR operations.
+type Error = flexible enum : uint32 {
+    /// Internal error in QRTR.
+    INTERNAL_ERROR = 1;
+    /// Returned by blocking [`QrtrClientConnection.Read`] and
+    /// [`QrtrClientConnection.Write`] due to resource constraints.
+    ALREADY_PENDING = 2;
+    /// Remote node unavailable.
+    REMOTE_NODE_UNAVAILABLE = 3;
+    /// Port is already bound.
+    ALREADY_BOUND = 4;
+    /// Operation is not supported.
+    NOT_SUPPORTED = 5;
+    /// Returned by non-blocking [`QrtrClientConnection.Read`] and
+    /// [`QrtrClientConnection.Write`].
+    WOULD_BLOCK = 6;
+    /// No resources.
+    NO_RESOURCES = 7;
+    /// Invalid args.
+    INVALID_ARGS = 8;
+};
+
+/// The connection used between a QRTR client and the QRTR driver.
+protocol QrtrClientConnection {
+    /// Reads a QRTR frame via the connection.
+    ///
+    /// Only one read request can be performed at a time.
+    /// - `src_node_id`: Source node ID of the QRTR frame.
+    /// - `src_port`: Source port of the QRTR frame.
+    /// - `data`: QRTR payload.
+    /// * Errors:
+    ///   - `WOULD_BLOCK`: Cannot read; should wait in non-blocking mode.
+    ///   - `ALREADY_PENDING`: More than one read operation is pending in blocking mode.
+    ///   - `INTERNAL_ERROR`: Unexpected QRTR error.
+    flexible Read() -> (struct {
+        src_node_id NodeId;
+        src_port PortId;
+        data vector<uint8>:MAX;
+    }) error Error;
+
+    /// Writes a QRTR frame.
+    ///
+    /// Only one write request can be performed at a time.
+    /// * Errors:
+    ///   - `WOULD_BLOCK`: Cannot write; should wait in non-blocking mode.
+    ///   - `ALREADY_PENDING`: More than one write operation is pending in blocking mode.
+    ///   - `REMOTE_NODE_UNAVAILABLE`: Target node unavailable.
+    ///   - `INTERNAL_ERROR`: Unexpected QRTR error.
+    flexible Write(struct {
+        dst_node_id NodeId;
+        dst_port PortId;
+        data vector<uint8>:MAX;
+    }) -> () error Error;
+
+    /// Retrieves the signals eventpair.
+    ///
+    /// - response `signals` an eventpair that is signalled with
+    ///            `SIGNAL_READABLE` and `SIGNAL_WRITABLE` when
+    ///            read and write buffers are available, respectively.
+    flexible GetSignals() -> (resource struct {
+        signals zx.Handle:<EVENTPAIR, zx.Rights.TRANSFER | zx.Rights.DUPLICATE | zx.Rights.WAIT>;
+    });
+
+    /// Retrieves the port id.
+    flexible GetPortId() -> (struct {
+        port_id PortId;
+    });
+
+    /// Retrieves the node id of AP.
+    flexible GetNodeId() -> (struct {
+        node_id NodeId;
+    });
+
+    /// Close the connection.
+    ///
+    /// Server end drops its end of the channel after replying. This can be
+    /// used for synchronous resource release.
+    flexible CloseConnection() -> ();
+};
+
+/// Connection Options used by QrtrConnector.
+type ConnectionOptions = table {
+    /// Blocking mode
+    ///
+    /// Optional. Interpreted as true if absent.
+    1: blocking bool;
+    /// Request to reserve a Port when creating the connection.
+    ///
+    /// Optional.
+    2: port PortId;
+};
+
+/// Vends client connections with no access constraints in QRTR.
+// TODO(https://fxbug.dev/407551423): Create access constrained version of
+// QRTR connnection vending APIs.
+@discoverable
+protocol QrtrConnector {
+    /// Gets a new connection from QRTR.
+    ///
+    /// If `port` is specificed in options, creates a connection with target
+    /// port. Otherwise, assigns a random port for the connection.
+    /// * Errors:
+    ///   - `INTERNAL_ERROR`: Unexpected QRTR error.
+    ///   - `INVALID_ARGS`: Invalid arguments in `ConnectionOptions`.
+    ///   - `NO_RESOURCES`: No non-reserved port available.
+    ///   - `ALREADY_BOUND`: Specified port in `ConnectionOptions` is in use.
+    flexible GetConnection(resource struct {
+        options ConnectionOptions;
+        proxy server_end:QrtrClientConnection;
+    }) -> () error Error;
+};
+
+/// The channel for a transport driver that communicates with the remote
+/// processor and the QRTR driver.
+///
+/// Every message is preambled by a QRTR header, consult the appropriate
+/// specification for format.
+protocol QrtrTransportChannel {
+    /// Reads a QRTR frame from a transport driver.
+    ///
+    /// Blocks until an inbound frame is ready to be consumed.
+    /// Only one read request can be performed at a time.
+    /// - `data`: QRTR frame.
+    /// * Errors:
+    ///   - `ALREADY_PENDING`: More than one read operation is pending.
+    ///   - `INTERNAL_ERROR`: Unexpected QRTR error.
+    flexible Read() -> (struct {
+        data vector<uint8>:MAX;
+    }) error Error;
+
+    /// Writes a QRTR frame to a transport driver.
+    ///
+    /// Only one write request can be performed at a time.
+    /// * Errors:
+    ///   - `ALREADY_PENDING`: More than one write operation is pending.
+    ///   - `INTERNAL_ERROR`: Unexpected QRTR error.
+    flexible Write(struct {
+        data vector<uint8>:MAX;
+    }) -> () error Error;
+};
+
+/// Used by a transport driver that communicates with a remote processor
+/// to establish a new channel to the QRTR driver.
+@discoverable
+protocol QrtrTransportConnector {
+    /// Establishes a channel.
+    ///
+    /// Child drivers should only establish one connection to the QRTR driver.
+    flexible EstablishConnection(resource struct {
+        options @generated_name("TransportConnectionOptions") table {
+            /// Network Cluster ID
+            ///
+            /// Optional. Interpreted as `NET_ID_DEFAULT_VALUE` if absent.
+            1: net_id NetId;
+        };
+        proxy client_end:QrtrTransportChannel;
+    }) -> () error Error;
+};
+
+service ClientService {
+    qrtr_connector client_end:QrtrConnector;
+};
+
+service TransportService {
+    qrtr_transport_connector client_end:QrtrTransportConnector;
+};

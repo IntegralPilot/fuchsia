@@ -1,0 +1,187 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Generate a manifest file that contains pre-build information about
+# all sdk_atom() targets reachable from 'deps'. This includes such targets that
+# are not sdk deps, such as atoms used within a prebuilt library but not
+# exposed.
+#
+# Arguments:
+#  output: Output file GN path.
+#  deps: List of dependencies to walk for "idk_atom_prebuild_info" metadata.
+#  testonly: Usual GN meaning.
+#
+template("idk_prebuild_manifest") {
+  # The manifest contains a list of JSON objects, each one of them corresponding
+  # to a single sdk_atom() target, with the following fields.
+  #
+  #   atom_id (string)
+  #     Unique ID for this atom (e.g. "sdk://pkg/fdio")
+  #
+  #   atom_label (string)
+  #      GN label (without toolchain) of the target that generates the atom.
+  #      For atom types that support cross-compiling, the CPU architecture is
+  #      appended to avoid duplicate labels.
+  #
+  #   atom_type (string)
+  #     The type of the underlying SDK atom. This is used to interpret the value
+  #     of 'prebuild_info' to generate the final 'meta.json' file.
+  #
+  #   atom_files (list)
+  #     A list of objects with 'source' and 'dest' fields describing which files
+  #     to copy to the final SDK export locations for this atom.
+  #     Each 'source' path is relative to the Ninja build directory.
+  #     Each 'dest' path is relative to the SDK export directory.
+  #
+  #   meta_dest (string)
+  #     The path of the metadata file in the final IDK, relative to the IDK
+  #     root. It is usually something like "pkg/<idk_name>/meta.json".
+  #
+  #   meta_contents (scope)
+  #     Scope representing the metadata file contents.
+  #
+  #   atom_deps (list[string])
+  #     List of labels to direct atom dependencies for the current atom.
+  #     Supported only for the following library types: bind, C++ prebuilt,
+  #     C++ source, Dart, FIDL.
+  #
+  #   category (string)
+  #     Describes the availability of the element. See sdk_atom.gni.
+  #
+  #   idk_name (string)
+  #     Name of the atom in the IDK (e.g. "magma_common"). For example, the
+  #     library name or package distribution name.
+  #     Supported only for packages and bind, C++ prebuilt, C++ source, Dart,
+  #     and FIDL libraries.
+  #     Names must be unique across the IDK for a given `atom_type`. In some
+  #     cases, where the `meta_dest` values do not collide because the atom
+  #     types use different base paths, atoms of different types can share the
+  #     same name.
+  #
+  #   is_stable (bool)
+  #     Whether the atom is stable and subject to compatibility guarantees.
+  #
+  #   prebuild_info
+  #     Optional: The value of the target's original 'meta.source_prebuild_info'
+  #     if it was defined. This should contain enough information to recreate
+  #     the final meta.json file from the manifest only for this atom. Exact
+  #     content will depend on the value of 'atom_type'. See below for exact
+  #     schemas for each type.
+  #
+  # Now, the list of schemas for all supported 'atom_type' value:
+  #
+  # ----------------------------------------------------------------------------
+  #
+  #   "cc_source_library"
+  #
+  #   LINT.IfChange
+  #
+  #     include_dir (string)
+  #       Directory path that must be added to the include search path at
+  #       compile time to find the headers of this library. Relative to the SDK
+  #       export dir (e.g. "pkg/magma_common/include")
+  #
+  #     headers (list[string])
+  #       List of C++ header file paths for this atom, relative to the SDK
+  #       export directory. Thus they will always have 'include_dir' as a
+  #       prefix.
+  #
+  #     sources (list[string])
+  #       List of C++ source file paths for this atom, relative to the SDK
+  #       export directory.
+  #
+  #     file_base(string)
+  #        The root path for all files in the IDK. The paths above include this.
+  #
+  #   LINT.ThenChange(//build/bazel/rules/idk/private/idk_cc_source_library.bzl:idk_cc_source_library, //build/cpp/sdk_source_set.gni)
+  #
+  # ----------------------------------------------------------------------------
+  #
+  #   "cc_prebuilt_library"
+  #
+  #   LINT.IfChange(cc_prebuilt_library)
+  #
+  #     format (string)
+  #       Either "static" (for static library archives) or "shared" (for ELF
+  #       shared libraries).
+  #
+  #     runtime_deps_file (string)
+  #       Path to a JSON file that lists the runtime dependencies of the
+  #       library, each defined through a schema described in
+  #      //build/cpp/verify_runtime_deps.gni.
+  #
+  #     binaries (scope)
+  #       Describes one variant of the prebuilt library. Has the following
+  #       schema:
+  #
+  #         api_level (string)
+  #           API level, can be "PLATFORM" or a decimal string (e.g. "11").
+  #
+  #         arch (string)
+  #           CPU architecture name of the binary (e.g. "x64" or "arm64").
+  #
+  #         link_lib (string)
+  #           Path of link-time prebuilt library file, relative to SDK export
+  #           dir. E.g. "arch/x64/lib/libfdio.so". For "shared" prebuilts, this
+  #           will usually be a small link-stub, not a real library.
+  #
+  #       The following part of the schema only applies to shared libraries.
+  #
+  #         dist_lib (string)
+  #           Only for "shared" prebuilts. Path of distributable (stripped)
+  #           version of the library, relative to the SDK export dir (e.g.
+  #           "arch/x64/dist/libfdio.so").
+  #
+  #         dist_path (string)
+  #           Only for "shared" prebuilts. Installation path of the library,
+  #           relative to Fuchsia package root (e.g. "lib/fdio.so")
+  #
+  #         debug_lib (string)
+  #           Only for "shared" prebuilts. Path of unstripped version of the
+  #           prebuilt library, relative to SDK export dir (e.g.
+  #           "arch/x64/symbols/libfdio.so")
+  #
+  #         ifs (string)
+  #           Only for "shared" prebuilts. Path of the IFS file for the prebuilt
+  #           library, relative to SDK export dir (e.g. "pkg/fdio/fdio.ifs")
+  #
+  #     include_dir (string)
+  #     headers (list[string])
+  #     file_base (string)
+  #       Same as "cc_source_library"
+  #
+  #   LINT.ThenChange(//build/bazel/rules/idk/private/idk_cc_prebuilt_library.bzl, //build/cpp/sdk_prebuilt_library_impl.gni)
+  #
+  # ----------------------------------------------------------------------------
+  #
+  #   "package"
+  #
+  #   LINT.IfChange
+  #
+  #     api_level (string)
+  #       API level, can be "PLATFORM" or a decimal string (e.g. "11").
+  #
+  #     arch (string)
+  #       CPU architecture name of the binary (e.g. "x64" or "arm64").
+  #
+  #     package_manifest (string)
+  #       Path to the manifest for the underlying Fuchsia package.
+  #
+  #   LINT.ThenChange(//build/packages/sdk_fuchsia_package.gni )
+  #
+  #
+  #
+  generated_file(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    outputs = [ invoker.output ]
+    data_keys = [ "idk_atom_prebuild_info" ]
+    walk_keys = [ "idk_atom_prebuild_info_barrier" ]
+    output_conversion = "json"
+    deps = invoker.deps
+  }
+}

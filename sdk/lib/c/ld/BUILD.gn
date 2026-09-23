@@ -1,0 +1,267 @@
+# Copyright 2024 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("../libc.gni")
+
+# This will be linked into the new libc.so to integrate with //sdk/lib/ld.  It
+# will never be used by the legacy libc.so, so this directory is not in the
+# $libc_components list in ../BUILD.gn; but it has a unittests target.
+libc_source_set("ld") {
+  sources = []
+  libc_deps = [
+    ":ld-fini",
+    ":ld-on-tls-segments",
+    ":ld-start-compiler-abi",
+    ":ld-start-main",
+    ":ld-tls",
+    ":ld-writable-segments",
+    ":log-storage",
+    ":sanitizer-log-write",
+  ]
+}
+
+# These files implement the ../startup/start-main.h functions that interact
+# with ld::abi.  It's reached via :ld rather than from ../startup so that the
+# latter could be used in common between old and new libc implementations.
+libc_source_set("ld-start-main") {
+  sources = [
+    "ctors.cc",
+    "sanitizer-module-loaded.cc",
+  ]
+  libc_deps = [ ":ld-abi" ]
+  deps = [
+    "../dlfcn:dlfcn-abi",
+    "../startup:headers",
+    "//sdk/lib/ld:headers",
+  ]
+}
+
+libc_source_set("ld-start-compiler-abi") {
+  # TODO(https://fxbug.dev/342469121): This won't need to be its own basic_abi
+  # hermetic set here once startup:musl-glue is removed.  Instead, it can just
+  # be a plain libc_source_set in deps of startup:start-compiler-abi.
+  basic_abi = true
+  global_symbols = [ "${libc_namespace}_InitialStackSize" ]
+  undefined_symbols = [ "_ld_abi" ]
+  sources = [ "initial-stack-size.cc" ]
+  libc_deps = [ ":ld-abi" ]
+  deps = [
+    "../startup:headers",
+    "//sdk/lib/ld:headers",
+    "//zircon/system/ulib/zircon-internal",
+  ]
+}
+
+# This implements the ThreadStorage methods that handle ELF TLS via the
+# <sdk/lib/ld/abi.h> passive ABI.
+libc_source_set("ld-tls") {
+  # TODO(https://fxbug.dev/342469121): This won't need to be its own basic_abi
+  # hermetic set here once startup:musl-glue is removed.
+  basic_abi = true
+  global_symbols = [
+    "${libc_namespace}_GetTlsLayout",
+    "${libc_namespace}_InitializeTls",
+  ]
+  undefined_symbols = [
+    "${libc_namespace}_gLog",
+    "_ld_abi",
+  ]
+  sources = [ "ld-tls.cc" ]
+  non_test_deps = [ ":log-panic" ]
+  libc_deps = [
+    ":ld-abi",
+    "../threads:thread-storage",
+  ]
+  deps = [ "//sdk/lib/ld:headers" ]
+}
+
+libc_source_set("ld-fini") {
+  sources = [ "ld-fini.cc" ]
+  libc_deps = [ ":ld-abi" ]
+  deps = [
+    "//sdk/lib/ld:ld.as-needed",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+}
+
+libc_source_set("ld-abi") {
+  public = [ "ld-abi.h" ]
+  public_deps = [ "//sdk/lib/ld:abi-headers" ]
+  testonly_public_deps = [ "//sdk/lib/ld/testing:ld-abi-testing" ]
+  sources = []
+}
+
+libc_test("ld-abi.unittests") {
+  sources = []
+}
+
+libc_test("unittests") {
+  sources = []
+  deps = [ ":log-tests" ]
+}
+
+source_set("log.headers") {
+  public = [ "log.h" ]
+  public_deps = [
+    "..:asm-linkage",
+    "//sdk/lib/ld:ld-log-zircon",
+  ]
+}
+
+# This implements the methods that can be used on LIBC_NAMESPACE::gLog whether
+# from inside an hermetic_source_set() or in the main libc code.  A hermetic
+# caller will have its own copy of this code but that can safely access gLog,
+# which is defined in :log-storage outside any hermetic_source_set().
+libc_source_set("log") {
+  public_deps = [ ":log.headers" ]
+  sources = [ "log.cc" ]
+  libc_deps = [ ":ld-abi" ]
+  deps = [
+    "//sdk/lib/ld:ld.as-needed",
+    "//src/lib/symbolizer-markup",
+  ]
+}
+
+libc_source_set("sanitizer-log-write") {
+  # __sanitizer_log_write is called by sanitizer runtimes and might have
+  # problems if it calls back into them or relied on their state (such as
+  # shadow memory for instrumented memory accesses).  It shouldn't be necessary
+  # for it to avoid the compiler ABI per se.  But nontrivial sanitizer runtimes
+  # will use the compiler ABI and thus are all excluded in the user.basic
+  # environment; so the easiest way to avoid them is to use a basic_abi=true
+  # hermetic_source_set().
+  basic_abi = true
+  global_symbols = [ "__sanitizer_log_write" ]
+  undefined_symbols = [
+    "_ld_abi",
+    "${libc_namespace}_gLog",
+  ]
+
+  sources = [ "sanitizer-log-write.cc" ]
+  libc_deps = [
+    ":log",
+    ":log-panic",
+  ]
+}
+
+# This is meant to be used in deps of basic_abi libc_source_set()s, which must
+# list "${libc_namespace}_gLog" in $undefined_symbols.  It provides the panic
+# printfs used by various assert macros and such.
+libc_source_set("log-panic") {
+  visibility = [ "//src/bringup/lib/userboot/*" ]
+  sources = [ "log-panic.cc" ]
+  deps = [ ":log.headers" ]
+  libc_deps = [
+    "../stdio/printf_core:wrapper",
+    "../stdlib:abort",
+  ]
+}
+
+# This is used in the main libc, both old and new implementations.  It just
+# defines the LIBC_NAMESPACE::gLog variable, which hermetic_source_set()s using
+# :log-panic will refer to.
+libc_source_set("log-storage") {
+  visibility = [ ":*" ]
+  sources = [ "log-storage.cc" ]
+  deps = [ ":log.headers" ]
+}
+
+libc_test("log-tests") {
+  sources = [ "log-tests.cc" ]
+  deps = [
+    ":log.headers",
+    "../test:safe-zero-construction",
+    "//zircon/system/ulib/zxtest",
+  ]
+}
+
+source_set("writable-segments") {
+  public = [ "writable-segments.h" ]
+  public_deps = [ "../dlfcn:dlfcn-abi" ]
+}
+
+libc_source_set("ld-writable-segments") {
+  sources = [ "ld-writable-segments.cc" ]
+  deps = [ ":writable-segments" ]
+  libc_deps = [ ":ld-abi" ]
+}
+
+libc_source_set("ld-on-tls-segments") {
+  sources = [ "ld-on-tls-segments.cc" ]
+  deps = [
+    "../threads:thread",
+    "../threads:thread-storage",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+  libc_deps = [ ":ld-abi" ]
+}
+
+# This is linked into the legacy libc.so to satisfy references from the old
+# musl integrated dynamic linker code.
+libc_source_set("musl-glue") {
+  # These things are called only after the full compiler ABI is available.
+  sources = [
+    "_dl_phdr_report_globals.cc",
+    "musl-ctors.cc",
+  ]
+  deps = [
+    ":writable-segments",
+    "../startup:headers",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+
+  libc_deps = [
+    ":log-storage",
+    ":musl-glue.basic",
+  ]
+}
+
+# These things are called too early in startup to use the compiler ABI.
+# (Except __sanitizer_log_write, but see comments above.)
+libc_source_set("musl-glue.basic") {
+  basic_abi = true
+
+  # These symbols are what the legacy libc.so gets from this libc_source_set().
+  global_symbols = [
+    "__sanitizer_log_write",
+    "_dl_log_write",
+    "_dl_log_write_init",
+    "_dl_log_write_init_fallback",
+  ]
+
+  undefined_symbols = [
+    "${libc_namespace}_gLog",
+    "_dl_log_unlogged",
+  ]
+
+  # _dl_log_write's global state has destructor registration, though it takes
+  # care to be constinit so it's guaranteed safe to use before constructors.
+  allow_init = true
+  undefined_symbols += [
+    "__cxa_atexit",
+    "__dso_handle",
+  ]
+
+  sources = [
+    "_dl_log_write.cc",
+
+    # This is not really part of the glue with ld per se, but in the legacy
+    # musl implementation it is intertwined with the ld glue code.  In the new
+    # implementation the function is defined in the ":sanitizer-log-write"
+    # target above and it directly uses the passive ABI via ":log".
+    "__sanitizer_log_write.cc",
+  ]
+  libc_deps = [ ":log-panic" ]
+  deps = [
+    ":log.headers",
+    "../stdlib:hermetic",
+    "../string:hermetic",
+    "//sdk/lib/c/stdio/printf_core:wrapper",
+    "//sdk/lib/ld:ld-log-zircon",
+    "//sdk/lib/ld:processargs",
+    "//src/lib/elfldltl:headers",
+    "//zircon/system/ulib/fbl",
+    "//zircon/third_party/ulib/musl:musl_internal",
+  ]
+}

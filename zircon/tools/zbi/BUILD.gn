@@ -1,0 +1,308 @@
+# Copyright 2019 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_inputs.gni")
+import("//build/go/go_binary.gni")
+import("//build/sdk/sdk_host_tool.gni")
+import("//build/zbi/zbi.gni")
+import("//build/zbi/zbi_input.gni")
+import("zbi_item.gni")
+
+executable("zbi") {
+  sources = [ "zbi.cc" ]
+  deps = [
+    "//sdk/lib/stdcompat",
+    "//sdk/lib/zbi-format:internal",
+    "//src/lib/zbitl",
+    "//third_party/boringssl:crypto-static",
+    "//third_party/lz4",
+    "//third_party/rapidjson",
+    "//third_party/zstd",
+    "//zircon/system/ulib/fbl",
+    "//zircon/third_party/ulib/cksum",
+  ]
+  defines = [ "ZSTD_STATIC_LINKING_ONLY" ]
+}
+
+if (is_host) {
+  sdk_host_tool("zbi_sdk") {
+    category = "partner"
+    output_name = "zbi"
+    deps = [ ":zbi" ]
+  }
+
+  bazel_input_file("bazel_input") {
+    generator = ":zbi"
+    outputs = [ "${root_out_dir}/zbi" ]
+  }
+}
+
+group("tests") {
+  testonly = true
+  deps = [
+    ":make-single-item-zbi-input-test",
+    ":zbi-deduplication-test",
+    ":zbi-input-chrdev-test",
+    ":zbi-input-size-limit-test",
+    ":zbi-storage-kernel-test.compressed",
+    ":zbi-storage-kernel-test.uncompressed",
+  ]
+}
+
+template("input_test") {
+  test_name = target_name
+  jq_path = "//prebuilt/third_party/jq/$host_platform/bin/jq"
+
+  zbi("$test_name.zbi") {
+    testonly = true
+    cpu = ""
+    deps = [ ":$test_name.input" ]
+  }
+
+  zbi_input("$test_name.input") {
+    testonly = true
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "expected",
+                             "fields",
+                           ])
+  }
+
+  action("$test_name.json") {
+    testonly = true
+    deps = [ ":$test_name.zbi" ]
+    zbi_outputs = get_target_outputs(deps[0])
+    sources = [ zbi_outputs[1] ]  # Just the JSON file.
+    outputs = [ "$target_out_dir/$target_name" ]
+    inputs = [ jq_path ]
+    script = "jq-test.sh"
+
+    fields = string_join(", ", invoker.fields)
+    args = rebase_path(inputs + sources + outputs, root_build_dir) +
+           [ "[ .[] | {$fields} ]" ]
+  }
+
+  generated_file("$test_name.expected.json") {
+    testonly = true
+    outputs = [ "$target_gen_dir/$target_name" ]
+    output_conversion = "json"
+    contents = invoker.expected
+  }
+
+  action(test_name) {
+    testonly = true
+    deps = [
+      ":$test_name.expected.json",
+      ":$test_name.json",
+    ]
+
+    sources = get_target_outputs(deps[0]) + get_target_outputs(deps[1])
+    inputs = [ jq_path ]
+    outputs = [ "$target_out_dir/$test_name.ok" ]
+    script = "json-diff.sh"
+    args = rebase_path([ jq_path ] + outputs + sources, root_build_dir)
+  }
+}
+
+input_test("zbi-input-size-limit-test") {
+  args = [ "--uncompressed" ]
+  type = "ramdisk:42"
+  sources = [ "BUILD.gn" ]
+  fields = [
+    "type",
+    "size",
+  ]
+  expected = [
+    {
+      type = "RAMDISK"
+      size = 42
+    },
+  ]
+}
+
+input_test("zbi-input-chrdev-test") {
+  args = [ "--uncompressed" ]
+  type = "ramdisk:23"
+  sources = [ "/dev/zero" ]
+  fields = [
+    "type",
+    "size",
+  ]
+  expected = [
+    {
+      type = "RAMDISK"
+      size = 23
+    },
+  ]
+}
+
+bootfs_entry = "$target_gen_dir/bootfs-entry.txt"
+generated_file("bootfs-entry") {
+  output_conversion = "list lines"
+  contents = []
+  outputs = [ bootfs_entry ]
+}
+
+bootfs_manifest = "$target_gen_dir/bootfs-manifest.txt"
+generated_file("bootfs-manifest") {
+  output_conversion = "list lines"
+  contents = [ "DEST=" + rebase_path(bootfs_entry, root_build_dir) ]
+  outputs = [ bootfs_manifest ]
+  deps = [ ":bootfs-entry" ]
+}
+
+input_test("zbi-storage-kernel-test.compressed") {
+  sources = [ bootfs_manifest ]
+  args = [
+    "--compressed=max",
+    "--files-type=kernel",
+  ]
+  fields = [
+    "type",
+    "uncompressed_size",
+    "contents",
+  ]
+  expected = [
+    {
+      type = "KERNEL"
+      uncompressed_size = 4096
+      contents = [
+        {
+          length = 0
+          name = "DEST"
+          offset = 4096
+          size = 0
+        },
+      ]
+    },
+  ]
+
+  deps = [ ":bootfs-manifest" ]
+}
+
+input_test("zbi-storage-kernel-test.uncompressed") {
+  sources = [ bootfs_manifest ]
+  args = [
+    "--uncompressed",
+    "--files-type=kernel",
+  ]
+  fields = [
+    "type",
+    "size",
+    "uncompressed_size",
+    "contents",
+  ]
+  expected = [
+    {
+      type = "KERNEL"
+      size = 4096
+      uncompressed_size = 4096
+      contents = [
+        {
+          length = 0
+          name = "DEST"
+          offset = 4096
+          size = 0
+        },
+      ]
+    },
+  ]
+
+  deps = [ ":bootfs-manifest" ]
+}
+
+deduplication_manifest = "$target_gen_dir/deduplication-manifest.txt"
+deduplication_files = [
+  {
+    dest = "file"
+    source = "testdata/file.txt"
+  },
+  {
+    dest = "copy"
+    source = "testdata/copy.txt"
+  },
+  {
+    dest = "symlink"
+    source = "testdata/symlink.txt"
+  },
+]
+
+generated_file("deduplication-manifest") {
+  output_conversion = "list lines"
+  contents = []
+  foreach(file, deduplication_files) {
+    contents += [ "${file.dest}=" + rebase_path(file.source, root_build_dir) ]
+  }
+  outputs = [ deduplication_manifest ]
+}
+
+input_test("zbi-deduplication-test") {
+  args = [
+    "--uncompressed",
+    "--files-type=RAMDISK",
+  ]
+  sources = [ deduplication_manifest ]
+  fields = [
+    "type",
+    "contents",
+  ]
+  expected = [
+    {
+      type = "RAMDISK"
+      contents = [
+        {
+          length = 8
+          name = "copy"
+          offset = 4096
+          size = 4096
+        },
+        {
+          length = 8
+          name = "file"
+          offset = 4096
+          size = 4096
+        },
+        {
+          length = 8
+          name = "symlink"
+          offset = 4096
+          size = 4096
+        },
+      ]
+    },
+  ]
+  deps = [ ":deduplication-manifest" ]
+}
+
+# Used by `zbi_item.gni`.
+go_binary("make_single_item_zbi") {
+  sources = [ "make_single_item_zbi.go" ]
+  deps = [ "//sdk/fidl/zbi:zbi_zither.go" ]
+}
+
+zbi_item("zbi-test-single-item") {
+  type = "ZBI_TYPE_KERNEL_DRIVER"
+  extra = "ZBI_KERNEL_DRIVER_ARM_PSCI_CPU_SUSPEND"
+  contents = [
+    {
+      id = 1
+    },
+  ]
+}
+
+input_test("make-single-item-zbi-input-test") {
+  deps = [ ":zbi-test-single-item" ]
+
+  fields = [
+    "type",
+    "size",
+  ]
+  expected = [
+    {
+      type = "KERNEL_DRIVER"
+      size = 24
+    },
+  ]
+}

@@ -1,0 +1,132 @@
+{{/*
+// Copyright 2025 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+#![cfg(test)]
+#![allow(unused_imports)]
+#![allow(invalid_from_utf8)]
+#![allow(clippy::approx_constant)]
+
+use {
+    assert_matches::assert_matches,
+    fidl_next::{
+        AsDecoderExt as _, Chunk,
+        Decode, DecodeError, DecoderExt as _,
+        Encode, EncodeError, EncoderExt as _,
+        ValidationError,
+        ClientEnd, ServerEnd, chunks,
+    },
+    fidl_next::fuchsia::channel::Buffer,
+    fidl_next::fuchsia::zx as zx,
+    fidl_next_test_conformance as test_conformance,
+    zerocopy::IntoBytes,
+    zx_status::Status,
+    zx_types as zx_types,
+    gidl_util::{
+        HandleDef, HandleSubtype, copy_handle, create_handles, decode_value,
+        get_handle_koid, get_info_handle_valid, repeat, select_handle_infos,
+        select_raw_handle_infos, to_zx_handle_disposition_t,
+    },
+    std::convert::TryFrom,
+    zx::{NullableHandle, AsHandleRef as _},
+};
+
+
+{{ range .EncodeSuccessCases }}
+    #[test]
+    fn encode_{{ .Name }}() {
+        {{- if .HandleDefs }}
+            let handle_defs = create_handles(&{{ .HandleDefs }});
+        {{- end }}
+        let value = {{ .Value }};
+        let mut buffer = Buffer::new();
+        buffer.encode_next::<{{ .WireValueType }}, _>(value).unwrap();
+        assert_eq!(chunks!{{ .Bytes }}.as_slice(), buffer.chunks);
+        // TODO: support handle dispositions
+        {{-  if .RawHandles }}
+        assert_eq!(
+            buffer.handles.iter().map(|h| h.raw_handle()).collect::<Vec<_>>(),
+            &{{ .RawHandles }}
+        );
+        {{- else }}
+        assert_eq!(buffer.handles, &[]);
+        {{- end }}
+    }
+{{ end }}
+
+{{ range .DecodeSuccessCases }}
+    #[test]
+    fn decode_{{ .Name }}() {
+        {{- if .HandleDefs }}
+            let handle_defs = create_handles(&{{ .HandleDefs }});
+            let _handle_koids = handle_defs.iter().map(get_handle_koid).collect::<Vec<_>>();
+            #[allow(unused)]
+            let mut handle_infos = select_handle_infos(&handle_defs, &{{ .Handles }});
+        {{- end }}
+
+        let buffer = Buffer {
+            chunks: Vec::from(chunks!{{ .Bytes }}),
+            handles: vec!{{ .HandleValues }},
+        };
+        let {{ .ValueVar }}: {{ .ValueType }} = buffer.into_decoded::<{{ .WireValueType }}>().unwrap().take();
+        {{ .EqualityCheck }}
+        {{- if .UnusedHandles }}
+        let unused_handles = select_raw_handle_infos(&handle_defs, &{{ .UnusedHandles }});
+        assert_eq!(
+            unused_handles.iter().map(get_info_handle_valid).collect::<Vec<_>>(),
+            repeat(Err(Status::BAD_HANDLE), unused_handles.len()),
+        );
+        {{- end }}
+    }
+{{ end }}
+
+{{ range .EncodeFailureCases }}
+    #[test]
+    fn encode_failure_{{ .Name }}() {
+        {{- if .HandleDefs }}
+            let handle_defs = create_handles(&{{ .HandleDefs }});
+        {{- end }}
+
+        let mut buffer = Buffer::new();
+        let value = {{ .Value }};
+        match buffer.encode_next(value) {
+            Err(err) => assert_matches!(err, {{ .ErrorPattern }}),
+            Ok(_) => panic!("unexpected successful encoding"),
+        }
+        // TODO: check that we get the right error.
+        // TODO: check that handles are closed
+    }
+{{ end }}
+
+{{ range .DecodeFailureCases }}
+    #[test]
+    fn decode_failure_{{ .Name }}() {
+        {{- if .HandleDefs }}
+            let handle_defs = create_handles(&{{ .HandleDefs }});
+            let _handle_koids = handle_defs.iter().map(get_handle_koid).collect::<Vec<_>>();
+            #[allow(unused)]
+            let mut handle_infos = select_handle_infos(&handle_defs, &{{ .Handles }});
+        {{- end }}
+
+        let buffer = Buffer {
+            chunks: Vec::from(chunks!{{ .Bytes }}),
+            handles: vec!{{ .HandleValues }}
+        };
+
+        match buffer.into_decoded::<{{ .WireValueType }}>() {
+            Err(err) => assert_matches!(err, {{ .ErrorPattern }}),
+            Ok(value) => panic!("unexpected successful decoding to: {:?}", value.take()),
+        }
+
+        {{- if .HandleDefs }}
+            assert_eq!(
+                handle_defs.iter().map(get_info_handle_valid).collect::<Vec<_>>(),
+                repeat(Err(Status::BAD_HANDLE), handle_defs.len()),
+            );
+        {{- end }}
+
+    }
+{{ end }}
+

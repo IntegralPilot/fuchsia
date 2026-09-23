@@ -1,0 +1,87 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+"""Cquery that returns prebuild info for all atoms in the IDK dependency graph of the given target.
+
+For each such atom, it extracts information from the FuchsiaIdkAtomInfo
+provider and formats it as a JSON dictionary, mimicking the structure of the
+prebuild info generated from the GN build. The prebuild info for all atoms is
+returned in a JSON list.
+
+Only atoms in the IDK deps tree are included. This means that, for example,
+atoms coresponding to libraries used only in the internal implementation of a
+prebuilt library atom are not included.
+
+Example use:
+    fx bazel cquery --config=fuchsia_platform build/bazel/bazel_idk/tests:test_molecule_idk --output=starlark --starlark:file=build/bazel/bazel_idk/idk_prebuild_info.cquery
+"""
+
+def _get_path(file_or_target):
+    """Gets the path from a File or a Target object."""
+    if hasattr(file_or_target, "path"):
+        path = file_or_target.path
+    else:
+        # It's a Target, so get the path from its files depset.
+        path = file_or_target.files.to_list()[0].path
+
+    # Make the path relative to the GN output directory.
+    return "../../" + path
+
+def _files_map_to_json(files_map):
+    """Converts a dict of {dest: src_file} to a list of {"dest": ..., "source": ...}."""
+    return [{"dest": dest, "source": _get_path(src)} for dest, src in files_map.items()]
+
+def _generate_prebuild_info_for_atom(target):
+    provider = providers(target)["//build/bazel/rules/idk/private:providers.bzl%FuchsiaIdkAtomInfo"]
+
+    # Decode the JSON-encoded strings from additional_prebuild_info.
+    prebuild_info = {
+        k: json.decode(v)
+        for k, v in provider.additional_prebuild_info.items()
+    }
+
+    return {
+        "api_area": provider.api_area,
+        "atom_deps": [str(d.label) for d in provider.deps],
+        "atom_files": _files_map_to_json(provider.atom_files_map),
+        "atom_id": provider.id,
+        "atom_label": str(target.label),
+        "atom_type": provider.type,
+        "category": provider.category,
+        "idk_name": provider.idk_name,
+        "is_stable": provider.is_stable,
+        "meta_dest": provider.meta_dest,
+        "prebuild_info": prebuild_info,
+    }
+
+def _generate_prebuild_info_for_all_atoms(target):
+    atom_targets = []
+    p = providers(target)
+
+    # If the `target` is an atom, include it in the output.
+    provider = p.get("//build/bazel/rules/idk/private:providers.bzl%FuchsiaIdkAtomInfo")
+    if provider:
+        atom_targets.append(target)
+    else:
+        provider = p.get("//build/bazel/rules/idk/private:providers.bzl%FuchsiaIdkMoleculeInfo")
+
+    # In either case, include all atom dependencies.
+    atom_targets += provider.atoms_depset.to_list()
+
+    infos = []
+    for atom in atom_targets:
+        infos.append(json.encode_indent(_generate_prebuild_info_for_atom(atom), indent = "  "))
+
+    return infos
+
+def format(target):
+    """Returns a JSON list of prebuild info for all atoms in the IDK dependency graph of the given target.
+
+    Args:
+        target: The target to query.
+
+    Returns:
+        Formatted JSON string containing prebuild info.
+    """
+    return "[\n" + ",\n".join(_generate_prebuild_info_for_all_atoms(target)) + "\n]"

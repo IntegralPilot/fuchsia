@@ -1,0 +1,394 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.sysmem2;
+
+using zx;
+
+/// Allocates system memory buffers.
+///
+/// Epitaphs are not used in this protocol.
+@available(added=19)
+@discoverable
+open protocol Allocator {
+    /// Allocates a buffer collection on behalf of a single client (aka
+    /// initiator) who is also the only participant (from the point of view of
+    /// sysmem).
+    ///
+    /// This call exists mainly for temp/testing purposes.  This call skips the
+    /// [`fuchsia.sysmem2/BufferCollectionToken`] stage, so there's no way to
+    /// allow another participant to specify its constraints.
+    ///
+    /// Real clients are encouraged to use
+    /// [`fuchsia.sysmem2/Allocator.AllocateSharedCollection`] instead, and to
+    /// let relevant participants directly convey their own constraints to
+    /// sysmem by sending `BufferCollectionToken`s to those participants.
+    ///
+    /// + request `collection_request` The server end of the
+    ///   [`fuchsia.sysmem2/BufferCollection`].
+    flexible AllocateNonSharedCollection(resource table {
+        1: collection_request server_end:BufferCollection;
+    });
+
+    /// Creates a root [`fuchsia.sysmem2/BufferCollectionToken`].
+    ///
+    /// The `BufferCollectionToken` can be "duplicated" for distribution to
+    /// participants by using
+    /// [`fuchsia.sysmem2/BufferCollectionToken.Duplicate`]. Each
+    /// `BufferCollectionToken` can be converted into a
+    /// [`fuchsia.sysmem2.BufferCollection`] using
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`].
+    ///
+    /// Buffer constraints can be set via
+    /// [`fuchsia.sysmem2/BufferCollection.SetConstraints`].
+    ///
+    /// Success/failure to populate the buffer collection with buffers can be
+    /// determined from
+    /// [`fuchsia.sysmem2/BufferCollection.WaitForAllBuffersAllocated`].
+    ///
+    /// Closing the client end of a `BufferCollectionToken` or
+    /// `BufferCollection` (without `Release` first) will fail all client ends
+    /// in the same failure domain, which by default is all client ends of the
+    /// buffer collection. See
+    /// [`fuchsia.sysmem2/BufferCollection.SetDispensable`] and
+    /// [`fuchsia.sysmem2/BufferCollection.AttachToken`] for ways to create
+    /// separate failure domains within a buffer collection.
+    flexible AllocateSharedCollection(resource table {
+        1: token_request server_end:BufferCollectionToken;
+    });
+
+    /// Convert a [`fuchsia.sysmem2/BufferCollectionToken`] into a
+    /// [`fuchsia.sysmem2/BufferCollection`].
+    ///
+    /// At the time of sending this message, the buffer collection hasn't yet
+    /// been populated with buffers - the participant must first also send
+    /// [`fuchsia.sysmem2/BufferCollection.SetConstraints`] via the
+    /// `BufferCollection` client end.
+    ///
+    /// All `BufferCollectionToken`(s) duplicated from a root
+    /// `BufferCollectionToken` (created via `AllocateSharedCollection`) must be
+    /// "turned in" via `BindSharedCollection` (or `Release`ed), and all
+    /// existing `BufferCollection` client ends must have sent `SetConstraints`
+    /// before the logical BufferCollection will be populated with buffers (or
+    /// will fail if the overall set of constraints can't be satisfied).
+    ///
+    /// + request `token` The client endpoint of a channel whose server end was
+    ///   sent to sysmem using
+    ///   [`fuchsia.sysmem2/Allocator.AllocateSharedCollection`] or whose server
+    ///   end was sent to sysmem using
+    ///   [`fuchsia.sysmem2/BufferCollectionToken.Duplicate`].  The token is
+    ///   being "turned in" in exchange for a
+    ///   [`fuchsia.sysmem2/BufferCollection`].
+    /// + request `buffer_collection_request` The server end of a
+    ///   [`fuchsia.sysmem2/BufferCollection`] channel.  The sender retains the
+    ///   client end. The `BufferCollection` channel is a single participant's
+    ///   connection to the logical buffer collection. Typically there will be
+    ///   other participants with their own `BufferCollection` channel to the
+    ///   logical buffer collection.
+    flexible BindSharedCollection(resource table {
+        1: token client_end:BufferCollectionToken;
+        2: buffer_collection_request server_end:BufferCollection;
+    });
+
+    /// Checks whether a [`fuchsia.sysmem2/BufferCollectionToken`] is known to
+    /// the sysmem server.
+    ///
+    /// With this call, the client can determine whether an incoming token is a
+    /// real sysmem token that is known to the sysmem server, without any risk
+    /// of getting stuck waiting forever on a potentially fake token to complete
+    /// [`fuchsia.sysmem2/BufferCollectionToken.DuplicateSync`] or
+    /// [`fuchsia.sysmem2/BufferCollectionToken.Sync`] (or any other two-way
+    /// FIDL message). In cases where the client trusts the source of the token
+    /// to provide a real token, this call is not typically needed outside of
+    /// debugging.
+    ///
+    /// If the validate fails sometimes but succeeds other times, the source of
+    /// the token may itself not be calling
+    /// [`fuchsia.sysmem2/BufferCollectionToken.Sync`] or
+    /// [`fuchsia.sysmem2/BufferCollection.Sync`] after creating/duplicating the
+    /// token but before sending the token to the current client. It may be more
+    /// convenient for the source to use
+    /// [`fuchsia.sysmem2/BufferCollectionToken.DuplicateSync`] to duplicate
+    /// token(s), since that call has the sync step built in. Or, the buffer
+    /// collection may be failing before this call is processed by the sysmem
+    /// server, as buffer collection failure cleans up sysmem's tracking of
+    /// associated tokens.
+    ///
+    /// This call has no effect on any token.
+    ///
+    /// + request `token_server_koid` The koid of the server end of a channel
+    ///   that might be a BufferCollectionToken channel.  This can be obtained
+    ///   via `zx_object_get_info` `ZX_INFO_HANDLE_BASIC` `related_koid`.
+    /// - response `is_known` true means sysmem knew of the token at the time
+    ///   sysmem processed the request, but doesn't guarantee that the token is
+    ///   still valid by the time the client receives the reply. What it does
+    ///   guarantee is that the token at least was a real token, so a two-way
+    ///   call to the token won't stall forever (will fail or succeed fairly
+    ///   quickly, not stall). This can already be known implicitly if the
+    ///   source of the token can be trusted to provide a real token. A false
+    ///   value means the token wasn't known to sysmem at the time sysmem
+    ///   processed this call, but the token may have previously been valid, or
+    ///   may yet become valid. Or if the sender of the token isn't trusted to
+    ///   provide a real token, the token may be fake. It's the responsibility
+    ///   of the sender to sync with sysmem to ensure that previously
+    ///   created/duplicated token(s) are known to sysmem, before sending the
+    ///   token(s) to other participants.
+    flexible ValidateBufferCollectionToken(table {
+        1: token_server_koid zx.Koid;
+    }) -> (table {
+        1: is_known bool;
+    });
+
+    /// Set information about the current client that can be used by sysmem to
+    /// help diagnose leaking memory and allocation stalls waiting for a
+    /// participant to send [`fuchsia.sysmem2/BufferCollection.SetConstraints`].
+    ///
+    /// This sets the debug client info on all [`fuchsia.sysmem2/Node`](s)
+    /// subsequently created by this this [`fuchsia.sysmem2/Allocator`]
+    /// including any [`fuchsia.sysmem2/BufferCollection`](s) created via
+    /// [`fuchsia.sysmem2/Allocator.BindSharedCollection`] (in the absence of
+    /// any prior call to [`fuchsia.sysmem2/Allocator.SetDebugClientInfo`],
+    /// these `BufferCollection`(s) have the same initial debug client info as
+    /// the token turned in to create the `BufferCollection`).
+    ///
+    /// This info can be subsequently overridden on a per-`Node` basis by
+    /// sending [`fuchsia.sysmem2/Node.SetDebugClientInfo`].
+    ///
+    /// Sending [`fuchsia.sysmem2/Allocator.SetDebugClientInfo`] once per
+    /// `Allocator` is the most efficient way to ensure that all
+    /// [`fuchsia.sysmem2/Node`](s) will have at least some debug client info
+    /// set, and is also more efficient than separately sending the same debug
+    /// client info via [`fuchsia.sysmem2/Node.SetDebugClientInfo`] for each
+    /// created [`fuchsia.sysmem2/Node`].
+    ///
+    /// + request `name` This can be an arbitrary string, but the current
+    ///   process name (see `fsl::GetCurrentProcessName`) is a good default.
+    /// + request `id` This can be an arbitrary id, but the current process ID
+    ///   (see `fsl::GetCurrentProcessKoid`) is a good default.
+    flexible SetDebugClientInfo(table {
+        1: name string:MAX_CLIENT_NAME_LENGTH;
+        2: id uint64;
+    });
+
+    /// Given a handle to a sysmem-provided VMO, this returns additional info
+    /// about the corresponding sysmem logical buffer.
+    ///
+    /// Most callers will duplicate a VMO handle first and send the duplicate to
+    /// this call.
+    ///
+    /// If the client has created a child VMO of a sysmem-provided VMO, that
+    /// child VMO isn't considered a "sysmem VMO" for purposes of this call.
+    ///
+    /// + request `vmo` A handle to a sysmem-provided VMO (or see errors).
+    /// + request `need_weak` Iff set to true, the response will have weak_vmo
+    ///   set to a weak VMO for the buffer, regardless of whether `vmo` in the
+    ///   request was weak or strong.
+    /// - response `buffer_collection_id` The buffer collection ID, which is
+    ///   unique per logical buffer collection per boot.
+    /// - response `buffer_index` The buffer index of the buffer within the
+    ///   buffer collection. This is the same as the index of the buffer within
+    ///   [`fuchsia.sysmem2/BufferCollectionInfo.buffers`]. The `buffer_index`
+    ///   is the same for all sysmem-delivered VMOs corresponding to the same
+    ///   logical buffer, even if the VMO koids differ. The `buffer_index` is
+    ///   only unique across buffers of a buffer collection. For a given buffer,
+    ///   the combination of `buffer_collection_id` and `buffer_index` is unique
+    ///   per boot.
+    /// - response `close_weak_asap` Iff `vmo` is a handle to a weak sysmem VMO
+    ///   OR need_weak is set to true, the `close_weak_asap` field will be set
+    ///   in the response. This handle will signal `ZX_EVENTPAIR_PEER_CLOSED`
+    ///   when all weak VMO handles to the buffer should be closed as soon as
+    ///   possible. This is signalled shortly after all strong sysmem VMOs to
+    ///   the buffer are closed (including any held indirectly via strong
+    ///   `BufferCollectionToken` or strong `BufferCollection`). Failure to
+    ///   close all weak sysmem VMO handles to the buffer quickly upon
+    ///   `ZX_EVENTPAIR_PEER_CLOSED` is considered a VMO leak caused by the
+    ///   client still holding a weak sysmem VMO handle and results in loud
+    ///   complaints to the log by sysmem (after a delay). The buffers of a
+    ///   collection can be freed independently of each other. The
+    ///   `ZX_EVENTPAIR_PEER_CLOSED` may already be signalled before the
+    ///   response arrives at the client. A client that isn't prepared to
+    ///   directly handle weak sysmem VMOs and waiting on close_weak_asap, on
+    ///   seeing this field set in response to a request that had need_weak
+    ///   un-set, typically should ignore the fact that the vmo handle was a
+    ///   weak vmo handle; typically another participant that's also a client of
+    ///   this participant via some other protocol has taken responsibility for
+    ///   ensuring that this participant will close all handles to the buffer,
+    ///   typically by shutting down this participant's context holding a vmo
+    ///   handle in some other way. That said, it is not harmful for both
+    ///   participants to directly handle close_weak_asap, even if one
+    ///   participant can take responsibility for handling close_weak_asap. See
+    ///   also `[fuchsia.sysmem2/Node.SetWeakOk]` for_child_nodes_also.
+    /// - response `weak_vmo` This field is set in the response iff the request
+    ///   had `need_weak` set to true. When set, this is a weak VMO handle to
+    ///   the same buffer as `vmo` in the request, but may not have the same
+    ///   koid as `vmo` had (this applies regardless of whether `vmo` was strong
+    ///   or weak).
+    /// * error `[fuchsia.sysmem2/Error.NOT_FOUND]` - the vmo isn't a sysmem
+    ///   VMO. Both strong and weak sysmem VMOs can be passed to this call, and
+    ///   the VMO handle passed in to this call itself keeps the VMO's info
+    ///   alive for purposes of responding to this call. Because of this,
+    ///   ZX_ERR_NOT_FOUND errors are unambiguous (even if there are no other
+    ///   handles to the VMO when calling; even if other handles are closed
+    ///   before the GetVmoInfo response arrives at the client).
+    /// * error `[fuchsia.sysmem2/Error.UNSPECIFIED]` The request failed for an
+    ///   unspecified reason. See the log for more info.
+    /// * error `[fuchsia.sysmem2/Error.PROTOCOL_DEVIATION]` The vmo field
+    ///   wasn't set, or there was some other problem with the request field(s).
+    ///   See the log.
+    flexible GetVmoInfo(resource table {
+        /// `vmo` is required to be set; ownership is transferred to the server
+        /// so in most cases a client will duplicate a handle and transfer the
+        /// duplicate via this field.
+        ///
+        /// The GetVmoInfo call will fail with `NOT_FOUND` if this VMO isn't a
+        /// sysmem-provided VMO. Children of sysmem-provided VMOs don't count as
+        /// sysmem-provided VMOs.
+        ///
+        /// Assuming this is a sysmem-provided VMO, the handle can be a sysmem
+        /// strong VMO handle or a sysmem weak VMO handle.
+        ///
+        /// If this field is sysmem weak VMO handle, `close_weak_asap` will be
+        /// set in the response (not the only reason for close_weak_asap to be
+        /// set).
+        ///
+        /// This field is required.
+        1: vmo zx.Handle:VMO;
+        /// Iff set to true, a successful response will have weak_vmo set to a
+        /// sysmem weak VMO handle for the buffer, regardless of whether the vmo
+        /// handle in the request was weak or not.
+        ///
+        /// Also, when `weak_vmo` is set in the response, `close_weak_asap` will
+        /// also be set in the response, whether `vmo` was sysmem strong or
+        /// sysmem weak (not the only reason for close_weak_asap to be set).
+        ///
+        /// If set to true and `vmo` is a weak vmo and there aren't any
+        /// remaining strong vmo handles for the logical buffer (and the sysmem
+        /// server has had a chance to notice that), the request will fail with
+        /// `Error.NO_MORE_STRONG_VMO_HANDLES`.
+        ///
+        /// This field is optional. The default is false.
+        @available(added=32)
+        2: need_weak bool;
+        /// Iff set to true, a successful response will have
+        /// single_buffer_settings set to the SingleBufferSettings for the
+        /// buffer's buffer collection.
+        ///
+        /// The fields in SingleBufferSettings can be thought of as similar in
+        /// nature to the information available from zx_object_get_info with
+        /// topic ZX_INFO_VMO, which doesn't require any rights on the VMO
+        /// handle to succeed. This information can be needed by the caller to
+        /// know how to correctly handle / use the VMO. Similarly, this call
+        /// doesn't require any particular rights in order to get
+        /// single_buffer_settings - just ZX_RIGHT_TRANSFER for the client's
+        /// message to send successfully, and of course the `vmo` field must be
+        /// a handle to a sysmem-provided VMO.
+        ///
+        /// Clients should avoid manually checking whether
+        /// `single_buffer_settings` is consistent with the client's
+        /// BufferCollectionConstraints (or at least, shouldn't only rely on
+        /// that checking in the client). To have sysmem check, see
+        /// `constraints_to_check`.
+        ///
+        /// This field is optional. The default is false.
+        @available(added=32)
+        3: need_single_buffer_settings bool;
+        /// Iff set, `constraints_ok` will be set in the response indicating
+        /// whether the sent constraints are compatible with the parent buffer
+        /// collection as allocated.
+        ///
+        /// Buffer counts are not checked for consistency, as there's no way for
+        /// sysmem to know whether the passed-in `vmo` was originally handed out
+        /// to the same logical participant that's now checking the vmo against
+        /// its constraints, and we also want to avoid adding things that might
+        /// lock sysmem into a static number of buffers per collection.
+        ///
+        /// This can be thought of as checking `constraints_to_check` against
+        /// the `single_buffer_settings` (if that is/were requested), but sysmem
+        /// is free to check against additional info as well (such as a
+        /// hypothetical future sysmem3's buffer collection info, or modified
+        /// semantics for sysmem2 fields that this client hasn't opted into, or
+        /// similar). In other words, clients should let sysmem do this check,
+        /// regardless of whether the client also does some checking of its own.
+        ///
+        /// This field is optional. If un-set, no constraints checking occurs.
+        @available(added=32)
+        4: constraints_to_check BufferCollectionConstraints;
+        /// If set, `vmo_settings_match` will be set to indicate whether the
+        /// parent collection of `vmo` and `vmo_settings_to_check` have the same
+        /// SingleBufferSettings. This will be true if both are the same VMO,
+        /// will be true if both VMOs are from the same collection, and can also
+        /// be true if two VMOs from different collections have the same
+        /// SingleBufferSettings.
+        @available(added=32)
+        5: vmo_settings_to_check zx.Handle:VMO;
+
+        /// When vmo_settings_to_check is set to a VMO and
+        /// vmo_settings_to_check_ignore_size is set to true, the buffer size
+        /// is ignored when comparing the two buffer's settings. This can be
+        /// useful to set when checking video decoder input buffers.
+        @available(added=32)
+        6: vmo_settings_to_check_ignore_size bool;
+    }) -> (resource table {
+        /// The buffer_collection_id and buffer_index together uniquely identify
+        /// a buffer per boot.
+        1: buffer_collection_id uint64;
+        /// The buffer_collection_id and buffer_index together uniquely identify
+        /// a buffer per boot.
+        ///
+        /// This buffer_index is in the same space as specified/implied by
+        /// `BufferCollectionInfo` from collection allocation.
+        ///
+        /// Clients that don't have direct control over the provenance of `vmo`
+        /// should assume that buffer_index could be any uint64. Such clients
+        /// may wish to check the buffer_collection_id against client-known
+        /// buffer collections before looking at buffer_index, and/or ensure
+        /// that looking up a client-known buffer by buffer_collection_id and
+        /// buffer_index doesn't rely on buffer_index(s) being packed near 0, at
+        /// least until a client-known buffer is found that the client knows
+        /// will have buffer_index packed near 0.
+        2: buffer_index uint64;
+        /// If vmo was a sysmem weak VMO handle or need_weak was set to true (or
+        /// both), this field will be set. Later when ZX_EVENTPAIR_PEER_CLOSED
+        /// is signalled on this eventpair endpoint, all weak VMO handles to
+        /// this buffer should be closed asap (all strong VMO handles were
+        /// already closed by this point). In some cases, a client may be able
+        /// to rely on a different participant to notice and inform the client,
+        /// so this field being set is potentially ignore-able by some clients.
+        ///
+        /// Client authors should ensure that when the buffer's close_weak_asap
+        /// server_end closes, the client will close all handles to the buffer
+        /// as soon as possible. This can be achieved directly or indirectly.
+        /// Client authors should not assume that this is achieved indirectly.
+        3: close_weak_asap zx.Handle:EVENTPAIR;
+        /// Iff `need_weak` was set to true, this field is set to a sysmem weak
+        /// VMO handle to the same sysmem buffer (assuming no Error). The koid
+        /// may be different than the koid of the `vmo` in the request,
+        /// regardless of whether `vmo` in the request was a strong or weak VMO
+        /// handle. The `weak_vmo` will have no more rights than the `vmo`
+        /// handle had. In most cases, the client should also retain
+        /// `close_weak_asap` and notice when ZX_EVENTPAIR_PEER_CLOSED is
+        /// signalled and close the `weak_vmo` (and any handles to child VMOs)
+        /// ASAP.
+        @available(added=32)
+        4: weak_vmo zx.Handle:VMO;
+        /// Iff `need_single_buffer_settings` is set, this field will be set to
+        /// the SingleBufferSettings of the vmo's collection. See also
+        /// `[fuchsia.sysmem2/Allocator.GetVmoInfo]`
+        /// `need_single_buffer_settings`.
+        @available(added=32)
+        5: single_buffer_settings SingleBufferSettings;
+        /// Iff `constraints_to_check` was set, this field will be set. If true,
+        /// the vmo conforms to `constraints_to_check`. If false, the vmo does
+        /// not conform to `constraints_to_check`.
+        @available(added=32)
+        6: constraints_ok bool;
+        /// Iff `vmo_settings_to_check` was set, this field will be set. If
+        /// true, `vmo` and `vmo_settings_to_check` have the same
+        /// SingleBufferSettings. If false, `vmo` and `vmo_settings_to_check`
+        /// have different SingleBufferSettings. The reason for not matching may
+        /// not be visible to the client if SingleBufferSettings has a new field
+        /// or similar.
+        @available(added=32)
+        7: vmo_settings_match bool;
+    }) error Error;
+};

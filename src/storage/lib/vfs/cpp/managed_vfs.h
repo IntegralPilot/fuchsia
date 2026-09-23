@@ -1,0 +1,93 @@
+// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_STORAGE_LIB_VFS_CPP_MANAGED_VFS_H_
+#define SRC_STORAGE_LIB_VFS_CPP_MANAGED_VFS_H_
+
+#ifndef __Fuchsia__
+#error "Fuchsia-only header"
+#endif
+
+#include <lib/async/cpp/task.h>
+#include <lib/async/dispatcher.h>
+#include <lib/fit/defer.h>
+#include <lib/fit/function.h>
+#include <lib/zx/channel.h>
+#include <lib/zx/result.h>
+#include <zircon/compiler.h>
+#include <zircon/types.h>
+
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
+#include <fbl/intrusive_double_list.h>
+
+#include "src/storage/lib/vfs/cpp/fuchsia_vfs.h"
+#include "src/storage/lib/vfs/cpp/vnode.h"
+
+namespace fs {
+
+// A specialization of |Vfs| which tracks FIDL connections. and integrates them with Vnode requests.
+// This implementation is the normal one used on Fuchsia. It will not work in host builds.
+//
+// This class is thread-safe, but it is unsafe to shutdown the dispatch loop before shutting down
+// the ManagedVfs object, and a multi-threaded dispatcher is *not* supported.
+class ManagedVfs : public FuchsiaVfs {
+ public:
+  explicit ManagedVfs(async_dispatcher_t* dispatcher);
+
+  // The ManagedVfs destructor is only safe to execute if no connections are actively registered.
+  //
+  // To ensure that this state is achieved, it is recommended that clients issue a call to
+  // |Shutdown| before calling the destructor.
+  ~ManagedVfs() override;
+
+  // Asynchronously drop all connections managed by the VFS.
+  //
+  // Invokes |handler| once when all connections are destroyed. It is safe to delete ManagedVfs from
+  // within the closure.
+  //
+  // It is unsafe to call Shutdown multiple times.
+  void Shutdown(ShutdownCallback handler) override __TA_EXCLUDES(lock_);
+
+  void CloseAllConnectionsForVnode(const Vnode& node,
+                                   CloseAllConnectionsForVnodeCallback callback) final;
+
+ private:
+  // Posts the task for FinishShutdown if it is safe to do so.
+  void MaybeAsyncFinishShutdown() __TA_REQUIRES(lock_);
+
+  // Identifies if the filesystem has closed existing connections and prevents news ones. This will
+  // allow use to call FinishShutdown and terminate.
+  bool NoMoreClients() const __TA_REQUIRES(lock_);
+
+  // Invokes the handler from |Shutdown| once all connections have been released and remotes have
+  // been unmounted.
+  void FinishShutdown(async_dispatcher_t*, async::TaskBase*, zx_status_t status)
+      __TA_EXCLUDES(lock_);
+
+  zx::result<> RegisterConnection(std::unique_ptr<internal::Connection> connection,
+                                  zx::channel& channel) final __TA_EXCLUDES(lock_);
+
+  // Called when all connections to the VFS are closed.
+  virtual void OnNoConnections() {}
+
+  std::mutex lock_;
+
+  // All live connections. There can be more than one connection per node.
+  fbl::DoublyLinkedList<internal::Connection*> connections_ __TA_GUARDED(lock_);
+
+  async::TaskMethod<ManagedVfs, &ManagedVfs::FinishShutdown> shutdown_task_ __TA_GUARDED(lock_){
+      this};
+  ShutdownCallback shutdown_handler_ __TA_GUARDED(lock_);
+
+  std::unordered_map<internal::Connection*,
+                     std::shared_ptr<fit::deferred_action<fit::callback<void()>>>>
+      closing_connections_ __TA_GUARDED(lock_);
+};
+
+}  // namespace fs
+
+#endif  // SRC_STORAGE_LIB_VFS_CPP_MANAGED_VFS_H_

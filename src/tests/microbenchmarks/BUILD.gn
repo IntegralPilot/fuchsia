@@ -1,0 +1,495 @@
+# Copyright 2016 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components.gni")
+import("//build/fidl/fidl.gni")
+import("//build/testing/host_test.gni")
+import("//build/testing/perf/test.gni")
+import("//src/starnix/build/args.gni")
+import("//src/starnix/kernel/starnix.gni")
+import("//src/starnix/tests/build/starnix_linux_test_component.gni")
+import("//src/starnix/tests/environments.gni")
+import("//src/starnix/tests/starnix_test_subpackages.gni")
+import("//src/storage/fshost/generated_fshost_config.gni")
+import("//zircon/vdso/vdso.gni")
+
+# This can be built as a Fuchsia executable or as a host executable.
+# The latter allows running some of the benchmarks on Linux for
+# comparison against Fuchsia.
+#
+# In principle this could be built for Mac too, but it may require
+# changes to build and run successfully on Mac.
+
+fuchsia_microbenchmark_sources = [
+  "atomics.cc",
+  "clock_posix.cc",
+  "example.cc",
+  "filesystem.cc",
+  "main.cc",
+  "malloc.cc",
+  "memcpy.cc",
+  "null.cc",
+  "pthreads.cc",
+  "random_memcpy.cc",
+  "round_trips_futex.cc",
+  "round_trips_posix.cc",
+  "stdcompat.cc",
+]
+
+fuchsia_microbenchmark_shared_process_sources = [ "main.cc" ]
+
+if (is_linux) {
+  fuchsia_microbenchmark_sources += [
+    "clone.cc",
+    "fork.cc",
+
+    # The getpid() microbenchmark would work on Fuchsia, but it is
+    # not useful to run it on Fuchsia because Fuchsia's getpid()
+    # function does not return a real process ID.
+    "getpid.cc",
+    "process_spawn_posix.cc",
+    "unshare.cc",
+  ]
+}
+
+if (is_fuchsia) {
+  fuchsia_microbenchmark_sources += [
+    "async_loop.cc",
+    "channels.cc",
+    "clock.cc",
+    "context_switch_overhead.cc",
+    "events.cc",
+    "fdio_spawn.cc",
+    "fifos.cc",
+    "futex.cc",
+    "get_info.cc",
+    "handle.cc",
+    "handle_creation.cc",
+    "inspect.cc",
+    "lazy_dir.cc",
+    "mem_alloc.cc",
+    "mmu.cc",
+    "mutex.cc",
+    "object_wait.cc",
+    "ports.cc",
+    "prng.cc",
+    "pseudo_dir.cc",
+    "round_trips.cc",
+    "sleep.cc",
+    "sockets.cc",
+    "streams.cc",
+    "threads.cc",
+    "timer.cc",
+    "tracing.cc",
+    "user_pager.cc",
+    "util.cc",
+    "vmar.cc",
+    "vmo.cc",
+  ]
+
+  if (!exclude_testonly_syscalls) {
+    fuchsia_microbenchmark_sources += [
+      # Uses `zx_syscall_test_*()`.
+      "syscalls.cc",
+    ]
+  }
+
+  fuchsia_microbenchmark_shared_process_sources += [ "futex.cc" ]
+}
+
+fuchsia_microbenchmark_deps = [
+  "//sdk/lib/stdcompat",
+  "//sdk/lib/syslog/cpp",
+  "//src/lib/fxl",
+  "//zircon/system/ulib/fbl",
+  "//zircon/system/ulib/perftest",
+]
+
+if (is_fuchsia) {
+  fuchsia_microbenchmark_deps += [
+    ":fuchsia.zircon.benchmarks_hlcpp",
+    "//sdk/lib/async-loop:async-loop-cpp",
+    "//sdk/lib/async-loop:async-loop-default",
+    "//sdk/lib/fdio",
+    "//sdk/lib/scheduler/cpp",
+    "//src/lib/fsl",
+    "//src/storage/lib/vfs/cpp",
+    "//src/zircon/lib/zircon",
+    "//zircon/system/ulib/inspect",
+    "//zircon/system/ulib/trace",
+    "//zircon/system/ulib/zx",
+  ]
+}
+
+executable("fuchsia_microbenchmarks_bin") {
+  output_name = "fuchsia_microbenchmarks"
+  testonly = true
+  sources = fuchsia_microbenchmark_sources
+  if (is_fuchsia && !exclude_testonly_syscalls) {
+    sources += [
+      # Uses `zx_restricted_*()` which is available in the 'next' vdso.
+      "restricted_enter.cc",
+    ]
+  }
+
+  # Check if the board is the vim3 to set a build define that will ultimately be
+  # used to control the affinity of the benchmarking threads.
+  # TODO(https://fxbug.dev/42050716): Find a better way of controlling what cores are used for
+  # benchmarking.
+  board_is_vim3 = board_name == "vim3"
+  defines = [ "BOARD_IS_VIM3=${board_is_vim3}" ]
+
+  deps = fuchsia_microbenchmark_deps
+}
+
+# Like fuchsia_microbenchmark_bin, except:
+#   - runs a subset of the benchmarks
+#   - does not support RunSubprocess.
+executable("fuchsia_microbenchmarks_shared_process_bin") {
+  output_name = "fuchsia_microbenchmarks_shared_process"
+  testonly = true
+  sources = fuchsia_microbenchmark_shared_process_sources
+  defines = [ "NO_SUBPROCESS=1" ]
+
+  # Check if the board is the vim3 to set a build define that will ultimately be
+  # used to control the affinity of the benchmarking threads.
+  # TODO(https://fxbug.dev/42050716): Find a better way of controlling what cores are used for
+  # benchmarking.
+  board_is_vim3 = board_name == "vim3"
+  defines += [ "BOARD_IS_VIM3=${board_is_vim3}" ]
+
+  deps = fuchsia_microbenchmark_deps
+}
+
+# This is an executable that immediately exits when run.  This is used by the
+# process-spawn benchmarks.
+executable("no_op_executable") {
+  output_name = "no_op_executable"
+  testonly = true
+  sources = [ "no_op_executable.cc" ]
+  deps = []
+  public_deps = []
+  emit_tool_path = false
+}
+
+# "Helper" executable used to implement the context_switch_overhead benchmark.
+executable("context_switch_overhead_helper") {
+  output_name = "context_switch_overhead_helper"
+  testonly = true
+  sources = [ "context_switch_overhead_helper.cc" ]
+  deps = [
+    "//sdk/lib/fdio",
+    "//sdk/lib/scheduler/cpp",
+    "//sdk/lib/sys/cpp",
+    "//sdk/lib/syslog/cpp",
+    "//zircon/system/ulib/zx",
+  ]
+}
+
+# "Helper" executable used to implement the get_info benchmark.
+executable("get_info_helper") {
+  output_name = "get_info_helper"
+  testonly = true
+  sources = [ "get_info_helper.cc" ]
+  deps = [
+    "//sdk/lib/fdio",
+    "//zircon/system/ulib/zx",
+  ]
+}
+
+if (is_fuchsia) {
+  # "Helper" executable used to implement the round_trips benchmarks on Fuchsia.
+  executable("round_trips_helper") {
+    output_name = "round_trips_helper"
+    testonly = true
+    sources = [
+      "main.cc",
+      "round_trips.cc",
+    ]
+    deps = [
+      ":fuchsia.zircon.benchmarks_hlcpp",
+      "//sdk/lib/async-loop:async-loop-cpp",
+      "//sdk/lib/async-loop:async-loop-default",
+      "//sdk/lib/fdio",
+      "//sdk/lib/scheduler/cpp",
+      "//sdk/lib/syslog/cpp",
+      "//src/lib/fxl",
+      "//src/storage/lib/vfs/cpp",
+      "//src/zircon/lib/zircon",
+      "//zircon/system/ulib/inspect",
+      "//zircon/system/ulib/perftest",
+      "//zircon/system/ulib/zx",
+    ]
+  }
+}
+
+fidl("fuchsia.zircon.benchmarks") {
+  testonly = true
+  sources = [
+    "async_loop.fidl",
+    "round_tripper.fidl",
+  ]
+  enable_hlcpp = true
+}
+
+fuchsia_unittest_package("fuchsia_microbenchmarks") {
+  package_name = "fuchsia_microbenchmarks"
+
+  manifest = "meta/fuchsia_microbenchmarks.cml"
+
+  deps = [
+    ":context_switch_overhead_helper",
+    ":fuchsia_microbenchmarks_bin",
+    ":get_info_helper",
+    ":no_op_executable",
+    ":round_trips_helper",
+  ]
+  test_type = "system"
+}
+
+# Like fuchsia_microbenchmarks, but runs in a shared process.
+fuchsia_unittest_package("fuchsia_microbenchmarks_shared_process") {
+  package_name = "fuchsia_microbenchmarks_shared_process"
+
+  manifest = "meta/fuchsia_microbenchmarks_shared_process.cml"
+
+  deps = [ ":fuchsia_microbenchmarks_shared_process_bin" ]
+  test_type = "system"
+}
+
+fuchsia_component_perf_test("fuchsia_microbenchmarks_test") {
+  package = ":fuchsia_microbenchmarks"
+  component_name = "fuchsia_microbenchmarks"
+  test_type = "system"
+
+  # We run the fuchsia_microbenchmarks process multiple times.  That is useful
+  # for tests that exhibit between-process variation in results (e.g. due to
+  # memory layout chosen when a process starts) -- it reduces the variation in
+  # the average that we report.
+  process_runs = 6
+
+  # Runs: we override the default number of within-process iterations of each
+  # test case and use a lower value.  This reduces the overall time taken and
+  # reduces the chance that these invocations hit Infra Swarming tasks' IO
+  # timeout (swarming_io_timeout_secs -- the amount of time that a task is
+  # allowed to run without producing log output).
+  test_component_args = [
+    "-p",
+    "--quiet",
+    "--runs",
+    "120",
+  ]
+  results_path_test_arg = "--out"
+
+  expected_metric_names_filepath = "//src/tests/end_to_end/perf/expected_metric_names/fuchsia.microbenchmarks.txt"
+}
+
+# Like fuchsia_microbenchmarks_test, but uses a shared process.
+fuchsia_component_perf_test("fuchsia_microbenchmarks_shared_process_test") {
+  package = ":fuchsia_microbenchmarks_shared_process"
+  component_name = "fuchsia_microbenchmarks_shared_process"
+  test_type = "system"
+
+  # We run the fuchsia_microbenchmarks process multiple times.  That is useful
+  # for tests that exhibit between-process variation in results (e.g. due to
+  # memory layout chosen when a process starts) -- it reduces the variation in
+  # the average that we report.
+  process_runs = 6
+
+  # Runs: we override the default number of within-process iterations of each
+  # test case and use a lower value.  This reduces the overall time taken and
+  # reduces the chance that these invocations hit Infra Swarming tasks' IO
+  # timeout (swarming_io_timeout_secs -- the amount of time that a task is
+  # allowed to run without producing log output).
+  test_component_args = [
+    "-p",
+    "--quiet",
+    "--runs",
+    "120",
+  ]
+  results_path_test_arg = "--out"
+
+  expected_metric_names_filepath = "//src/tests/end_to_end/perf/expected_metric_names/fuchsia.microbenchmarks.shared_process.txt"
+}
+
+if (is_linux && is_host) {
+  host_test("fuchsia_microbenchmarks_host") {
+    binary_path = "$root_out_dir/fuchsia_microbenchmarks"
+    deps = [
+      ":fuchsia_microbenchmarks_bin",
+      ":runtime_deps",
+    ]
+  }
+  host_test_data("runtime_deps") {
+    sources = [ "$root_out_dir/no_op_executable" ]
+    deps = [ ":no_op_executable" ]
+  }
+}
+
+if (host_os == "linux" && !is_asan) {
+  resource("no_op_executable_in_test_dir") {
+    testonly = true
+    out_dir = get_label_info(":no_op_executable", "root_out_dir")
+    sources = [ "${out_dir}/no_op_executable" ]
+    outputs = [ "data/tests/no_op_executable" ]
+    deps = [ ":no_op_executable" ]
+  }
+
+  # Benchmarks that duplicate coverage already provided by gVisor benchmarks
+  # are omitted here.
+  starnix_microbenchmark_sources = [
+    "clone.cc",
+    "main.cc",
+    "malloc.cc",
+    "memcpy.cc",
+    "null.cc",
+    "random_memcpy.cc",
+    "starnix_filesystem.cc",
+    "starnix_tracefs.cc",
+    "stdcompat.cc",
+    "unshare.cc",
+  ]
+
+  executable("starnix_microbenchmarks_bin") {
+    output_name = "starnix_microbenchmarks"
+    testonly = true
+    sources = starnix_microbenchmark_sources
+    deps = fuchsia_microbenchmark_deps + [ "//sdk/lib/zircon-assert" ]
+  }
+
+  template("starnix_microbenchmark_rules") {
+    test_target_toolchain = target_linux_toolchain
+    if (defined(invoker.test_target_toolchain)) {
+      test_target_toolchain = invoker.test_target_toolchain
+    }
+
+    component_label = "${target_name}_component"
+    unittest_package_label = "${target_name}_unittestmode"
+    perftest_package_label = "${target_name}_perftestmode"
+    perf_test_label = "${target_name}_test"
+    metrics_name =
+        invoker.metrics_name  # ex fuchsia.microbenchmarks.starnix.txt
+
+    starnix_toolchain_test_component(component_label) {
+      test_label = ":starnix_microbenchmarks_bin"
+      test_binary = "starnix_microbenchmarks"
+      test_toolchain = test_target_toolchain
+
+      manifest = invoker.manifest
+      component_name = "starnix_microbenchmarks"
+      deps = [ ":no_op_executable_in_test_dir($test_target_toolchain)" ]
+      is_starnix_benchmark = true
+      test_type = "starnix"
+    }
+
+    fuchsia_test_package(unittest_package_label) {
+      test_components = [ ":${component_label}" ]
+
+      subpackages = starnix_test_subpackages +
+                    [ "//src/starnix/containers/debian:debian_package" ]
+
+      deps = [ "//src/lib/testing/expectation:expectation_comparer" ]
+
+      test_specs = {
+        if (defined(invoker.test_specs)) {
+          forward_variables_from(invoker.test_specs, "*")
+        }
+        if (!defined(package_resolution_timeout_secs)) {
+          package_resolution_timeout_secs = 660
+        }
+      }
+    }
+
+    fuchsia_package(perftest_package_label) {
+      testonly = true
+
+      subpackages = starnix_test_subpackages +
+                    [ "//src/starnix/containers/debian:debian_package" ]
+
+      deps = [ ":${component_label}" ]
+
+      # This package intentionally contains many non-Fuchia ELF binaries that
+      # are not under /data/, and some of them are even unstripped, so disable
+      # these checks to build successfully.
+      disable_elf_binaries_checks = true
+    }
+
+    fuchsia_component_perf_test(perf_test_label) {
+      package = ":${perftest_package_label}"
+      component_name = "starnix_microbenchmarks"
+      test_type = "starnix"
+
+      # We run the fuchsia_microbenchmarks process multiple times. That is
+      # useful for tests that exhibit between-process variation in results (e.g.
+      # due to memory layout chosen when a process starts) -- it reduces the
+      # variation in the average that we report.
+      process_runs = 6
+
+      # Runs: we override the default number of within-process iterations of
+      # each test case and use a lower value. This reduces the overall time
+      # taken and reduces the chance that these invocations hit Infra Swarming
+      # tasks' IO timeout (swarming_io_timeout_secs -- the amount of time that a
+      # task is allowed to run without producing log output).
+      test_component_args = [
+        "-p",
+        "--quiet",
+        "--runs",
+        "120",
+      ]
+      results_path_test_arg = "--out"
+
+      expected_metric_names_filepath =
+          "//src/tests/end_to_end/perf/expected_metric_names/${metrics_name}"
+    }
+  }
+
+  starnix_microbenchmark_rules("starnix_microbenchmarks") {
+    metrics_name = "fuchsia.microbenchmarks.starnix.txt"
+    manifest = "meta/starnix_microbenchmarks.cml"
+  }
+}
+
+# This contains all the dependencies necessary for running
+# fuchsia_microbenchmarks in unit test mode.
+group("tests") {
+  testonly = true
+  deps = [ ":fuchsia_microbenchmarks" ]
+  if (!is_asan) {
+    deps += [ ":fuchsia_microbenchmarks_shared_process" ]
+  }
+
+  if (host_os == "linux") {
+    deps += [ ":fuchsia_microbenchmarks_host($host_toolchain)" ]
+
+    # NOTE: Minfs does not support the POSIX attributes required to run Starnix.
+    # TODO(https://fxbug.dev/359323478): Figure out a better way to disable these tests on Minfs
+    # without relying on a global GN argument.
+    if (!is_asan && data_filesystem_format != "minfs") {
+      deps += [
+        ":starnix_microbenchmarks_perftestmode",
+        ":starnix_microbenchmarks_unittestmode",
+      ]
+    }
+  }
+}
+
+# Convenience target so that one can pass "--with //src/tests/microbenchmarks"
+# to "fx set".
+group("microbenchmarks") {
+  testonly = true
+  deps = [ ":tests" ]
+}
+
+group("benchmarks") {
+  testonly = true
+  deps = [ ":fuchsia_microbenchmarks_test" ]
+  if (!is_asan) {
+    deps += [ ":fuchsia_microbenchmarks_shared_process_test" ]
+  }
+
+  # NOTE: Minfs does not support the POSIX attributes required to run Starnix.
+  if (!is_asan && host_os == "linux" && data_filesystem_format != "minfs") {
+    deps += [ ":starnix_microbenchmarks_test" ]
+  }
+}

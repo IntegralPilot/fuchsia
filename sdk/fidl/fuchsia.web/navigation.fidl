@@ -1,0 +1,264 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.web;
+
+using fuchsia.mem;
+using fuchsia.net.http;
+
+/// Interface supplied by the embedder for receiving notifications about navigation events in a
+/// [`Frame`].
+closed protocol NavigationEventListener {
+    /// Called immediately after [`Frame.SetNavigationEventListener`] and every time user-visible
+    /// navigation state has changed. In the first call, `change` contains the current navigation
+    /// state (empty before the first navigation request). In every following call, `change` will
+    /// have values set for all fields that have changed at any time since the previous
+    /// notification. This means that some fields may have the same value as was previously
+    /// reported, for example, if they changed to some other value and back again. If a field is
+    /// unset, then its value has not changed at any time since the previous notification.
+    ///
+    /// Implementer must call the acknowledgement callback to receive new navigation events.
+    strict OnNavigationStateChanged(resource struct {
+        change NavigationState;
+    }) -> ();
+};
+
+closed protocol NavigationPolicyProvider {
+    /// Called when the [`Frame`] is processing a navigation request in one of the phase(s)
+    /// specified in [`NavigationPolicyProviderParams`]. Navigation is paused until the result is
+    /// received. The returned [`NavigationDecision`] defines how the navigation should proceed.
+    strict EvaluateRequestedNavigation(struct {
+        requested_navigation RequestedNavigation;
+    }) -> (resource struct {
+        decision NavigationDecision;
+    });
+};
+
+/// Represents the return status of a [`NavigationController`] method.
+@strict_audit(bug="https://fxbug.dev/467127821", state="PENDING_REVIEW")
+type NavigationControllerError = strict enum : int32 {
+    /// The provided URL is invalid.
+    INVALID_URL = 1;
+
+    /// At least one of the provided headers was invalid.
+    INVALID_HEADER = 2;
+};
+
+/// Provides methods for controlling and querying the navigation state of a [`Frame`].
+closed protocol NavigationController {
+    /// Tells the [`Frame`] to navigate to a `url`.
+    ///
+    /// - `url`: The address to navigate to.
+    /// - `params`: Additional parameters that affect how the resource will be  loaded (e.g.
+    ///   cookies, HTTP headers, etc.)
+    ///
+    /// If an error occurred, the [`NavigationControllerError`] will be set to one of these values:
+    /// - `INVALID_URL`: The `url` parameter is invalid.
+    /// - `INVALID_HEADER`: At least one of the headers in [`LoadUrlParams.headers`] is invalid.
+    strict LoadUrl(resource struct {
+        url Url;
+        params LoadUrlParams;
+    }) -> () error NavigationControllerError;
+
+    /// Tells the [`Frame`] to navigate to the previous page in its history, if any.
+    strict GoBack();
+
+    /// Tells the [`Frame`] to navigate to the next page in its history, if any.
+    strict GoForward();
+
+    /// Tells the [`Frame`] to stop the current navigation if a navigation is ongoing.
+    strict Stop();
+
+    /// Tells the [`Frame`] to reload the current page.
+    strict Reload(struct {
+        type ReloadType;
+    });
+
+    /// Returns information for the currently visible content regardless of loading state, or an
+    /// empty entry if no content is being displayed.
+    @deprecated("Use a NavigationEventListener to receive state changes, instead.")
+    @available(removed=10)
+    strict GetVisibleEntry() -> (resource struct {
+        entry NavigationState;
+    });
+};
+
+/// Additional parameters for modifying the behavior of [`NavigationController.LoadUrl`].
+type LoadUrlParams = resource table {
+    /// Provides a hint to the browser UI about how [`NavigationController.LoadUrl`] was triggered.
+    1: type LoadUrlReason;
+
+    /// The URL that linked to the resource being requested.
+    2: referrer_url Url;
+
+    /// Should be set to true to propagate user activation to the frame. User activation implies
+    /// that the user is interacting with the web frame. It enables some web features that are not
+    /// available otherwise. For example, autoplay will work only when this flag is set to true.
+    3: was_user_activated bool;
+
+    /// Custom HTTP headers. RFC7540 does not specify a limit on the number nor
+    /// size of headers.
+    4: headers vector<fuchsia.net.http.Header>:MAX;
+};
+
+/// Contains information about the [`Frame`]'s navigation state.
+type NavigationState = resource table {
+    /// The page's URL.
+    1: url Url;
+
+    /// The user-visible page title. While W3C style recommendation is that HTML
+    /// TITLE tags not exceed 64 characters in length, there is no actual limit.
+    2: title string:MAX;
+
+    /// Indicates whether this was a navigation to an error page.
+    3: page_type PageType;
+
+    /// Indicates if there is a following navigation.
+    4: can_go_forward bool;
+
+    /// Indicates if there is a previous navigation.
+    5: can_go_back bool;
+
+    /// Indicates that the main document's statically declared resources have been loaded.
+    6: is_main_document_loaded bool;
+
+    /// Current favicon for the page. The field is set only when the `FAVICON` flag is set for the
+    /// `NavigationEventListener` and the favicon has changed.
+    7: favicon Favicon;
+
+    /// Indicates type of the error when `page_type` is set to `ERROR`.
+    @available(added=25)
+    8: error_detail ErrorDetail;
+};
+
+/// Characterizes the type of reload.
+@strict_audit(bug="https://fxbug.dev/467127821", state="PENDING_REVIEW")
+type ReloadType = strict enum : uint32 {
+    /// Reloads the current entry, bypassing the cache for the main resource.
+    PARTIAL_CACHE = 0;
+
+    /// Reloads the current entry, bypassing the cache entirely.
+    NO_CACHE = 1;
+};
+
+/// Characterizes the origin of a [`NavigationController.LoadUrl`] request.
+@strict_audit(bug="https://fxbug.dev/467127821", state="PENDING_REVIEW")
+type LoadUrlReason = strict enum : uint32 {
+    /// Navigation was initiated by the user following a link.
+    LINK = 0;
+
+    /// Navigation was initiated by a user-provided URL.
+    TYPED = 1;
+};
+
+/// Characterizes the page type in a [`NavigationState`].
+@strict_audit(bug="https://fxbug.dev/467127821", state="PENDING_REVIEW")
+type PageType = strict enum {
+    /// Regular web page.
+    NORMAL = 0;
+
+    /// Error page.
+    ERROR = 1;
+};
+
+/// Indicates the reason for the error when `page_type` is set to [`PageType.ERROR`].
+@available(added=25)
+type ErrorDetail = flexible enum {
+    /// Page has failed to load. No content is rendered.
+    LOAD_FAILED = 0;
+
+    /// Tried to navigate to a site blocked by the explicit content filter. The corresponding
+    /// error page is rendered, see
+    /// [`CreateFrameParams.explicit_sites_filter_error_page`].
+    EXPLICIT_CONTENT_BLOCKED = 1;
+
+    /// The renderer process has crashed. No content is rendered.
+    CRASH = 2;
+};
+
+/// Unique identifier of a navigation. Can be used to correlate different phases for the
+/// same navigation. Guaranteed to be unique for all navigations in the same [`Context`].
+alias NavigationId = uint64;
+
+/// Identifies a navigation phase.
+@strict_audit(bug="https://fxbug.dev/467127821", state="PENDING_REVIEW")
+type NavigationPhase = strict bits : uint32 {
+    /// Navigation is being started.
+    START = 0x1;
+
+    /// Navigation was redirected.
+    REDIRECT = 0x2;
+
+    /// Navigation response is being processed. At this point navigation hasn't been committed
+    /// yet, so it is not too late to cancel it.
+    PROCESS_RESPONSE = 0x4;
+
+    /// Navigation has failed.
+    FAIL = 0x8;
+};
+
+/// Used to specify which navigation events should be delegated to [`NavigationPolicyProvider`].
+type NavigationPolicyProviderParams = table {
+    /// Specifies the set of navigation phases in the main frame that should be evaluated.
+    1: main_frame_phases NavigationPhase;
+
+    /// Specifies the set of navigation phases in subframes that should be evaluated.
+    2: subframe_phases NavigationPhase;
+};
+
+type RequestedNavigation = table {
+    /// Unique ID of the navigation.
+    1: id NavigationId;
+
+    /// Current navigation phase. Exactly one bit will be set.
+    2: phase NavigationPhase;
+
+    /// Whether the navigation is taking place in the main frame versus in a subframe.
+    3: is_main_frame bool;
+
+    /// Whether the navigation happened without changing the document.
+    4: is_same_document bool;
+
+    /// Whether the navigation is a POST request.
+    5: is_http_post bool;
+
+    /// The current target URL of the navigation. This may change for the same navigation after
+    /// encountering a server redirect.
+    6: url Url;
+
+    /// Whether the navigation was initiated by a user gesture.
+    7: has_gesture bool;
+
+    /// Whether the navigation has encountered a server redirect or not.
+    8: was_server_redirect bool;
+};
+
+/// Empty struct used in NavigationDecision for actions that don't hav any arguments.
+// TODO: https://fxbug.dev/42159332
+type NoArgumentsAction = struct {};
+
+/// Navigation action that should be taken in response to a navigation request. Returned from
+/// [`NavigationPolicyProvider.EvaluateRequestedNavigation`].
+@strict_audit(bug="https://fxbug.dev/467127821", state="PENDING_REVIEW")
+type NavigationDecision = strict resource union {
+    /// Navigation should proceed normally.
+    1: proceed NoArgumentsAction;
+
+    /// Navigation should be aborted. The frame should stay on the current page.
+    2: abort NoArgumentsAction;
+};
+
+/// Used to represent a favicon for a page. An empty table (all fields are unset) is used to indicate
+/// that the page doesn't have a favicon.
+type Favicon = resource table {
+    /// The image content encoded as an RGBA bitmap with premultiplied alpha channel. The data is
+    /// densely packed, so the stride is always `4 * width` and the total size is
+    /// `4 * width * height`.
+    1: data fuchsia.mem.Buffer;
+
+    /// The width of the image.
+    2: width uint32;
+
+    /// The height of the image.
+    3: height uint32;
+};

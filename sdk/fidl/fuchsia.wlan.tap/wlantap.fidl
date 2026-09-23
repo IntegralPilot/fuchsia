@@ -1,0 +1,212 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.wlan.tap;
+
+using fuchsia.wlan.common;
+using fuchsia.wlan.internal;
+using fuchsia.wlan.driver;
+using fuchsia.wlan.softmac;
+using fuchsia.wlan.ieee80211 as ieee80211;
+using zx;
+
+/// IEEE Std 802.11-2016 defines 12 values in dot11SupportedDataRatesRxTable
+const MAX_NUM_RATES uint8 = 12;
+
+type BandInfo = struct {
+    band ieee80211.WlanBand;
+    ht_caps box<ieee80211.HtCapabilities>;
+    vht_caps box<ieee80211.VhtCapabilities>;
+    rates vector<uint8>:MAX_NUM_RATES;
+    primary_channels vector<ieee80211.ChannelNumber>:ieee80211.MAX_UNIQUE_CHANNEL_NUMBERS;
+};
+
+/// Describes the capabilities of the fake wlantap-phy device to be created.
+type WlantapPhyConfig = struct {
+    // TODO(https://fxbug.dev/42143255): wlantap will configure all of its ifaces to use the same MAC address
+    sta_addr ieee80211.MacAddr;
+    factory_addr ieee80211.MacAddr;
+    mac_role fuchsia.wlan.common.WlanMacRole;
+    supported_phys vector<ieee80211.WlanPhyType>:fuchsia.wlan.common.MAX_SUPPORTED_PHY_TYPES;
+    hardware_capability fuchsia.wlan.driver.WlanSoftmacHardwareCapability;
+    bands vector<BandInfo>:8;
+    name string:32; // Arbitrary maximum size of 32 chosen to satisfy FidlLint
+    quiet bool;
+    discovery_support fuchsia.wlan.softmac.DiscoverySupport;
+    mac_sublayer_support fuchsia.wlan.common.MacSublayerSupport;
+    security_support fuchsia.wlan.common.SecuritySupport;
+    spectrum_management_support fuchsia.wlan.common.SpectrumManagementSupport;
+};
+
+/// Instruct the wlantap-ctl device to creates a fake wlantap-phy device based on the
+/// `WlantapPhyConfig` passed in. The newly created wlantap-phy device will use the channel to
+/// allow a `WlantapPhy` client to observe and control its behavior.
+closed protocol WlantapCtl {
+    strict CreatePhy(resource struct {
+        config WlantapPhyConfig;
+        proxy server_end:WlantapPhy;
+    }) -> (struct {
+        status zx.Status;
+    });
+};
+
+/// Information pertaining to incoming packets. One WlanRxInfo is associated with each packet.
+/// You are encouraged to use the default value in //src/connectivity/wlan/testing/hw-sim/src/lib.rs
+/// See wlan_rx_info_t for details about each field.
+type WlanRxInfo = struct {
+    rx_flags uint32;
+    valid_fields uint32;
+    phy ieee80211.WlanPhyType;
+    data_rate uint32;
+    primary ieee80211.ChannelNumber;
+    mcs uint8;
+    rssi_dbm int8;
+    snr_dbh int16;
+    bandwidth ieee80211.ChannelBandwidth;
+    vht_secondary_80_channel ieee80211.ChannelNumber;
+};
+
+/// Instruction from generic WLAN driver on how to send a packet. One WlanTxInfo per packet.
+/// These values are populated by the wlantap driver and should not be specified manually.
+/// See wlan_tx_info_t for details about each field.
+type WlanTxInfo = struct {
+    tx_flags uint32;
+    valid_fields uint32;
+    tx_vector_idx uint16;
+    phy ieee80211.WlanPhyType;
+    cbw uint8;
+    mcs uint8;
+};
+
+/// An outgoing packet that is to be "sent" by the wlantap device. `data` contains the packet
+/// in its wire format.
+type WlanTxPacket = struct {
+    data vector<uint8>:MAX;
+    info WlanTxInfo;
+};
+
+/// Configuration pertaining to security keys, often used by RSN and other secure authentication.
+/// These values are populated by the wlantap driver and should not be specified manually.
+/// See wlan_key_config_t for details about each field.
+type WlanKeyConfig = struct {
+    protection uint8;
+    cipher_oui array<uint8, 3>;
+    cipher_type uint8;
+    key_type uint8;
+    peer_addr ieee80211.MacAddr;
+    key_idx uint8;
+    key vector<uint8>:32;
+};
+
+/// Country code the device is to switch to.
+/// These values are populated by the wlantap driver and should not be specified manually.
+/// See also phy.fidl CountryCode.
+type SetCountryArgs = struct {
+    alpha2 array<uint8, fuchsia.wlan.internal.COUNTRY_CODE_LEN>;
+};
+
+/// Allow the test program to observe and control the behavior of the wlantap-phy device.
+/// A wlantap-phy device is a special vendor device and its driver (Fuchsia being the vendor)
+/// used for testing purpose.
+/// Implements a subset of `wlan_softmac_ifc_t` and `wlan_softmac_protocol_ops_t` defined in
+/// fuchsia.wlan.softmac/softmac.fidl
+/// Implements a subset of `WlanPhyImpl` protocol defined in
+/// fuchsia.hardware.phyimpl/wlanphy-impl.fidl
+closed protocol WlantapPhy {
+    /// Shutdown the phy device so that it does not respond to any further calls.
+    /// Once shutdown, there is no way to restart the device.
+    /// It can only be called at the end of a test.
+    strict Shutdown() -> ();
+
+    // wlan_softmac_ifc_t callbacks
+    // simulating events happening at the devices side that are passed up to the driver.
+
+    /// The device "receives" a frame "over the air" and pass it up to driver.
+    strict Rx(struct {
+        data vector<uint8>:MAX;
+        info WlanRxInfo;
+    });
+    /// For rate selection (Minstrel), the device's last frame transmission is a success/failure,
+    /// with a certain number of retries.
+    strict ReportTxResult(struct {
+        txr fuchsia.wlan.softmac.WlanTxResult;
+    });
+
+    strict ScanComplete(struct {
+        scan_id uint64;
+        status zx.Status;
+    });
+
+    // wlan_softmac_protocol_ops_t
+    // events indicating that the wlan-softmac device received interface request calls from the driver.
+
+    /// The device is to send a frame "over the air".
+    strict -> Tx(struct {
+        args TxArgs;
+    });
+    /// The device created by its parent device (wlantap-phy: wlanphy) is
+    /// detected and being connected by wlanstack/wlancfg.
+    /// The device is to enter the "running" state.
+    strict -> WlanSoftmacStart();
+    /// The device is to switch to the specified channel.
+    strict -> SetChannel(struct {
+        args SetChannelArgs;
+    });
+    /// AP: The device is to use args.config as a template for beacon frames.
+    /// Client: The device is to be configured with this BSS as it peer.
+    strict -> JoinBss(struct {
+        args JoinBssArgs;
+    });
+
+    strict -> StartScan(struct {
+        args StartScanArgs;
+    });
+
+    // TODO: Enable/Disable Beaconing.
+
+    /// The device is to install the keys (often coming from RSN, exceptions apply).
+    strict -> SetKey(struct {
+        args SetKeyArgs;
+    });
+
+    // WlantaphyImpl (defined in banjo)
+    // events indicating that the wlanphy device received interface rquest calls from the driver.
+
+    /// The device is to change its radio and power settings to conform to the regulation of the
+    /// specified country.
+    strict -> SetCountry(struct {
+        args SetCountryArgs;
+    });
+};
+
+type TxArgs = struct {
+    wlan_softmac_id uint16;
+    packet WlanTxPacket;
+};
+
+type SetChannelArgs = struct {
+    wlan_softmac_id uint16;
+    primary ieee80211.ChannelNumber;
+    bandwidth ieee80211.ChannelBandwidth;
+    vht_secondary_80_channel ieee80211.ChannelNumber;
+};
+
+type JoinBssArgs = struct {
+    wlan_softmac_id uint16;
+    config fuchsia.wlan.driver.JoinBssRequest;
+};
+
+type StartScanArgs = struct {
+    wlan_softmac_id uint16;
+    scan_id uint64;
+};
+
+type SetKeyArgs = struct {
+    wlan_softmac_id uint16;
+    config WlanKeyConfig;
+};
+
+service Service {
+    wlantap_ctl client_end:WlantapCtl;
+};

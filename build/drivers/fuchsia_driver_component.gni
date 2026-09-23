@@ -1,0 +1,168 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/components/fuchsia_component.gni")
+import("//build/dist/distribution_manifest.gni")
+import("//build/drivers/driver_manifest.gni")
+import("//tools/cmc/build/cmc.gni")
+
+# Defines a Fuchsia driver component.
+# A driver component is a normal component that launches a driver.
+# For more information on components see:
+# https://fuchsia.dev/fuchsia-src/development/components/build
+#
+# At the moment this template will generate the Component Manifest
+# at build time. If you'd like to write your own Component Manifest,
+# simply use the fuchsia_component build template.
+#
+# The component manifest is automatically generated that points to the
+# correct driver library and bind file. If 'deps' includes more than
+# one driver library or more than one bind file, this will cause a build-time
+# error.
+#
+# Parameters
+#
+#   manifest (optional)
+#     The component manifest. Either this or `cm_label` must be specified.
+#     Type: path
+#   cm_label (optional)
+#     A `fuchsia_component_manifest` target label. Either this or `manifest` must be specified.
+#     Type: GN label, e.g. `:my_manifest`
+#   info (mandatory for //src and //zircon)
+#     Name of the file containing the driver information file.
+#     Type: file
+#   applicable_licenses
+#   deps
+#   testonly
+#   visibility
+template("fuchsia_driver_component") {
+  if (current_toolchain == default_toolchain) {
+    _has_manifest = defined(invoker.manifest)
+    _has_cm_label = defined(invoker.cm_label)
+    _has_dml_label = defined(invoker.dml_label)
+
+    _manifest_sources = 0
+    if (_has_manifest) {
+      _manifest_sources += 1
+    }
+    if (_has_cm_label) {
+      _manifest_sources += 1
+    }
+    if (_has_dml_label) {
+      _manifest_sources += 1
+    }
+    assert(
+        _manifest_sources == 1,
+        "Exactly one of `manifest`, `cm_label`, or `dml_label` must be defined")
+
+    if (_has_dml_label) {
+      _cm_label = "${invoker.dml_label}_manifest"
+    }
+
+    driver_path =
+        get_path_info(get_path_info(invoker.target_name, "abspath"), "dir")
+    splitted_path = string_split(driver_path, "/")
+    base_folder = splitted_path[2]  # after removing "//"
+    create_driver_doc = false
+    if (base_folder == "src" || base_folder == "zircon") {
+      # Public drivers (defined as drivers in //src and //zircon) must provide
+      # an 'info' field with a driver information file.
+      assert(defined(invoker.info), "Must include driver info")
+      create_driver_doc = true
+    } else {
+      # Ignore info assignment if present, e.g. from //tools templates.
+      if (defined(invoker.info)) {
+        not_needed(invoker, [ "info" ])
+      }
+    }
+
+    if (create_driver_doc) {
+      doc_output = "${target_gen_dir}/${target_name}-doc.json"
+      doc_target = "${target_name}-driver-info"
+
+      name = invoker.target_name
+      if (defined(invoker.component_name)) {
+        name = invoker.component_name
+      }
+      doc_input = invoker.info
+      action(doc_target) {
+        visibility = [ ":*" ]
+        forward_variables_from(invoker,
+                               [
+                                 "applicable_licenses",
+                                 "testonly",
+                               ])
+        script = "//build/drivers/create_driver_doc.py"
+        inputs = [
+          driver_path,
+          doc_input,
+        ]
+        outputs = [ "${doc_output}" ]
+        args = [
+          "--name",
+          name,
+          "--driver_path",
+          driver_path,
+          "--doc_input",
+          rebase_path(doc_input, root_build_dir),
+          "--doc_output",
+          rebase_path(outputs[0], root_build_dir),
+        ]
+      }
+    }
+
+    fuchsia_component(target_name) {
+      # TODO(https://fxbug.dev/42161384): Remove check_includes = false.
+      if (!defined(invoker.cm_label)) {
+        check_includes = false
+      }
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "component_name",
+                               "manifest_deps",
+                               "restricted_features",
+                               "testonly",
+                               "visibility",
+                             ])
+      if (defined(_cm_label)) {
+        cm_label = _cm_label
+      } else if (defined(invoker.cm_label)) {
+        cm_label = invoker.cm_label
+      } else if (defined(invoker.manifest)) {
+        manifest = invoker.manifest
+      }
+
+      if (defined(invoker.deps)) {
+        deps = invoker.deps
+      } else {
+        deps = []
+      }
+      if (create_driver_doc) {
+        deps += [ ":${doc_target}" ]
+        not_needed(invoker, [ ":${doc_target}" ])
+      }
+      deps += [ "//src/devices/misc/drivers/compat:driver" ]
+      metadata = {
+        # Used by the assert_driver_components template.
+        driver_component_barrier = []
+
+        if (create_driver_doc) {
+          # Used by the create_all_drivers_doc template.
+          fuchsia_driver_doc_file = [ doc_output ]
+        }
+      }
+    }
+  } else {
+    group(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "applicable_licenses",
+                               "testonly",
+                             ])
+      deps = [ ":$target_name($default_toolchain)" ]
+    }
+    not_needed(invoker, "*")
+  }
+}

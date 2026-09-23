@@ -1,0 +1,379 @@
+# Copyright 2016 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/board.gni")
+import("//build/config/build_id.gni")
+import("//build/config/clang/clang.gni")
+import("//build/config/clang/clang_target_toolchain_info.gni")
+import("//build/config/compiler_config.gni")
+import("//build/config/current_target_tuple.gni")
+import("//build/config/fuchsia/target_api_level.gni")
+import("//build/config/fuchsia/zircon_asserts.gni")
+import("//build/config/sanitizers/sanitizer_default_options.gni")
+import("//build/config/sysroot.gni")
+import("//build/icu/third_party_icu_headers.gni")
+import("//build/rust/config.gni")
+import("//build/toolchain/ccache.gni")
+import("//build/toolchain/rbe.gni")
+import("//src/lib/icu/third_party_icu_headers.gni")
+
+# This is what is built into the Clang driver for --target=*-fuchsia.
+default_elf_page_size = 4096
+
+declare_args() {
+  # **TODO(https://fxbug.dev/42107211):** This is _extremely experimental_ and
+  # **must not** be set for production (including SDK) builds.
+  #
+  # This is the ELF ABI maximum page size.  It can always be increased (by
+  # powers of two) while staying ABI-compatible, but never decreased; any
+  # increases likely affect storage and memory sizes.  Binaries linked by
+  # this GN build will be compatible with ELF loading on a system that at
+  # runtime actually uses page sizes as big as this, as well as anything
+  # smaller down to 4k.  No system that uses page sizes larger than this
+  # will be able to load any ELF binaries produced by this build.
+  experimental_elf_page_size = default_elf_page_size
+}
+
+# ccache, at least in some configurations, caches preprocessed content. This
+# means that by the time the compiler sees it, macros are unrolled. A number
+# of gcc and clang diagnostics are conditioned on whether the source is part
+# of a macro or not. This is because a "reasonable" looking macro invocation
+# may end up doing something silly internally. This can mean self assignment
+# and tautological comparisons, since macros are not typed. Macros also tend
+# to over-parenthesize, and so on. This particular list of options was found
+# via trial and error, and might be the best way of keeping the build quiet.
+config("ccache") {
+  cflags = [
+    "-Wno-error",
+    "-Qunused-arguments",
+    "-Wno-parentheses-equality",
+    "-Wno-self-assign",
+    "-Wno-tautological-compare",
+    "-Wno-unused-command-line-argument",
+  ]
+  asmflags = cflags
+}
+
+compiler_config("compiler") {
+  configs = [
+    ":compiler_sysroot",
+    ":compiler_target",
+    ":compiler_fuchsia_api_level",
+    ":max-page-size",
+    "//build/config:cpu_baseline",
+  ]
+
+  if (use_ccache) {
+    configs += [ ":ccache" ]
+  }
+
+  linker_flags = []
+  if (build_id_format != "" && !is_pecoff) {
+    linker_flags += [ "--build-id=$build_id_format" ]
+  }
+
+  if (is_release) {
+    # https://fxbug.dev/42166874#c15: forcing one codegen unit produces
+    # smaller binaries but makes builds slower.
+    # Enforce one codegen unit only when we really care about
+    # size (release builds).
+    configs += [ "//build/config/rust:one_codegen_unit" ]
+  } else {
+    configs += [ "//build/config/rust:codegen_units_16" ]
+  }
+
+  rustflags = [ "-Clinker=$rebased_clang_prefix/lld" ]
+
+  _clang_resource_dir =
+      "${rebased_clang_dir}/${clang_target_toolchain_info.resource_dir}"
+
+  # When linking C++ runtime libraries into Rust binaries, we should use
+  # the correct multilib variant.
+  #
+  # TODO(https://fxbug.dev/42177702): Rather then hardcoding the directory names here,
+  # these should ideally come from runtime.json.
+  _multilib_dir = ""
+  if (toolchain_variant.tags + [ "asan" ] - [ "asan" ] !=
+      toolchain_variant.tags) {
+    _multilib_dir = "/asan+noexcept"
+  } else if (toolchain_variant.tags + [ "hwasan" ] - [ "hwasan" ] !=
+             toolchain_variant.tags) {
+    _multilib_dir = "/hwasan+noexcept"
+  } else {
+    _multilib_dir = "/noexcept"
+  }
+
+  # Which libc++ to link:
+  _libcxx_dir =
+      "${rebased_clang_dir}/lib/${current_target_tuple}${_multilib_dir}"
+
+  # These could alternatively come from clang's '--print-search-dirs', but
+  # that would require an exec_script and post-processing of the output or a
+  # JSON file generated during the toolchain build.
+  rust_linker_flags = [
+    "-L${_libcxx_dir}",
+    "-L${_clang_resource_dir}/lib/${current_target_tuple}",
+    "--pack-dyn-relocs=relr",
+    "-dynamic-linker=ld.so.1",
+  ]
+
+  if (rust_rbe_enable) {
+    rustflags += [ "--remote-flag=--cxx-stdlibdir=${_libcxx_dir}" ]
+  }
+
+  # TODO(https://fxbug.dev/42130451): Eventually the default in the compler driver.
+  rust_linker_flags += [ "-zrel" ]
+}
+
+config("compiler_sysroot") {
+  if (defined(sysroot) && sysroot != "") {
+    cflags = [ "--sysroot=" + rebase_path(sysroot, root_build_dir) ]
+    asmflags = cflags
+    ldflags = cflags
+
+    rustflags = [
+      "-L",
+      rebase_path("$sysroot/lib", root_build_dir),
+      "-Clink-arg=--sysroot=" + rebase_path(sysroot, root_build_dir),
+    ]
+  }
+}
+
+config("compiler_target") {
+  cflags = [ "--target=$current_target_tuple" ]
+  asmflags = cflags
+  ldflags = cflags
+}
+
+config("compiler_fuchsia_api_level") {
+  if (is_gcc || !is_fuchsia) {
+    defines =
+        [ "__Fuchsia_API_level__=${current_build_target_api_level_as_integer}" ]
+  } else {
+    cflags =
+        [ "-ffuchsia-api-level=${current_build_target_api_level_as_integer}" ]
+    asmflags = cflags
+    ldflags = cflags
+  }
+}
+
+compiler_config("max-page-size") {
+  default_size = experimental_elf_page_size == default_elf_page_size
+  if (!default_size || is_gcc) {
+    linker_flags = [ "-zmax-page-size=$experimental_elf_page_size" ]
+  }
+}
+
+config("shared_library_config") {
+  cflags = [ "-fPIC" ]
+
+  # Ensure assembly code can use `#ifdef __PIC__`
+  asmflags = cflags
+  ldflags = cflags
+}
+
+config("fdio_config") {
+  # This config is only a marker that is used to signal that a given executable
+  # should link with fdio. With fdio now getting built in this very build, there
+  # need to be a proper dependency.
+  # See the override of the `executable` template in
+  # //build/config/BUILDCONFIG.gni where that build edge is added.
+}
+
+config("executable_config") {
+}
+
+config("enable_zircon_asserts") {
+  # BAZEL_MIGRATION_NOTE: A Bazel C++ target that wants to force this feature
+  # should use `features = ["enable_zircon_asserts"]` in its definition.
+  # To disable the feature, use `features = ["-enable_zircon_asserts"]
+  #
+  # LINT.IfChange(enable_zircon_asserts_flags)
+  defines = [ "ZX_ASSERT_LEVEL=2" ]
+  # LINT.ThenChange(//build/bazel_sdk/bazel_rules_fuchsia/common/toolchains/clang/toolchain_utils.bzl:enable_zircon_asserts_flags)
+}
+
+config("zircon_asserts") {
+  if (zircon_asserts) {
+    configs = [ ":enable_zircon_asserts" ]
+  }
+}
+
+config("no_cpp_standard_library") {
+  ldflags = [ "-nostdlib++" ]
+}
+
+config("static_cpp_standard_library") {
+  ldflags = [
+    # Use libc++ as the C++ standard library.
+    "-stdlib=libc++",
+
+    # Use libunwind as the unwinder.
+    "-unwindlib=libunwind",
+
+    # Request static linking for standard C++ library. Despite the name, this
+    # option applies to both libstdc++ and libc++, whichever is used by Clang.
+    "-static-libstdc++",
+
+    # Request static linking for unwinder. Despite the name, this option
+    # applies to both libgcc and libunwind, whichever is used by Clang.
+    "-static-libgcc",
+  ]
+
+  # -static-libstdc++ and -static-libgcc options are handled by the C++
+  # compiler driver (that is clang), whereas these link-args get passed
+  # straight to lld by rustc and need to be expanded manually.
+  rustflags = [ "-Clink-args=--push-state -Bstatic -lc++ -Bdynamic -lm --pop-state -l:libunwind.a" ]
+}
+
+# Configure a rust target to link to libc++ dynamically.
+config("dynamic_cpp_standard_library") {
+  rustflags = [ "-Clink-args=--push-state -Bdynamic -lc++ --pop-state" ]
+}
+
+config("dynamic_rust_standard_library") {
+  rustflags = [ "-Cprefer-dynamic" ]
+}
+
+config("static_rust_standard_library") {
+  rustflags = [ "-Cprefer-dynamic=no" ]
+}
+
+# Configure a larger (2MB) stack size for Rust binaries.
+#
+# Currently, threads created by Rust's libstd have a hardcoded default stack
+# size of 2MB on Fuchsia. This can create overflows when moving code to the
+# main thread, whose default stack size is 256kB. To remove this wrinkle, the
+# default stack size is changed to 2MB for Rust binaries.
+config("large_rust_stack") {
+  rustflags = [ "-Clink-args=-zstack-size=0x200000" ]
+}
+
+# Enable additional integer-math sanitizers
+config("integer-paranoia") {
+  cflags = [
+    "-fsanitize=integer-divide-by-zero,signed-integer-overflow",
+    "-fsanitize-undefined-trap-on-error",
+  ]
+}
+
+# clang_libunwind is only available on fuchsia.
+# See the definition in //build/config/clang/clang.gni.
+if (is_fuchsia) {
+  # LINT.IfChange
+  # TODO(https://fxbug.dev/42135607): Get this information from runtime.json instead
+  _clang_libunwind =
+      "${rebased_clang_prefix}/../${clang_target_toolchain_info.libunwind_so}"
+
+  # LINT.ThenChange(//build/config/clang/generate_config_json.py)
+
+  config("libunwind") {
+    libs = [ _clang_libunwind ]
+  }
+}
+
+# NOTE: This config's label is hard-coded in //build/config/BUILDCONFIG.gn
+# so don't rename it without updating that file too!
+compiler_config("static-pie-config") {
+  cflags = [
+    "-fno-sanitize=all",
+    "-fno-stack-protector",
+  ]
+  ldflags = [
+    "-nostdlib",
+    "-nostartfiles",
+  ]
+  linker_flags = [ "-no-dynamic-linker" ]
+}
+
+group("maybe_scudo_default_options") {
+  if (scudo_default_options != "" && scudo_default_options != []) {
+    public_deps = [ ":scudo_default_options" ]
+  }
+}
+
+sanitizer_default_options("scudo_default_options") {
+}
+
+# TODO(https://fxbug.dev/42180987): This works around a toolchain issue in LTO builds
+# where code generation results in a dependency on a Zircon vDSO call but
+# doesn't link -lzircon to supply it at link time.  This is added to deps of
+# the few targets where this has caused link failures to just explicitly link
+# it in.  As soon as the toolchain issues are resolved, this and the deps on it
+# will all be removed.
+group("uses-outline-atomics-fxbug98632") {
+  visibility = [
+    "${icu_root}:*",
+    "//src/developer/debug/debug_agent/test_data:*",
+    "//src/developer/debug/e2e_tests/inferiors:*",
+    "//src/graphics/examples/vkproto:*",
+    "//src/graphics/examples/vkproto/cmd-buf-benchmark:*",
+    "//third_party/boringssl:*",
+    "//third_party/ffmpeg:*",
+    "//third_party/icu/default:*",
+    "//third_party/icu/latest:*",
+  ]
+  if (current_cpu == "arm64" && is_fuchsia) {
+    deps = [ "//src/zircon/lib/zircon" ]
+  }
+}
+
+# toolchain_variant.{executable_,source,}deps point to these usually, so
+# BUILDCONFIG.gn (for $default_toolchain) and the toolchain definitions don't
+# have to keep the details in sync.  These use only data_deps so that there is
+# no automatic retriggering of the dependent target just because one of the
+# sysroot actions re-runs, only if a file found via depfile changed.  Note this
+# could mean that newly-added sysroot files that would now be seen in a search
+# path but were not before don't cause rebuilds that would now pick them up.
+# But that won't happen if the old files previously found instead were removed
+# from the sysroot, since the additions cause the cleanup scan that would
+# remove old files and thereby cause rebuilds of their dependents via depfile.
+
+group("terminal_link_deps") {
+  # toolchain_variant.deps is used by loadable_module() and executable().  It's
+  # responsible for making sure there are data_deps for any shared_library()
+  # targets that may be runtime file dependencies.  This gets those files into
+  # the Fuchsia package via their distribution_entries metadata.
+  data_deps = [ "//zircon/public/sysroot:data($variant_base_toolchain)" ]
+}
+
+group("executable_deps") {
+  # Every normal executable() depends on this.  But since :link_deps has to
+  # include the startfiles because of the RBE wrapper, it has nothing do do.
+}
+
+group("link_deps") {
+  # Every linking target depends on this.  The RBE wrapper requires that
+  # Scrt1.o be present for all links, not just executable links (which might
+  # actually use it).  If the RBE support were more sophisticated, installing
+  # Scrt1.o could be just in :executable_deps instead.  But it's not.  So this
+  # ensures that things are in place for Scrt1.o and the like to be found in
+  # the sysroot where the compiler will look for them before the executable()
+  # is linked.  But it doesn't contribute any link inputs as a GN target, so it
+  # does no harm to have it in deps even when the link uses -nostartfiles or
+  # equivalent.
+  data_deps = [ "//zircon/public/sysroot:startfiles($variant_base_toolchain)" ]
+}
+
+group("source_deps") {
+  # Every normal target that has $sources it compiles depends on this.  Note
+  # this includes linking targets as well as compilation-only targets, both
+  # terminal and non-terminal (shared_library() targets).
+  #
+  # It ensures that everything the compiler expects to find in the sysroot is
+  # ready for a compilation step or linking step that's not an executable(),
+  # i.e. doesn't use startfiles.  It doesn't modify how anything gets compiled
+  # or linked (by propagating configs or link inputs, etc.).  So it's harmless
+  # to have it in deps even for a target that doesn't use the sysroot headers
+  # or linking stubs.
+  #
+  # The individual compilation steps do not wait for data_deps, only the target
+  # as a whole.  So these must be deps and action re-runs will cause rebuilds.
+  # But the link steps have direct order-only Ninja deps on their data_deps, so
+  # action re-runs for those alone won't always cause relinks.
+  deps = [
+    "//zircon/public/sysroot:include($variant_base_toolchain)",
+    "//zircon/public/sysroot:lib($variant_base_toolchain)",
+  ]
+}

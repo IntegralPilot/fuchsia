@@ -1,0 +1,424 @@
+# Copyright 2021 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/current_target_tuple.gni")
+import("//build/config/zircon/standard.gni")
+import("//build/toolchain/zircon/clang.gni")
+
+_llvm_ifs = "$clang_tool_dir/llvm-ifs"
+
+# Putting this in lib_dirs early in the configs resolution order preempts the
+# lib_dirs in each ifs_shared_library() `.as-needed` target's implied config().
+# Thus each libs reference in the source_set() underlying the `.as-needed`
+# target resolves to the no-link-inputs file in ifs-as-needed instead.  A later
+# link step should use an ifs_shared_library_libs() target to get the same
+# shared library dependencies into the final link.  These files are just empty
+# files with comments, so they are reused across all toolchains.
+_common_gen_dir = get_label_info(".($default_toolchain)", "root_gen_dir")
+ifs_shared_library_as_needed_dir = "$_common_gen_dir/ifs-as-needed"
+
+# The metadata-generated linker scripts from ifs_shared_library_libs() all go
+# into this directory instead of $target_gen_dir.  See comments at the setting
+# of ifs_shared_library_ldscript metadata in ifs_shared_library().
+_gen_stub_ldscript_dir = "$root_gen_dir/ifs_shared_library_libs"
+
+# Define a linkable shared library built from a text ABI (.ifs) specification.
+#
+# This uses a `.ifs` file kept in the source tree to create a linkable ELF
+# shared library stub file.  This can be used at link time to build executable
+# and (non-stub) shared library binaries without reference to the actual
+# runtime shared library.  The real (non-stub) shared library to be used at
+# runtime must be compiled separately and included at runtime as necessary.
+# This target only takes care of satisfying any link-time dependencies.
+# Its label is used in `deps` like a shared_library() target.
+#
+# This defines three public targets and a config.
+#
+#   * "$target_name"
+#     - The main target acts like shared_library() for linking purposes, but is
+#     not a GN target with outputs.
+#
+#   * "$target_name.stub"
+#     - This is the target whose direct outputs include the linking stub ELF
+#     file itself, e.g. for use as input to a copy() target or the like.  This
+#     does not act as a link input in GN deps; use the main target for that.
+#
+#   * "$target_name.config"
+#     - This config() is defined to make `-l$output_name` implicit link
+#     arguments work by supplying a `lib_dirs` that will find the stub and
+#     nothing else.  This config is propagated from the main target via
+#     public_configs, but this alone may not be sufficient for it to reach the
+#     linking targets unless all the intervening deps are via public_deps.
+#     **Note:** It's always better to use GN deps on the main target to get the
+#     stub into the link.  The `libs` method is provided only to handle cases
+#     like compiler driver, .deplibs, or other forms of implicit link-time
+#     dependencies that can't be replaced with normal explicit link inputs.
+#
+#   * "$target_name.as-needed"
+#     - This can be used *instead of* (not _in addition to_!) the main target
+#     to satisfy link-time dependencies for symbols defined in the `.ifs` file.
+#     Unlike the main target, this uses `--as-needed` semantics, meaning that
+#     no DT_NEEDED entry will be generated if none of these symbols is actually
+#     used in a given link.  This is appropriate for use in the deps of a
+#     static library where some, but not all, of the source files going into
+#     that static library depend on symbols in this shared library ABI.
+#     **Note:** This is the **only** kind of shared library target that can
+#     appear in the linking deps graph of an hermetic_source_set() target.
+#     ifs_shared_library_libs() targets provide the mechanism for propagating a
+#     dependency on "$target_name.as-needed" through a relocatable link step
+#     such as hermetic_source_set().
+#
+# Parameters
+#
+#   * abi
+#     - Required: Source path to a `.ifs` file defining the library's ELF ABI.
+#     **NOTE:** This file must be consistent across $current_cpu values!
+#     - Type: file
+#
+#   * output_name
+#     - Optional: The plain name of the linkable library file to write,
+#     without the `lib` prefix or the `.so` extension.
+#     - Type: string
+#     - Default: $target_name
+#
+#   * data_deps, public, public_configs, public_deps
+#     - Optional: As for shared_library().
+#
+#   * deps
+#     - Optional: Any dependencies that went into the creation of the supplied
+#       `.ifs` file.
+#     - Type: list(label)
+#
+template("ifs_shared_library") {
+  main_target = target_name
+  main_label = get_label_info(":$main_target", "label_with_toolchain")
+  stub_target = "$target_name.stub"
+  config_target = "$target_name.config"
+
+  gen_target_base = "_ifs_shared_library.$target_name."
+  gen_target = "$gen_target_base$clang_cpu"
+  gen_label = ":$gen_target($default_toolchain)"
+  gen_dir_base = get_label_info(gen_label, "target_gen_dir") + "/$target_name."
+
+  if (defined(invoker.output_name)) {
+    output_name = invoker.output_name
+  } else {
+    output_name = target_name
+  }
+
+  gen_dir = "$gen_dir_base$clang_cpu"
+  gen_stub_file = "$gen_dir/lib$output_name.so"
+  public_stub_file = "$target_out_dir/lib$output_name.so"
+
+  as_needed_target = "$main_target.as-needed"
+  gen_stub_as_needed_file = "$gen_dir.as-needed/lib$output_name.so"
+  gen_as_needed_skip_target = gen_target_base + "as-needed.skip"
+
+  # This has the actual stub ELF file directly in libs, so lib_dirs searching.
+  source_set(main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "data_deps",
+                             "public",
+                             "public_configs",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    configs += [ ":$config_target" ]
+    libs = [ gen_stub_file ]
+    deps = [ gen_label ]
+    metadata = {
+      # This is a barrier like shared_library() would be.
+      link_output_barrier = []
+    }
+  }
+
+  # This provides lib_dirs such that `libs = [ output_name ]` (or a generated
+  # `-l$output_name` outside GN's knowledge, perhaps built into the compiler)
+  # would find the actual stub ELF file.
+  config(config_target) {
+    forward_variables_from(invoker, [ "visibility" ])
+    if (defined(visibility)) {
+      visibility += [ ":$main_target" ]
+    }
+    lib_dirs = [ gen_dir ]
+  }
+
+  # This provides `libs = [ output_name ]` and a lib_dirs such that it will be
+  # resolved to the $gen_stub_as_needed_file input linker script, getting the
+  # link stub wrapped in AS_NEEDED.
+  #
+  # However, this also generates an alternate lib$output_name.so input linker
+  # script in the shared directory that //build/config:ifs-as-needed injects
+  # into lib_dirs.  Thus any dependent link target using that config will use
+  # the alternate file instead.  It provides no link input, so
+  # ifs_shared_library_libs() must be used to collect the link input this
+  # target would have produced if not preempted by the
+  # //build/config:ifs-as-needed config.
+  source_set(as_needed_target) {
+    forward_variables_from(invoker,
+                           [
+                             "data_deps",
+                             "public",
+                             "public_configs",
+                             "public_deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    libs = [ output_name ]
+    deps = [
+      ":$gen_as_needed_skip_target.a($default_toolchain)",
+      ":$gen_as_needed_skip_target.so($default_toolchain)",
+      ":$gen_target.as-needed($default_toolchain)",
+
+      # gen_stub_as_needed_file points to the file this generates.
+      gen_label,
+    ]
+    lib_dirs = [
+      # This holds the "lib$output_name.so" that will be found if
+      # //build/config:ifs-as-needed is not preempting it.
+      get_path_info(gen_stub_as_needed_file, "dir"),
+    ]
+
+    # The generated_file() in the ifs_shared_library_libs() target collects the
+    # ifs_shared_library_ldscript metadata to produce an input linker script.
+    # For relative paths used in input linker scripts, the linker will try
+    # resolving that relative to directory containing that script file.
+    #
+    # Ordinarily that generated script would go in the $target_gen_dir of the
+    # ifs_shared_library_libs() target.  But that isn't known here, and can't
+    # be known: each ifs_shared_library_libs() will have the $target_gen_dir
+    # for its BUILD.gn file's directory; there is no correlation between the
+    # $target_gen_dir of that target and anything this ifs_shared_library()
+    # target can know.  So instead every ifs_shared_library_libs() target puts
+    # its metadata-collected linker script into $_gen_stub_ldscript_dir, a
+    # single directory for all targets (in the toolchain).  (To preserve
+    # uniqueness, the script's file name is generated so as to encode the full
+    # label without producing any slashes.)  Thus, the fragment here refers to
+    # the link stub's path relative to $_gen_stub_ldscript_dir.
+    ldscript_relative_gen_stub_file =
+        rebase_path(gen_stub_file, _gen_stub_ldscript_dir)
+
+    metadata = {
+      # This is a barrier like shared_library() would be.
+      link_output_barrier = []
+
+      # This will be collected by ifs_shared_library_libs().
+      ifs_shared_library_ldscript = [
+        "/* $main_label",
+        " * uses this for indirect deps via //build/config:ifs-as-needed.",
+        " * See ifs_shared_library_libs() documentation for details.",
+        " */",
+        "INPUT(AS_NEEDED($ldscript_relative_gen_stub_file))",
+      ]
+
+      # If this rolls up into a Rust link, the RBE wrapper will need to know
+      # that the stub and its .as-needed wrapper are both potential inputs.
+      rust_compilation_deps = rebase_path([
+                                            gen_stub_as_needed_file,
+                                            gen_stub_file,
+                                          ],
+                                          root_build_dir)
+    }
+  }
+
+  copy(stub_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    deps = [ gen_label ]
+    sources = [ gen_stub_file ]
+    outputs = [ public_stub_file ]
+  }
+
+  if (current_toolchain == default_toolchain) {
+    as_needed_label =
+        get_label_info(":$main_target.as-needed", "label_no_toolchain")
+
+    # Define a target to generate a stub for each CPU type, but all generated
+    # in the default toolchain since nothing but CPU varies among them.  Note
+    # that because of GN's special treatment of the default toolchain, these
+    # will all get Ninja targets even if they're not in any GN deps graph.
+    # But since these targets depend only on the source files and don't cause
+    # anything else new to get built, that should not add any build overhead.
+    foreach(cpu, standard_fuchsia_cpus) {
+      foreach(translation, clang_cpu_translations) {
+        if (cpu == translation.gn) {
+          cpu = translation.clang
+        }
+      }
+
+      gen_target = "$gen_target_base$cpu"
+      gen_dir = "$gen_dir_base$cpu"
+      gen_stub_file = "$gen_dir/lib$output_name.so"
+      gen_stub_as_needed_file = "$gen_dir.as-needed/lib$output_name.so"
+
+      action(gen_target) {
+        forward_variables_from(invoker,
+                               [
+                                 "deps",
+                                 "testonly",
+                                 "visibility",
+                               ])
+        if (defined(visibility)) {
+          visibility += [
+            ":$main_target",
+            ":$stub_target",
+          ]
+        }
+
+        script = _llvm_ifs
+        sources = [ invoker.abi ]
+        outputs = [ gen_stub_file ]
+        args = [
+          "--input-format=IFS",
+          "--target=$cpu-fuchsia",
+          "--write-if-changed",
+          "--output-elf=" + rebase_path(gen_stub_file, root_build_dir),
+          rebase_path(invoker.abi, root_build_dir),
+        ]
+      }
+
+      # This is an input linker script that just wraps that file in AS_NEEDED.
+      generated_file("$gen_target.as-needed") {
+        visibility = [ ":$as_needed_target" ]
+        forward_variables_from(invoker, [ "testonly" ])
+
+        relative_stub_path =
+            rebase_path(gen_stub_file,
+                        get_path_info(gen_stub_as_needed_file, "dir"))
+        outputs = [ gen_stub_as_needed_file ]
+        output_conversion = "list lines"
+        contents = [
+          "/* $as_needed_label",
+          " * uses this to link in the shared library only if referenced.",
+          " * This file is used for a deps path that reaches that",
+          " * without an intervening ifs_shared_library_libs() target.",
+          " * See ifs_shared_library_libs() documentation for details.",
+          " */",
+          "INPUT(AS_NEEDED($relative_stub_path))",
+        ]
+      }
+    }
+
+    # This is an input linker script that just does nothing.  It exists to
+    # preempt the file from the as-needed stub target when its output dir comes
+    # first in the search order via //build/config:ifs-as-needed.  It provides
+    # no input to the link.  For a relocatable link, the as-needed dependency
+    # will be found via metadata collection.  Both lib$output_name.a and
+    # lib$output_name.so are generated to ensure this preempts any other
+    # resolution for -l$output_name in the lib_dirs search path, even if that's
+    # left to the linker's -L path and whichever file name it searches for.
+    foreach(extension,
+            [
+              "a",
+              "so",
+            ]) {
+      generated_file("$gen_as_needed_skip_target.$extension") {
+        visibility = [ ":$as_needed_target" ]
+        forward_variables_from(invoker, [ "testonly" ])
+
+        outputs =
+            [ "$ifs_shared_library_as_needed_dir/lib$output_name.$extension" ]
+        output_conversion = "list lines"
+        contents = [
+          "/* $as_needed_label",
+          " * links this in when //build/config:ifs-as-needed is used.",
+          " * See ifs_shared_library_libs() documentation for details.",
+          " */",
+        ]
+      }
+    }
+  } else {
+    not_needed(invoker,
+               [
+                 "abi",
+                 "deps",
+               ])
+  }
+}
+
+# Define a link input for using ifs_shared_library() `.as-needed` subtargets.
+#
+# This defines a target usable in deps of a linking target.  Its effect is to
+# make sure linking stubs go into that link for any `.as-needed` subtargets in
+# the deps of this input target.  This is needed in an outer link that includes
+# the output of another relocatable link.  The deps for this target should
+# include the deps of the relocatable link, whose configs should include
+# //build/config:ifs-as-needed.  This template is used implicitly by
+# hermetic_source_set(), which uses that config automatically.
+#
+# Parameters
+#
+#   * deps
+#     - Required: Should reach ifs_shared_library() `.as-needed` subtargets.
+#     - Type: list(label)
+#
+#   * visibility, testonly
+#     - Optional: Usual GN meanings.
+#
+template("ifs_shared_library_libs") {
+  libs_target = target_name
+  gen_target = "_ifs_shared_library_libs.$target_name.gen"
+  prologue_target = "_ifs_shared_library_libs.$target_name.prologue"
+
+  # See comment in metadata above.  All these scripts must go into a single
+  # common directory (for the toolchain), rather than $target_gen_dir.  This
+  # allows each input linker script fragment to use a script-relative path to
+  # its link stub file ($gen_stub_file in ifs_shared_library() implementation).
+  # To make sure the same $target_name in two ifs_shared_library_libs() targets
+  # in different directories doesn't result in a collision, each generated
+  # script's file name encodes its full label path rather than its path under
+  # $root_gen_dir to $target_gen_dir doing that implicitly.
+  gen_prefix = string_replace(rebase_path(".", "//"), "/", ".")
+  gen_file = "$_gen_stub_ldscript_dir/$gen_prefix$libs_target.ld"
+
+  source_set(libs_target) {
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "testonly",
+                           ])
+    libs = [ gen_file ]
+
+    # **NOTE::** This cannot be plain deps!  The generated_file() target is not
+    # a barrier to libs propagating up from its own deps graph all the way
+    # through this source_set() into the containing link!  Anything in deps
+    # could cross any hermetic_source_set() boundary and bring in the
+    # constituents to that partial link also directly into the outer link.
+    # Using data_deps instead avoid this and it's more than sufficient because
+    # the generated_file() target is fully resolved at `gn gen` and doesn't
+    # cause any runtime work anyway.
+    data_deps = [ ":$gen_target" ]
+  }
+
+  generated_file(gen_target) {
+    visibility = [ ":$libs_target" ]
+    forward_variables_from(invoker, [ "testonly" ])
+
+    deps = [ ":$prologue_target" ] + invoker.deps
+
+    outputs = [ gen_file ]
+    output_conversion = "list lines"
+    data_keys = [ "ifs_shared_library_ldscript" ]
+    walk_keys = [ "link_output_barrier" ]
+  }
+
+  # This comes first in the metadata walk so its contribution will be the first
+  # thing in $gen_file.
+  group(prologue_target) {
+    visibility = [ ":$gen_target" ]
+    forward_variables_from(invoker, [ "testonly" ])
+    metadata = {
+      ifs_shared_library_ldscript = [
+        "/* This file is generated by the ifs_shared_library_libs() target",
+        " * " + get_label_info(":$libs_target", "label_with_toolchain"),
+        " */",
+      ]
+    }
+  }
+}

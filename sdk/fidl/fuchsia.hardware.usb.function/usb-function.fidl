@@ -1,0 +1,386 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.usb.function;
+
+using zx;
+using fuchsia.hardware.usb.endpoint;
+using fuchsia.hardware.usb.descriptor;
+
+const MAX_STRING_LEN uint32 = 126;
+const MAX_STRINGS uint32 = 255;
+const MAX_ENDPOINTS uint32 = 255;
+const MAX_INTERFACES uint32 = 32;
+/// Maximum length of a configuration descriptor block (32 KiB).
+///
+/// Note: While the USB specification allows configuration descriptors up to 65,535 bytes (64 KiB),
+/// this limit is set to 32,768 bytes (32 KiB) to leave ample headroom (32 KiB) for future FIDL
+/// protocol evolution (new struct fields, handles, or message headers) within Zircon's 64 KiB
+/// channel message limit (`ZX_CHANNEL_MAX_MSG_BYTES`, 65,536 bytes).
+const MAX_DESCRIPTOR_LEN uint32 = 32768;
+
+/// Protocol for configuring a USB function.
+///
+/// This protocol is implemented by the USB peripheral controller (protocol server) and called by
+/// the USB function driver (protocol client).
+///
+/// Closing the `UsbFunction` channel automatically deconfigures the function and closes the `iface`
+/// ([`UsbFunctionInterface`]) channel.
+@discoverable
+closed protocol UsbFunction {
+    /// Connect to an allocated endpoint.
+    ///
+    /// This must be called after the endpoint has been allocated via [`AllocResources`]. If the
+    /// endpoint channel was not provided during `AllocResources`, this method must be called to
+    /// establish the endpoint channel before any data transfers can occur on the endpoint.
+    ///
+    /// If the endpoint channels were not provided in `AllocResources` and this is never called, the
+    /// protocol client cannot communicate with the endpoint (no channel is established). This does
+    /// not prevent control-plane callbacks (like `SetConfigured`) from being made.
+    ///
+    /// The endpoint connection persists across `Configure` and `Deconfigure` calls. If the protocol
+    /// server closes the connection (server end closes), it indicates that the endpoint is no
+    /// longer available (e.g. device disconnected or function removed). The protocol client should
+    /// clean up by closing its client end of the channel, cancelling any pending I/O operations,
+    /// and stopping any tasks using the endpoint. The protocol client is not required to call
+    /// `DisableEndpoint` or `Deconfigure` in this case (and such calls may fail if the interface is
+    /// being torn down).
+    ///
+    /// * error:
+    ///     * `ZX_ERR_NOT_FOUND` if endpoint address does not exist (e.g. not allocated).
+    ///     * `ZX_ERR_ALREADY_BOUND` if the endpoint is already bound to an active channel. To
+    ///       connect a new channel, the existing channel must be closed first. Note that channel
+    ///       closure detection is asynchronous; if the protocol client closes the existing channel
+    ///       and immediately calls `ConnectToEndpoint`, it may still fail with
+    ///       `ZX_ERR_ALREADY_BOUND` if the protocol server has not yet processed the closure.
+    strict ConnectToEndpoint(resource struct {
+        ep_addr uint8;
+        ep server_end:fuchsia.hardware.usb.endpoint.Endpoint;
+    }) -> () error zx.Status;
+
+    /// Configure the function with the given descriptors.
+    ///
+    /// **Ordering**: This must be called after `AllocResources` has been called to allocate all
+    /// interfaces, endpoints, and strings referenced in the descriptors. Calling this when already
+    /// configured returns `ZX_ERR_ALREADY_BOUND`.
+    ///
+    /// This binds the [`UsbFunctionInterface`] callback channel (where the protocol client acts as
+    /// the server).
+    ///
+    /// `configuration` is a vector of concatenated USB descriptors in standard USB wire format
+    /// (Interface -> Endpoint -> Class/Vendor descriptors). A raw byte vector is used to allow
+    /// arbitrary class-specific and vendor-specific descriptors that cannot be statically defined
+    /// in FIDL.
+    ///
+    /// This byte vector is expected to contain one or more interface descriptors following the
+    /// USB specification.
+    ///
+    /// This descriptor block is cached by the peripheral controller and sent *as-is* to the host in
+    /// response to standard host `GET_DESCRIPTOR` (Configuration) requests.
+    ///
+    /// **Structure and Validation**:
+    /// - Must begin with an Interface or Interface Association descriptor.
+    /// - Standard descriptors (Interface, Endpoint) embedded in the vector must follow the standard
+    ///   USB specification descriptor layouts.
+    /// - All interface numbers and endpoint addresses must match the resources allocated in
+    ///   [`AllocResources`].
+    /// - The peripheral controller parses this vector linearly using descriptor length fields.
+    ///   Mismatched resource IDs or malformed layouts return `ZX_ERR_INVALID_ARGS`.
+    ///
+    /// `iface` is the client end of [`UsbFunctionInterface`] which the protocol server uses to send
+    /// events to the protocol client.
+    ///
+    /// The function remains configured until `Deconfigure` is called or the `iface` channel is
+    /// closed. If `iface` is closed, the function is automatically deconfigured, which stops the
+    /// peripheral controller and disconnects the device from the host.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_INVALID_ARGS` if the configuration is invalid or references unallocated
+    ///       resources.
+    ///     * `ZX_ERR_ALREADY_BOUND` if the function interface is already bound.
+    ///     * `ZX_ERR_NO_MEMORY` if the protocol server fails to allocate memory to store the
+    ///       descriptors.
+    ///     * `ZX_ERR_BAD_STATE` if the peripheral device is stopping or tearing down.
+    strict Configure(resource struct {
+        configuration vector<uint8>:MAX_DESCRIPTOR_LEN;
+        iface client_end:UsbFunctionInterface;
+    }) -> () error zx.Status;
+
+    /// Deconfigure the function.
+    ///
+    /// **Ordering**: Can be called at any time. If the function is not configured, it trivially
+    /// succeeds.
+    ///
+    /// This is the opposite of `Configure`. The protocol server disables all physical endpoints
+    /// for this function, clears its stored descriptors, and unbinds the `iface` channel. If the
+    /// function was active, the peripheral controller may trigger a USB re-enumeration to reflect
+    /// the updated function configuration.
+    ///
+    /// This does *not* close the endpoint channels (they remain connected and can be reused if the
+    /// function is re-configured).
+    ///
+    /// * error:
+    ///     * `ZX_ERR_UNAVAILABLE` if a deconfiguration is already in progress.
+    strict Deconfigure() -> () error zx.Status;
+
+    /// Allocate resources for the function.
+    ///
+    /// This method is atomic. If any resource allocation fails, all allocations made during this
+    /// call are rolled back.
+    ///
+    /// This must be called during driver initialization before `Configure`. Calling this after the
+    /// function has been configured returns `ZX_ERR_BAD_STATE`.
+    ///
+    /// `interface_count` informs how many interfaces to create. `interface_nums` returns a vector
+    /// of length `interface_count` containing the allocated interface numbers.
+    ///
+    /// `endpoints` is a vector of endpoints to allocate. The direction and endpoint server end are
+    /// provided. The protocol client can optionally provide endpoint channels in `endpoints`
+    /// to connect them immediately. If an endpoint channel is not provided, the protocol client
+    /// must call [`ConnectToEndpoint`] later to use it. `endpoint_addrs` returns a vector of the
+    /// same size containing the allocated endpoint addresses, where element `i` corresponds 1:1
+    /// to element `i` of `endpoints`. All endpoint channels provided here or connected later via
+    /// [`ConnectToEndpoint`] persist across [`Configure`] and [`Deconfigure`] calls.
+    ///
+    /// `strings` is a vector of strings to allocate. `string_indices` returns a vector of the
+    /// same size containing the allocated string indices, where element `i` corresponds 1:1 to
+    /// element `i` of `strings`.
+    ///
+    /// Returns the interface ids, endpoint ids, and string ids that were allocated. On error, no
+    /// resources are allocated.
+    ///
+    /// The allocated resource numbers and addresses remain allocated for the lifetime of the
+    /// connection to `UsbFunction`. They are *not* freed on `Deconfigure`.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_BAD_STATE` if the function has already been configured.
+    ///     * `ZX_ERR_NO_RESOURCES` if any resource namespace numbers are exhausted.
+    ///     * `ZX_ERR_INVALID_ARGS` if the endpoint configuration contains invalid arguments.
+    strict AllocResources(resource struct {
+        interface_count uint8;
+        endpoints vector<@generated_name("EndpointResource") resource struct {
+            direction fuchsia.hardware.usb.descriptor.EndpointDirection;
+            endpoint server_end:fuchsia.hardware.usb.endpoint.Endpoint;
+            /// Information about the endpoint (e.g. Bulk, Interrupt).
+            ep_info fuchsia.hardware.usb.endpoint.EndpointInfo;
+            /// The maximum packet size the endpoint supports.
+            max_packet_size uint32;
+        }>:MAX_ENDPOINTS;
+        strings vector<string:MAX_STRING_LEN>:MAX_STRINGS;
+    }) -> (struct {
+        interface_nums vector<uint8>:MAX_INTERFACES;
+        endpoint_addrs vector<uint8>:MAX_ENDPOINTS;
+        string_indices vector<uint8>:MAX_STRINGS;
+    }) error zx.Status;
+
+    /// Stall the endpoint.
+    ///
+    /// The endpoint must have been allocated and configured.
+    ///
+    /// This method returns after the hardware confirms the stall condition is active. All pending
+    /// transfers queued on the endpoint are cancelled and completed with `ZX_ERR_IO_REFUSED` via
+    /// `OnCompletion`. While the endpoint is stalled, any new requests submitted via
+    /// `QueueRequests` must immediately fail and complete with `ZX_ERR_IO_REFUSED`.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_BAD_STATE` if the function is not configured.
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the device is not running, disconnected, or inactive.
+    ///     * `ZX_ERR_NOT_FOUND` if the endpoint address does not exist (not allocated).
+    strict EndpointSetStall(struct {
+        endpoint_address uint8;
+    }) -> () error zx.Status;
+
+    /// Clear the endpoint's stalled state.
+    ///
+    /// The endpoint must have been allocated and configured.
+    ///
+    /// This method returns after the hardware confirms the stall has been cleared. As required by
+    /// USB 2.0 Section 9.4.5, clearing the halt feature also resets the endpoint's data toggle bit
+    /// to `DATA0` in hardware. The client must resubmit any cancelled transfers once the endpoint
+    /// is cleared. Any requests queued *after* this method returns are processed normally.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_BAD_STATE` if the function is not configured.
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the device is not running, disconnected, or inactive.
+    ///     * `ZX_ERR_NOT_FOUND` if the endpoint address does not exist (not allocated).
+    strict EndpointClearStall(struct {
+        endpoint_address uint8;
+    }) -> () error zx.Status;
+
+    /// Configure and enable an endpoint with the given configuration.
+    ///
+    /// Called by the function driver in response to `SetConfigured` (when `configured == true`) or
+    /// `SetInterface` requests to enable physical transfers on the endpoint. Calling this before
+    /// the function has been configured via `Configure` returns `ZX_ERR_BAD_STATE`. Clients should
+    /// wait for the `SetConfigured` or `SetInterface` request before configuring endpoints to
+    /// ensure the host is ready.
+    ///
+    /// The endpoint must have been allocated via `AllocResources`.
+    ///
+    /// Returns only after the physical endpoint has been configured by the DCI driver.
+    ///
+    /// See USB 2.0 Specification Section 9.6.6 (Endpoint Descriptor) for details on the standard
+    /// endpoint configuration fields mapped in `EndpointConfiguration`.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_BAD_STATE` if the function is not configured.
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the device is not running, disconnected, or inactive.
+    ///     * `ZX_ERR_NOT_FOUND` if the endpoint address does not exist (not allocated).
+    ///     * `ZX_ERR_INVALID_ARGS` if the configuration is invalid.
+    strict ConfigureEndpoint(struct {
+        endpoint_address uint8;
+        endpoint_configuration EndpointConfiguration;
+    }) -> () error zx.Status;
+
+    /// Disable an endpoint.
+    ///
+    /// Called by the function driver in response to `SetConfigured` (when `configured == false`)
+    /// or `SetInterface` requests to disable physical transfers on the endpoint. Calling this when
+    /// the endpoint is already disabled is a no-op and returns `ZX_OK`. If called before the
+    /// function has been configured via `Configure`, it also trivially succeeds (`ZX_OK`), as the
+    /// endpoint is already unconfigured and disabled.
+    ///
+    /// The endpoint must have been allocated via `AllocResources`.
+    ///
+    /// Returns only after the physical endpoint has been disabled by the DCI driver.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the device is not running, disconnected, or inactive.
+    ///     * `ZX_ERR_NOT_FOUND` if the endpoint address does not exist (not allocated).
+    strict DisableEndpoint(struct {
+        endpoint_address uint8;
+    }) -> () error zx.Status;
+};
+
+/// Protocol offered to [`UsbFunction`] instances to handle host-initiated
+/// requests.
+///
+/// This protocol is implemented by the USB function driver (protocol server)
+/// and called by the USB peripheral controller (protocol client).
+open protocol UsbFunctionInterface {
+    /// Callback for handling EP0 class/vendor-specific control requests targeting the interface(s)
+    /// owned by this function.
+    ///
+    /// This is called when the host sends a control request to the device. The protocol server (of
+    /// [`UsbFunctionInterface`]) should process the request and return the result.
+    ///
+    /// The host expects a response within a strict timeout period defined by the USB specification
+    /// Section 9.2.6 (50ms for requests without data, and 500ms for read data stages). Because of
+    /// these hardware-enforced limits, the implementation must reply as quickly as possible and
+    /// avoid blocking the dispatcher.
+    ///
+    /// `setup` is the control request metadata (setup packet). `write` contains the raw bytes sent
+    /// by the host in the Data Stage of a host-to-device (OUT) control transfer. It is empty for
+    /// device-to-host (IN) transfers. `read` in the response payload contains the raw bytes
+    /// returned to the host in the Data Stage of a device-to-host (IN) control transfer. It must
+    /// be empty for host-to-device (OUT) transfers.
+    ///
+    /// Any error returned by this method (including `ZX_ERR_NOT_SUPPORTED`) causes the
+    /// peripheral controller to stall Endpoint 0, signaling a "Request Error" to the host.
+    ///
+    /// * error:
+    ///     * `ZX_ERR_NOT_SUPPORTED` if the request is not supported by the protocol server.
+    ///     * `ZX_ERR_INVALID_ARGS` if the setup packet or data is invalid.
+    ///     * `ZX_ERR_IO_NOT_PRESENT` if the device was disconnected while processing the request.
+    flexible Control(struct {
+        setup fuchsia.hardware.usb.descriptor.UsbSetup;
+        write vector<uint8>:MAX;
+    }) -> (struct {
+        read vector<uint8>:MAX;
+    }) error zx.Status;
+
+
+    /// Inform the protocol server (of [`UsbFunctionInterface`]) when the USB device configured
+    /// state changes.
+    ///
+    /// Called with `configured == true` in response to a `SET_CONFIGURATION` control request that
+    /// selects a configuration that contains this function. In this case, the protocol server
+    /// should use [`UsbFunction.ConfigureEndpoint`] to configure its endpoints.
+    ///
+    /// Per USB 2.0 Specification Section 9.4.7, receiving a `SET_CONFIGURATION` request when the
+    /// function is already configured is valid and should reset/re-initialize the function state
+    /// rather than returning an error.
+    ///
+    /// Called with `configured == false` when configuration is disabled or USB is disconnected.
+    /// The protocol server should then use [`UsbFunction.DisableEndpoint`] to disable its
+    /// endpoints.
+    ///
+    /// The protocol server must perform all endpoint configuration/disabling and wait for those
+    /// calls to complete before replying to this method. This ensures that the protocol client can
+    /// report success/failure back to the host (by ACK'ing or STALL'ing the `SET_CONFIGURATION`
+    /// request).
+    ///
+    /// Any error returned by this method causes the peripheral controller to stall Control
+    /// Endpoint 0, signaling a failure to the host (rejecting the `SET_CONFIGURATION` request).
+    ///
+    /// * error:
+    ///     * `ZX_ERR_BAD_STATE` if the device or function is in an uninitialized state where
+    ///       configuration transitions are invalid (excluding re-configuring an active state).
+    ///     * `ZX_ERR_INVALID_ARGS` if the speed or configuration parameters are invalid.
+    ///     * `ZX_ERR_NOT_SUPPORTED` if the requested speed or configuration is unsupported.
+    ///     * `ZX_ERR_NO_RESOURCES` if endpoint allocation or hardware configuration fails.
+    flexible SetConfigured(struct {
+        configured bool;
+        speed fuchsia.hardware.usb.descriptor.UsbSpeed;
+    }) -> () error zx.Status;
+
+    /// Called to set an alternate setting for an interface due to a `SET_INTERFACE` control
+    /// request.
+    ///
+    /// The protocol server (of [`UsbFunctionInterface`]) must use [`UsbFunction.ConfigureEndpoint`]
+    /// and [`UsbFunction.DisableEndpoint`] to configure or disable the interface's endpoints as
+    /// appropriate for the new alternate setting.
+    ///
+    /// Depending on the alternate setting definition, this transition may require configuring new
+    /// endpoints (via `ConfigureEndpoint`), disabling existing endpoints (via `DisableEndpoint`),
+    /// or doing both. If an alternate setting does not use any endpoints, no endpoint
+    /// configuration calls are required.
+    ///
+    /// The protocol server must perform all endpoint configuration/disabling and wait for those
+    /// calls to complete before replying to this method. This ensures that the protocol client can
+    /// report success/failure back to the host (by ACK'ing or STALL'ing the `SET_INTERFACE`
+    /// request).
+    ///
+    /// Any error returned by this method causes the peripheral controller to stall Control
+    /// Endpoint 0, signaling a failure to the host (rejecting the `SET_INTERFACE` request).
+    ///
+    /// * error:
+    ///     * `ZX_ERR_NOT_SUPPORTED` if the alternate setting is not supported.
+    ///     * `ZX_ERR_INVALID_ARGS` if the interface or alt_setting is invalid.
+    ///     * Other errors if the function driver fails to configure or disable endpoints for the
+    ///       new setting.
+    flexible SetInterface(struct {
+        interface uint8;
+        alt_setting uint8;
+    }) -> () error zx.Status;
+};
+
+
+
+/// Endpoint configuration given to [`UsbFunction.ConfigureEndpoint`].
+type EndpointConfiguration = table {
+    1: descriptor @generated_name("EndpointDescriptor") struct {
+        bm_attributes uint8;
+        /// The endpoint's max packet size.
+        ///
+        /// Note: This is expressed in host-endianness, as opposed to the wire descriptors that are
+        /// always little-endian.
+        w_max_packet_size uint16;
+        b_interval uint8;
+    };
+    2: super_speed_companion @generated_name("SuperSpeedEndpointCompanionDescriptor") struct {
+        b_max_burst uint8;
+        bm_attributes uint8;
+        /// The endpoint's max super-speed maximum bytes per interval.
+        ///
+        /// Note: This is expressed in host-endianness, as opposed to the wire descriptors that are
+        /// always little-endian.
+        w_bytes_per_interval uint16;
+    };
+};
+
+
+service UsbFunctionService {
+    device client_end:UsbFunction;
+};

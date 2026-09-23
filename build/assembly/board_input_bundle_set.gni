@@ -1,0 +1,117 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_inputs.gni")
+import("//build/compiled_action.gni")
+
+# Creates a board input bundle set, which contains multiple board input bundles.
+#
+# Parameters
+#
+#  board_input_bundles (optional; default = [])
+#    [list of targets] board_input_bundle() targets to include.
+#
+#  version (optional)
+#    [string] String representing the release version for this board config.
+#    Either this field or "version_file" must be set.
+#
+#  version_file (optional)
+#    [string] Path to a file containing the release version for this config.
+#    Either this field or "version" must be set.
+#
+template("board_input_bundle_set") {
+  labels = {
+    main_target = target_name
+    bazel_input = "$target_name.bazel_input"
+  }
+
+  files = {
+    output_dir = "$target_out_dir/$target_name"
+    board_input_bundle_dirs = []
+  }
+
+  board_input_bundles = []
+  if (defined(invoker.board_input_bundles)) {
+    board_input_bundles = invoker.board_input_bundles
+    foreach(bib, invoker.board_input_bundles) {
+      _bib_name = get_label_info(bib, "name")
+      _bib_dir = get_label_info(bib, "target_out_dir") + "/" + _bib_name
+      files.board_input_bundle_dirs += [ _bib_dir ]
+    }
+  }
+
+  compiled_action(labels.main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    tool = "//build/assembly/tools/assembly_config"
+    tool_output_name = "assembly_config"
+    outputs = [ files.output_dir ]
+
+    # The contents of these folders are dynamic, and managed entirely by this
+    # action. Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    hermetic_action_ignored_prefixes =
+        [ "${files.output_dir}" ] + files.board_input_bundle_dirs
+
+    deps = board_input_bundles
+    args = [
+      "generate",
+      "board-input-bundle-set",
+      "--name",
+      target_name,
+      "--repo",
+      "fuchsia",
+      "--output",
+      rebase_path(files.output_dir, root_build_dir),
+    ]
+
+    foreach(bib, files.board_input_bundle_dirs) {
+      args += [
+        "--board-input-bundles",
+        rebase_path(bib, root_build_dir),
+      ]
+    }
+
+    assert(
+        defined(invoker.version) || defined(invoker.version_file),
+        "board_input_bundle_set(\"target_name\") must define `version` or `version_file`")
+    if (defined(invoker.version) && invoker.version != "") {
+      args += [
+        "--version",
+        invoker.version,
+      ]
+    }
+
+    if (defined(invoker.version_file) && invoker.version_file != "") {
+      inputs = [ invoker.version_file ]
+      args += [
+        "--version-file",
+        rebase_path(invoker.version_file, root_build_dir),
+      ]
+    }
+
+    metadata = {
+      board_input_bundle_sets_barrier = []
+      board_input_bundle_sets = [
+        {
+          label =
+              get_label_info(":${labels.main_target}", "label_with_toolchain")
+          name = target_name
+          cipd_name = target_name
+          outdir = rebase_path(files.output_dir, root_build_dir)
+        },
+      ]
+    }
+  }
+
+  bazel_input_directory(labels.bazel_input) {
+    forward_variables_from(invoker, [ "testonly" ])
+    generator = ":${labels.main_target}"
+    output_directory = files.output_dir
+  }
+}

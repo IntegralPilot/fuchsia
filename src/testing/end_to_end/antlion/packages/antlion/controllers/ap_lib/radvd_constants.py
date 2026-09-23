@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+#
+# Copyright 2025 The Fuchsia Authors
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+DEFAULT_PREFIX = "fd00::/64"
+
+IGNORE_IF_MISSING_ON = "on"
+IGNORE_IF_MISSING_OFF = "off"
+
+ADV_SEND_ADVERT_ON = "on"
+ADV_SEND_ADVERT_OFF = "off"
+
+UNICAST_ONLY_ON = "on"
+UNICAST_ONLY_OFF = "off"
+
+ADV_MANAGED_FLAG_ON = "on"
+ADV_MANAGED_FLAG_OFF = "off"
+
+ADV_OTHER_CONFIG_FLAG_ON = "on"
+ADV_OTHER_CONFIG_FLAG_OFF = "off"
+
+ADV_DEFAULT_PREFERENCE_ON = "on"
+ADV_DEFAULT_PREFERENCE_OFF = "off"
+
+ADV_SOURCE_LL_ADDRESS_ON = "on"
+ADV_SOURCE_LL_ADDRESS_OFF = "off"
+
+ADV_HOME_AGENT_FLAG_ON = "on"
+ADV_HOME_AGENT_FLAG_OFF = "off"
+
+ADV_HOME_AGENT_INFO_ON = "on"
+ADV_HOME_AGENT_INFO_OFF = "off"
+
+ADV_MOB_RTR_SUPPORT_FLAG_ON = "on"
+ADV_MOB_RTR_SUPPORT_FLAG_OFF = "off"
+
+ADV_INTERVAL_OPT_ON = "on"
+ADV_INTERVAL_OPT_OFF = "off"
+
+ADV_ON_LINK_ON = "on"
+ADV_ON_LINK_OFF = "off"
+
+ADV_AUTONOMOUS_ON = "on"
+ADV_AUTONOMOUS_OFF = "off"
+
+ADV_ROUTER_ADDR_ON = "on"
+ADV_ROUTER_ADDR_OFF = "off"
+
+ADV_ROUTE_PREFERENCE_LOW = "low"
+ADV_ROUTE_PREFERENCE_MED = "medium"
+ADV_ROUTE_PREFERENCE_HIGH = "high"
+
+ADV_RDNSS_OPEN_ON = "on"
+ADV_RDNSS_OPEN_OFF = "off"

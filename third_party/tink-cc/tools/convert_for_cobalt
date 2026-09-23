@@ -1,0 +1,856 @@
+#! /usr/bin/env python3
+
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+"""Automated build conversion script for tink-cc in Cobalt standalone.
+
+This script parses upstream BUILD.bazel files located inside the third_party/tink-cc/src/
+submodule using an in-memory build graph evaluation engine (without needing the bazel binary).
+It traverses dependencies starting from Cobalt's required root targets, converts them to GN format,
+and outputs modular, structured BUILD.gn files across subdirectories under third_party/tink-cc/.
+
+Usage:
+  python3 third_party/tink-cc/tools/convert_for_cobalt
+
+When uprevving tink-cc in the future, simply run this script from the Cobalt workspace root
+to regenerate and update all BUILD.gn files automatically.
+"""
+
+import os.path
+import sys
+import datetime
+import collections
+
+
+class GnVariables(collections.OrderedDict):
+
+  def __setitem__(self, key, value):
+    if isinstance(value, list):
+      value = SetGnListValue(value)
+    super().__setitem__(key, value)
+    super().move_to_end(key)
+
+
+class GnListValue(object):
+
+  def __init__(self, items):
+    assert (isinstance(items, list))
+    self._items = items
+
+  def __getitem__(self, idx):
+    return self._items[idx]
+
+  def __len__(self):
+    return len(self._items)
+
+  def __iter__(self):
+    yield from self._items
+
+
+class RemoveGnListValue(GnListValue):
+  pass
+
+
+class SetGnListValue(GnListValue):
+  pass
+
+
+def IsSubdir(parent, child):
+  if parent == child:
+    return False
+  return (os.path.commonpath([parent, child]) == parent)
+
+
+class BazelGlobals(object):
+  IGNORABLES = frozenset([
+      'load',
+      'package',
+      'licenses',
+      'exports_files',
+      'select',
+  ])
+
+  def __init__(self, build_graph, dirpath):
+    self._build_graph = build_graph
+    self._dirpath = dirpath
+    self._set_objects = {}
+
+  def __getitem__(self, key):
+    if key in self._set_objects:
+      return self._set_objects[key]
+
+    if key == '__builtins__':
+      raise KeyError(key)
+
+    if key in self.IGNORABLES:
+      return lambda *args, **kwargs: None
+
+    return self._build_graph.GetTargetAdder(self._dirpath, key)
+
+  def __setitem__(self, key, value):
+    self._set_objects[key] = value
+
+  def __contains__(self, key):
+    if key == '__builtins__':
+      raise KeyError(key)
+
+    return True
+
+  def __len__(self):
+    return 1
+
+
+class BuildGraph(object):
+
+  def __init__(self, root_path, ignored_targets):
+    self._targets = {}
+    if not os.path.isabs(root_path):
+      raise Exception('{} is not an absolute path.'.format(root_path))
+    self._root_path = root_path
+    self._ignored_targets = ignored_targets
+
+    # These are specs that will be remapped.
+    self._spec_map_old_to_new = {}
+
+  def AddTarget(self, target_cls, dirpath, name, deps=None, **kwargs):
+    if deps:
+      deps = [MakeTargetRef(dep, dirpath) for dep in deps]
+      deps = [dep for dep in deps if dep.spec() not in self._ignored_targets]
+      for i in range(len(deps)):
+        if deps[i].spec() not in self._spec_map_old_to_new:
+          continue
+        deps[i] = MakeTargetRef(self._spec_map_old_to_new[deps[i].spec()],
+                                dirpath)
+
+    target = target_cls(
+        dirpath=dirpath,
+        name=name,
+        sort_id=len(self._targets),
+        deps=deps,
+        **kwargs)
+    assert (isinstance(target, Target))
+    self._targets[target.spec()] = target
+
+  def GetTargetAdder(self, absdirpath, target_type):
+    if not IsSubdir(self._root_path, absdirpath):
+      Exception(
+          'GetTargetAdder expected a path under {} which {} is not.'.format(
+              self._root_path, absdirpath))
+    dirpath = os.path.relpath(absdirpath, self._root_path)
+    if target_type == 'proto_library':
+      return self.GetProtoLibraryAdder(dirpath)
+    elif target_type == 'cc_library':
+      return self.GetCcLibraryAdder(dirpath)
+    elif target_type == 'cc_proto_library':
+      return self.GetCcProtoLibraryAdder(dirpath)
+    return self.GetUnknownTargetAdder(dirpath, target_type)
+
+  def GetUnknownTargetAdder(self, dirpath, target_type):
+
+    def Add(*args, **kwargs):
+      if 'name' not in kwargs or args:
+        raise Exception(
+            '"{}" is not a target type. Please add to IGNORABLES.'.format(
+                target_type))
+      name = kwargs['name']
+      deps = kwargs.get('deps', [])
+      self.AddTarget(
+          UnknownTarget, dirpath, name, deps=deps, target_type=target_type)
+
+    return Add
+
+  def GetCcProtoLibraryAdder(self, dirpath):
+
+    def Add(name, deps=None, **kwargs):
+      self.AddTarget(CcProtoLibTarget, dirpath, name, deps=deps)
+
+    return Add
+
+  def GetProtoLibraryAdder(self, dirpath):
+
+    def Add(name, srcs, deps=None, **kwargs):
+      self.AddTarget(ProtoLibTarget, dirpath, name, srcs=srcs, deps=deps)
+
+    return Add
+
+  def GetCcLibraryAdder(self, dirpath):
+
+    def Add(name, srcs=None, hdrs=None, deps=None, **kwargs):
+      self.AddTarget(
+          CcLibTarget, dirpath, name, hdrs=hdrs, srcs=srcs, deps=deps)
+
+    return Add
+
+  def AddToGraph(self, dirpath):
+    filepath = os.path.join(dirpath, 'BUILD.bazel')
+    fp = open(filepath, 'r')
+    content = fp.read()
+    gs = BazelGlobals(self, dirpath)
+    exec(content, {}, gs)
+
+  def GetTarget(self, target_spec):
+    target_spec = self._spec_map_old_to_new.get(target_spec, target_spec)
+    if target_spec in self._ignored_targets:
+      raise Exception('{} is being ignored'.format(target_spec))
+    ref = MakeTargetRef(target_spec, '')
+    if not ref.InTree():
+      raise Exception('{} is not in the tree.'.format(target_spec))
+    if target_spec not in self._targets:
+      dirpath, _ = ParseTargetSpec(target_spec)
+      absdirpath = os.path.join(self._root_path, dirpath)
+      self.AddToGraph(absdirpath)
+      if target_spec not in self._targets:
+        print(self._targets.keys())
+        raise Exception('{} could not be found in {}'.format(
+            target_spec, absdirpath))
+
+    return self._targets[target_spec]
+
+
+##############################################################
+# The Targets themselves.
+##############################################################
+class Target(object):
+
+  def __init__(self, dirpath, name, sort_id, deps):
+    assert (isinstance(sort_id, int))
+    self._sort_id = sort_id
+    assert (isinstance(name, str))
+    self._name = name
+    assert (isinstance(dirpath, str))
+    self._dirpath = dirpath
+    self._deps = deps or []
+    assert (all(isinstance(dep, TargetRef) for dep in self._deps))
+
+  def __repr__(self):
+    raise NotImplementedError
+
+  def name(self):
+    return self._name
+
+  def spec(self):
+    # When target is added to graph, the relative dirpath is computed by
+    # os.path.relpath(absdirpath, root_path). The function returns '.' as
+    # dirpath for the targets lives in root dir.
+    #
+    # Skip dirpath '.' to avoid returning spec like '//.:target'.
+    dirpath = self._dirpath if self._dirpath != '.' else ''
+    return '//{}:{}'.format(dirpath, self._name)
+
+  def deps(self):
+    return self._deps
+
+  def dirpath(self):
+    return self._dirpath
+
+  def sort_id(self):
+    return self._sort_id
+
+  def target_type(self):
+    raise NotImplementedError
+
+  def IsUnknown(self):
+    return False
+
+  def IsProto(self):
+    return False
+
+  def RemapDep(self, old, new):
+    for i in range(len(self._deps)):
+      if self._deps[i].spec() == old:
+        self._deps[i] = MakeTargetRef(new, self._dirpath)
+
+
+class UnknownTarget(Target):
+
+  def __init__(self, dirpath, name, sort_id, target_type, deps):
+    super().__init__(dirpath, name, sort_id, deps=deps)
+    assert (isinstance(target_type, str))
+    self._target_type = target_type
+
+  def __repr__(self):
+    return 'UnknownTarget<{}: {}>'.format(self._target_type, self.spec())
+
+  def IsUnknown(self):
+    return True
+
+
+class LibTarget(Target):
+
+  def __init__(self, dirpath, name, sort_id, deps, srcs=None):
+    super().__init__(dirpath, name, sort_id, deps)
+    self.srcs = srcs or []
+
+  def __repr__(self):
+    return 'LibTarget<{}>'.format(self.spec())
+
+
+class ProtoLibTarget(LibTarget):
+
+  def IsProto(self):
+    return True
+
+  def __repr__(self):
+    return 'ProtoLibTarget<{}>'.format(self.spec())
+
+  def target_type(self):
+    return 'Proto Library'
+
+
+class CcProtoLibTarget(Target):
+
+  def IsProto(self):
+    return True
+
+  def __repr__(self):
+    return 'CcProtoLibTarget<{}>'.format(self.spec())
+
+  def target_type(self):
+    return 'CC Proto Library'
+
+
+class CcLibTarget(LibTarget):
+
+  def __init__(self, dirpath, name, sort_id, deps, srcs=None, hdrs=None):
+    super().__init__(dirpath, name, sort_id, srcs=srcs, deps=deps)
+    self.hdrs = hdrs or []
+
+  def __repr__(self):
+    return 'CcLibTarget<{}>'.format(self.spec())
+
+  def target_type(self):
+    return 'CC Library'
+
+
+##############################################################
+# Target references. (Used mostly for dependencies)
+##############################################################
+def ParseTargetSpec(dep):
+  parts = dep.split(':')
+  dirpath = parts[0][2:]
+  if len(parts) == 1:
+    name = os.path.basename(dep)
+  elif len(parts) == 2:
+    name = parts[1]
+  else:
+    raise Exception('I do not know how to deal with this dep: "{}"'.format(dep))
+
+  return dirpath, name
+
+
+def MakeTargetRef(dep, dirpath):
+  if dep[0] == ':':
+    return InTreeTargetRef(dirpath, dep[1:])
+  if dep[:2] == '//':
+    dirpath, name = ParseTargetSpec(dep)
+    return InTreeTargetRef(dirpath, name)
+
+  tink_base_prefix = '@tink_base'
+  if dep.startswith(tink_base_prefix):
+    dep = dep[len(tink_base_prefix):]
+    dirpath, name = ParseTargetSpec(dep)
+    return TinkBaseTargetRef(dirpath, name)
+
+  absl_prefix = '@abseil-cpp'
+  if dep.startswith(absl_prefix):
+    dep = dep[len(absl_prefix):]
+    dirpath, name = ParseTargetSpec(dep)
+    return AbslTargetRef(dirpath, name)
+
+  if dep == '@protobuf':
+    return ProtobufLiteTargetRef()
+
+  if dep == '@rapidjson':
+    return RapidJsonTargetRef()
+
+  googletest_prefix = '@googletest'
+  if dep.startswith(googletest_prefix):
+    dep = dep[len(googletest_prefix):]
+    dirpath, name = ParseTargetSpec(dep)
+    return GoogleTestTargetRef(dirpath, name)
+
+  boringssl_prefix = '@boringssl'
+  if dep.startswith(boringssl_prefix):
+    dep = dep[len(boringssl_prefix):]
+    dirpath, name = ParseTargetSpec(dep)
+    return BoringSslTargetRef(dirpath, name)
+
+  return UnknownTargetRef(dirpath, dep)
+
+
+class TargetRef(object):
+
+  def InTree(self):
+    return False
+
+  def IsUnknown(self):
+    return False
+
+
+class UnknownTargetRef(TargetRef):
+  def __init__(self, dirpath, dep):
+    self._dirpath = dirpath
+    self._dep = dep
+
+  def IsUnknown(self):
+    return True
+
+  def spec(self):
+    return '<{} in {}'.format(self._dep, self._dirpath)
+
+
+class PathTargetRef(TargetRef):
+
+  def __init__(self, dirpath, name):
+    self._dirpath = dirpath
+    self._name = name
+
+  def name(self):
+    return self._name
+
+  def spec(self):
+    # When target is added to graph, the relative dirpath is computed by
+    # os.path.relpath(absdirpath, root_path). The function returns '.' as
+    # dirpath for the targets lives in root dir. The relative dirpath is
+    # also used to make TargetRefs for the target's dependencies.
+    #
+    # Skip dirpath '.' to avoid returning spec like '//.:target'.
+    dirpath = self._dirpath if self._dirpath != '.' else ''
+    return '//{}:{}'.format(dirpath, self._name)
+
+  def dirpath(self):
+    return self._dirpath
+
+  def __repr__(self):
+    return '{}<{}>'.format(type(self).__name__, self.spec())
+
+
+class TinkBaseTargetRef(PathTargetRef):
+
+  def GetGnDep(self):
+    spec = self.spec()
+    prefix = '//'
+    if not spec.startswith(prefix):
+      raise Exception(
+          'I do not know how to deal with Tink base dependency {}'.format(spec))
+    return '//third_party/tink/' + spec[len(prefix):]
+
+
+class InTreeTargetRef(PathTargetRef):
+
+  def InTree(self):
+    return True
+
+
+class AbslTargetRef(PathTargetRef):
+
+  def GetGnDep(self):
+    spec = self.spec()
+    prefix = '//'
+    if not spec.startswith(prefix):
+      raise Exception(
+          'I do not know how to deal with Absl dependency {}'.format(spec))
+    return '//third_party/abseil-cpp/' + spec[len(prefix):]
+
+
+class GoogleTestTargetRef(PathTargetRef):
+  pass
+
+
+class ProtobufLiteTargetRef(TargetRef):
+
+  def GetGnDep(self):
+    return '//third_party/protobuf:protobuf_lite'
+
+  def spec(self):
+    return '@protobuf_lite'
+
+
+class RapidJsonTargetRef(TargetRef):
+
+  def spec(self):
+    return '@rapidjson'
+
+
+class BoringSslTargetRef(PathTargetRef):
+
+  def GetGnDep(self):
+    if self._dirpath:
+      raise Exception(
+          'BoringSSL dep {} has dirpath {}. I do not know how to deal with that.'
+          .format(self.spec(), self._dirpath))
+    return '//third_party/boringssl:' + self._name
+
+
+##############################################################
+# TargetFetcher grabs all the targets we need.
+##############################################################
+class TargetFetcher(object):
+
+  def __init__(self, build_graph, initial_targets, error_on_unknown):
+    # _to_fetch is a list of target specs.
+    self._to_fetch = initial_targets
+    self._targets = []
+    self._fetched = set()
+    self._build_graph = build_graph
+    self._error_on_unknown = error_on_unknown
+
+  def FetchAll(self):
+    while self._to_fetch:
+      self.FetchNext()
+    return self._targets
+
+  def FetchNext(self):
+    spec = self._to_fetch.pop(0)
+    if spec in self._fetched:
+      return
+    target = self._build_graph.GetTarget(spec)
+    if target.IsUnknown() and self._error_on_unknown:
+      raise Exception('Found unknown target: {}'.format(target))
+    self._targets.append(target)
+
+    # We add both the actual spec and the spec we tried to fetch just in
+    # case there was a remapping.
+    self._fetched.add(target.spec())
+    self._fetched.add(spec)
+    for dep in target.deps():
+      if dep.IsUnknown():
+        raise Exception('Found unknown dep: {} for {}'.format(dep.spec(), target.spec()))
+      if not dep.InTree():
+        continue
+      if dep.spec() not in self._fetched:
+        self._to_fetch.append(dep.spec())
+
+##############################################################
+# BuildFile holds the information necessary to create a build file.
+##############################################################
+class BuildFile(object):
+
+  def __init__(self, dirpath, targets, subdirs):
+    self.dirpath = dirpath
+    # Directory mapping spec to target.
+    self.targets = targets
+    self.subdirs = sorted(subdirs)
+
+  def HasProto(self):
+    return any(t.IsProto() for t in self.targets.values())
+
+  def HasCcLib(self):
+    return any(isinstance(t, CcLibTarget) for t in self.targets.values())
+
+  def __contains__(self, target_or_spec):
+    spec = target_or_spec
+    if hasattr(target_or_spec, 'spec'):
+      spec = target_or_spec.spec()
+    if not isinstance(spec, str):
+      raise Exception(
+          '{} should be a spec string or have a spec method.'.format(
+              target_or_spec))
+
+    return spec in self.targets
+
+
+def CreateBuildFiles(targets):
+  build_file_targets = {}
+  for t in targets:
+    if t.dirpath() not in build_file_targets:
+      build_file_targets[t.dirpath()] = {}
+    build_file_targets[t.dirpath()][t.spec()] = t
+
+  dirpaths = [k for k in build_file_targets.keys()]
+  build_files = []
+
+  for dirpath, targets in build_file_targets.items():
+    subdirs = []
+    for d in dirpaths:
+      # If d is an immediate subdirectory of dirpath, add it to subdirs
+      if not IsSubdir(dirpath, d):
+        continue
+      rel = os.path.relpath(d, dirpath)
+      if os.path.basename(rel) == rel:
+        subdirs.append(rel)
+
+    build_files.append(BuildFile(dirpath, targets, subdirs))
+
+  return build_files
+
+
+class BuildFileWriter(object):
+
+  def __init__(self, rootdir, build_graph, max_line):
+    self._rootdir = rootdir
+    self._max_line = max_line
+    self._build_graph = build_graph
+
+  def GetTargetForInTreeDep(self, dep):
+    assert (isinstance(dep, InTreeTargetRef))
+    target = self._build_graph.GetTarget(dep.spec())
+
+    # We don't generate CcProtoLibTargets, so we try to dereference them to
+    # find the ProtoLibTarget that they refer to.
+    if isinstance(target, CcProtoLibTarget):
+      assert (len(target.deps()) == 1)
+      target = self._build_graph.GetTarget(target.deps()[0].spec())
+      assert (isinstance(target, ProtoLibTarget))
+
+    return target
+
+  def GetBuildFilePath(self, dirpath):
+    raise NotImplementedError
+
+  def WriteBuildFile(self, build_file):
+    self._indent = 0
+    self._filepath = self.GetBuildFilePath(build_file)
+    # Ensure package subdirectory exists on disk before opening file for writing.
+    # This automatically handles brand new directories introduced by future tink-cc uprevs.
+    os.makedirs(os.path.dirname(self._filepath), exist_ok=True)
+    self._fp = open(self._filepath, 'w+')
+    self._build_file = build_file
+    self._nl = False
+
+    print('Writing to {},'.format(self._filepath))
+    self.WriteHeader()
+    # We generate a stable sort order to stabilize the .gn files.
+    targets = sorted(
+        build_file.targets.values(), key=lambda target: target.sort_id())
+
+    for target in targets:
+      self.WriteTarget(target)
+
+    assert (self._indent == 0)
+
+  def WriteHeader(self):
+    year = datetime.datetime.today().year
+    self.emitlines([
+        '# Copyright {} The Fuchsia Authors. All rights reserved.'.format(year),
+        '# Use of this source code is governed by a BSD-style license that can be',
+        '# found in the LICENSE file.',
+        '#',
+        '# WARNING: This file is automatically generated.',
+        '# Do not edit manually.'
+    ])
+
+  def WriteTarget(self, target):
+    self.emitnl('# {} : {}'.format(target.target_type(), target.name()))
+
+  def emit(self, s):
+    if self._nl:
+      self._fp.write('  ' * self._indent)
+      self._nl = False
+    if not isinstance(s, str):
+      raise Exception('emit expected a string, not {}'.format(s))
+    self._fp.write(s)
+
+  def emitnl(self, s):
+    self.emit(s)
+    self.nl()
+
+  def emitlines(self, lines):
+    for line in lines:
+      self.emitnl(line)
+
+  def nl(self):
+    self._fp.write('\n')
+    self._nl = True
+
+  def indent(self):
+    self._indent += 1
+
+  def deindent(self):
+    self._indent -= 1
+
+
+class GnWriter(BuildFileWriter):
+
+  def __init__(self, rootdir, deps_prefix, build_graph, max_line):
+    super().__init__(
+        rootdir=rootdir, build_graph=build_graph, max_line=max_line)
+    assert (deps_prefix.startswith('//'))
+    assert (not deps_prefix.endswith('/'))
+    self._deps_prefix = deps_prefix
+
+  def GetBuildFilePath(self, build_file):
+    return os.path.join(self._rootdir, build_file.dirpath, 'BUILD.gn')
+
+  def WriteHeader(self):
+    super().WriteHeader()
+    if self._build_file.HasProto():
+      self.nl()
+      self.emitnl('import("//third_party/protobuf/proto_library.gni")')
+    self.nl()
+
+  def WriteTarget(self, target):
+    # Skip cc_proto_lib targets.
+    if isinstance(target, CcProtoLibTarget):
+      return
+    super().WriteTarget(target)
+
+    if isinstance(target, CcLibTarget):
+      self.WriteCcLibTarget(target)
+    elif isinstance(target, ProtoLibTarget):
+      self.WriteProtoLibTarget(target)
+    else:
+      raise NotImplementedError('I do not know how to write {}'.format(
+          str(target)))
+
+    self.nl()
+
+  def GnDep(self, dep):
+    if not dep.InTree():
+      return dep.GetGnDep()
+
+    target = self.GetTargetForInTreeDep(dep)
+
+    if target in self._build_file:
+      return ':{}'.format(target.name())
+    if target.spec().startswith('//:'):
+      return '{}:{}'.format(self._deps_prefix, target.spec()[3:])
+    return '{}/{}'.format(self._deps_prefix, target.spec()[2:])
+
+  def FormatValue(self, value):
+    if isinstance(value, str):
+      return '"{}"'.format(value)
+
+    if isinstance(value, TargetRef):
+      return '"{}"'.format(self.GnDep(value))
+
+    raise Exception('I do not know how to write the {} value'.format(
+        repr(value)))
+
+  def WriteGnVariable(self, name, value):
+    if isinstance(value, SetGnListValue):
+      self.WriteGnSetListVariable(name, value)
+      return
+    if isinstance(value, RemoveGnListValue):
+      self.WriteGnRemoveListVariable(name, value)
+      return
+    self.emitnl('{} = {}'.format(name, self.FormatValue(value)))
+
+  def WriteGnListVariable(self, name, value, op):
+    if len(value) == 0:
+      return
+
+    if len(value) == 1:
+      single_line = '{} {} [ {} ]'.format(name, op, self.FormatValue(value[0]))
+      if len(single_line) <= self._max_line:
+        self.emitnl(single_line)
+        return
+
+    self.emitnl('{} {} ['.format(name, op))
+    self.indent()
+
+    for item in value:
+      self.emitnl('{},'.format(self.FormatValue(item)))
+
+    self.deindent()
+    self.emitnl(']')
+
+  def WriteGnSetListVariable(self, name, value):
+    self.WriteGnListVariable(name, value, "=")
+
+  def WriteGnRemoveListVariable(self, name, value):
+    # Add and then remove the variable in case the var wasn't already added
+    self.WriteGnListVariable(name, value, "+=")
+    self.WriteGnListVariable(name, value, "-=")
+
+  def WriteGnTarget(self, target_type, name, variables):
+    self.emitnl('{}("{}") {{'.format(target_type, name))
+    self.indent()
+    for var, value in variables.items():
+      self.WriteGnVariable(var, value)
+    self.deindent()
+    self.emitnl('}')
+    pass
+
+  def WriteProtoLibTarget(self, target):
+    # Convert Bazel proto_library to GN proto_library.
+    # Source paths are prefixed with "//third_party/tink-cc/src/" because BUILD.gn files sit
+    # in third_party/tink-cc/... while actual proto definitions live in the src/ submodule.
+    variables = GnVariables()
+    variables['cc_generator_options'] = 'lite'
+    variables['proto_in_dir'] = '//third_party/tink-cc/src'
+    variables['extra_configs'] = ['//third_party/tink-cc:tink_config']
+    variables['sources'] = sorted(["//third_party/tink-cc/src/" + (target.dirpath() + "/" if target.dirpath() else "") + s for s in target.srcs])
+    variables['deps'] = target.deps()
+
+    self.WriteGnTarget('proto_library', target.name(), variables)
+
+  def WriteCcLibTarget(self, target):
+    # Convert Bazel cc_library to GN source_set.
+    # Prepend submodule path prefix so GN resolves headers and sources cleanly against src/.
+    variables = GnVariables()
+    variables['configs'] = RemoveGnListValue(['//build/config:no_rtti'])
+    variables['sources'] = sorted(["//third_party/tink-cc/src/" + (target.dirpath() + "/" if target.dirpath() else "") + s for s in target.srcs + target.hdrs])
+    variables['public_deps'] = target.deps()
+    variables['public_configs'] = ['//third_party/tink-cc:tink_config']
+
+    self.WriteGnTarget('source_set', target.name(), variables)
+
+def FetchTargets(targets, root_path, ignored_targets):
+  graph = BuildGraph(root_path, ignored_targets)
+  fetcher = TargetFetcher(graph, targets, error_on_unknown=True)
+  targets = fetcher.FetchAll()
+  print('Found {} targets.'.format(len(targets)))
+  return targets, graph
+
+def WriteTargetsToGn(targets, graph, root_path, deps_prefix):
+  build_files = CreateBuildFiles(targets)
+  gn_writer = GnWriter(
+      rootdir=root_path,
+      build_graph=graph,
+      max_line=80,
+      deps_prefix=deps_prefix)
+  for f in build_files:
+    gn_writer.WriteBuildFile(f)
+
+
+
+def main(args):
+  script_path = os.path.abspath(args[0])
+  tools_path = os.path.dirname(script_path)
+  # tink_path is //third_party/tink-cc (where BUILD.gn files are generated).
+  tink_path = os.path.dirname(tools_path)
+  # src_path is //third_party/tink-cc/src (the upstream git submodule where BUILD.bazel files live).
+  src_path = os.path.join(tink_path, "src")
+
+  # Clean existing generated BUILD.gn files to prevent orphaned files when target locations move.
+  for root, dirs, files in os.walk(tink_path):
+    if "src" in dirs and root == tink_path:
+      dirs.remove("src")
+    if "tools" in dirs and root == tink_path:
+      dirs.remove("tools")
+    for f in files:
+      if f == "BUILD.gn":
+        # Do not delete the root BUILD.gn file as it contains manually written Cobalt-specific configs.
+        if root == tink_path:
+          continue
+        os.remove(os.path.join(root, f))
+
+  ignored_targets = frozenset([])
+
+  targets = [
+      "//tink/hybrid:config_v0",
+      "//tink/hybrid:hybrid_config",
+      "//tink/hybrid:hpke_config",
+      "//tink/hybrid:hybrid_decrypt_factory",
+      "//tink/hybrid:hybrid_encrypt_factory",
+      "//tink/hybrid:hybrid_key_templates",
+      "//tink:binary_keyset_reader",
+      "//tink:binary_keyset_writer",
+      "//tink:cleartext_keyset_handle",
+      "//tink:hybrid_decrypt",
+      "//tink:hybrid_encrypt",
+      "//tink:keyset_handle",
+      "//tink/util:status",
+      "//tink/util:statusor",
+      "//proto:tink_proto",
+      "//tink/signature:signature_config",
+      "//tink/signature:signature_key_templates",
+  ]
+  targets, graph = FetchTargets(targets, src_path, ignored_targets)
+  WriteTargetsToGn(targets, graph, tink_path, "//third_party/tink-cc")
+
+if __name__ == "__main__":
+  sys.exit(main(sys.argv))

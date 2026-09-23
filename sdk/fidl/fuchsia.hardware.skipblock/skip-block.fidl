@@ -1,0 +1,149 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.hardware.skipblock;
+
+using zx;
+
+// Matches the value of ZBI_PARTITION_GUID_LEN.
+const GUID_LEN uint32 = 16;
+
+type PartitionInfo = struct {
+    /// Partition type GUID.
+    partition_guid array<uint8, GUID_LEN>;
+    /// Describes the read/write size.
+    block_size_bytes uint64;
+    /// Describes size of partition in terms of blocks.
+    partition_block_count uint32;
+};
+
+type ReadWriteOperation = resource struct {
+    /// Memory object describing buffer to read into or write from.
+    vmo zx.Handle:VMO;
+    /// VMO offset in bytes.
+    vmo_offset uint64;
+    /// Block # to begin operation from.
+    block uint32;
+    /// Number of blocks to read or write.
+    block_count uint32;
+};
+
+type WriteBytesMode = strict enum {
+    /// In this mode, WriteBytes() performs the following steps:
+    /// 1. Reads data from the minimum block range that covers the specified write range into a
+    /// buffer. (i.e. if 1 block contains 4 pages, then the minimum block range that covers page
+    /// range [3, 6] is block range [0, 1])
+    /// 2. Updates the buffer with input write data,
+    /// 3. Erase the storage in the minimum block range.
+    /// 4. Write the updated buffer into the minimum block range.
+    ///
+    /// This mode only changes data in the specified write range on the storage, data out of the
+    // range remains unchanged.
+    READ_MODIFY_ERASE_WRITE = 1;
+    /// In this mode, WriteBytes() performs the following steps:
+    /// 1. Erase the minimum block range that covers the specified write range.
+    /// 2. Write new input data on the specified write range.
+    ///
+    /// This mode changes data in the minmum block range w.r.t the specified write range on the
+    /// storage. Storage out of the specified write range will be in an erased state and available
+    /// for write in the future.
+    ERASE_WRITE = 2;
+};
+
+type WriteBytesOperation = resource struct {
+    /// Memory object describing buffer to write from.
+    vmo zx.Handle:VMO;
+    /// VMO offset in bytes.
+    vmo_offset uint64;
+    /// Device offset in bytes to begin operation from.
+    /// Must be flash page aligned.
+    offset uint64;
+    /// Number of bytes to write.
+    /// Must be flash page aligned.
+    size uint64;
+    /// The write mode. This option does not affect WriteBytesWithoutErase().
+    mode WriteBytesMode;
+};
+
+/// SkipBlock is a layer on top of a raw NAND device that skips bad blocks, but provides no
+/// higher-level processing like wear leveling.
+///
+/// Skip-block partitions are used when data needs to be accessible by the bootloader. The
+/// bootloader doesn't understand the more advanced FTL partitions and this data isn't written
+/// frequently enough for performance or wear-leveling to be an issue.
+closed protocol SkipBlock {
+    /// Returns information about the skip-block partition.
+    ///
+    /// The block count can shrink in the event that a bad block is grown. It is
+    /// recommended to call this again after a bad block is grown.
+    strict GetPartitionInfo() -> (struct {
+        status zx.Status;
+        partition_info PartitionInfo;
+    });
+
+    /// Reads the specified blocks into the provided vmo.
+    strict Read(resource struct {
+        op ReadWriteOperation;
+    }) -> (struct {
+        status zx.Status;
+    });
+
+    /// Erases and writes the specified blocks from the provided vmo.
+    ///
+    /// In the event that bad block is grown, the partition will shrink and
+    /// `bad_block_grown` will be set to true. Since this causes the logical to
+    /// physical block map to change, all previously written blocks at logical
+    /// addresses after the section being written should be considered corrupted,
+    /// and rewritten if applicable.
+    strict Write(resource struct {
+        op ReadWriteOperation;
+    }) -> (struct {
+        status zx.Status;
+        bad_block_grown bool;
+    });
+
+    /// Erases and writes the specified bytes from the provided vmo. If offset
+    /// and size in `op` are not aligned to `block_size_bytes` then the driver will
+    /// first read the partitially written blocks and combine them with the
+    /// provided vmo.
+    ///
+    /// In the event that bad block is grown, the partition will shrink and
+    /// `bad_block_grown` will be set to true. Since this causes the logical to
+    /// physical block map to change, all previously written blocks at logical
+    /// addresses after the section being written should be considered corrupted,
+    /// and rewritten if applicable.
+    strict WriteBytes(resource struct {
+        op WriteBytesOperation;
+    }) -> (struct {
+        status zx.Status;
+        bad_block_grown bool;
+    });
+
+    /// Similar to WriteBytes except that it does not erase before writing
+    /// to a block, and it will simply abort when any error, including bad block
+    /// grown, occurs. The service is intended to be used for fine-tune optimization to reduce
+    /// NAND PE cycles.
+    ///
+    /// It should be noted that the caller must follow the requirements of the NAND chip.
+    /// Not all chips support write-without-erase, and those that do usually require writing
+    /// only to empty pages and in order (i.e. from the LSB page to MSB page within a block)
+    /// Failure to follow these requirements is undefined behavior, and may result in unexpected
+    /// changes to the NAND even outside the given write range and crc errors that leave the
+    /// storage in an unreadable state.
+    ///
+    /// The safe way of using this method is to first back up the data in the minimal
+    /// block range that covers the write range. If the method returns failure, fall back and
+    /// re-write the backed-up data (can be updated with the new data) to the minimal block
+    /// range using either WriteBytes or Write method.
+    strict WriteBytesWithoutErase(resource struct {
+        op WriteBytesOperation;
+    }) -> (struct {
+        status zx.Status;
+    });
+};
+
+// Added to allow service connection to replace devfs
+service Service {
+    skipblock client_end:SkipBlock;
+};

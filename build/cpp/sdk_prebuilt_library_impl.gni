@@ -1,0 +1,770 @@
+# Copyright 2018 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/fuchsia/target_api_level.gni")
+import("//build/cpp/verify_pragma_once.gni")
+import("//build/cpp/verify_public_headers.gni")
+import("//build/cpp/verify_public_symbols.gni")
+import("//build/cpp/verify_runtime_deps.gni")
+import("//build/sdk/plasa/config.gni")
+import("//build/sdk/plasa/plasa_fragment_cc.gni")
+import("//build/sdk/sdk_atom.gni")
+import("//build/sdk/sdk_atom_alias.gni")
+
+# LINT.IfChange(sdk_prebuilt_library_impl)
+# A library that can be exported to an SDK in binary form.
+#
+# Parameters
+#
+#   prebuilt_library_type (required)
+#     The type of library - "static" or "shared".
+#
+#   category (required)
+#     Publication level of the library in SDKs.
+#     See //build/sdk/sdk_atom.gni.
+#
+#   sdk_area (optional)
+#     [string] The API area responsible for maintaining this library.
+#     See //build/sdk/sdk_atom.gni.
+#
+#   api (optional)
+#     Override path for the file representing the API of this library.
+#     This file is used to ensure modifications to the library's API are
+#     explicitly acknowledged.
+#     If not specified, the path will be "<sdk_name>.api".
+#     Not allowed when `no_headers` is true or `category` is "internal".
+#
+#   no_headers (optional)
+#     Specifies that the library's headers are NOT included in the SDK.
+#     When true, the API modification acknowledgement mechanism is disabled.
+#     (Only the IFS file mechanism will be used.)
+#     When true, `public` must be an empty list and `public_configs` and
+#     `public_deps` must be empty or not specified.
+#     Defaults to false.
+#     May only be specified when `prebuilt_library_type` is "shared".
+#
+#   libcxx_linkage (optional)
+#     Whether or how to link libc++. SDK shared libraries cannot link libc++.so
+#     dynamically because libc++.so does not have a stable ABI. Can be either
+#     "none" or "static".
+#     Defaults to "none".
+#
+#   output_name (optional)
+#     Name of the library to generate. Defaults to $target_name.
+#     Will be appended to "lib" to generate the library file name.
+#     Must not begin with "lib".
+#
+#   sdk_name (required)
+#     Name of the library in the SDK.
+#
+#   include_base (optional)
+#     Path to the root directory for includes.
+#     Defaults to "include".
+#
+#   runtime_deps (optional)
+#     List of labels representing the library's runtime dependencies. This is
+#     only needed for runtime dependencies inherited from private dependencies
+#     (`deps` or indirect dependencies not through an IDK atom's `public_deps`).
+#     See the technical note below. These labels must have associated IDK
+#     targets (end in "_sdk"). Only IDK shared objects should be specified.
+#     When specified, `deps` must be defined and non-empty.
+#
+#   sdk_headers_for_internal_use (optional)
+#     Out of the headers specified in `public` or `sources`, some headers are
+#     part of the SDK but not meant for direct inclusion by users, i.e. they are
+#     only transitively included by other public headers. They usually contain
+#     implementation details. Re-specify those headers here.
+#
+#     When enumerating the platform surface area (PlaSA), these headers will
+#     be excluded. See /build/sdk/plasa/plasa_fragment_cc.gni.
+#
+#     See https://fxbug.dev/42068255 for more details about this field.
+#
+# ==============================================================================
+#
+# TECHNICAL NOTE ON 'runtime_deps':
+#
+# The `runtime_deps` parameter is used to list the sdk_shared_library()
+# targets that this target depends on at runtime but that cannot be computed
+# directly by GN. Doing so ensures that the dependencies are included in the IDK
+# collection and that they are is listed in the IDK metadata for the target so
+# that IDK consumers will know to package them when using the target.
+#
+# To better understand why this is necessary, consider the following example:
+#
+#     sdk_shared_library("foo") {
+#       ...
+#       deps = [ ":bar" ]
+#     }
+#
+#     sdk_shared_library("bar") {
+#       ...
+#     }
+#
+# These definitions end up creating at least four GN targets:
+#
+#  - a 'foo' and 'bar' target, which are real shared_library() targets
+#    used to build libfoo.so and libbar.so respectively.
+#
+#    and due to the 'deps' value, 'foo' will depend on 'bar'.
+#
+#  - a 'foo_sdk' and a 'bar_sdk' targets that generate an sdk_atom() wrapping
+#    each library, i.e. the target responsible for creating a meta.json file
+#    for each library, and used to generate exported SDKs.
+#
+#    'foo_sdk' depends on 'foo', and 'bar_sdk' depends on 'bar', as in:
+#
+#
+#     foo <--- foo_sdk
+#      |
+#      v
+#     bar <--- bar_sdk
+#
+# However, without "runtime_deps", 'foo_sdk' will _not_ depend on 'bar_sdk',
+# which means that if an sdk_collection() target depends on 'foo_sdk', the
+# atom for the 'bar_sdk' target will be ignored. The result is a "broken"
+# exported dir that will not include a prebuilt for libbar.so, even though
+# it is needed at runtime by libfoo.so.
+#
+# To fix this, set 'runtime_deps' to point to bar,
+# as in:
+#
+#    sdk_shared_library("foo") {
+#      ...
+#      deps = [ ":bar" ]
+#      runtime_deps = [ ":bar" ]
+#    }
+#
+#    sdk_shared_library("bar") {
+#      ...
+#    }
+#
+# Which results in the following (correct) dependency graph:
+#
+#     foo <--- foo_sdk
+#      |          |
+#      |          |--- this dependency added through runtime_deps!
+#      v          v
+#     bar <--- bar_sdk
+#
+#
+# There are also indirect scenarios, such as the following example:
+#
+#     sdk_shared_library("foo") {
+#       ...
+#       deps = [ ":baz" ]
+#     }
+#
+#     static_library("baz") {
+#       ...
+#       deps = [ ":bar" ]
+#     }
+#
+#     sdk_shared_library("bar") {
+#       ...
+#     }
+#
+# This creates the following dependencies:
+#
+#     foo <--- foo_sdk
+#      |
+#      v
+#     baz
+#      |
+#      v
+#     bar <--- bar_sdk
+#
+# In this case, 'foo' has no direct knowledge of 'bar' but still has a runtime
+# dependency on it.
+#
+# To fix this, set 'runtime_deps' to point to the SDK atom target for bar as
+# before, as in:
+#
+#    sdk_shared_library("foo") {
+#      ...
+#      deps = [ ":baz" ]
+#      runtime_deps = [ ":bar" ]
+#    }
+#
+#
+# The runtime dependencies for the atom defined by this template are collected
+# by the `generate_runtime_deps()` subtarget. During IDK generation,
+# `//build/cpp/verify_runtime_deps.py` verifies that all runtime dependencies
+# are covered by the atom's dependencies, which are the union of `public_deps`
+#  and `runtime_deps` in this template.
+#
+template("sdk_prebuilt_library_impl") {
+  assert(defined(invoker.prebuilt_library_type),
+         "The library type must be specified.")
+  prebuilt_library_type = invoker.prebuilt_library_type
+
+  assert(!defined(invoker.stable),
+         "Libraries are always stable (except internal).")
+  assert(defined(invoker.category), "Must define an SDK category")
+
+  if (defined(invoker.runtime_deps)) {
+    assert(
+        defined(invoker.deps) && invoker.deps != [],
+        "Runtime dependencies are only applicable if there are private dependencies.")
+
+    # Ensure `runtime_deps` entries do not end in "_sdk".
+    _new_runtime_deps = []
+    foreach(dep, invoker.runtime_deps) {
+      # Handle targets in third-party repos that still specify the "_sdk"
+      # target.
+      if (dep == "//sdk/lib/fdio:fdio_sdk") {
+        dep = "//sdk/lib/fdio:fdio"
+      } else if (dep == "//zircon/system/ulib/trace-engine:trace-engine_sdk") {
+        dep = "//zircon/system/ulib/trace-engine:trace-engine"
+      }
+
+      # Guard against specifying "_sdk" targets, which used to be required.
+      assert(string_replace("${dep}###", "_sdk###", "") == "${dep}###",
+             "Runtime dependency `${dep}` must not end in '_sdk'.")
+      _new_runtime_deps += [ dep ]
+    }
+    invoker.runtime_deps = []
+    invoker.runtime_deps = _new_runtime_deps
+  }
+
+  valid_categories = [
+    # "internal" is deprecated; only specific legacy cases below are allowed.
+    # "compat_test" is only for ABI compatibility and thus not applicable.
+    # "host_tool" is only for ABI compatibility and thus not applicable.
+    # "prebuilt" is only for ABI compatibility and thus not applicable.
+    "partner",
+  ]
+
+  # TODO(https://fxbug.dev/376105715): Remove "internal" support once devicetree is in "partner".
+  is_internal = invoker.category == "internal"
+  assert(
+      !is_internal ||
+          (prebuilt_library_type == "static" && target_name == "devicetree"),
+      "'internal' is only supported for one static library. Do not add more internal static libraries.")
+
+  assert(
+      valid_categories + [ invoker.category ] - [ invoker.category ] !=
+          valid_categories || is_internal,
+      "'${target_name}' has unsupported SDK category '${invoker.category}'. Must be one of ${valid_categories}.")
+
+  output_name = target_name
+  if (defined(invoker.output_name)) {
+    assert(prebuilt_library_type != "static",
+           "`output_name` is not supported for static libraries.")
+
+    assert(
+        invoker.output_name != output_name,
+        "The specified `output_name` (`${invoker.output_name}`) matches the default. `output_name` only needs to be specified when overriding the default.")
+    output_name = invoker.output_name
+  }
+
+  # `output_name` should not start with `lib` for consistency and simplicity.
+  # Prepend ### and use string_replace to mimic behavior of has_prefix, for lack
+  # of such a function in GN.
+  assert(
+      string_replace("###${output_name}", "###lib", "") == "###${output_name}")
+
+  assert(
+      defined(invoker.sdk_name),
+      "Libraries in the IDK must specify a name that is meaningful in that context.")
+  sdk_name = invoker.sdk_name
+
+  sdk_root_path = "pkg/${sdk_name}"
+  sdk_id = "sdk://${sdk_root_path}"
+
+  assert(!defined(invoker.no_headers) || prebuilt_library_type == "shared",
+         "`no_headers` is only supported for shared libraries.")
+  no_headers = defined(invoker.no_headers) && invoker.no_headers
+
+  # If a prebuilt library is only provided for packaging purposes (by not
+  # exposing headers) then it should not have any public headers, dependencies,
+  # or configs specifying `include_dirs` or `defines`. `public` must be
+  # specified as an empty list to prevent inclusion of headers specified in
+  # `sources`.
+  #
+  # In rare cases, `public_configs` may be needed to specify cflags required
+  # for compatibility. Vulkan-Loader is an exception for this reason.
+  assert(!no_headers ||
+         (defined(invoker.public) && invoker.public == [] &&
+          (!defined(invoker.public_deps) || invoker.public_deps == []) &&
+          (!defined(invoker.public_configs) || invoker.public_configs == [] ||
+           get_label_info(":${target_name}", "label_no_toolchain") ==
+           "//third_party/Vulkan-Loader/src:libvulkan")))
+
+  main_target_name = target_name
+  sdk_target_name = "${main_target_name}_sdk"
+
+  if (prebuilt_library_type == "static") {
+    # This is subtle: When `runtime_deps` is defined, `deps` may contain labels
+    # for `shared_library()` objects corresponding to atoms listed in
+    # `runtime_deps`.
+    #
+    # For example:
+    #   deps = [ "//some:shared_lib", "//some:static_lib" ]
+    #   runtime_deps = [ "//some:shared_lib_sdk" ]
+    #
+    # As described in `//build/config/BUILDCONFIG.gn`, in most cases, the label
+    # "//some:shared_lib" points either to a real `shared_library()` target or
+    # to a `group()` that redirects to it. However, in the default toolchain
+    # when variants are enabled, the label will redirect to a variant. Such
+    # redirects are disabled for shared objects in the IDK (see the use of
+    # `shlib_toolchain_no_default_variant_redirect` in defining
+    # `main_lib_target`for "shared" libraries) and thus must also be disabled
+    # here.
+    #
+    # To do this, we will rewrite `deps` such that any targets representing IDK
+    # shared objects refer directly to the target on
+    # `shlib_toolchain_no_default_variant_redirect` toolchain rather than going
+    # through the group. For example, by converting "//some:shared_lib" to
+    # "//some:shared_lib:shared_lib(//build/toolchain/fuchsia:arm64-shared)". We
+    # determine that a `deps` is an IDK shared object target if there is a
+    # corresponding entry in `runtime_deps`. This covers the case of a private
+    # dependency on an IDK shared object. Public dependencies (`public_deps`)
+    # are on the "_sdk" target, which is already correct - see the reference to
+    # the `main_lib_target` above.
+    if (current_toolchain == default_toolchain &&
+        defined(invoker.runtime_deps)) {
+      _new_deps = []
+      foreach(dep, invoker.deps) {
+        _dep_label = get_label_info(dep, "label_no_toolchain")
+        if (invoker.runtime_deps + [ _dep_label ] - [ _dep_label ] !=
+            invoker.runtime_deps) {
+          # The label for the private dep is also in runtime_deps.
+          # Ensure there is no variant redirect.
+          dep = _dep_label + "(${shlib_toolchain_no_default_variant_redirect})"
+        }
+        _new_deps += [ dep ]
+      }
+      invoker.deps = []
+      invoker.deps = _new_deps
+    }
+  }
+
+  if (prebuilt_library_type == "static") {
+    underlying_target_type = "static_library"
+    prebuild_format = "static"
+    allowlist = "//build/sdk:partner_idk_static_libraries_allowlist"
+  } else if (prebuilt_library_type == "shared") {
+    underlying_target_type = "shared_library"
+    prebuild_format = "shared"
+    allowlist = "//build/sdk:partner_idk_shared_libraries_allowlist"
+  } else {
+    assert("Unrecognized `prebuilt_library_type` '${prebuilt_library_type}'.")
+  }
+
+  target(underlying_target_type, main_target_name) {
+    forward_variables_from(invoker,
+                           "*",
+                           [
+                             "api",
+                             "category",
+                             "sdk_area",
+                             "include_base",
+                             "no_headers",
+                             "sdk_headers_for_internal_use",
+                             "runtime_deps",
+                             "sdk_name",
+                           ])
+
+    if (defined(visibility)) {
+      visibility += [ ":${sdk_target_name}" ]
+    }
+
+    if (!defined(libcxx_linkage)) {
+      libcxx_linkage = "none"
+    }
+    assert(libcxx_linkage == "none" || libcxx_linkage == "static")
+
+    # Prebuilt shared libraries are eligible for inclusion in the SDK. We do not
+    # want to dynamically link against libc++.so because we let clients bring
+    # their own toolchain, which might have a different C++ Standard Library or
+    # a different C++ ABI entirely.
+    if (!defined(configs)) {
+      configs = []
+    }
+    if (libcxx_linkage == "static") {
+      configs += [ "//build/config/fuchsia:static_cpp_standard_library" ]
+    } else {
+      # Adding this linker flag keeps us honest about not committing to a
+      # specific C++ ABI. If this flag is causing your library to not
+      # compile, consider whether your library really ought to be in the SDK.
+      # If so, consider including your library in the SDK as source rather than
+      # precompiled. If you do require precompilation, you probably need to
+      # find a way not to depend on dynamically linking C++ symbols because C++
+      # does not have a sufficiently stable ABI for the purposes of our SDK.
+      configs += [ "//build/config/fuchsia:no_cpp_standard_library" ]
+    }
+
+    if (prebuilt_library_type == "shared") {
+      assert(!defined(metadata))
+      metadata = {
+        if (is_fuchsia) {
+          # Used by //build/cpp/verify_runtime_deps.py.
+          sdk_runtime_deps = [
+            {
+              sdk_id = sdk_id
+              label = get_label_info(":${target_name}", "label_with_toolchain")
+            },
+          ]
+        }
+      }
+    }
+
+    # Ensure that targets using this template are included in the allowlist.
+    # The allowlist target's `visibility` list ensures that the target using
+    # this template is in the allowlist.
+    if (!is_internal) {
+      assert(
+          invoker.category == "partner",
+          "Create a separate allowlist when adding support for other categories.")
+      deps += [ allowlist ]
+    } else {
+      not_needed([ "allowlist" ])
+    }
+
+    if (defined(visibility) && generate_plasa_artifacts) {
+      visibility += [ ":${main_target_name}_cc_stub" ]
+    }
+  }
+
+  # Identify dependencies.
+  sdk_deps = []
+  all_deps = []
+  if (defined(invoker.deps)) {
+    all_deps += invoker.deps
+  }
+  if (defined(invoker.public_deps)) {
+    all_deps += invoker.public_deps
+
+    foreach(dep, invoker.public_deps) {
+      full_label = get_label_info(dep, "label_no_toolchain")
+      sdk_dep = "${full_label}_sdk"
+      sdk_deps += [ sdk_dep ]
+    }
+  }
+
+  if (defined(invoker.runtime_deps)) {
+    foreach(dep, invoker.runtime_deps) {
+      full_label = get_label_info(dep, "label_no_toolchain")
+      sdk_dep = "${full_label}_sdk"
+      sdk_deps += [ sdk_dep ]
+    }
+  }
+
+  # Process headers.
+  all_headers = []
+  if (!no_headers) {
+    if (defined(invoker.public)) {
+      all_headers += invoker.public
+    } else {
+      # If public headers are not defined, pick them from `sources`.
+      assert(defined(invoker.sources))
+      foreach(source_file, invoker.sources) {
+        extension = get_path_info(source_file, "extension")
+        if (extension == "h") {
+          all_headers += [ source_file ]
+        }
+      }
+    }
+  }
+  assert(
+      all_headers != [] || no_headers,
+      "Library does not contain any headers. If this is intentional, set `no_headers = true`")
+  if (defined(invoker.sdk_headers_for_internal_use)) {
+    assert(
+        invoker.sdk_headers_for_internal_use + all_headers - all_headers == [],
+        "Headers for internal use must also be in the list of public headers.")
+
+    # vfs_internal is a special case where the library is for internal use.
+    assert(
+        all_headers - invoker.sdk_headers_for_internal_use != [] ||
+            no_headers ||
+            get_label_info(":${target_name}", "label_no_toolchain") ==
+                "//sdk/lib/vfs/internal:vfs_internal",
+        "Library does not contain any headers for external use. If this is intentional, set `no_headers = true`")
+  }
+
+  if (defined(invoker.include_base)) {
+    include_base = invoker.include_base
+    assert(include_base != "include", "No need to specify the default value.")
+    assert(
+        include_base != "/" + string_replace(include_base, "/", "", 1),
+        "Absolute paths are not allowed. The include base must be within the current directory.")
+  } else if (!no_headers) {
+    include_base = "include"
+  }
+
+  include_dest = "${sdk_root_path}/include"
+
+  sdk_metadata_headers = []
+  sdk_header_files = []
+
+  foreach(header, all_headers) {
+    destination = rebase_path(header, include_base)
+    header_dest = "${include_dest}/${destination}"
+    sdk_metadata_headers += [ header_dest ]
+    sdk_header_files += [
+      {
+        source = header
+        dest = header_dest
+      },
+    ]
+  }
+
+  # Add binaries.
+  #
+  link_lib_dir = "${sdk_prebuilt_base_for_target_api_level}/lib"
+
+  # Determine the API file path we will use if needed as it may be used to
+  # determine another path below.
+  tentative_api_file = "${sdk_name}.api"
+  if (defined(invoker.api)) {
+    assert(
+        rebase_path(invoker.api, "//") != rebase_path(tentative_api_file, "//"),
+        "The specified `api` file (`${invoker.api}`) matches the default. `api` only needs to be specified when overriding the default.")
+    tentative_api_file = invoker.api
+  }
+
+  if (prebuilt_library_type == "static") {
+    # Use the binary from the shared library toolchain to allow the static
+    # libraries shipped in the IDK to be linked into shared libraries See
+    # https://fxbug.dev/404169865.
+    main_lib_target = ":${main_target_name}(${shlib_toolchain})"
+    main_lib_out_dir = get_label_info(main_lib_target, "target_out_dir")
+    lib_name = "lib${output_name}.a"
+
+    link_lib = "${link_lib_dir}/${lib_name}"
+    link_lib_source = "${main_lib_out_dir}/${lib_name}"
+  } else if (prebuilt_library_type == "shared") {
+    # Select shared library binary from the proper toolchain.
+    # See shlib_toolchain_no_default_variant_redirect documentation comment
+    # in //build/config/BUILDCONFIG.gn to understand why this is needed.
+    main_lib_target =
+        ":${main_target_name}(${shlib_toolchain_no_default_variant_redirect})"
+    main_lib_out_dir = get_label_info(main_lib_target, "root_out_dir")
+
+    lib_name = "lib${output_name}.so"
+
+    # For convenience, the IFS file name should match the name of the link stub.
+    ifs_file_name = "lib${output_name}.ifs"
+
+    link_lib = "${link_lib_dir}/${lib_name}"
+    link_lib_source = "${main_lib_out_dir}/link_stub/${lib_name}"
+    dist_lib = "${sdk_prebuilt_base_for_target_api_level}/dist/${lib_name}"
+    debug_lib = "${sdk_prebuilt_base_for_target_api_level}/debug/${lib_name}"
+
+    generated_ifs_file = "${main_lib_out_dir}/${ifs_file_name}"
+    packaged_ifs_file = "${link_lib_dir}/${ifs_file_name}"
+    _goldens_dir = "//sdk/history"
+    ifs_goldens_dir = "${_goldens_dir}/${current_build_target_api_level}"
+    ifs_golden_file = "${ifs_goldens_dir}/${ifs_file_name}"
+
+    # TODO(https://fxbug.dev/310006516): Remove this block when the `arch/`
+    # directory is removed from the IDK.
+    if (current_build_target_api_level == "PLATFORM") {
+      # TODO(https://fxbug.dev/489520075): Remove after rolling Vulkan-Loader
+      # to a revision with the new name.
+      if (target_name == "libvulkan") {
+        ifs_file_name = "${output_name}.ifs"
+      }
+
+      # Unlike other target API levels, the golden file is always in the same
+      # directory as the `.api` file is or would be.
+      ifs_golden_file =
+          get_path_info(tentative_api_file, "dir") + "/${ifs_file_name}"
+
+      packaged_ifs_file = "${sdk_root_path}/${ifs_file_name}"
+    }
+
+    ifs_file_for_idk = ifs_golden_file
+
+    # There are not golden files for "HEAD", but the IDK needs to provide IFS
+    # files for all API levels. Therefore, use the generated file.
+    # TODO(https://fxbug.dev/334936990): Generate a filtered IFS file as done
+    # in `verify_public_symbols()`.
+    if (current_build_target_api_level == "HEAD") {
+      ifs_file_for_idk = generated_ifs_file
+    }
+  }
+
+  sdk_files = sdk_header_files + [
+                {
+                  source = link_lib_source
+                  dest = link_lib
+                },
+              ]
+
+  if (prebuilt_library_type == "shared") {
+    sdk_files += [
+      {
+        source = "${main_lib_out_dir}/${lib_name}"
+        dest = dist_lib
+      },
+      {
+        source = "${main_lib_out_dir}/lib.unstripped/${lib_name}"
+        dest = debug_lib
+      },
+      {
+        # `generated_ifs_file` contains text, including undefined
+        # symbols, that should not be exposed. In addition, the Target
+        # and other such text can vary by architecture and would cause
+        # errors when assembling the IDK. `verify_public_symbols()`
+        # removes such text, so we must use its output for the IDK.
+        # `verify_public_symbols_target_name` verifies the golden file
+        # against a stripped version of `generated_ifs_file`, so we
+        # can use the golden file here. (Ideally, we would use the
+        # stripped file - see https://fxbug.dev/383416850.)
+        source = ifs_file_for_idk
+        dest = packaged_ifs_file
+      },
+    ]
+  }
+  if (generate_plasa_artifacts) {
+    _plasa_artifacts_target_name = "${main_target_name}_plasa"
+    plasa_fragment_cc(_plasa_artifacts_target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "sdk_headers_for_internal_use",
+                               "testonly",
+                             ])
+      file_base = sdk_root_path
+
+      # Other variables used from the local scope:
+      #   all_deps
+      #   all_headers
+      #   include_base
+      #   main_target_name
+    }
+  } else {
+    not_needed([ "all_deps" ])
+    not_needed(invoker, [ "sdk_headers_for_internal_use" ])
+  }
+
+  runtime_deps_target_name = "${target_name}_runtime_deps"
+  runtime_deps_file_name = "${target_gen_dir}/${target_name}.runtime_deps"
+  generate_runtime_deps(runtime_deps_target_name) {
+    atom_target = main_lib_target
+    runtime_deps_file = runtime_deps_file_name
+  }
+
+  # If changing this, also change
+  # //build/sdk/idk_prebuild_manifest.gni:cc_prebuilt_library.
+  _common_binaries = {
+    api_level = "$current_build_target_api_level"
+    arch = target_cpu
+    link_lib = link_lib
+  }
+  _prebuild_info = {
+    format = prebuild_format
+    runtime_deps_file = rebase_path(runtime_deps_file_name, root_build_dir)
+    include_dir = include_dest
+    file_base = sdk_root_path
+    headers = sdk_metadata_headers
+    if (prebuilt_library_type == "shared") {
+      binaries = {
+        forward_variables_from(_common_binaries, "*")
+
+        dist_lib = dist_lib
+        dist_path = "lib/${lib_name}"
+        debug_lib = debug_lib
+        ifs = packaged_ifs_file
+      }
+    } else {
+      binaries = _common_binaries
+    }
+  }
+
+  # Exempt internal libraries from pragma verification.
+  should_verify_pragma = !is_internal
+  if (should_verify_pragma) {
+    verify_pragma_target_name = "${main_target_name}_sdk_pragma"
+    verify_pragma_once(verify_pragma_target_name) {
+      headers = all_headers
+    }
+  }
+
+  verify_public_headers_target = "${main_target_name}.verify_public_headers"
+  verify_public_headers(verify_public_headers_target) {
+    forward_variables_from(invoker, [ "testonly" ])
+    target_label = main_lib_target
+    headers = all_headers
+  }
+
+  # IFS files only apply to shared libraries, and we do not maintain golden IFS
+  # files for "HEAD".
+  verify_public_symbols = prebuilt_library_type == "shared" &&
+                          current_build_target_api_level != "HEAD"
+  if (verify_public_symbols) {
+    verify_public_symbols_target_name =
+        "${main_target_name}_sdk_verify_public_symbols"
+    verify_public_symbols(verify_public_symbols_target_name) {
+      current = generated_ifs_file
+      reference = ifs_golden_file
+      library_name =
+          get_label_info(":${main_target_name}", "label_with_toolchain")
+
+      deps = [ main_lib_target ]
+    }
+  }
+
+  sdk_atom(sdk_target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "category",
+                             "sdk_area",
+                             "testonly",
+                           ])
+
+    id = sdk_id
+    idk_name = sdk_name
+
+    if (no_headers) {
+      assert(
+          !defined(invoker.api) && sdk_header_files == [],
+          "`no_headers` targets do not require/support modification acknowledgement.")
+      assert(!is_internal)  # Would not enter else if.
+      not_needed([ "tentative_api_file" ])
+    } else if (is_internal) {
+      assert(
+          !defined(invoker.api),
+          "\"internal\" targets do not require/support modification acknowledgement.")
+      not_needed([ "tentative_api_file" ])
+    } else {
+      api = tentative_api_file
+      api_contents = sdk_header_files
+    }
+
+    meta = {
+      source_prebuild_info = _prebuild_info
+      dest = "${sdk_root_path}/meta.json"
+      type = "cc_prebuilt_library"
+    }
+
+    files = sdk_files
+
+    deps = sdk_deps
+
+    non_sdk_deps = [
+      ":${runtime_deps_target_name}",
+      ":${verify_public_headers_target}",
+      main_lib_target,
+    ]
+    if (should_verify_pragma) {
+      non_sdk_deps += [ ":${verify_pragma_target_name}" ]
+    }
+    if (verify_public_symbols) {
+      non_sdk_deps += [ ":${verify_public_symbols_target_name}" ]
+    }
+    if (generate_plasa_artifacts) {
+      non_sdk_deps += [ ":${_plasa_artifacts_target_name}" ]
+    }
+
+    # Explicitly add non-public dependencies, in case some of the source files
+    # are generated.
+    if (defined(invoker.deps)) {
+      non_sdk_deps += invoker.deps
+    }
+  }
+}
+# LINT.ThenChange(//build/bazel/rules/idk/private/idk_cc_prebuilt_library.bzl:idk_cc_prebuilt_library)

@@ -1,0 +1,178 @@
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+/// This library defines a protocol for test clients to communicate with the metrics recorder,
+/// specifying:
+/// - Metrics type: e.g., temperature, CPU, GPU, network, power.
+/// - Test duration.
+/// - Sampling rate.
+/// - Record processed statistics: minimum, maximum, and average values.
+/// - Statistic processing interval (if applicable).
+@available(added=17)
+library fuchsia.power.metrics;
+
+// Type aliase for client Id for convenience
+alias ClientId = string:16;
+
+/// Errors associated with Recorder methods.
+/// If the request contains any of the following errors, it will fail without
+/// affecting the existing logging tasks.
+@strict_audit(bug="https://fxbug.dev/467127481", state="PENDING_REVIEW")
+type RecorderError = strict enum : uint32 {
+    /// Indicates that no driver is found for requested metric logging.
+    NO_DRIVERS = 1;
+    /// Indicates that an invalid sampling interval was provided.
+    INVALID_SAMPLING_INTERVAL = 2;
+    /// Requests to start logging will fail if logging is already active for a
+    /// given client.
+    ALREADY_LOGGING = 3;
+    /// Indicates that the logging request contains duplicated metric type.
+    DUPLICATED_METRIC = 4;
+    /// Indicates that the total number of active clients has reached the
+    /// allowed maxium (defined by `MAX_CONCURRENT_CLIENTS = 20` in
+    /// the Recorder to keep memory use bounded).
+    TOO_MANY_ACTIVE_CLIENTS = 5;
+    /// Indicates that statistics is enabled and an invalid statistics interval
+    /// is provided.
+    INVALID_STATISTICS_INTERVAL = 6;
+    /// Indicates that the request failed due to an internal error.
+    INTERNAL = 7;
+};
+
+/// Metric type requested in Recorder methods.
+@strict_audit(bug="https://fxbug.dev/467127481", state="PENDING_REVIEW")
+type Metric = strict union {
+    1: temperature Temperature;
+    2: cpu_load CpuLoad;
+    3: power Power;
+    4: gpu_usage GpuUsage;
+    5: network_activity NetworkActivity;
+};
+
+type StatisticsArgs = struct {
+    /// Length of the interval in milliseconds for summarizing statistics (e.g.,
+    /// min, max, avg).
+    /// Must be equal to or larger than `sampling_interval_ms` in the metrics.
+    /// Must be smaller than `duration_ms` of the logging request.
+    /// Must not be smaller than 500ms if `output_stats_to_syslog` is enabled in
+    /// the logging request.
+    statistics_interval_ms uint32;
+};
+
+/// Temperature metric details.
+type Temperature = struct {
+    /// Length of the sampling interval in milliseconds.
+    /// Must not be smaller than 500ms if `output_samples_to_syslog` is enabled
+    /// in the logging request.
+    /// Must be smaller than `duration_ms` of the logging request.
+    sampling_interval_ms uint32;
+
+    /// Boxed(optional) statistics arguments. If none, statistics is disabled.
+    statistics_args box<StatisticsArgs>;
+};
+
+/// CPU Load metric details.
+type CpuLoad = struct {
+    /// Length of the polling interval in milliseconds.
+    /// Must be smaller than `duration_ms` of the logging request.
+    /// Must not be smaller than 500ms if `output_samples_to_syslog` is enabled
+    /// in the logging request.
+    interval_ms uint32;
+};
+
+/// GPU Usage metric details.
+type GpuUsage = struct {
+    /// Length of the polling interval in milliseconds.
+    /// Must be smaller than `duration_ms` of the logging request.
+    /// Must not be smaller than 500ms if `output_samples_to_syslog` is enabled
+    /// in the logging request.
+    interval_ms uint32;
+};
+
+/// Network Activity metric details.
+type NetworkActivity = struct {
+    /// Length of the polling interval in milliseconds.
+    /// Must be smaller than `duration_ms` of the logging request.
+    /// Must not be smaller than 500ms if `output_samples_to_syslog` is enabled
+    /// in the logging request.
+    interval_ms uint32;
+};
+
+/// Power metric details.
+type Power = struct {
+    /// Length of the sampling interval in milliseconds.
+    /// Must not be smaller than 500ms if `output_samples_to_syslog` is enabled
+    /// in the logging request.
+    /// Must be smaller than `duration_ms` of the logging request.
+    sampling_interval_ms uint32;
+
+    /// Boxed(optional) statistics arguments. If none, statistics is disabled.
+    statistics_args box<StatisticsArgs>;
+};
+
+/// A protocol for managing on-demand metrics logging.
+@discoverable
+closed protocol Recorder {
+    /// Initiates logging of specified metrics for the provided duration.
+    /// Supports concurrent logging of different metrics. Logging may be
+    /// terminated early with a call to `StopLogging`.
+    ///
+    /// This call will fail if logging of the specified metric is already
+    /// active. For this reason, a client may wish to precede a `StartLogging`
+    /// call with a `StopLogging` call, after which the only reason for The
+    /// logger to be active would be a conflict with another client.
+    ///
+    /// + request `client_id` String format Id of the client. Client may choose
+    ///     any Id with a maximum byte size of 8 (e.g., "ffxTest").
+    /// + request `metrics` Type of the metrics to be polled and logged.
+    /// + request `duration_ms` Duration of logging in milliseconds. After this
+    ///     duration, polling and logging will cease.
+    /// + request `output_samples_to_syslog` Toggle for outputting raw data to
+    ///     syslog.
+    /// + request `output_stats_to_syslog` Toggle for outputting any available
+    ///     statistics to syslog.
+    /// + error a [fuchsia.metrics.test/MeticsLoggerError] value indicating why
+    ///     the request failed.
+    strict StartLogging(struct {
+        client_id ClientId;
+        metrics vector<Metric>:MAX;
+        duration_ms uint32;
+        output_samples_to_syslog bool;
+        output_stats_to_syslog bool;
+    }) -> () error RecorderError;
+
+    /// Initiates logging of specified metrics. Supports concurrent logging of
+    /// different metrics. Logging will only end upon a `StopLogging` call.
+    ///
+    /// `StartLogging` should be preferred for usage in automated tests to
+    /// ensure that logging terminates even if the test crashes.
+    ///
+    /// + request `client_id` String format Id of the client. Client may choose
+    ///     any Id with a maximum byte size of 8 (e.g., "ffxTest").
+    /// + request `metrics` Type of the metrics to be polled and logged.
+    /// + request `output_samples_to_syslog` Toggle for outputting raw data to
+    ///     syslog.
+    /// + request `output_stats_to_syslog` Toggle for outputting any available
+    ///     statistics to syslog.
+    /// + error a [fuchsia.metrics.test/RecorderError] value indicating why
+    ///     the request failed.
+    strict StartLoggingForever(struct {
+        client_id ClientId;
+        metrics vector<Metric>:MAX;
+        output_samples_to_syslog bool;
+        output_stats_to_syslog bool;
+    }) -> () error RecorderError;
+
+    /// Terminates all active logging tasks with the given client_id. It is
+    /// valid to call this method when logging is inactive.
+    ///
+    /// + request `client_id` String format Id of the client.
+    /// - response `status` A bool value indicating if existing logging was
+    ///     stopped (true) or there'sno existing logging for the client.
+    strict StopLogging(struct {
+        client_id ClientId;
+    }) -> (struct {
+        stopped bool;
+    });
+};

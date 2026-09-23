@@ -1,0 +1,289 @@
+// Copyright 2023 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=HEAD)
+library fuchsia.cpu.profiler;
+using zx;
+using fuchsia.component;
+using fuchsia.url;
+using fuchsia.test.manager;
+
+/// Curated set of platform independent IDs
+type CounterId = flexible enum : uint8 {
+    /// A counter increments each nanosecond
+    NANOSECONDS = 0;
+    /// A counter increments each cpu cycle
+    CYCLES = 1;
+    /// A counter increments on each instruction retired
+    INSTRUCTIONS_RETIRED = 2;
+    /// A counter increments on each branch correctly predicted
+    BRANCHES_PREDICTED = 3;
+    /// A counter increments on each branch mispredicted
+    BRANCHES_MISPREDIDCTED = 4;
+};
+
+type Counter = flexible union {
+    /// Curated set of platform independent ids that get converted into the
+    /// appropriate hardware specific counter id.
+    1: platform_independent CounterId;
+
+    /// In the case a counter is not widely supported across
+    /// platform or not included in the curated set, one can
+    /// specify a platform dependent id that will not get
+    /// converted.
+    2: platform_dependent uint32;
+};
+
+/// Various approaches to obtaining a backtrace
+type CallgraphStrategy = flexible enum : uint8 {
+    /// Don't try to get a callgraph
+    NONE = 0;
+    /// Copy out stack memory and attempt to parse the DWARF info.
+    /// This is the slowest and most memory intensive of the approaches, but
+    /// gives the most accurate callgraphs. Parsing dwarf allows the callgraph
+    /// to trace inlined and leaf functions which other approaches do not
+    /// support.
+    DWARF = 1;
+    /// Intel CPUs support a hardware feature called Last Branch Records (LBR)s
+    /// which record up to the last 32 calls made depending on hardware version.
+    /// On supported CPUs, this is a low overhead approach to finding the
+    /// callgraph with the caveat that stacks that exceed 32 calls in depth will
+    /// overflow the hardware buffer.
+    LAST_BRANCH_RECORD = 2;
+    /// arm and riscv support shadow call stacks which are an efficient way for us
+    /// to find and copy out the call stack. However, leaf functions and code
+    /// compiled without shadow callstack support, such as the vdso will not
+    /// appear in the returned callgraph.
+    SHADOW_CALL_STACK = 3;
+    /// A general approach of parsing the frame pointers of the callstack. Frame
+    /// pointers are supported across architectures and are slightly more
+    /// expensive than the lbrs or shadow call stacks, but much cheaper than
+    /// parsing dwarf. Code compiled with omitted frame pointers and inlined
+    /// functions will not appear in the resulting stacks.
+    FRAME_POINTER = 4;
+};
+
+type CallgraphConfig = table {
+    1: strategy CallgraphStrategy;
+};
+
+type Sample = table {
+    /// Whether the profiler should include callgraph information and if so,
+    /// what strategy it should use.
+    1: callgraph CallgraphConfig;
+    /// The value of a counter since the last sample
+    2: counters vector<Counter>:64;
+};
+
+/// An adhoc set of running tasks to attach to.
+type Task = flexible union {
+    /// Profile a process and all threads associated with it.
+    1: process zx.Koid;
+    /// Profile a single thread.
+    2: thread zx.Koid;
+    /// Profile a job and all processes and threads associated with it.
+    3: job zx.Koid;
+    /// Profile everything running on the system.
+    ///
+    /// Equivalent to finding root job's koid and passing it as a Task::job.
+    4: system_wide struct {};
+};
+
+/// A component to optionally launch and attach to
+type AttachConfig = flexible resource union {
+    /// Launch a component with the given url and moniker then attach to it when
+    /// it's launched
+    1: launch_component table {
+        /// The url of the component to launch (required)
+        1: url fuchsia.url.Url;
+        /// The location to launch the component. If not specified, a default
+        /// location will be used.
+        2: moniker string:fuchsia.component.MAX_MONIKER_LENGTH;
+    };
+
+    /// Attach to an existing component by moniker. If a component doesn't exist
+    /// at that moniker, wait for it to appear and attach to it when it does.
+    2: attach_to_component_moniker string:fuchsia.component.MAX_MONIKER_LENGTH;
+
+    /// Attach to an existing component by url. If the component doesn't
+    /// exist with the specified url, wait for it to appear and attach to it when
+    /// it does.
+    3: attach_to_component_url string:fuchsia.url.MAX_URL_LENGTH;
+
+    /// Connect to test_manager, launch a test with the given url, then attach
+    /// to it. Forwards the url and options to
+    /// `fuchsia.test.manager.SuiteRunner.Run`
+    4: launch_test resource table {
+        /// The url of the test to launch.
+        1: url fuchsia.url.Url;
+        /// Options specifying how the suite should be run
+        2: options fuchsia.test.manager.RunSuiteOptions;
+    };
+};
+
+/// A target may be an adhoc set of tasks, or one defined by a component/test
+type TargetConfig = flexible resource union {
+    /// An adhoc set of threads/processes/jobs
+    1: tasks vector<Task>:64;
+    /// Profile a component and all tasks it launches
+    2: component AttachConfig;
+};
+
+/// Profiling information about the profile itself
+type SamplingConfig = table {
+    /// How many ticks of the counter should occur between each sample
+    1: period uint64;
+    /// The counter to the rate on
+    2: timebase Counter;
+    /// What information the profiler will write when it takes
+    /// a sample.
+    3: sample Sample;
+};
+
+type OnBootAttachConfig = flexible union {
+    /// Attach to an existing component by moniker. If a component doesn't exist
+    /// at that moniker, wait for it to appear and attach to it when it does.
+    1: attach_to_component_moniker string:fuchsia.component.MAX_MONIKER_LENGTH;
+
+    /// Attach to an existing component by url. If the component doesn't
+    /// exist with the specified url, wait for it to appear and attach to it when
+    /// it does.
+    2: attach_to_component_url string:fuchsia.url.MAX_URL_LENGTH;
+};
+
+type OnBootTargetConfig = flexible union {
+    /// An adhoc set of threads/processes/jobs
+    1: tasks vector<Task>:64;
+    /// Profile a component and all tasks it launches
+    2: component OnBootAttachConfig;
+};
+
+@serializable
+type OnBootConfig = table {
+    1: configs vector<SamplingConfig>:64;
+    2: target OnBootTargetConfig;
+};
+
+
+
+/// SamplingConfig to the TargetConfig.
+type Config = resource table {
+    1: configs vector<SamplingConfig>:64;
+    2: target TargetConfig;
+};
+
+@discoverable
+closed protocol Session {
+    /// Set up and prepare to profile
+    strict Configure(resource table {
+        1: output zx.Handle:SOCKET;
+        2: config Config;
+    }) -> () error flexible enum : uint32 {
+        BAD_SOCKET = 1;
+        BAD_STATE = 2;
+        INVALID_CONFIGURATION = 3;
+        MISSING_SAMPLE_CONFIGS = 4;
+        MISSING_TARGET_CONFIGS = 5;
+        MISSING_COMPONENT_URL = 6;
+    };
+
+    /// Begin profiling and optionally begin writing data to the configured
+    /// socket
+    strict Start(table {
+        /// If true, delays writing data to the output socket until the profiling
+        /// session ends. This reduces overhead, but also caps the maximum output
+        /// size to the requested buffer size.
+        1: buffer_size_mb uint64;
+        2: buffer_results bool;
+    }) -> () error flexible enum : uint32 {
+        BAD_STATE = 1;
+    };
+
+    /// End the profiling session and write out data to the earlier
+    /// configured socket if not already writing.
+    strict Stop() -> (SessionResult);
+
+    /// Clean up and unconfigure the profiler. Flushes the remaining data and
+    /// closes the provided socket. Doesn't return until all data has been
+    /// successfully written.
+    strict Reset() -> ();
+};
+
+/// The result returned after stopping a profiling session.
+type SessionResult = table {
+    1: samples_collected uint64;
+    2: mean_sample_time uint64;
+    3: median_sample_time uint64;
+    4: min_sample_time uint64;
+    5: max_sample_time uint64;
+    // The session may be unable to extract information about where symbols
+    // are in a process's address space due to the process being too short
+    // lived, or otherwise unable to be read. In this case, functions
+    // sampled from this process may not be able to be fully symbolized.
+    //
+    // missing_process_mappings contains processes for which this occurred
+    // during the run.
+    6: missing_process_mappings vector<zx.Koid>:MAX;
+};
+
+/// Error codes for SessionManager operations.
+type ManagerError = flexible enum : uint32 {
+    /// A general error when starting a profile.
+    START = 1;
+
+    /// The requested task_id does not exist or is no longer running.
+    NO_SUCH_TASK = 2;
+
+    /// The configuration provided was invalid.
+    INVALID_CONFIGURATION = 3;
+
+    /// The device cannot support more concurrent sessions.
+    TOO_MANY_SESSIONS = 4;
+
+    /// A general error when stopping a profile.
+    STOP = 5;
+};
+
+/// Status of the profiling session managed by SessionManager.
+type ProfilerStatus = table {
+    /// Unique id of this profiling session.
+    1: task_id uint64;
+};
+
+@discoverable
+closed protocol SessionManager {
+    compose Session;
+    /// Starts a standalone profiling session. This session runs independently
+    /// of the client connection and buffers data internally.
+    strict StartSession(resource table {
+        /// The profiling configuration.
+        1: config Config;
+    }) -> (table {
+        /// Unique identifier for this background session.
+        1: task_id uint64;
+    }) error ManagerError;
+
+    /// Ends the profiling session and writes out the buffered data.
+    strict StopSession(resource table {
+        /// The ID of the session to retrieve.
+        1: task_id uint64;
+        /// The socket to write the profile data into.
+        2: output zx.Handle:SOCKET;
+    }) -> (SessionResult) error ManagerError;
+
+    /// Aborts an ongoing trace session without saving results.
+    strict AbortSession(table {
+        1: task_id uint64;
+    }) -> () error ManagerError;
+
+    /// Returns the active profiling sessions. Currently assuming 1 active max,
+    /// but returns a vector for future-proofing.
+    strict Status() -> (table {
+        1: sessions vector<ProfilerStatus>:MAX;
+    }) error ManagerError;
+
+    /// Configures an on-boot profiling session.
+    strict StartSessionOnBoot(table {
+        1: config OnBootConfig;
+    }) -> () error ManagerError;
+};

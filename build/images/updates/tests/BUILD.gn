@@ -1,0 +1,158 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# Always use the `$target_out_dir` associated with `$default_toolchain`.
+out_dir = get_label_info(":stub($default_toolchain)", "target_out_dir")
+
+bazel_assembled_test_dir = "$out_dir/bazel_assembled_fx_publish_working_dir"
+bazel_assembly_cache_packages_list =
+    "$bazel_assembled_test_dir/assembly_cache_packages.list"
+
+if (is_fuchsia) {
+  import("//build/assembly/packages_from_product_assembler.gni")
+  import("//build/bazel/assembly/bazel_product_bundle.gni")
+
+  bazel_product_bundle("bazel_pb") {
+    testonly = true
+    product_bundle_name = "updates_test.fake_board"
+    bazel_product_bundle_target = ":fake_bundle"
+    bazel_product_image_target = "//build/images/updates/tests:fake_product"
+    bazel_inputs_from_gn = []
+    image_use_vbmeta = false
+    image_has_fxfs_blob = true
+    generate_image_metadata = false
+  }
+  packages_from_product_assembler("bazel_assembly_cache_packages.list") {
+    assembly_label = ":bazel_pb($default_toolchain)"
+    package_set = "cache"
+    outputs = [ bazel_assembly_cache_packages_list ]
+    testonly = true
+  }
+}
+
+if (is_host) {
+  import("//build/python/python_action.gni")
+  import("//build/python/python_binary.gni")
+  import("//build/python/python_host_test.gni")
+  import("//build/testing/host_test_data.gni")
+  import("//src/sys/pkg/repositories/devhost/devhost.gni")
+
+  python_binary("populate_fx_publish_working_dir") {
+    main_source = "populate_fx_publish_working_dir.py"
+  }
+
+  # Populates a fake build directory `$output` for running fx publish tests.
+  # This involves:
+  #  - Generating a new `amber-files` repository,
+  #  - Symlinking `host-tools/package-tool`, and
+  #  - Copying the transitive closure of `$package_manifest_list`.
+  # We also need to symlink `$output/$output` to `$output` but that cannot be done in the build step
+  # since infra will fail to upload/materialize cyclic symlinks.
+  #
+  # Arguments:
+  #
+  #   package_manifest_list (path)
+  #     Path to the package manifest list.
+  #
+  #   output (path)
+  #     The directory to place the replicated packages and empty repository.
+  #
+  #   deps
+  #   testonly
+  #   visibility
+  template("populate_fx_publish_working_dir") {
+    assert(defined(invoker.package_manifest_list),
+           "must define a `package_manifest_list` path argument")
+    assert(defined(invoker.output), "must define a `output` path argument")
+
+    _copied_package_dir = invoker.output
+
+    # Create a empty repository for `//tools/devshell:fx_publish_test`.
+    # This way, the test can inherit the publish options from the build system.
+    _amber_files_target = "${target_name}_amber_files"
+    devhost_repository_publish(_amber_files_target) {
+      testonly = true
+
+      output_repository_dir = "${_copied_package_dir}/amber-files"
+
+      deps = []
+      package_list_manifests = [ "stub_package_manifest_list.json" ]
+    }
+
+    _package_manifest_list = invoker.package_manifest_list
+    _deps = [
+      ":${_amber_files_target}($host_toolchain)",
+      "//src/sys/pkg/bin/package-tool:host",
+    ]
+    if (defined(invoker.deps)) {
+      _deps += invoker.deps
+    }
+
+    python_action(target_name) {
+      forward_variables_from(invoker,
+                             [
+                               "visibility",
+                               "testonly",
+                             ])
+      binary_label =
+          "//build/images/updates/tests:populate_fx_publish_working_dir"
+      depfile = "$target_gen_dir/$target_name.d"
+      inputs = [ _package_manifest_list ]
+
+      outputs = [ "$target_out_dir/$target_name.populated" ]
+      args = [
+        "--working-dir",
+        rebase_path(_copied_package_dir, root_build_dir),
+        "--stamp-file",
+        rebase_path(outputs[0], root_build_dir),
+        "--depfile",
+        rebase_path(depfile, root_build_dir),
+      ]
+      deps = _deps
+      testonly = true
+    }
+  }
+
+  populate_fx_publish_working_dir("fx_publish_bazel_assembly_working_dir") {
+    package_manifest_list = bazel_assembly_cache_packages_list
+    deps = [
+      ":bazel_assembly_cache_packages.list($default_toolchain)",
+
+      # NOTE: It's necessary to claim bazel assembly directly as a dependency.
+      # Without this, if there are no changes in images_assembly.json, this
+      # target won't correctly rebuild, even if the content of the packages it
+      # reference have changed.
+      ":bazel_pb($default_toolchain)",
+    ]
+    output = bazel_assembled_test_dir
+    testonly = true
+  }
+
+  host_test_data("fx_publish_bazel_test_data") {
+    sources = [ bazel_assembled_test_dir ]
+    deps = [ ":fx_publish_bazel_assembly_working_dir" ]
+  }
+
+  python_host_test("fx_publish_bazel_assembled_test") {
+    main_source = "//tools/devshell/tests/subcommands/fx_publish_test.py"
+    sources = [
+      "//tools/devshell/contrib/__init__.py",
+      "//tools/devshell/contrib/publish.py",
+      "//tools/devshell/contrib/terminal.py",
+    ]
+    test_data_deps = [ ":fx_publish_bazel_test_data" ]
+    main_callable = "main"
+    extra_args = [
+      "--test-dir",
+      rebase_path(bazel_assembled_test_dir, root_build_dir),
+      "--expect-cache-packages",
+      "hello_fuchsia_cpp/0",
+    ]
+  }
+
+  group("fx_publish_tests") {
+    testonly = true
+    public_deps = [ ":fx_publish_bazel_assembled_test" ]
+  }
+}

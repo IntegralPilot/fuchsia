@@ -1,0 +1,194 @@
+# Copyright 2025 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/bazel/bazel_inputs.gni")
+import("//build/compiled_action.gni")
+import("//build/group_with_inputs.gni")
+
+# Creates a Product Input Bundle, which holds a subset of packages for a
+# product.
+#
+# NOTE: This template DOES NOT use GN metadata, all labels for packages must be
+# the actual target that creates the package.
+#
+# Parameters
+#
+#  Main Board Input Bundle
+#
+#  base_packages, cache_packages, flexible_packages
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the respective package set.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a package target, it will cause an error
+#    like:
+#      "no dependency provides the input <package_name>/package_manifest.json"
+#
+#  packages_for_product_config
+#    [list, GN labels] A list of GN labels of fuchsia_package targets to
+#    include in the product input bundle, but only include in the images if the
+#    product config references it.
+#
+#    Note: These are direct labels for specific targets, not deps to walk for
+#    metadata.  If the target isn't a package target, it will cause an error
+#    like:
+#      "no dependency provides the input <package_name>/package_manifest.json"
+#
+#  version (optional)
+#    [string] String representing the release version for this board config.
+#    Either this field or "version_file" must be set.
+#
+#  version_file (optional)
+#    [string] Path to a file containing the release version for this config.
+#    Either this field or "version" must be set.
+#
+#  Outputs
+#    A directory structure and manifest
+#
+#   manifest path:
+#     $target_out_dir/$target_name/product_input_bundle.json
+#
+# GN usual meanings
+#  testonly, visibility
+#
+template("product_input_bundle") {
+  labels = {
+    main_target = target_name
+    bazel_inputs = "${target_name}.bazel_input"
+  }
+
+  files = {
+    # The directory where the product input bundle contents are written to.
+    bundle_dir = "${target_out_dir}/${target_name}"
+
+    # The "official" output that is told to GN.
+    bundle_file = "${bundle_dir}/product_input_bundle.json"
+
+    # The files that we create as book-keeping between our tasks.
+    depfile = "${target_out_dir}/${target_name}.d"
+  }
+
+  creation_deps = []
+  creation_inputs = []
+  creation_args = []
+
+  assert(
+      defined(invoker.version) || defined(invoker.version_file),
+      "board_input_bundle(\"target_name\") must define `version` or `version_file`")
+  if (defined(invoker.version) && invoker.version != "") {
+    creation_args += [
+      "--version",
+      invoker.version,
+    ]
+  }
+  if (defined(invoker.version_file) && invoker.version_file != "") {
+    creation_inputs += [ invoker.version_file ]
+    creation_args += [
+      "--version-file",
+      rebase_path(invoker.version_file, root_build_dir),
+    ]
+  }
+
+  creation_args += [
+    "--repo",
+    "fuchsia",
+  ]
+
+  foreach(package_set,
+          [
+            "base_packages",
+            "cache_packages",
+            "flexible_packages",
+            "packages_for_product_config",
+          ]) {
+    if (defined(invoker[package_set])) {
+      # The list of package manifest files, for validating that the package
+      # targets are all actually package targets.
+      _package_manifests = []
+
+      # Calculate the path to the package manifest for each label
+      foreach(package, invoker[package_set]) {
+        _package_out_dir = get_label_info(package, "target_out_dir")
+        _package_name = get_label_info(package, "name")
+        _manifest_path =
+            "${_package_out_dir}/${_package_name}/package_manifest.json"
+        _package_manifests += [ _manifest_path ]
+      }
+
+      # Create a group that depends on each package-creating label, and lists
+      # each computed package manifest path as an input file.  This allows the
+      # template to enforce that the labels used are instantiations of the
+      # `fuchsia_package()` template.
+      group_with_inputs("${target_name}.${package_set}") {
+        forward_variables_from(invoker, [ "testonly" ])
+        visibility = [ ":${labels.main_target}" ]
+        public_deps = invoker[package_set]
+        inputs = _package_manifests
+      }
+
+      # Add the group to the deps of the bundle.
+      creation_deps += [ ":${target_name}.${package_set}" ]
+      creation_inputs += _package_manifests
+
+      # Add all the package manifests to the creation args.
+      foreach(_package_manifest, _package_manifests) {
+        creation_args += [
+          string_replace("--${package_set}", "_", "-"),
+          rebase_path(_package_manifest, root_build_dir),
+        ]
+      }
+
+      # Because of a bug in GN, where using `invoker[package_set]` doesn't mark
+      # invoker.base_packages (etc.) as having been used...
+      not_needed(invoker, [ package_set ])
+    }
+  }
+
+  compiled_action(labels.main_target) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    tool = "//build/assembly/tools/assembly_config"
+    tool_output_name = "assembly_config"
+
+    # The contents of these folders are dynamic, and managed entirely by this
+    # action.  Further, this action will need to delete items from these
+    # directories that are not added back (on an incremental build, if an item
+    # is removed from one of these sets)
+    hermetic_action_ignored_prefixes = [ "${files.bundle_dir}" ]
+
+    inputs = creation_inputs
+    outputs = [ files.bundle_file ]
+    depfile = files.depfile
+    deps = creation_deps
+    args = [
+             "generate",
+             "product-input-bundle",
+             "--name",
+             target_name,
+             "--output",
+             rebase_path(files.bundle_dir, root_build_dir),
+             "--depfile",
+             rebase_path(depfile, root_build_dir),
+           ] + creation_args
+    metadata = {
+      product_input_bundles_barrier = []
+      product_input_bundles = [
+        {
+          label =
+              get_label_info(":${labels.main_target}", "label_with_toolchain")
+          name = target_name
+          outdir = rebase_path(files.bundle_dir, root_build_dir)
+        },
+      ]
+    }
+  }
+
+  bazel_input_directory(labels.bazel_inputs) {
+    generator = ":${labels.main_target}"
+    output_directory = files.bundle_dir
+  }
+}

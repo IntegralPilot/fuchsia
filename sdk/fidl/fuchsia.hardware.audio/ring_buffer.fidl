@@ -1,0 +1,282 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.audio;
+
+using zx;
+
+/// Delay information as returned by the driver.
+@available(added=27)
+type DelayInfo = table {
+    /// The driver's best estimate (for the chosen format) of the delay internal to the hardware it
+    /// abstracts.
+    ///
+    /// "Internal" refers to the hardware between the DAI interconnect and the ring buffer (such as
+    /// an SoC audio subsystem), whereas "external" refers to hardware on the far side of any DAI
+    /// interconnect (such as hardware codecs).
+    ///
+    /// For a given frame during playback, this is any delay after the driver copies it out of the
+    /// ring buffer, before it exits any interconnect.
+    /// For a given frame during recording, this is any delay after it enters the interconnect,
+    /// before the driver moves it into the ring buffer.
+    ///
+    /// `internal_delay` must be taken into account by the client when determining the requirements
+    /// for minimum lead time (during playback) and minimum capture delay (during capture).
+    ///
+    /// This delay must not include the inherent delay added by the temporary buffering needed
+    /// to copy data in and out of the ring buffer, which is contained in `RingBufferProperties`
+    /// field `driver_transfer_bytes`.
+    ///
+    /// Required.
+    1: internal_delay zx.Duration;
+
+    /// The driver's best estimate (for the chosen format) of the delay external to the hardware it
+    /// abstracts.
+    ///
+    /// "External" refers to hardware on the far side of any DAI interconnect (such as hardware
+    /// codecs), whereas "internal" refers to hardware between the DAI interconnect and the ring
+    /// buffer (such as an SoC audio subsystem).
+    ///
+    /// `external_delay` must be taken into account by the client when determining the requirements
+    /// for minimum lead time (during playback) and minimum capture delay (during capture).
+    ///
+    /// If not included, `external_delay` is unknown. If unknown, a client may treat it however it
+    /// chooses (consider it zero or some large number, autodetect it, etc).
+    ///
+    /// Like `internal_delay`, this delay must not include the inherent delay added by the temporary
+    /// buffering needed to copy data in and out of the ring buffer, which is contained in
+    /// `RingBufferProperties` field `driver_transfer_bytes`.
+    ///
+    /// Optional.
+    2: external_delay zx.Duration;
+};
+
+/// Properties of the ring buffer. These values don't change once the ring buffer is created.
+type RingBufferProperties = table {
+    /// When set to true, indicates that the ring buffer runs in a different cache coherency domain,
+    /// and thus clients must ensure that their data writes are flushed all the way to main memory
+    /// (during playback), or that their view of the ring buffer must be invalidated before any
+    /// reads (during capture). This is because there may be hardware external to the CPUs that
+    /// reads/writes main memory, bypassing the CPUs.
+    ///
+    /// When set to false, indicates that the ring buffer runs in the same cache coherency domain as
+    /// the CPUs, hence the driver is not required to flush/invalidate the ring buffer.
+    /// Note that in this case, the driver and client still must synchronize their data access, for
+    /// instance by inserting the appropriate acquire fences before reading and releasing fences
+    /// after writing, or (more commonly) by obeying the Producer/Consumer pattern described in
+    /// [Ring Buffer Behavior](https://fuchsia.dev/fuchsia-src/development/audio/ring_buffer.md).
+    ///
+    /// Required.
+    3: needs_cache_flush_or_invalidate bool;
+
+    /// The driver's best estimate of the time needed for the hardware to emit (during playback) or
+    /// accept (during capture) frames, after a channel is activated by `SetActiveChannels`.
+    ///
+    /// The driver estimates that after `SetActiveChannels(channel)->(set_time)` enables a channel,
+    /// its data will resume flowing at approximately `set_time` + `turn_on_delay`.
+    /// Hardware can take time to become fully operational (e.g. due to a power state change, or
+    /// communication delays between a Bluetooth driver's multiple hardware entities). The client
+    /// must take this delay into account, if it is unacceptable to drop the actual audio frames
+    /// and instead play/capture silence during this interval.
+    /// If not included, `turn_on_delay` is unknown.
+    ///
+    /// Optional.
+    4: turn_on_delay zx.Duration;
+
+    /// Size (in bytes) of the temporary buffers or FIFOs used by the driver when consuming or
+    /// generating the ring buffer contents.
+    ///
+    /// The `driver_transfer_bytes` field is covered extensively in
+    /// [Ring Buffer Behavior](https://fuchsia.dev/fuchsia-src/development/audio/ring_buffer.md).
+    ///
+    /// `driver_transfer_bytes` must not include the impact of delays caused by hardware or software
+    /// processing abstracted by the driver. Those delays are communicated by `internal_delay` and
+    /// `external_delay` fields in `DelayInfo`; they are orthogonal to this value.
+    ///
+    /// Required.
+    @available(added=27)
+    5: driver_transfer_bytes uint32;
+};
+
+type RingBufferPositionInfo = struct {
+    /// The driver's best estimate of the time (in the CLOCK_MONOTONIC timeline) at which the
+    /// playback/capture pointer reached the position indicated by `position`.
+    ///
+    /// `turn_on_delay` impact should not be incorporated into 'timestamp'.
+    /// No delays indicated in `DelayInfo` should be incorporated.
+    timestamp zx.Time;
+
+    /// The playback/capture pointer position (in bytes) in the ring buffer at time
+    /// `timestamp` as estimated by the driver.
+    position uint32;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type GetVmoError = strict enum {
+    /// The ring buffer setup failed due to an invalid argument, e.g. min_frames is too big.
+    INVALID_ARGS = 1;
+
+    /// The ring buffer setup failed due to an internal error.
+    INTERNAL_ERROR = 2;
+};
+
+/// Ring buffers are used to convey audio between parties (usually in different processes), allowing
+/// concurrent, asynchronous data access without requiring locks. This pattern works because both
+/// parties share an understanding of which buffer areas are safe to access, and how those areas
+/// change over time.
+///
+/// For in-depth description of the responsibilities for both _producers_ and _consumers_,
+/// before the ring buffer is started as well as while it is active, please see
+/// [Ring Buffer Behavior](https://fuchsia.dev/fuchsia-src/development/audio/ring_buffer.md).
+///
+open protocol RingBuffer {
+    /// Accessor for top level static properties.
+    strict GetProperties() -> (struct {
+        properties RingBufferProperties;
+    });
+
+    /// Gets the ring buffer current position via a hanging get.
+    ///
+    /// `WatchClockRecoveryPositionInfo` may only be called after `GetVmo` was called, where a
+    /// `clock_recovery_notifications_per_ring` was specified.
+    ///
+    /// The driver must respond to a client's first `WatchClockRecoveryPositionInfo` call, but will
+    /// not respond to subsequent client calls until the position information has changed from what
+    /// was most recently provided to that client.
+    ///
+    /// The driver must not respond to a `WatchClockRecoveryPositionInfo` until after it has replied
+    /// to the `Start` command.
+    ///
+    /// At the `start_time` returned by `Start`, position is always 0. From there, it
+    /// progresses at the rate specified by the rate, sample format (and clock domain,
+    /// if the device is not in the same clock domain as`CLOCK_MONOTONIC`).
+    ///
+    /// If `clock_recovery_notifications_per_ring` is not zero, the driver will reply with its
+    /// estimated position to be used for clock recovery at most at
+    /// `clock_recovery_notifications_per_ring` frequency.
+    ///
+    /// The `RingBufferPositionInfo` return values must include timestamps that are monotonically
+    /// increasing.
+    ///
+    /// The driver will close the protocol channel with an error of `ZX_ERR_BAD_STATE`, if there is
+    /// already a pending `WatchClockRecoveryPositionInfo` for this client.
+    strict WatchClockRecoveryPositionInfo() -> (struct {
+        position_info RingBufferPositionInfo;
+    });
+
+    /// Requests a shared buffer to be used for moving bulk audio data between client and driver.
+    ///
+    /// The client requests `min_frames` as the size for part of the ring buffer it needs.
+    /// The driver returns the actual size of allocated ring buffer space in `num_frames`.
+    ///
+    /// `num_frames` must be at least `min_frames` plus `driver_transfer_bytes` (in frames) such
+    /// that ring buffer contents can be transfered in and out, or else the call must be failed
+    /// with GetVmoError.INVALID_ARGS.
+    ///
+    /// The driver may increase the ring buffer size beyond `min_frames` plus
+    /// `driver_transfer_bytes` (in frames) due to any internal requirements, for instance
+    /// alignment.
+    ///
+    /// Clients can treat the entire returned ring buffer as safe to access, except for the
+    /// `driver_transfer_bytes` immediately adjacent to the current position, see the
+    /// `driver_transfer_bytes` parameter specification in `RingBufferProperties` for more details.
+    ///
+    /// The returned VMO handle must include ZX_RIGHT_TRANSFER, ZX_RIGHT_READ and ZX_RIGHT_MAP.
+    /// If the ring buffer is "outgoing" (conveys audio data from client to device), then the
+    /// handle must also include ZX_RIGHT_WRITE.
+    ///
+    /// If `clock_recovery_notifications_per_ring` is non-zero, the driver will send replies to
+    /// `WatchClockRecoveryPositionInfo` client requests at most at
+    /// `clock_recovery_notifications_per_ring` frequency. These notifications are meant to be used
+    /// for clock recovery.
+    ///
+    // TODO(https://fxbug.dev/42067582): Reconsider the `clock_recovery_notifications_per_ring`
+    // parameter, once we must recover clocks from devices being actively rate-adjusted in hardware.
+    strict GetVmo(struct {
+        min_frames uint32;
+        clock_recovery_notifications_per_ring uint32;
+    }) -> (resource struct {
+        num_frames uint32;
+        ring_buffer zx.Handle:VMO;
+    }) error GetVmoError;
+
+    /// Start the ring buffer.
+    ///
+    /// The `start_time` value (in the CLOCK_MONOTONIC timeline) indicates when position began
+    /// moving, starting at the beginning of the ring buffer, i.e. the driver has started to read or
+    /// write from or to the ring buffer position 0, subject to the overall position and buffering
+    /// behavior described in 'Ring buffer behavior' below.
+    ///
+    /// If `Start` is called before `GetVmo`, the channel must be closed with `ZX_ERR_BAD_STATE`.
+    /// If `Start` is called while this RingBuffer is already started, or if `Start` is called for
+    /// a second time before the first call has completed, then the channel must be closed with an
+    /// error `ZX_ERR_BAD_STATE` returned.
+    /// If `Start` is called before `SetActiveChannels`, then by default all channels are active.
+    ///
+    strict Start() -> (struct {
+        start_time zx.Time;
+    });
+
+    /// Stop the ring buffer.
+    ///
+    /// Once this call's response is received, no further position notifications will be sent until
+    /// `Start` is called again.
+    ///
+    /// If `Stop` is called before `GetVmo`, the channel must be closed with `ZX_ERR_BAD_STATE`.
+    // TODO(https://fxbug.dev/42115360): Add timestamp parameter.
+    strict Stop() -> ();
+
+    /// Sets which channels are active via a bitmask.
+    ///
+    /// The total number of channels is the `number_of_channels` in `Format`, specifically in
+    /// `PcmFormat`, i.e. this bitmask has up to `number_of_channels` bits set (maximum 64).
+    /// The least significant bit corresponds to channel index 0. Channels not set (bits are 0) in
+    /// the bitmask are inactive. By default all channels are active. Hence creating a RingBuffer
+    /// turns on the hardware associated for all channels.
+    ///
+    /// Inactive channels indicate to the driver that it may turn off hardware associated with the
+    /// inactive channels. A subsequent `SetActiveChannels` setting an inactive channel to active
+    /// may incur in a `turn_on_delay` to actually restart playback/capture of the channels.
+    ///
+    /// Deactivating one, several, or all channels does not `Stop` the ring buffer, nor does it
+    /// change the ring buffer's behavior with regard to position. Once `Start` is called, a ring
+    /// buffer's position advances (and position notifications sent as needed) regardless of the
+    /// number of active channels, including if no channels are active. This means that the format
+    /// in the ring buffer is not changed.
+    ///
+    /// If the driver does not support deactivating channels, it must return `ZX_ERR_NOT_SUPPORTED`.
+    /// If the mask is incorrect, i.e. enables channels outside the number of bits to use for a
+    /// given `number_of_channels`, then the driver must return `ZX_ERR_INVALID_ARGS`.
+    ///
+    /// The `set_time` value (in the CLOCK_MONOTONIC timeline) indicates when configuring
+    /// the hardware to activate or deactivate channels is completed. `set_time` does not include
+    /// the potential `turn_on_delay`, the driver does not delay the reply waiting for the
+    /// hardware to actually turn on, the driver replies with a `set_time` indicating when the
+    /// hardware configuration was completed. If the requested channel configuration is already
+    /// active, the returned `set_time` can be before `SetActiveChannels` was called but must be
+    /// before the reply is sent. If called again with the same configuration, the reply must
+    /// include the same `set_time` value as was previously returned.
+    ///
+    /// For input channels, it is not required that the driver zero-out inactive channels.
+    ///
+    /// If `SetActiveChannels` is called for a second time before the first call has completed,
+    /// the channel must be closed with an error `ZX_ERR_BAD_STATE` returned.
+    strict SetActiveChannels(struct {
+        active_channels_bitmask uint64;
+    }) -> (struct {
+        set_time zx.Time;
+    }) error zx.Status;
+
+    /// Get information about delays via a hanging get.
+    ///
+    /// The driver will immediately reply to the first `WatchDelayInfo` sent by the client.
+    /// The driver will not respond to subsequent client `WatchDelayInfo` calls until the delay info
+    /// changes from what was most recently reported.
+    ///
+    /// If `WatchDelayInfo` is called for a second time before the first call has completed, the
+    /// channel must be closed with an error `ZX_ERR_BAD_STATE` returned.
+    @available(added=27)
+    flexible WatchDelayInfo() -> (struct {
+        delay_info DelayInfo;
+    });
+};

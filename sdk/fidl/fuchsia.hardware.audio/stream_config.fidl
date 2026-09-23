@@ -1,0 +1,183 @@
+// Copyright 2019 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+library fuchsia.hardware.audio;
+
+using fuchsia.hardware.audio.signalprocessing;
+
+/// Gain state requested by the client or returned by the driver.
+type GainState = table {
+    /// Current mute state. If not included, the state is unmuted.
+    ///
+    /// Optional.
+    1: muted bool;
+
+    /// Current Automatic Gain Control (AGC) state. If not included, AGC is disabled.
+    ///
+    /// Optional.
+    2: agc_enabled bool;
+
+    /// Current gain in decibels.
+    ///
+    /// Required.
+    3: gain_db float32;
+};
+
+type StreamProperties = table {
+    /// A unique identifier. If not included, there is no unique id for this StreamConfig.
+    /// See `unique_id.fidl` for considerations about specific pre-defined values and ranges.
+    ///
+    /// Optional.
+    1: unique_id UniqueId;
+
+    /// Driver type is input (true) or output (false)
+    ///
+    /// Required.
+    2: is_input bool;
+
+    /// Gain mute capability. If not included, the StreamConfig can't mute.
+    ///
+    /// Optional.
+    3: can_mute bool;
+
+    /// Automatic Gain Control (AGC) capability. If not included, the StreamConfig can't AGC.
+    ///
+    /// Optional.
+    4: can_agc bool;
+
+    /// Minimum gain in decibels.
+    ///
+    /// Required.
+    5: min_gain_db float32;
+
+    /// Maximum gain in decibels.
+    ///
+    /// Required.
+    6: max_gain_db float32;
+
+    /// Gain step in decibels, this value must not be negative, but may be zero to convey an
+    /// effectively continuous range of values. Must not exceed `max_gain_db` - `min_gain_db`.
+    ///
+    /// Required.
+    7: gain_step_db float32;
+
+    /// Plug Detect Capabilities.
+    ///
+    /// Required.
+    8: plug_detect_capabilities PlugDetectCapabilities;
+
+    /// UI string for the manufacturer name. If not included, the manufacturer is unspecified.
+    /// If included, this string must be non-empty.
+    ///
+    /// Optional.
+    9: manufacturer string:MAX_UI_STRING_SIZE;
+
+    /// UI string for the product name. If not included, the product name is unspecified.
+    /// If included, this string must be non-empty.
+    ///
+    /// Optional.
+    10: product string:MAX_UI_STRING_SIZE;
+
+    /// An identifier for the clock domain in which this hardware operates. If
+    /// two hardware devices have the same clock domain, their clock rates are
+    /// identical and perfectly synchronized. Although these two clocks have the
+    /// same rate, the clock positions may be offset from each other by an
+    /// arbitrary (but fixed) amount. The clock_domain typically comes from a
+    /// system wide entity, such as a platform bus or global clock tree.
+    ///
+    /// There are two special values:
+    ///
+    /// *  `CLOCK_DOMAIN_MONOTONIC` means the hardware is operating at the same
+    ///    rate as the system montonic clock.
+    ///
+    /// *  `CLOCK_DOMAIN_EXTERNAL` means the hardware is operating at an unknown
+    ///    rate and is not synchronized with any known clock, not even with
+    ///    other clocks in domain `CLOCK_DOMAIN_EXTERNAL`.
+    ///
+    /// If the domain is not `CLOCK_DOMAIN_MONOTONIC`, client must use position
+    /// notification updates to recover the hardware's clock.
+    ///
+    /// Required.
+    11: clock_domain ClockDomain;
+};
+
+/// For an overview see
+/// [Audio Driver Streaming Interface](https://fuchsia.dev/fuchsia-src/development/audio/drivers/streaming)
+/// # Deprecation
+///
+/// Not supported anymore, instead use an
+/// [Audio Composite](https://fuchsia.dev/fuchsia-src/development/audio/drivers/composite)
+/// with one Ring Buffer, see
+/// [Audio Drivers Architecture](https://fuchsia.dev/fuchsia-src/development/audio/drivers/architecture)
+@deprecated
+closed protocol StreamConfig {
+    /// Allows providing driver health state.
+    compose Health;
+
+    /// Allows providing signal processing capabilities.
+    compose fuchsia.hardware.audio.signalprocessing.Connector;
+
+    /// Retrieves top level static properties.
+    strict GetProperties() -> (struct {
+        properties StreamProperties;
+    });
+
+    /// Gets formats supported by a given driver. When not all combinations supported by the
+    /// driver can be described with one `SupportedFormats`, the driver returns more than one
+    /// `SupportedFormats` in the returned vector. For example, if one `SupportedFormats` allows
+    /// for 32 bits samples at 48KHz, and 16 bits samples at 96KHz, but not 32 bits samples at
+    /// 96KHz, then the driver replies with 2 `SupportedFormats`: <<32bits>,<48KHz>> and
+    /// <<16bits>,<96KHz>>. For simplicity, this example ignores parameters other than rate and
+    /// bits per sample. In the case where the driver supports either 16 or 32 bits samples at
+    /// either 48 or 96KHz, the driver would reply with 1 `SupportedFormats`:
+    /// <<16bits,32bits>,<48KHz,96KHz>>.
+    strict GetSupportedFormats() -> (struct {
+        supported_formats vector<SupportedFormats>:MAX_COUNT_FORMATS;
+    });
+
+    /// `CreateRingBuffer` is sent by clients to select a stream format based on information that
+    /// the driver provides in `GetSupportedFormats` what is supported by the client, and any other
+    /// requirement. The `ring_buffer` channel is used to control the audio buffer, if a previous
+    /// ring buffer channel had been established and was still active, the driver must close that
+    /// (ring buffer) channel and make every attempt to gracefully quiesce any on-going streaming
+    /// operations in the process.
+    strict CreateRingBuffer(resource struct {
+        format Format;
+        ring_buffer server_end:RingBuffer;
+    });
+
+    /// Get the gain state via a hanging get. The driver will reply to the first `WatchGainState`
+    /// sent by the client and this reply must include a `gain_db` set to 0dB or lower. The driver
+    /// will not respond to subsequent client `WatchGainState` calls until the gain state changes
+    /// from what was most recently reported.
+    /// If `WatchGainState` is called for a second time before the first call has completed, then
+    /// the protocol channel must be closed with the error `ZX_ERR_BAD_STATE`.
+    strict WatchGainState() -> (struct {
+        gain_state GainState;
+    });
+
+    /// Client update of the gain state.
+    strict SetGain(struct {
+        target_state GainState;
+    });
+
+    /// Get the plug detect state via a hanging get. The driver will reply to the first
+    /// `WatchPlugState` sent by the client. The driver will not respond to subsequent client
+    /// `WatchPlugState` calls until the plug state changes from what was most recently reported.
+    /// If `WatchPlugState` is called for a second time before the first call has completed, then
+    /// the protocol channel must be closed with the error `ZX_ERR_BAD_STATE`.
+    strict WatchPlugState() -> (struct {
+        plug_state PlugState;
+    });
+};
+
+/// # Deprecation
+///
+/// Not supported anymore, instead use an
+/// [Audio Composite](https://fuchsia.dev/fuchsia-src/development/audio/drivers/composite)
+/// with one Ring Buffer, see
+/// [Audio Drivers Architecture](https://fuchsia.dev/fuchsia-src/development/audio/drivers/architecture)
+@deprecated
+service StreamConfigService {
+    stream_config client_end:StreamConfig;
+};

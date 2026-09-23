@@ -1,0 +1,64 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be found in the LICENSE file.
+
+#ifndef SRC_CONNECTIVITY_WLAN_DRIVERS_LIB_LOG_CPP_TEST_INCLUDE_WLAN_DRIVERS_TEST_LOG_OVERRIDES_H_
+#define SRC_CONNECTIVITY_WLAN_DRIVERS_LIB_LOG_CPP_TEST_INCLUDE_WLAN_DRIVERS_TEST_LOG_OVERRIDES_H_
+
+#include <string>
+
+#include <gtest/gtest.h>
+#include <wlan/drivers/log.h>
+
+namespace wlan::drivers {
+
+constexpr const char* kDebugTag = "dtag";
+constexpr const char* kTraceTag = "ttag";
+
+constexpr fx_log_severity_t kSeverityNone = 0x7f;
+
+class LogTest : public ::testing::Test {
+ public:
+  void SetUp() override {
+    Reset();
+    instance_ = this;
+  }
+
+  void TearDown() override { instance_ = nullptr; }
+
+  void Reset() {
+    flag_ = kSeverityNone;
+    tag_.clear();
+  }
+
+  void ZxlogfEtcOverride(fx_log_severity_t flag, const char* tag, ...) {
+    ASSERT_NE(kSeverityNone, flag);
+    flag_ = flag;
+    if (tag != nullptr) {
+      tag_.assign(tag);
+    }
+  }
+
+  void Validate(fx_log_severity_t flag, const char* tag = nullptr) const {
+    ASSERT_EQ(flag_, flag);
+    if (tag != nullptr) {
+      ASSERT_STREQ(tag_.c_str(), tag);
+    }
+  }
+
+  bool LogInvoked() const { return (flag_ != kSeverityNone); }
+
+  static LogTest& GetInstance() {
+    EXPECT_NE(instance_, nullptr);
+    return *instance_;
+  }
+
+ private:
+  // instance of test that is accessible from mock driver logging functions.
+  static LogTest* instance_;
+
+  fx_log_severity_t flag_;
+  std::string tag_;
+};
+}  // namespace wlan::drivers
+
+#endif  // SRC_CONNECTIVITY_WLAN_DRIVERS_LIB_LOG_CPP_TEST_INCLUDE_WLAN_DRIVERS_TEST_LOG_OVERRIDES_H_

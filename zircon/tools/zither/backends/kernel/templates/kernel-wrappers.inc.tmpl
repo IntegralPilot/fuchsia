@@ -1,0 +1,84 @@
+{{/*
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+{{- define "Generate-kernel-wrappers.inc" -}}
+// Copyright 2022 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// DO NOT EDIT. Generated from FIDL library zx by zither, a Fuchsia platform
+// tool.
+
+extern "C" {
+
+{{ range . }}
+{{ if not .VdsoCall }}
+{{ $syscallName := LowerCaseWithUnderscores . }}
+{{ $userOutHandles := UserOutHandles . }}
+{{ $lastParamIndex := LastParameterIndex . }}
+
+syscall_result wrapper_{{ $syscallName }}(
+{{- range .Parameters -}}
+SafeSyscallArgument<{{ ParameterType . }}>::RawType arg_{{ LowerCaseWithUnderscores . }},
+{{- end -}}
+uint64_t pc);
+syscall_result wrapper_{{ $syscallName }}(
+{{- range .Parameters -}}
+SafeSyscallArgument<{{ ParameterType . }}>::RawType arg_{{ LowerCaseWithUnderscores . }},
+{{- end -}}
+uint64_t pc) {
+    return do_syscall(
+        ZX_SYS_{{ $syscallName }}, pc, &VDso::ValidSyscallPC::{{ $syscallName }},
+        [&](ProcessDispatcher* current_process) -> uint64_t {
+{{/* Write out locals for the ouput handles */}}
+{{- range $userOutHandles }}
+    zx_handle_t out_handle_{{ LowerCaseWithUnderscores . }} = ZX_HANDLE_INVALID;
+{{- end }}
+
+{{- if .NoReturn }} /*noreturn*/ {{ else if not .ReturnType }} /*void*/ {{ else }} auto result = {{ end }} sys_{{ $syscallName }} (
+{{- range $i, $param := .Parameters }}
+{{- $paramName := LowerCaseWithUnderscores $param }}
+{{- $paramType := ParameterType $param }}
+{{- $arg := printf "SafeSyscallArgument<%s>::Sanitize(arg_%s)" $paramType $paramName }}
+{{- if PassedAsPointer $param }}
+    {{- if IsUserOutHandle $param }}
+        {{- $arg = printf "&out_handle_%s" $paramName }}
+    {{- else if $param.IsStrictInput }}
+        {{- $arg = printf "make_user_in_ptr(%s)" $arg }}
+    {{- else if $param.IsStrictOutput }}
+        {{- $arg = printf "make_user_out_ptr(%s)" $arg }}
+    {{- else }}
+        {{- $arg = printf "make_user_inout_ptr(%s)" $arg }}
+    {{- end }}
+{{- end }}
+    {{ $arg }}{{ if ne $i $lastParamIndex }},{{end}}
+{{- end -}}
+);
+{{- if len $userOutHandles }} {{/* Complete copy-out of output handles. */}}
+    if (result != ZX_OK)
+        return result;
+{{- end }}
+{{- range $userOutHandles }}
+    result = make_user_out_ptr(SafeSyscallArgument<{{ ParameterType . }}>::Sanitize(arg_{{ LowerCaseWithUnderscores . }})).copy_to_user(out_handle_{{ LowerCaseWithUnderscores . }});
+    if (result != ZX_OK) {
+        Thread::Current::SignalPolicyException(ZX_EXCP_POLICY_CODE_HANDLE_LEAK, 0u);
+    }
+{{- end }}
+{{- if .NoReturn }}
+    /* NOTREACHED */
+    return ZX_ERR_BAD_STATE;
+{{- else if not .ReturnType }}
+    return ZX_OK;
+{{- else }}
+    return result;
+{{- end }}
+});
+}
+
+{{ end }}
+{{ end }}
+
+}
+{{ end }}

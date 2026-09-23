@@ -1,0 +1,142 @@
+{{/*
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+*/}}
+
+{{- define "Method:UnownedResult:WireMessagingHeader" }}
+{{- EnsureNamespace "" }}
+
+template<>
+class [[nodiscard]] {{ .WireUnownedResult }} final : public {{ .BaseWireResult }} {
+ public:
+  {{- if .Transport.HasSyncClient }}
+    {{- $args := (printf "%s client_end" .Protocol.UnownedClientEnd) }}
+    {{- $args = (List $args "::fidl::internal::AnyBufferAllocator& allocator") }}
+    {{- $args = (List $args (printf "%s* request" .WireTransactionalRequest)) }}
+    explicit {{ .WireUnownedResult.Self }}({{ RenderParams $args }});
+  {{- end }}
+
+  {{- if .HasResponsePayload }}
+    explicit {{ .WireUnownedResult.Self }}({{ .WireResponse }}* response);
+    explicit {{ .WireUnownedResult.Self }}(
+        ::fit::result<::fidl::Error, ::fidl::DecodedValue<{{ .WireResponse }}>>&& decoded,
+        ::fidl::internal::MessageStorageViewBase* storage_view
+    );
+  {{- else }}
+    explicit {{ .WireUnownedResult.Self }}(
+        ::fit::result<::fidl::Error>&& decoded,
+        ::fidl::internal::MessageStorageViewBase* storage_view
+    );
+  {{- end }}
+
+  explicit {{ .WireUnownedResult.Self }}(const ::fidl::Status& result);
+  {{ .WireUnownedResult.Self }}({{ .WireUnownedResult.Self }}&&) = default;
+  {{ .WireUnownedResult.Self }}(const {{ .WireUnownedResult.Self }}&) = delete;
+  {{ .WireUnownedResult.Self }}& operator=({{ .WireUnownedResult.Self }}&&) = default;
+  {{ .WireUnownedResult.Self }}& operator=(const {{ .WireUnownedResult.Self }}&) = delete;
+  ~{{ .WireUnownedResult.Self }}() = default;
+
+  {{ if .HasResponse -}}
+  private:
+    {{- if .HasResponsePayload }}
+      ::fidl::DecodedValue<{{ .WireResponse }}> decoded_;
+    {{- end }}
+  {{- end }}
+};
+
+{{- end }}
+
+
+
+{{- define "Method:UnownedResult:WireMessagingSource" }}
+
+  {{- if .Transport.HasSyncClient }}
+  {{- EnsureNamespace "" }}
+    {{- $args := (printf "%s client_end" .Protocol.UnownedClientEnd) }}
+    {{- $args = (List $args "::fidl::internal::AnyBufferAllocator& allocator") }}
+    {{- $args = (List $args (printf "%s* request" .WireTransactionalRequest)) }}
+    {{ .WireUnownedResult }}::{{ .WireUnownedResult.Self }}({{ RenderParams $args }}) {
+      {{/* TODO(https://fxbug.dev/42167369): Factor out common buffer allocation logic once we have other instances
+      of this pattern. */ -}}
+
+      {{/* Allocate one buffer for both request/response (if applicable). */ -}}
+      constexpr uint32_t buffer_size = ::fidl::SyncClientMethodBufferSizeInChannel<{{ .Marker }}>();
+      ::fit::result<::fidl::Error, ::fidl::BufferSpan> allocation = allocator.TryAllocate(buffer_size);
+      if (!allocation.is_ok()) {
+        SetStatus(allocation.error_value());
+        return;
+      }
+      uint8_t* buffer = allocation->data;
+
+      {{- if .HasResponse -}}
+        {{/* TODO(https://fxbug.dev/42166787): We should be able optimize this to just the max of
+        the send/receive size, once Zircon channel calls guarantee that the
+        send/receive buffers can overlap.
+
+        For now, the invariant of SyncClientMethodBufferSizeInChannel is that it returns
+        the sum of the request/response size, so we can index into it and get the
+        address of the response buffer. */ -}}
+        constexpr uint32_t request_byte_capacity = ::fidl::MaxSizeInChannel<
+            {{ .WireTransactionalRequest }}, ::fidl::MessageDirection::kSending>();
+        uint8_t* request_bytes = buffer;
+        static_assert(buffer_size > request_byte_capacity);
+        uint32_t response_byte_capacity = buffer_size - request_byte_capacity;
+        uint8_t* response_bytes = &buffer[request_byte_capacity];
+      {{- else }}
+        uint32_t request_byte_capacity = buffer_size;
+        uint8_t* request_bytes = buffer;
+      {{- end }}
+
+      ::fidl::internal::UnownedEncodedMessage<{{ .WireTransactionalRequest }}> request_message(
+          request_bytes, request_byte_capacity, request);
+      auto& outgoing = request_message.GetOutgoingMessage();
+
+      {{- if .HasResponse }}
+        {{ .IncomingMessageHandleStorageForResponse }} handle_storage;
+        ::fit::result decoded = ::fidl::internal::InplaceDecodeTransactionalResponse<{{ .Marker }}>(
+            outgoing.Call(
+                client_end.handle(),
+                handle_storage.view(fidl::BufferSpan(response_bytes, response_byte_capacity))
+            )
+        );
+        SetStatus(::fidl::internal::StatusFromResult(decoded));
+        {{- if .HasResponsePayload }}
+          if (ok()) {
+            decoded_ = std::move(decoded.value());
+            ExtractValueFromDecoded(decoded_.pointer());
+          }
+        {{- end }}
+      {{- else }}
+        outgoing.Write(client_end.handle());
+        SetStatus(outgoing);
+      {{- end }}
+    }
+
+  {{- end }}
+
+  {{- if .HasResponsePayload }}
+    {{ .WireUnownedResult }}::{{ .WireUnownedResult.Self }}({{ .WireResponse }}* response)
+        : {{ .BaseWireResult }}(fidl::Status::Ok()), decoded_(response) {
+      ExtractValueFromDecoded(decoded_.pointer());
+    }
+
+    {{ .WireUnownedResult }}::{{ .WireUnownedResult.Self }}(
+        ::fit::result<::fidl::Error, ::fidl::DecodedValue<{{ .WireResponse }}>>&& decoded,
+        ::fidl::internal::MessageStorageViewBase* storage_view
+    ) : {{ .BaseWireResult }}(::fidl::internal::StatusFromResult(decoded)) {
+      if (decoded.is_ok()) {
+        decoded_ = std::move(decoded.value());
+        ExtractValueFromDecoded(decoded_.pointer());
+      }
+    }
+  {{- else }}
+    {{ .WireUnownedResult }}::{{ .WireUnownedResult.Self }}(
+        ::fit::result<::fidl::Error>&& decoded,
+        ::fidl::internal::MessageStorageViewBase* storage_view
+    ) : {{ .BaseWireResult }}(::fidl::internal::StatusFromResult(decoded)) {}
+  {{- end }}
+
+  {{ .WireUnownedResult }}::{{ .WireUnownedResult.Self }}(const ::fidl::Status& result) : {{ .BaseWireResult }}(result) {}
+
+{{- end }}

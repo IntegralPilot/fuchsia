@@ -1,0 +1,284 @@
+# Copyright 2017 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/config/compiler.gni")
+import("//build/config/compiler_config.gni")
+import("//build/config/lto/config.gni")
+import("//build/config/riscv64/riscv64.gni")
+import("//build/toolchain/toolchain_environment.gni")
+import("//build/toolchain/variant.gni")
+
+config("fat-lto-objects") {
+  if (!is_kernel) {
+    configs = [
+      ":fat-lto-objects-compilation",
+      ":fat-lto-objects-linking",
+    ]
+  }
+}
+
+config("fat-lto-objects-compilation") {
+  if (fat_lto_objects && !is_gcc) {
+    # TODO(https://fxbug.dev/340553826): - Add FatLTO support for Mach-O and COFF file formats
+    # Currently, FatLTO requires ELF, so its only valid on non-EFI Fuchsia and
+    # Linux
+    if (is_elf) {
+      cflags = [ "-ffat-lto-objects" ]
+    }
+  }
+}
+
+compiler_config("fat-lto-objects-linking") {
+  if (fat_lto_objects && !is_gcc) {
+    # TODO(https://fxbug.dev/340553826): - Add FatLTO support for Mach-O and COFF file formats
+    # Currently, FatLTO requires ELF, so its only valid on non-EFI Fuchsia and
+    # Linux
+    if (is_elf) {
+      ldflags = [ "-ffat-lto-objects" ]
+
+      # TODO(https://fxbug.dev/520129672): Enabling this on non-CFI builds leads to
+      # unexpected TLS effects, so let's enable this only on CFI builds for now.
+      if (toolchain_variant.tags + [ "cfi" ] - [ "cfi" ] !=
+          toolchain_variant.tags) {
+        rust_linker_flags = [ "--fat-lto-objects" ]
+      }
+    }
+  }
+}
+
+config("no-fat-lto-objects-compilation") {
+  if (fat_lto_objects && !is_gcc) {
+    # TODO(https://fxbug.dev/340553826): - Add FatLTO support for Mach-O and COFF file formats
+    # Currently, FatLTO requires ELF, so its only valid on non-EFI Fuchsia and
+    # Linux
+    if (is_elf) {
+      cflags = [ "-fno-fat-lto-objects" ]
+    }
+  }
+}
+
+compiler_config("no-fat-lto-objects-linking") {
+  # The --no-fat-lto-objects option is only valid in LLD
+  if (fat_lto_objects && !is_gcc) {
+    # TODO(https://fxbug.dev/340553826): - Add FatLTO support for Mach-O and COFF file formats
+    # Currently, FatLTO requires ELF, so its only valid on non-EFI Fuchsia and
+    # Linux
+    if (is_elf) {
+      linker_flags = [ "--no-fat-lto-objects" ]
+    }
+  }
+}
+
+config("no-fat-lto-objects") {
+  configs = [
+    ":no-fat-lto-objects-compilation",
+    ":no-fat-lto-objects-linking",
+  ]
+}
+
+compiler_config("lto-workarounds") {
+  visibility = [ ":*" ]
+
+  linker_llvm_flags = []
+
+  if (toolchain_environment != "kernel.phys32" &&
+      toolchain_environment != "kernel.efi") {
+    # TODO(https://fxbug.dev/42079915): LLD lets --no-pie trump the code
+    # generation switches, since we default to PIC, specify that to LTO links
+    # outside of x86_32 and EFI.
+    linker_llvm_flags += [ "-relocation-model=pic" ]
+
+    # TODO(https://fxbug.dev/481320391): Remove the TLSDESC workaround when the
+    # toolchain propagates the target information correctly in LTO builds.
+    linker_llvm_flags += [ "--enable-tlsdesc" ]
+  }
+}
+
+# This enables whole program devirtualization when LTO is enabled. Individual
+# binaries can opt-in to using this for LTO builds. This can be turned on safely
+# for self-contained binaries that do not expose the C++ ABI (such as the
+# kernel or fdio). This should only be used for LTO builds.
+#
+# Users should be careful when using this because this can lead to virtual
+# function calls unexpectedly being devirtualized if the compiler determines
+# that a virtual call can resolve to a function from only one vtable.
+# https://fxbug.dev/42075686 contains an example of this. For these cases, if
+# the C++ ABI is expected to be exposed from a shared library, then adding
+# [[clang::lto_visibility_public]] to the public/exported class will tell the
+# compiler that other subclasses may exist outside this LTO unit. See
+# https://clang.llvm.org/docs/LTOVisibility.html for more information on the
+# annotation.
+compiler_config("lto-whole-program-devirtualization") {
+  c_family_flags = [
+    # Opt-in for whole-program devirtualization and virtual constant
+    # propagation.
+    "-fwhole-program-vtables",
+  ]
+
+  # TODO(https://fxbug.dev/42061844): Temporarily disable branch funneling on
+  # lto. Branch funneling likely generates bad code involving return values not
+  # propagated correctly to other functions. Once this is resolved, come back
+  # and remove this.
+  #
+  # Note this would be a no-op if WPD were disabled anyway.
+  if (is_fuchsia) {
+    linker_llvm_flags = [ "-wholeprogramdevirt-branch-funnel-threshold=0" ]
+  }
+}
+
+compiler_config("no-lto-whole-program-devirtualization") {
+  c_family_flags = [ "-fno-whole-program-vtables" ]
+}
+
+# Enables linker plugin LTO.
+#
+# If an rlib is only ever going to get used later with a -Clto compilation then
+# you can pass -Clinker-plugin-lto to speed up compilation and avoid generating
+# object files that aren't used.
+#
+# See
+# https://doc.rust-lang.org/rustc/codegen-options/index.html#linker-plugin-lto
+# for details.
+config("lto-rust-linker-plugin") {
+  if (is_kernel || is_host) {
+    # TODO(https://fxbug.dev/529449843): `-Clinker-plugin-lto` forces rust to just emit LLVM
+    # bitcode and punt LTO to the linker. During the link, LTO can eliminate
+    # dead code which could contain references to symbols defined in a normal
+    # rlib that would be linked with this bitcode. If we're building a shared
+    # library, this can result in symbols which should be exported in the shared
+    # library from not being defined in the shared lib because there's nothing
+    # which would extract them from the rlib. This only occurs when LLD drives
+    # LTO. When rustc drives LTO, it creates a list of symbols that LTO should
+    # never omit which allows these symbols to make it to the final lib.
+    # Ideally, this would be fixed upstream, and ideally the quick workaround
+    # would be to gate this flag on `current_toolchain != shlib_toolchain`, but
+    # all rust targets which would use the shared library toolchain actually use
+    # the non-shared normal toolchain. As a backup workaround, we only limit
+    # this flag to the kernel since this would break rust shared lib targets.
+    rustflags = [
+      "-Zsplit-lto-unit",
+      "-Clinker-plugin-lto",
+    ]
+  }
+}
+
+# This can be appended with:
+# ```
+#   configs += [ "//build/config/lto:no-lto" ]
+# ```
+# in any particular target to disable LTO.
+compiler_config("no-lto") {
+  c_family_flags = [ "-fno-lto" ]
+  configs = [ ":no-lto-whole-program-devirtualization" ]
+  rustflags = [ "-Clto=off" ]
+}
+
+variant("lto") {
+  c_family_flags = [ "-flto" ]
+
+  configs = [
+    ":fat-lto-objects",
+    ":lto-workarounds",
+    ":lto-rust-linker-plugin",
+  ]
+
+  rustflags = [
+    "-Clto=fat",
+    "-Zdylib-lto",
+  ]
+
+  # TODO(https://fxbug.dev/533045810): WPD is temporarily disabled for all Fuchsia-contexts because
+  # WPD depends on module summaries emitted for all participating bitcode, but
+  # rust currently doesn't emit module summaries for full/fat LTO.
+  if (!is_fuchsia) {
+    configs += [ ":lto-whole-program-devirtualization" ]
+  }
+}
+
+# This config is used to opt-in targets to LTO while automatically excluding
+# scenarios where LTO is incompatible or redundant.
+config("lto-if-compatible") {
+  # Do not enable LTO for the instrumented variants.
+  # Do not enable LTO (here) for the lto or thinlto variants.
+  if (!is_instrumented && !is_lto_variant && !is_gcc) {
+    configs = [ ":lto" ]
+  }
+}
+
+config("thinlto-clang") {
+  cflags = [ "-flto=thin" ]
+  asmflags = cflags
+  ldflags = cflags
+  configs = [
+    ":fat-lto-objects",
+    ":lto-workarounds",
+
+    # As thin lto is multi-threaded, use the larger RBE workers
+    "//build/config/rbe:big_rbe_machine",
+  ]
+
+  # These switches have the same meaning but different spellings for
+  # lld-link vs ld.lld.
+  if (is_pecoff) {
+    _jobs = "/opt:lldltojobs="
+    _cache_dir = "/lldltocache:"
+  } else {
+    _jobs = "--thinlto-jobs="
+    _cache_dir = "--thinlto-cache-dir="
+  }
+
+  ldflags += [
+    # The ThinLTO driver launches a number of threads in parallel whose
+    # number is by default equivalent to the number of cores.  We need
+    # to limit the parallelism to avoid aggressive competition between
+    # different linker jobs.
+    "-Wl,${_jobs}$thinlto_jobs",
+
+    # Set the ThinLTO cache directory which is used to cache native
+    # object files for ThinLTO incremental builds.  This directory is
+    # not managed by Ninja and has to be cleaned manually, but it is
+    # periodically garbage-collected by the ThinLTO driver.
+    "-Wl,${_cache_dir}$thinlto_cache_dir",
+  ]
+}
+
+compiler_config("thinlto-rust") {
+  rustflags = [
+    "-Clto=thin",
+    "-Zdylib-lto",
+  ]
+
+  # These switches have the same meaning but different spellings for
+  # lld-link vs ld.lld.
+  if (is_pecoff) {
+    rust_linker_flags = [ "/lldltocache:${thinlto_cache_dir}" ]
+  } else {
+    rust_linker_flags = [ "--thinlto-cache-dir=${thinlto_cache_dir}" ]
+  }
+
+  configs = [
+    ":lto-rust-linker-plugin",
+    ":lto-workarounds",
+
+    # As thin lto is multi-threaded, use the larger RBE workers
+    "//build/config/rbe:big_rbe_machine",
+  ]
+}
+
+variant("thinlto") {
+  configs = [
+    ":thinlto-clang",
+    ":thinlto-rust",
+  ]
+}
+
+# This config is used to opt-in targets to ThinLTO while automatically excluding
+# scenarios where LTO is incompatible or redundant.
+config("thinlto-if-compatible") {
+  # Do not enable ThinLTO for the instrumented variants.
+  # Do not enable ThinLTO (here) for the lto or thinlto variants.
+  if (!is_instrumented && !is_lto_variant && !is_gcc) {
+    configs = [ ":thinlto" ]
+  }
+}

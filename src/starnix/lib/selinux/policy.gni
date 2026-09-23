@@ -1,0 +1,218 @@
+# Copyright 2026 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/testing/config.gni")
+
+_DEFAULT_INITIAL_SIDS =
+    "//src/starnix/lib/selinux/testdata/composite_policies/initial_sids"
+
+# Declares a set of SELinux policy fragment sources.
+#
+# Parameters:
+#   sources (optional)
+#     List of .conf policy fragment files.
+#
+#   deps (optional)
+#     Dependencies on other sepolicy_source_set targets.
+#
+template("sepolicy_source_set") {
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    metadata = {
+      sepolicy_sources = []
+      if (defined(invoker.sources)) {
+        sepolicy_sources += rebase_path(invoker.sources, root_build_dir)
+      }
+    }
+  }
+}
+
+# Verifies and compiles a SELinux policy into a binary policy.
+#
+# If `source` is specified, the policy is treated as a standalone policy and
+# verified/compiled directly without fragment merging.
+#
+# If `sources` or `deps` is specified, fragments from `sources` and all
+# transitive `sepolicy_sources` metadata from `deps` are merged together with
+# `initial_sids` into a unified `.conf` file before verification and
+# compilation.
+#
+# Parameters:
+#   source (optional)
+#     Path to a single standalone .conf file. Cannot be used with sources/deps.
+#
+#   sources (optional)
+#     List of .conf fragment files to include.
+#
+#   deps (optional)
+#     List of dependencies, typically sepolicy_source_set targets.
+#
+#   prebuilt (optional)
+#     Path to the checked-in binary policy prebuilt.
+#
+#   hash_file (optional)
+#     Path to the checked-in source hash file. Defaults to "${prebuilt}.hash".
+#
+#   handle_unknown (optional)
+#     "deny" (default), "allow", or "reject".
+#
+#   output_name (optional)
+#     Output binary filename in target_out_dir. Defaults to target_name.
+#
+template("sepolicy_binary") {
+  assert(
+      defined(invoker.source) || defined(invoker.sources) ||
+          defined(invoker.deps),
+      "sepolicy_binary($target_name) must specify 'source', 'sources', or 'deps'")
+  assert(
+      !defined(invoker.source) ||
+          (!defined(invoker.sources) && !defined(invoker.deps)),
+      "sepolicy_binary($target_name) cannot mix 'source' with 'sources' or 'deps'")
+
+  handle_unknown = "deny"
+  if (defined(invoker.handle_unknown)) {
+    handle_unknown = invoker.handle_unknown
+  }
+
+  output_name = target_name
+  if (defined(invoker.output_name)) {
+    output_name = invoker.output_name
+  }
+
+  if (defined(invoker.prebuilt)) {
+    prebuilt_policy = invoker.prebuilt
+  } else {
+    prebuilt_policy = output_name
+  }
+
+  if (defined(invoker.hash_file)) {
+    hash_file = invoker.hash_file
+  } else {
+    hash_file = "${prebuilt_policy}.hash"
+  }
+
+  if (defined(invoker.source)) {
+    # Standalone single-file policy: compile/verify directly on invoker.source.
+    policy_conf = invoker.source
+    policy_deps = []
+  } else {
+    # Composite policy:
+    # 1. Collect sepolicy_sources from deps if deps are present.
+    # 2. Merge initial_sids, direct sources, and dep fragments into $target_gen_dir/$target_name.conf.
+    # 3. Verify or compile the merged .conf file.
+
+    initial_sids = _DEFAULT_INITIAL_SIDS
+
+    merge_target = "${target_name}_merge"
+    merged_conf = "$target_gen_dir/$target_name.conf"
+    merge_depfile = "${merged_conf}.d"
+
+    has_deps = defined(invoker.deps)
+    if (has_deps) {
+      manifest_target = "${target_name}_manifest"
+      manifest_file = "$target_gen_dir/${target_name}.sources.manifest"
+
+      generated_file(manifest_target) {
+        forward_variables_from(invoker, [ "testonly" ])
+        deps = invoker.deps
+        data_keys = [ "sepolicy_sources" ]
+        output_conversion = "list lines"
+        outputs = [ manifest_file ]
+      }
+    }
+
+    action(merge_target) {
+      forward_variables_from(invoker, [ "testonly" ])
+      script = "//src/starnix/lib/selinux/scripts/merge_policies.py"
+
+      inputs = [ initial_sids ]
+      deps = []
+      if (has_deps) {
+        deps += [ ":$manifest_target" ]
+        inputs += [ manifest_file ]
+      }
+      if (defined(invoker.sources)) {
+        inputs += invoker.sources
+      }
+
+      outputs = [ merged_conf ]
+      depfile = merge_depfile
+
+      args = [
+        "--initial-sids",
+        rebase_path(initial_sids, root_build_dir),
+        "--output",
+        rebase_path(merged_conf, root_build_dir),
+        "--handle-unknown",
+        handle_unknown,
+        "--depfile",
+        rebase_path(merge_depfile, root_build_dir),
+      ]
+
+      if (has_deps) {
+        args += [
+          "--fragments-manifest",
+          rebase_path(manifest_file, root_build_dir),
+        ]
+      }
+
+      if (defined(invoker.sources)) {
+        args += [ "--inputs" ] + rebase_path(invoker.sources, root_build_dir)
+      }
+    }
+
+    policy_conf = merged_conf
+    policy_deps = [ ":$merge_target" ]
+  }
+
+  action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+    script = "//src/starnix/lib/selinux/scripts/verify_or_compile_policy.py"
+
+    out_policy = "$target_out_dir/$prebuilt_policy"
+    stamp_file = "$target_gen_dir/$target_name.verified"
+    depfile = "${stamp_file}.d"
+
+    inputs = [ policy_conf ]
+    deps = policy_deps
+
+    outputs = [
+      out_policy,
+      stamp_file,
+    ]
+
+    args = [
+      "--policy-name",
+      output_name,
+      "--source",
+      rebase_path(policy_conf, root_build_dir),
+      "--prebuilt",
+      rebase_path(prebuilt_policy, root_build_dir),
+      "--hash-file",
+      rebase_path(hash_file, root_build_dir),
+      "--output",
+      rebase_path(out_policy, root_build_dir),
+      "--handle-unknown",
+      handle_unknown,
+      "--stamp",
+      rebase_path(stamp_file, root_build_dir),
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+    ]
+
+    if (update_goldens) {
+      args += [ "--bless" ]
+    }
+  }
+}

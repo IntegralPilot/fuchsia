@@ -1,0 +1,137 @@
+#!/bin/bash
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+### Test "format-code" script.
+
+readonly TESTDATA="data/fx_format_code_test"
+
+BT_FILE_DEPS=(
+  "scripts/fx"
+  "tools/devshell/format-code"
+  "tools/devshell/lib/fx-cmd-locator.sh"
+  "tools/devshell/lib/fx-optional-features.sh"
+  "tools/devshell/lib/generate-ssh-config.sh"
+  "tools/devshell/lib/vars.sh"
+  "tools/devshell/lib/is_invoked_by_agent.sh"
+  "tools/devshell/lib/agents.txt"
+  "tools/devshell/tests/subcommands/${TESTDATA}/cml.cml"
+  "tools/devshell/tests/subcommands/${TESTDATA}/cplusplus.cc"
+  "tools/devshell/tests/subcommands/${TESTDATA}/rust.rs"
+  "tools/devshell/tests/subcommands/${TESTDATA}/fidl.test.fidl"
+  "tools/devshell/tests/subcommands/${TESTDATA}/gidl.gidl"
+  "tools/devshell/tests/subcommands/${TESTDATA}/gn.gn"
+  "tools/devshell/tests/subcommands/${TESTDATA}/gn.gni"
+  "tools/devshell/tests/subcommands/${TESTDATA}/json5.json5"
+  "tools/devshell/tests/subcommands/${TESTDATA}/python3.py"
+)
+
+MOCK_CLANG_DIR="prebuilt/third_party/clang/test"
+MOCK_SHAC="prebuilt/third_party/shac/shac"
+MOCK_PYTHON3_DIR="prebuilt/third_party/python3/test"
+BT_MOCKED_TOOLS=(
+  "scripts/fuchsia-vendored-python"
+  "tools/devshell/list-build-artifacts"
+  "tools/devshell/lib/platform.sh"
+  "${MOCK_CLANG_DIR}/bin/clang-format"
+  "${MOCK_PYTHON3_DIR}/bin/python3"
+  "${MOCK_SHAC}"
+  "${FUCHSIA_BUILD_DIR}/host_x64/cmc"
+  "${FUCHSIA_BUILD_DIR}/host_x64/fidl-format"
+  "${FUCHSIA_BUILD_DIR}/host_x64/gidl-format"
+)
+
+BT_MKDIR_DEPS=(
+  ".jiri_root"
+)
+
+BT_SET_UP() {
+  # Set up the testing framework.
+  source "${BT_TEMP_DIR}/tools/devshell/tests/lib/fuchsia-mock.sh"
+  fx="$(btf::setup_fx)"
+
+  # Set up mocked replacements for system utils.
+  export PATH="${BT_TEMP_DIR}/bin:${PATH}"
+  cat > "${BT_TEMP_DIR}/tools/devshell/lib/platform.sh.mock_side_effects" <<EOF
+    readonly PREBUILT_CLANG_DIR=${BT_TEMP_DIR}/${MOCK_CLANG_DIR}
+    readonly PREBUILT_SHAC=${BT_TEMP_DIR}/${MOCK_SHAC}
+    readonly PREBUILT_PYTHON3_DIR=${BT_TEMP_DIR}/${MOCK_PYTHON3_DIR}
+EOF
+}
+
+# Ensure that formatting an unchanged tree works
+TEST_fx-format-code-no-args() {
+  BT_EXPECT "${fx}" format-code 2> stderr
+}
+
+# Ensure that the commands for common file types are sensible.
+TEST_fx-format-code-commands() {
+  local out="${BT_TEMP_DIR}/_fx_format_code_output"
+  local files=(
+    "${TESTDATA}/cplusplus.cc"
+    "${TESTDATA}/rust.rs"
+    "${TESTDATA}/gn.gn"
+    "${TESTDATA}/gn.gni"
+    "${TESTDATA}/python3.py"
+  )
+  local csfiles
+  printf -v csfiles ",%s" "${files[@]}"
+  BT_EXPECT "${fx}" format-code --verbose --files="${csfiles:1}" > "${out}"
+  BT_EXPECT grep -q -E '"clang-format.*cplusplus.cc"' "${out}"
+  BT_EXPECT grep -q -E '"shac fmt .*/rust.rs .*/gn.gn .*/gn.gni .*/python3.py"' "${out}"
+}
+
+# Ensure that formatting a nonexistent file prints an error.
+TEST_fx-format-code-nonexistent-file() {
+  local err="${BT_TEMP_DIR}/_fx_format_code_stderr"
+  local path="${TESTDATA}/doesnotexist.py"
+  BT_EXPECT "${fx}" format-code --verbose --files="${path}" > /dev/null 2> "${err}"
+  BT_EXPECT grep -q -E '"ERROR: no such file: .*/doesnotexist.py"' "${err}"
+}
+
+# Ensure that no error gets printed if git reports a non-existent file, since it probably
+# means the file was deleted so it's expected that it would be ignored by `fx format-code`.
+TEST_fx-format-code-ignores-nonexistent-git-files() {
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts"
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/build"
+  btf::make_mock "git"
+  local out="${BT_TEMP_DIR}/_fx_format_code_ouput"
+  local err="${BT_TEMP_DIR}/_fx_format_code_stderr"
+  echo "${TESTDATA}/doestnotexist.cc" > "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts.mock_stdout"
+  echo "no-such-file" > "git.mock_stdout"
+  BT_EXPECT "${fx}" format-code --verbose > "${out}" 2> "${err}"
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${out}" "Files to be formatted:"
+  BT_EXPECT_FILE_CONTAINS_SUBSTRING "${out}" "no-such-file"
+  BT_EXPECT_EMPTY "$(cat "${err}")" "There should be no errors when given non-existent git files"
+}
+
+# Ensure that buildable format commands are built when needed
+TEST_fx-format-code-builds-required-commands() {
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts"
+  btf::make_mock "${BT_TEMP_DIR}/tools/devshell/build"
+  local out="${BT_TEMP_DIR}/_fx_format_code_output"
+  local err="${BT_TEMP_DIR}/_fx_format_code_stderr"
+  local files=(
+    "${TESTDATA}/cplusplus.cc"
+    "${TESTDATA}/gidl.gidl"
+    "${TESTDATA}/fidl.test.fidl"
+    "${TESTDATA}/cml.cml"
+    "${TESTDATA}/json5.json5"
+  )
+  local csfiles
+  printf -v csfiles ",%s" "${files[@]}"
+  echo "host_x64/gidl-format" > "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts.mock_stdout"
+  echo "host_x64/fidl-format" > "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts.mock_stdout.1"
+  echo "host_x64/cmc" > "${BT_TEMP_DIR}/tools/devshell/list-build-artifacts.mock_stdout.2"
+  # NOT EXPECTing success, since the missing commands are not actually built,
+  # but this test verifies that they would be built.
+  "${fx}" format-code --verbose --files="${csfiles:1}" > "${out}" 2> "${err}"
+  BT_EXPECT grep -q -E '"clang-format.*cplusplus.cc"' "${out}"
+  BT_EXPECT grep -q -E '"fidl-format not built; building now..."' "${err}"
+  BT_EXPECT grep -q -E '"gidl-format not built; building now..."' "${err}"
+  BT_EXPECT grep -q -E '"formatjson5 not built; building now..."' "${err}"
+  BT_EXPECT grep -q -E '"cmc not built; building now..."' "${err}"
+}
+
+BT_RUN_TESTS "$@"

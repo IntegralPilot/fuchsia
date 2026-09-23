@@ -1,0 +1,563 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/compiled_action.gni")
+import("//build/python/python_action.gni")
+import("//build/testing/golden_files.gni")
+import("//build/zircon/c_utils.gni")
+
+# Internal template used to preprocess a DTS file.
+#
+# Parameters
+#
+#   * sources
+#     - Required: DTS file to preprocess.
+#     - Type: list(path). Must only have one entry.
+#
+#   * deps
+#     - Optional: Usual GN meaning.
+#
+template("_preprocessed_dts") {
+  toolchain_utils_action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "sources",
+                             "deps",
+                           ])
+
+    assert([ sources[0] ] == sources, "Only one source file can be passed.")
+
+    utils = [ "cc" ]
+
+    source_root_relative = get_path_info(rebase_path(sources[0], "//"), "dir")
+    source_name = get_path_info(sources[0], "name")
+
+    # This is done to remove the '.S' extension added to the files and also
+    # place it in a relatively equivalent path to that of the source. This is
+    # required to allow includes that contain the full source path.
+    outputs =
+        [ "$target_gen_dir/$target_name/$source_root_relative/$source_name" ]
+    depfile = "$target_gen_dir/$source_name.d"
+
+    configs = [
+      "//build/config:relative_paths",
+      "//build/config:default_include_dirs",
+    ]
+
+    args = [
+      "-undef",
+      "-MD",
+      "-MF",
+      rebase_path(depfile, root_build_dir),
+      "-E",
+      "-P",
+      "{{include_dirs}}",
+      "{{defines}}",
+      "-x",
+      "assembler-with-cpp",
+      rebase_path(sources[0], root_build_dir),
+      "-o",
+      rebase_path(outputs[0], root_build_dir),
+    ]
+  }
+}
+
+# Defines a devicetree source file that can be included by other devicetree
+# files.
+#
+# Parameters
+#
+#   * sources
+#     - Required: Device tree source include file (.dtsi/.dtsi.S). Source files
+#       that include C header files should end with the extension `.dtsi.S` and
+#       it will be preprocessed by C compiler.
+#     - Type: list(path). Must only have one entry.
+#
+#   * deps
+#     - Optional: Other Devicetree fragment targets referenced by this fragment.
+#     - Type: list(label)
+#     - Default: []
+#
+template("devicetree_fragment") {
+  dtsi_file = invoker.sources
+  assert([ dtsi_file[0] ] == invoker.sources,
+         "Devicetree fragment can only have one source file")
+  extension = get_path_info(dtsi_file[0], "extension")
+  dtsi_extension =
+      get_path_info(get_path_info(dtsi_file[0], "name"), "extension")
+  assert(extension == "dtsi" || (extension == "S" && dtsi_extension == "dtsi"),
+         "Devicetree fragment can only have .dtsi or .dtsi.S source file.")
+  not_needed([ "dtsi_extension" ])
+
+  if (extension == "S") {
+    processed_dts_target = "_devicetree_fragment.$target_name.preprocessed"
+    _preprocessed_dts(processed_dts_target) {
+      forward_variables_from(invoker,
+                             [
+                               "sources",
+                               "deps",
+                             ])
+    }
+    processed_dts_outputs = get_target_outputs(":$processed_dts_target")
+    processed_dts_output_dir = get_path_info(processed_dts_outputs[0], "dir")
+    includes = [
+      # For dtsi includes referring to paths relative to `//`.
+      "$target_gen_dir/$processed_dts_target",
+
+      # For dtsi includes referring to current directory.
+      "$processed_dts_output_dir",
+    ]
+  } else {
+    includes = [ get_path_info(dtsi_file[0], "dir") ]
+  }
+
+  group(target_name) {
+    forward_variables_from(invoker, [ "deps" ])
+    if (!defined(deps)) {
+      deps = []
+    }
+
+    if (extension == "S") {
+      deps += [ ":$processed_dts_target" ]
+    }
+
+    metadata = {
+      devicetree_barrier = []
+      devicetree_includes = includes
+    }
+  }
+}
+
+# Defines a devicetree blob builder.
+#
+# Parameters
+#
+#   * sources
+#     - Required: Device tree source file (.dts/.dts.S). Source file that
+#       include C header files should end with the extension `.dts.S` and it
+#       will be preprocessed by C compiler before invoking the devicetree compiler.
+#     - Type: List(path). Must only have one entry.
+#
+#   * deps
+#     - Optional: Usual GN meaning.
+#
+#   * dtcflags
+#     - Optional: Flags to be passed to dtc compiler.
+#     - Type: List(flags).
+#
+#  * outputs
+#     - Optional: The singleton list containing the output blob path. This value
+#       can be accessed as `get_target_outputs(target_name)`.
+#     - Type: list(path). Must only have one entry.
+#     - Default: target_out_dir + "/" + get_path_info(sources[0], "name) + ".dtb"
+#
+template("dtb") {
+  dts_file = invoker.sources
+  assert([ dts_file[0] ] == invoker.sources,
+         "devicetree can only have a single input file")
+
+  extension = get_path_info(dts_file[0], "extension")
+  dts_extension = get_path_info(get_path_info(dts_file[0], "name"), "extension")
+  assert(extension == "dts" || (extension == "S" && dts_extension == "dts"),
+         "Only .dts or .dts.S source files accepted.")
+  not_needed([ "dts_extension" ])
+
+  processed_dts_target = "_dtb.$target_name.preprocessed"
+  dts_include_dirs_target = "_dtb.$target_name.includes"
+  dts_include_dirs_filename = dts_include_dirs_target + ".txt"
+
+  # Each devicetree_fragment() call puts a devicetree in a directory tree that
+  # mimics the source tree, so that we can properly restrict /include/
+  # statements in DTC. This generates a file containing paths to all of these
+  # directory trees, which we use below when calling DTC.
+  generated_file(dts_include_dirs_target) {
+    forward_variables_from(invoker, [ "deps" ])
+    data_keys = [ "devicetree_includes" ]
+    outputs = [ "$target_gen_dir/$dts_include_dirs_filename" ]
+    output_conversion = "list lines"
+    rebase = root_build_dir
+  }
+
+  # This passes the DTS files through the preprocessor to handle any C
+  # constants.
+  _preprocessed_dts(processed_dts_target) {
+    forward_variables_from(invoker,
+                           [
+                             "sources",
+                             "deps",
+                           ])
+  }
+
+  # This actually compiles the DTB.
+  dtc_path = "//prebuilt/third_party/dtc/${host_platform}/dtc"
+  python_action(target_name) {
+    binary_label = "//build/devicetree:dtc_py"
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                             "metadata",
+                           ])
+    deps = [ ":$dts_include_dirs_target" ]
+
+    if (extension == "S") {
+      deps += [ ":$processed_dts_target" ]
+      sources = get_target_outputs(":$processed_dts_target")
+    } else {
+      sources = invoker.sources
+    }
+    source_name = get_path_info(sources[0], "name")
+    depfile = "$target_gen_dir/$source_name.d"
+    includes_file = get_target_outputs(":$dts_include_dirs_target")
+
+    # Inform the build that we will be accessing the compiler and .includes.txt
+    # for the target
+    inputs = [
+      dtc_path,
+      includes_file[0],
+    ]
+
+    if (defined(invoker.outputs)) {
+      outputs = invoker.outputs
+    } else {
+      outputs = [ "$target_out_dir/$source_name.dtb" ]
+    }
+
+    args = [
+      "compile",
+      rebase_path(dtc_path, root_build_dir),
+      rebase_path(sources[0], root_build_dir),
+      rebase_path(outputs[0], root_build_dir),
+      rebase_path(depfile, root_build_dir),
+      rebase_path(includes_file[0], root_build_dir),
+    ]
+
+    if (defined(invoker.dtcflags)) {
+      args += invoker.dtcflags
+    }
+  }
+}
+
+# Defines a devicetree blob decompiler.
+#
+# Parameters
+#
+#   * sources
+#     - Required: Device tree blob file (.dtb).
+#     - Type: List(path). Must only have one entry.
+#
+#   * deps
+#     - Optional: Usual GN meaning.
+#
+#   * dtcflags
+#     - Optional: Flags to be passed to dtc compiler.
+#     - Type: List(flags).
+#
+#  * outputs
+#     - Optional: The singleton list containing the output dts path. This value
+#       can be accessed as `get_target_outputs(target_name)`.
+#     - Type: list(path). Must only have one entry.
+#     - Default: target_out_dir + "/" + get_path_info(sources[0], "name) + ".dts"
+#
+template("dts") {
+  dtc_path = "//prebuilt/third_party/dtc/${host_platform}/dtc"
+  python_action(target_name) {
+    binary_label = "//build/devicetree:dtc_py"
+    forward_variables_from(invoker,
+                           [
+                             "sources",
+                             "deps",
+                             "testonly",
+                             "visibility",
+                           ])
+    assert([ sources[0] ] == sources, "Only one input file accepted.")
+    assert(get_path_info(sources[0], "extension") == "dtb",
+           "Only .dtb source files accepted.")
+
+    source_name = get_path_info(sources[0], "name")
+
+    inputs = [ dtc_path ]
+    if (defined(invoker.outputs)) {
+      outputs = invoker.outputs
+    } else {
+      outputs = [ "$target_out_dir/$source_name.dts" ]
+    }
+
+    args = [
+      "decompile",
+      rebase_path(dtc_path, root_build_dir),
+      rebase_path(sources[0], root_build_dir),
+      rebase_path(outputs[0], root_build_dir),
+    ]
+
+    if (defined(invoker.dtcflags)) {
+      args += invoker.dtcflags
+    }
+  }
+}
+
+# Defines a devicetree to be built into a devicetree blob.
+#
+# This compiles the device-tree, performs verification, and also defines
+# assembly_inputs metadata for this target.
+#
+# There are two public targets -
+# 1. The main target compiles the devicetree source and runs all the necessary
+#    verification checks.
+#
+# 2. The target "$target_name.assembly_inputs" can be used to include the
+#    devicetree into assembly artifacts.
+#
+# Parameters
+#
+#   * sources
+#     - Required: Device tree source file (.dts)
+#     - Type: List(path). Must only have one entry.
+#
+#   * golden
+#     - Required: Path to the golden device tree source file
+#       (created by the template if not existing). It will be compared against
+#       the current dts after resolving all includes. This is useful to review
+#       changes done to the device tree either directly by the dts or
+#       indirectly by the includes and headers.
+#
+#   * deps
+#     - Optional: Other devicetree fragments and header file targets referenced
+#       by the source.
+#     - Type: list(label)
+#     - Default: []
+#
+#   * dtcflags
+#     - Optional: Flags to be passed to dtc compiler.
+#     - Type: List(flags).
+#
+#  * outputs
+#     - Optional: The singleton list containing the output blob path.
+#     - Type: list(path). Must only have one entry.
+#     - Default: target_out_dir + "/" + target_name + ".dtb"
+#
+#   * release_output
+#     - Optional: Whether to release this artifact, it will appear in the build
+#       api 'exported_files' if set to true
+#     - Type: boolean
+#     - Default: false
+#
+#
+template("devicetree") {
+  main_target = target_name
+  compiled_dtb_target = "$target_name.dtb"
+
+  decompiled_dts_target = "_devicetree.$target_name.decompiled"
+
+  golden_dts_target = "_devicetree.$target_name.golden"
+
+  assembly_inputs_target = "$target_name.assembly_inputs"
+
+  _dtb_path = []
+  if (defined(invoker.outputs)) {
+    _dtb_path = invoker.outputs
+  } else {
+    _dtb_path = [ "$target_out_dir/$compiled_dtb_target" ]
+  }
+
+  # Compile the dts
+  dtb(compiled_dtb_target) {
+    forward_variables_from(invoker,
+                           [
+                             "sources",
+                             "deps",
+                             "public_deps",
+                             "dtcflags",
+                             "release_output",
+                           ])
+    outputs = _dtb_path
+
+    visibility = [
+      ":${assembly_inputs_target}",
+      ":${decompiled_dts_target}",
+      ":${main_target}",
+    ]
+
+    metadata = {
+      if (defined(release_output) && release_output) {
+        exported_files = [
+          {
+            name = compiled_dtb_target
+            path = rebase_path(outputs[0], root_build_dir)
+          },
+        ]
+      }
+    }
+  }
+
+  # Decompile the compiled DTS so we can use it for the golden comparison.
+  # We use the decompiled DTS instead of the original DTS as all includes and
+  # C headers are resolved in the final dtb.
+  dts(decompiled_dts_target) {
+    forward_variables_from(invoker, [ "dtcflags" ])
+    deps = [ ":$compiled_dtb_target" ]
+    sources = get_target_outputs(":$compiled_dtb_target")
+  }
+
+  # Compare golden dts and decompiled dts file.
+  golden_files(golden_dts_target) {
+    deps = [ ":$decompiled_dts_target" ]
+    dts_outputs = get_target_outputs(":$decompiled_dts_target")
+    comparisons = [
+      {
+        forward_variables_from(invoker, [ "golden" ])
+        candidate = dts_outputs[0]
+      },
+    ]
+
+    visibility = [ ":${main_target}" ]
+  }
+
+  generated_file(assembly_inputs_target) {
+    contents = [
+      {
+        source = rebase_path(_dtb_path[0], root_build_dir)
+        destination = "built/artifacts/obj/devicetree/$compiled_dtb_target"
+      },
+    ]
+    output_conversion = "json"
+    deps = [ ":${compiled_dtb_target}" ]
+
+    outputs = [ "${target_out_dir}/${main_target}.assembly_inputs.json" ]
+
+    metadata = {
+      assembly_inputs = [
+        {
+          path = rebase_path(outputs[0], root_build_dir)
+        },
+      ]
+    }
+  }
+
+  group(main_target) {
+    public_deps = [
+      ":${compiled_dtb_target}",
+      ":${golden_dts_target}",
+    ]
+  }
+}
+
+# Defines a parsed devicetree output and verifies it against a golden file.
+#
+# This template runs the devicetree-parsed-dump tool on a compiled devicetree
+# blob (DTB) along with a set of visitor shared libraries to produce a
+# text-based parsed output. This output is then compared against a golden file.
+#
+# Parameters
+#
+#   * dtb (required)
+#     - Path to the .dtb file to dump.
+#     - Type: path
+#
+#   * golden (required)
+#     - Path to the golden file to compare against.
+#     - Type: path
+#
+#   * visitors (required)
+#     - List of labels to devicetree_visitor() targets. These visitors must be
+#       built for the host toolchain as they will be loaded by the dumper tool.
+#     - Type: list(label)
+#
+#   * deps, public_deps, testonly, visibility
+#     - Usual GN meaning.
+#
+template("devicetree_parsed") {
+  assert(defined(invoker.dtb), "dtb must be defined for $target_name")
+  assert(defined(invoker.golden), "golden must be defined for $target_name")
+  assert(defined(invoker.visitors) || defined(invoker.static_visitors),
+         "visitors or static_visitors must be defined for $target_name")
+
+  if (defined(invoker.static_visitors) && defined(invoker.visitors)) {
+    foreach(v, invoker.static_visitors) {
+      assert(filter_include(invoker.visitors, [ v ]) == [],
+             "Visitor $v cannot be both static and dynamic in $target_name")
+    }
+  }
+
+  dump_parsed_tool = "${target_name}.dumper"
+  if (defined(invoker.static_visitors)) {
+    not_needed(invoker, [ "static_visitors" ])
+  }
+  if (is_host) {
+    executable(dump_parsed_tool) {
+      forward_variables_from(invoker, [ "testonly" ])
+      visibility = [ ":*" ]
+      deps = [ "//sdk/lib/driver/devicetree/manager/dump-parsed" ]
+      if (defined(invoker.static_visitors)) {
+        foreach(visitor, invoker.static_visitors) {
+          _visitor_label = get_label_info(visitor, "label_no_toolchain")
+          deps += [ "${_visitor_label}.static" ]
+        }
+        configs +=
+            [ "//sdk/lib/driver/devicetree/visitors:static_visitor_config" ]
+      }
+      libs = [ "dl" ]
+    }
+  }
+
+  generation_target = "${target_name}.gen"
+  parsed_output = "$target_gen_dir/$target_name.dt.parsed"
+
+  compiled_action(generation_target) {
+    forward_variables_from(invoker,
+                           [
+                             "deps",
+                             "public_deps",
+                             "testonly",
+                           ])
+    tool = ":$dump_parsed_tool"
+
+    inputs = [ invoker.dtb ]
+
+    if (!defined(deps)) {
+      deps = []
+    }
+
+    args = [
+      rebase_path(invoker.dtb, root_build_dir),
+      rebase_path(parsed_output, root_build_dir),
+    ]
+
+    if (defined(invoker.visitors)) {
+      foreach(visitor_label, invoker.visitors) {
+        # Visitors must be built for the host toolchain.
+        _visitor = get_label_info(visitor_label, "label_no_toolchain")
+        _visitor += "($host_toolchain)"
+
+        _dir = get_label_info(_visitor, "root_out_dir")
+        _name = get_label_info(_visitor, "name")
+        _path = "$_dir/${_name}.so"
+        inputs += [ _path ]
+        deps += [ _visitor ]
+        args += [
+          "--visitor",
+          rebase_path(_path, root_build_dir),
+        ]
+      }
+    }
+
+    outputs = [ parsed_output ]
+  }
+
+  golden_files(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "testonly",
+                             "visibility",
+                           ])
+
+    deps = [ ":$generation_target" ]
+    comparisons = [
+      {
+        golden = invoker.golden
+        candidate = parsed_output
+      },
+    ]
+  }
+}

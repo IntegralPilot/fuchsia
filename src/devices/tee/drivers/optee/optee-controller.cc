@@ -1,0 +1,740 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#include "optee-controller.h"
+
+#include <inttypes.h>
+#include <lib/ddk/binding_driver.h>
+#include <lib/ddk/debug.h>
+#include <lib/ddk/device.h>
+#include <lib/ddk/io-buffer.h>
+#include <lib/ddk/metadata.h>
+#include <lib/ddk/platform-defs.h>
+#include <lib/driver/mmio/cpp/mmio-pinned-buffer.h>
+#include <lib/fit/defer.h>
+#include <lib/fit/function.h>
+#include <lib/zx/clock.h>
+#include <lib/zx/profile.h>
+#include <lib/zx/thread.h>
+#include <string.h>
+#include <zircon/assert.h>
+#include <zircon/threads.h>
+
+#include <limits>
+#include <memory>
+#include <optional>
+#include <thread>
+#include <utility>
+
+#include <ddktl/suspend-txn.h>
+#include <fbl/auto_lock.h>
+#include <tee-client-api/tee-client-types.h>
+
+#include "optee-client.h"
+#include "optee-util.h"
+#include "src/devices/tee/drivers/optee/tee-smc.h"
+
+namespace optee {
+
+constexpr int kDefaultNumThreads = 3;
+constexpr char kDefaultRoleName[] = "fuchsia.tee.default";
+
+static bool IsOpteeApi(const tee_smc::TrustedOsCallUidResult& returned_uid) {
+  return returned_uid.uid_0_3 == kOpteeApiUid_0 && returned_uid.uid_4_7 == kOpteeApiUid_1 &&
+         returned_uid.uid_8_11 == kOpteeApiUid_2 && returned_uid.uid_12_15 == kOpteeApiUid_3;
+}
+
+static bool IsOpteeApiRevisionSupported(const tee_smc::TrustedOsCallRevisionResult& returned_rev) {
+  // The cast is unfortunately necessary to mute a compiler warning about an unsigned expression
+  // always being greater than 0.
+  ZX_DEBUG_ASSERT(returned_rev.minor <= static_cast<uint32_t>(std::numeric_limits<int32_t>::max()));
+  return returned_rev.major == kOpteeApiRevisionMajor &&
+         static_cast<int32_t>(returned_rev.minor) >= static_cast<int32_t>(kOpteeApiRevisionMinor);
+}
+
+void OpteeControllerBase::WaitQueueWait(const uint64_t key) {
+  std::shared_ptr<WaitCtx> wait_ctx;
+  {
+    fbl::AutoLock wq_lock(&wq_lock_);
+    auto it = wait_queue_.find(key);
+    // If a signal was already sent (wake up before sleep), consume it and return immediately.
+    if (it != wait_queue_.end() && it->second.has_pending_signal) {
+      it->second.has_pending_signal = false;
+      // Clean up the map entry if there are no other waiters to prevent memory leaks.
+      if (it->second.waiters.empty()) {
+        wait_queue_.erase(it);
+      }
+      return;
+    }
+
+    // Allocate a new WaitCtx for this waiter. It is managed by shared_ptr to prevent
+    // use-after-free if the entry is erased from the map while we are still waiting.
+    wait_ctx = std::make_shared<WaitCtx>();
+    if (it == wait_queue_.end()) {
+      it = wait_queue_.emplace(key, WaitQueueEntry{}).first;
+    }
+    it->second.waiters.push_back(wait_ctx);
+  }
+
+  // Block the thread until signaled. The lock is released here to allow other threads
+  // to run concurrent wait/signal operations.
+  wait_ctx->Wait();
+}
+
+void OpteeControllerBase::WaitQueueSignal(const uint64_t key) {
+  fbl::AutoLock wq_lock(&wq_lock_);
+  auto it = wait_queue_.find(key);
+  // If the key is not in the map, buffer the signal for a future waiter.
+  if (it == wait_queue_.end()) {
+    wait_queue_.emplace(key, WaitQueueEntry{.has_pending_signal = true});
+    return;
+  }
+
+  // Wake up the first waiter in the queue (1:1 mapping between signal and waiter).
+  if (!it->second.waiters.empty()) {
+    std::shared_ptr<WaitCtx> wait_ctx = it->second.waiters.front();
+    it->second.waiters.pop_front();
+    wait_ctx->Signal();
+  } else {
+    // If all waiters have already been signaled, buffer the signal.
+    it->second.has_pending_signal = true;
+  }
+
+  // Clean up the map entry if the queue is empty and there are no buffered signals.
+  if (it->second.waiters.empty() && !it->second.has_pending_signal) {
+    wait_queue_.erase(it);
+  }
+}
+
+size_t OpteeControllerBase::WaitQueueSize() const { return wait_queue_.size(); }
+
+std::list<WaitCtx>::iterator OpteeControllerBase::CommandQueueInit() {
+  std::list<WaitCtx>::iterator it;
+  cq_lock_.Acquire();
+  command_queue_.emplace_back();
+  // get iterator to inserted element
+  it = std::prev(command_queue_.end());
+  cq_lock_.Release();
+
+  return it;
+}
+
+void OpteeControllerBase::CommandQueueWait(std::list<WaitCtx>::iterator& el) {
+  WaitCtx* ctx;
+  cq_lock_.Acquire();
+  ctx = &*el;
+  command_queue_wait_.push_back(ctx);
+  cq_lock_.Release();
+
+  ctx->Wait();
+
+  cq_lock_.Acquire();
+  // remove our WaitCtx if it is still in wait queue.
+  // This may happened if CommandQueueWait was called after the the WaitCtx was actually signaled
+  // (race between wait and signaled threads).
+  command_queue_wait_.remove(ctx);
+  cq_lock_.Release();
+}
+
+void OpteeControllerBase::CommandQueueSignal(const std::list<WaitCtx>::iterator& el) {
+  fbl::AutoLock cq_lock(&cq_lock_);
+
+  // remove our own context from command queue
+  command_queue_.erase(el);
+
+  // signal the first waiting thread if any
+  if (!command_queue_wait_.empty()) {
+    auto ctx = command_queue_wait_.front();
+    // remove WaitCtx from wait queue to void multi signaling the same context.
+    command_queue_wait_.pop_front();
+    ctx->Signal();
+  } else {  // signal context from command queue
+    // there is a more probability that last context in queue will get
+    // ThreadLimit than the first one.
+    // So, let's find the first not signaled WaitCtx from the end.
+    for (auto it = command_queue_.rbegin(); it != command_queue_.rend(); ++it) {
+      if (!it->Signaled()) {
+        it->Signal();
+        break;
+      }
+    }
+  }
+}
+
+size_t OpteeControllerBase::CommandQueueSize() const { return command_queue_.size(); }
+size_t OpteeControllerBase::CommandQueueWaitSize() const { return command_queue_wait_.size(); }
+
+OpteeController::~OpteeController() {
+  loop_.Quit();
+  loop_.JoinThreads();
+  loop_.Shutdown();
+}
+
+zx_status_t OpteeController::ValidateApiUid() const {
+  static const zx_smc_parameters_t kGetApiFuncCall =
+      tee_smc::CreateSmcFunctionCall(tee_smc::kTrustedOsCallUidFuncId);
+  union {
+    zx_smc_result_t raw;
+    tee_smc::TrustedOsCallUidResult uid;
+  } result;
+  zx_status_t status = zx_smc_call(secure_monitor_.get(), &kGetApiFuncCall, &result.raw);
+
+  return status == ZX_OK ? IsOpteeApi(result.uid) ? ZX_OK : ZX_ERR_NOT_FOUND : status;
+}
+
+zx_status_t OpteeController::ValidateApiRevision() const {
+  static const zx_smc_parameters_t kGetApiRevisionFuncCall =
+      tee_smc::CreateSmcFunctionCall(tee_smc::kTrustedOsCallRevisionFuncId);
+  union {
+    zx_smc_result_t raw;
+    tee_smc::TrustedOsCallRevisionResult revision;
+  } result;
+  zx_status_t status = zx_smc_call(secure_monitor_.get(), &kGetApiRevisionFuncCall, &result.raw);
+
+  return status == ZX_OK
+             ? IsOpteeApiRevisionSupported(result.revision) ? ZX_OK : ZX_ERR_NOT_SUPPORTED
+             : status;
+}
+
+zx_status_t OpteeController::GetOsRevision() {
+  static const zx_smc_parameters_t kGetOsRevisionFuncCall =
+      tee_smc::CreateSmcFunctionCall(kGetOsRevisionFuncId);
+  union {
+    zx_smc_result_t raw;
+    GetOsRevisionResult revision;
+  } result;
+  zx_status_t status = zx_smc_call(secure_monitor_.get(), &kGetOsRevisionFuncCall, &result.raw);
+
+  if (status != ZX_OK) {
+    return status;
+  }
+
+  os_revision_ = result.revision;
+
+  return ZX_OK;
+}
+
+zx_status_t OpteeController::ExchangeCapabilities() {
+  uint64_t nonsecure_world_capabilities = 0;
+  if (zx_system_get_num_cpus() == 1) {
+    nonsecure_world_capabilities |= kNonSecureCapUniprocessor;
+  }
+
+  const zx_smc_parameters_t func_call =
+      tee_smc::CreateSmcFunctionCall(kExchangeCapabilitiesFuncId, nonsecure_world_capabilities);
+  union {
+    zx_smc_result_t raw;
+    ExchangeCapabilitiesResult response;
+  } result;
+
+  zx_status_t status = zx_smc_call(secure_monitor_.get(), &func_call, &result.raw);
+
+  if (status != ZX_OK) {
+    return status;
+  }
+
+  if (result.response.status != kReturnOk) {
+    return ZX_ERR_INTERNAL;
+  }
+
+  secure_world_capabilities_ = result.response.secure_world_capabilities;
+
+  return ZX_OK;
+}
+
+zx_status_t OpteeController::InitializeSharedMemory() {
+  // The Trusted OS and Rich OS share a dedicated portion of RAM to send messages back and forth. To
+  // discover the memory region to use, we ask the platform device for a MMIO representing the TEE's
+  // entire dedicated memory region and query the TEE to discover which section of that should be
+  // used as the shared memory. The rest of the TEE's memory region is secure.
+
+  static constexpr uint32_t kTeeBtiIndex = 0;
+  zx::result bti = pdev_.GetBti(kTeeBtiIndex);
+  if (bti.is_error()) {
+    LOG(ERROR, "Failed to get bti: %s", bti.status_string());
+    return bti.status_value();
+  }
+  bti_ = std::move(bti.value());
+
+  // The TEE BTI will be pinned to get the physical address of the shared memory region between the
+  // Rich OS and the Trusted OS. This memory region is not used for DMA and only used for message
+  // exchange between the two "worlds." As the TEE is not distinct hardware, but rather the CPU
+  // operating in a different EL, it cannot be accessing the shared memory region at this time. The
+  // Trusted OS can never execute any code unless we explicitly call into it via SMC, and it can
+  // only run code during that SMC call. Once the call returns, the Trusted OS is no longer
+  // executing any code and will not until the next time we explicitly call into it. The physical
+  // addresses acquired from the BTI pinning are only used within the context of the OP-TEE
+  // CallWithArgs SMC calls.
+  //
+  // As the Trusted OS cannot be actively accessing this memory region, it is safe to release from
+  // quarantine.
+  zx_status_t status = bti_.release_quarantine();
+  if (status != ZX_OK) {
+    LOG(ERROR, "could not release quarantine bti - %d", status);
+    return status;
+  }
+
+  // The Secure World memory is located at a fixed physical address in RAM, so we have to request
+  // the platform device map the physical vmo for us.
+  static constexpr uint32_t kSecureWorldMemoryMmioIndex = 0;
+  zx::result mmio_dev_result = pdev_.GetMmio(kSecureWorldMemoryMmioIndex);
+  if (mmio_dev_result.is_error()) {
+    LOG(ERROR, "Failed to get secure world mmio: %s", mmio_dev_result.status_string());
+    return mmio_dev_result.status_value();
+  }
+  auto mmio_dev = std::move(mmio_dev_result.value());
+
+  // Briefly pin the first page of this VMO to determine the secure world's base physical address.
+  zx_paddr_t mmio_vmo_paddr;
+  zx::pmt pmt;
+  status =
+      bti_.pin(ZX_BTI_PERM_READ | ZX_BTI_CONTIGUOUS, *zx::unowned_vmo(mmio_dev.vmo),
+               /*offset=*/0, zx_system_get_page_size(), &mmio_vmo_paddr, /*addrs_count=*/1, &pmt);
+  if (status != ZX_OK) {
+    LOG(ERROR, "unable to pin secure world memory");
+    return status;
+  }
+
+  status = pmt.unpin();
+  ZX_DEBUG_ASSERT(status == ZX_OK);
+
+  zx_paddr_t secure_world_paddr = mmio_vmo_paddr + mmio_dev.offset;
+  size_t secure_world_size = mmio_dev.size;
+
+  // Now that we have the TEE's entire memory range, query the TEE to see which region of it we
+  // should use.
+  zx_paddr_t shared_mem_paddr;
+  size_t shared_mem_size;
+  status = DiscoverSharedMemoryConfig(&shared_mem_paddr, &shared_mem_size);
+
+  if (status != ZX_OK) {
+    LOG(ERROR, "unable to discover shared memory configuration");
+    return status;
+  }
+
+  if (shared_mem_paddr < secure_world_paddr ||
+      (shared_mem_paddr + shared_mem_size) > (secure_world_paddr + secure_world_size)) {
+    LOG(ERROR, "shared memory outside of secure world range");
+    return ZX_ERR_OUT_OF_RANGE;
+  }
+
+  // Map and pin the just the shared memory region of the secure world memory.
+  zx_off_t shared_mem_offset = shared_mem_paddr - mmio_vmo_paddr;
+  zx::result<fdf::MmioBuffer> mmio = fdf::MmioBuffer::Create(
+      shared_mem_offset, shared_mem_size, std::move(mmio_dev.vmo), ZX_CACHE_POLICY_CACHED);
+  if (mmio.is_error()) {
+    LOG(ERROR, "unable to map secure world memory: %s", mmio.status_string());
+    return mmio.status_value();
+  }
+
+  zx::result<fdf::MmioPinnedBuffer> pinned_mmio = mmio->Pin(bti_);
+  if (pinned_mmio.is_error()) {
+    LOG(ERROR, "unable to pin secure world memory: %s", pinned_mmio.status_string());
+    return pinned_mmio.status_value();
+  }
+
+  // Take ownership of the PMT so that we can explicitly unpin.
+  pinned_mmio_ = std::move(*pinned_mmio);
+  status = SharedMemoryManager::Create(std::move(*mmio), pinned_mmio_->get_paddr(),
+                                       &shared_memory_manager_);
+
+  if (status != ZX_OK) {
+    LOG(ERROR, "unable to initialize SharedMemoryManager");
+    return status;
+  }
+
+  return status;
+}
+
+zx_status_t OpteeController::DiscoverSharedMemoryConfig(zx_paddr_t* out_start_addr,
+                                                        size_t* out_size) {
+  static const zx_smc_parameters_t func_call =
+      tee_smc::CreateSmcFunctionCall(kGetSharedMemConfigFuncId);
+
+  union {
+    zx_smc_result_t raw;
+    GetSharedMemConfigResult response;
+  } result;
+
+  zx_status_t status = zx_smc_call(secure_monitor_.get(), &func_call, &result.raw);
+
+  if (status != ZX_OK) {
+    return status;
+  }
+
+  if (result.response.status != kReturnOk) {
+    return ZX_ERR_INTERNAL;
+  }
+
+  *out_start_addr = result.response.start;
+  *out_size = result.response.size;
+
+  return status;
+}
+
+zx_status_t OpteeController::Create(void* ctx, zx_device_t* parent) {
+  auto tee = std::make_unique<OpteeController>(parent);
+
+  auto status = tee->Bind();
+  if (status == ZX_OK) {
+    // devmgr is now in charge of the memory for tee
+    [[maybe_unused]] auto ptr = tee.release();
+  }
+
+  return status;
+}
+
+zx_status_t OpteeController::SetProfileByRole(thrd_t& thr, const std::string& role) {
+  const zx_status_t status =
+      device_set_profile_by_role(parent(), thrd_get_zx_handle(thr), role.data(), role.size());
+  if (status != ZX_OK) {
+    LOG(WARNING, "Failed to apply role \"%s\" to thread %d", role.c_str(), status);
+  }
+  return status;
+}
+
+zx_status_t OpteeController::CreateThreadPool(async::Loop* loop, uint32_t thread_count,
+                                              const std::string& role) {
+  zx_status_t status;
+
+  for (uint32_t i = 0; i < thread_count; ++i) {
+    thrd_t optee_thread;
+    char name[192];
+    snprintf(name, sizeof(name), "optee-thread-%s-%d", role.c_str(), i);
+    LOG(DEBUG, "Starting OPTEE thread %s for role %s...", name, role.c_str());
+    status = loop->StartThread(name, &optee_thread);
+    if (status != ZX_OK) {
+      LOG(ERROR, "could not start optee thread %d of %d", i, thread_count);
+      return status;
+    }
+
+    status = SetProfileByRole(optee_thread, role);
+    if (status != ZX_OK) {
+      LOG(ERROR, "could not set role to %s for %s thread: %d", role.c_str(), name, status);
+      return status;
+    }
+  }
+
+  return ZX_OK;
+}
+
+async_dispatcher_t* OpteeController::GetDispatcherForTa(const Uuid& ta_uuid) {
+  auto it = uuid_config_.find(ta_uuid);
+  if (it != uuid_config_.end()) {
+    LOG(DEBUG, "Assign request to %s to custom pool.", ta_uuid.ToString().c_str());
+    return it->second->dispatcher();
+  }
+
+  LOG(DEBUG, "Assign request to %s to default pool.", ta_uuid.ToString().c_str());
+  return loop_.dispatcher();
+}
+
+zx_status_t OpteeController::InitThreadPools() {
+  zx_status_t status = ZX_ERR_INTERNAL;
+  uint32_t default_pool_size = kDefaultNumThreads;
+
+  zx::result metadata_result = pdev_.GetFidlMetadata<fuchsia_hardware_tee::TeeMetadata>();
+  if (metadata_result.is_error()) {
+    LOG(INFO, "Using default thread configuration: Failed to get tee metadata for driver: %s",
+        metadata_result.status_string());
+    return CreateThreadPool(&loop_, default_pool_size, kDefaultRoleName);
+  }
+  const auto& metadata = metadata_result.value();
+
+  LOG(INFO, "Default thread pool size %d, %zu custom thread pools supplied.",
+      metadata.default_thread_count().value(), metadata.custom_threads().value().size());
+
+  if (metadata.default_thread_count().has_value() && metadata.default_thread_count().value() != 0) {
+    default_pool_size = metadata.default_thread_count().value();
+  }
+
+  status = CreateThreadPool(&loop_, default_pool_size, kDefaultRoleName);
+  if (status != ZX_OK) {
+    LOG(ERROR, "Failed to create default thread pool: %d", status);
+  }
+
+  if (metadata.custom_threads().has_value()) {
+    std::map<std::string, std::list<async::Loop>::iterator> roles;
+    const auto& custom_threads = metadata.custom_threads().value();
+    for (size_t i = 0; i < custom_threads.size(); ++i) {
+      const auto& custom_thread = custom_threads[i];
+      if (!custom_thread.count().has_value()) {
+        LOG(WARNING, "Custom thread %lu missing `count` field", i);
+        continue;
+      }
+      auto count = custom_thread.count().value();
+      if (count == 0) {
+        LOG(WARNING, "Custom thread %lu's count is 0", i);
+        continue;
+      }
+
+      if (!custom_thread.role().has_value()) {
+        LOG(WARNING, "Custom thread %lu missing `role` field", i);
+        continue;
+      }
+      auto role = custom_thread.role().value();
+      if (role.empty()) {
+        LOG(WARNING, "Custom thread %lu's role is empty", i);
+        continue;
+      }
+
+      if (!custom_thread.trusted_apps().has_value()) {
+        LOG(WARNING, "Custom thread %lu missing `trusted_apps` field", i);
+        continue;
+      }
+      auto trusted_apps = custom_thread.trusted_apps().value();
+      if (trusted_apps.empty()) {
+        LOG(WARNING, "Custom thread %lu's trusted apps is empty", i);
+        continue;
+      }
+
+      std::list<async::Loop>::iterator loop_it;
+      auto it = roles.find(role);
+      if (it != roles.end()) {
+        LOG(WARNING, "Multiple declaration of %s thread pool. Appending...", role.c_str());
+        loop_it = it->second;
+      } else {
+        loop_it = custom_loops_.emplace(custom_loops_.end(), &kAsyncLoopConfigNeverAttachToThread);
+        roles.emplace(role, loop_it);
+      }
+
+      status = CreateThreadPool(&(*loop_it), count, role);
+      if (status != ZX_OK) {
+        LOG(ERROR, "Failed to create thread pool %s: %d", role.c_str(), status);
+        return status;
+      }
+
+      fidl::Arena arena;
+      for (auto& app : trusted_apps) {
+        uuid_config_.emplace(fidl::ToWire(arena, app), loop_it);
+      }
+    }
+  }
+
+  return ZX_OK;
+}
+
+zx_status_t OpteeController::Bind() {
+  zx_status_t status = ZX_ERR_INTERNAL;
+
+  zx::result pdev_client_end =
+      DdkConnectFragmentFidlProtocol<fuchsia_hardware_platform_device::Service::Device>(parent(),
+                                                                                        "pdev");
+  if (pdev_client_end.is_error()) {
+    zxlogf(ERROR, "Failed to connect to platform device: %s", pdev_client_end.status_string());
+    return pdev_client_end.status_value();
+  }
+  pdev_ = fdf::PDev{std::move(pdev_client_end.value())};
+
+  status = InitThreadPools();
+  if (status != ZX_OK) {
+    return status;
+  }
+
+  static constexpr uint32_t kTrustedOsSmcIndex = 0;
+  zx::result secure_monitor = pdev_.GetSmc(kTrustedOsSmcIndex);
+  if (secure_monitor.is_error()) {
+    LOG(ERROR, "Failed to get secure monitor handle: %s", secure_monitor.status_string());
+    return secure_monitor.status_value();
+  }
+  secure_monitor_ = std::move(secure_monitor.value());
+
+  // TODO(https://fxbug.dev/42084132): Remove this once we have a tee core driver that will discover
+  // the TEE OS
+  status = ValidateApiUid();
+  if (status != ZX_OK) {
+    LOG(ERROR, "API UID does not match");
+    return status;
+  }
+
+  status = ValidateApiRevision();
+  if (status != ZX_OK) {
+    LOG(ERROR, "API revision not supported");
+    return status;
+  }
+
+  status = GetOsRevision();
+  if (status != ZX_OK) {
+    LOG(ERROR, "unable to get Trusted OS revision");
+    return status;
+  }
+
+  status = ExchangeCapabilities();
+  if (status != ZX_OK) {
+    LOG(ERROR, "could not exchange capabilities");
+    return status;
+  }
+
+  status = InitializeSharedMemory();
+  if (status != ZX_OK) {
+    LOG(ERROR, "could not initialize shared memory");
+    return status;
+  }
+
+  async_dispatcher_t* dispatcher = fdf::Dispatcher::GetCurrent()->async_dispatcher();
+  auto endpoints = fidl::CreateEndpoints<fuchsia_io::Directory>();
+  if (endpoints.is_error()) {
+    return endpoints.status_value();
+  }
+
+  fuchsia_hardware_tee::Service::InstanceHandler handler({
+      .device_connector = bindings_.CreateHandler(this, dispatcher, fidl::kIgnoreBindingClosure),
+  });
+  auto result = outgoing_.AddService<fuchsia_hardware_tee::Service>(std::move(handler));
+  if (result.is_error()) {
+    zxlogf(ERROR, "Failed to add service to the outgoing directory");
+    return result.status_value();
+  }
+
+  result = outgoing_.Serve(std::move(endpoints->server));
+  if (result.is_error()) {
+    zxlogf(ERROR, "Failed to serve outgoing directory");
+    return result.status_value();
+  }
+
+  std::array offers = {
+      fuchsia_hardware_tee::Service::Name,
+  };
+
+  status = DdkAdd(ddk::DeviceAddArgs(kDeviceName.data())
+                      .set_flags(DEVICE_ADD_ALLOW_MULTI_COMPOSITE)
+                      .set_fidl_service_offers(offers)
+                      .set_outgoing_dir(endpoints->client.TakeChannel())
+                      .set_proto_id(ZX_PROTOCOL_TEE));
+  if (status != ZX_OK) {
+    LOG(ERROR, "failed to add device");
+    return status;
+  }
+
+  return ZX_OK;
+}
+
+void OpteeController::DdkSuspend(ddk::SuspendTxn txn) {
+  loop_.Quit();
+  loop_.JoinThreads();
+  shared_memory_manager_ = nullptr;
+  pinned_mmio_.reset();  // Resetting the std::optional container will call the MmioPinnedBuffer
+                         // dtor which will call unpin.
+  txn.Reply(ZX_OK, txn.requested_state());
+}
+
+void OpteeController::DdkUnbind(ddk::UnbindTxn txn) {
+  // Initiate the removal of this device and all of its children.
+  txn.Reply();
+}
+
+void OpteeController::DdkRelease() {
+  // devmgr has given up ownership, so we must clean ourself up.
+  delete this;
+}
+
+void OpteeController::ConnectToDeviceInfo(
+    ConnectToDeviceInfoRequestView request,
+    [[maybe_unused]] ConnectToDeviceInfoCompleter::Sync& _completer) {
+  ZX_DEBUG_ASSERT(request->device_info_request.is_valid());
+
+  fidl::BindServer(loop_.dispatcher(), std::move(request->device_info_request), this);
+}
+
+void OpteeController::ConnectToApplication(
+    ConnectToApplicationRequestView request,
+    [[maybe_unused]] ConnectToApplicationCompleter::Sync& _completer) {
+  ConnectToApplicationInternal(Uuid(request->application_uuid),
+                               std::move(request->service_provider),
+                               std::move(request->application_request));
+}
+
+zx_status_t OpteeController::ConnectToApplicationInternal(
+    Uuid application_uuid, fidl::ClientEnd<fuchsia_tee_manager::Provider> service_provider,
+    fidl::ServerEnd<fuchsia_tee::Application> application_request) {
+  ZX_DEBUG_ASSERT(application_request.is_valid());
+  LOG(DEBUG, "Request to %s TA", application_uuid.ToString().c_str());
+
+  async_dispatcher_t* dispatcher = GetDispatcherForTa(application_uuid);
+  if (dispatcher == nullptr) {
+    LOG(ERROR, "Failed to get dispatcher for %s TA.", application_uuid.ToString().c_str());
+    return ZX_ERR_INTERNAL;
+  }
+
+  fidl::BindServer(
+      dispatcher, std::move(application_request),
+      std::make_unique<OpteeClient>(this, std::move(service_provider), application_uuid));
+
+  return ZX_OK;
+}
+
+void OpteeController::GetOsInfo(GetOsInfoCompleter::Sync& completer) {
+  fidl::Arena allocator;
+  fuchsia_tee::wire::OsRevision os_rev(allocator);
+  os_rev.set_major(os_revision().major);
+  os_rev.set_minor(os_revision().minor);
+
+  fuchsia_tee::wire::OsInfo os_info(allocator);
+  os_info.set_uuid(allocator, kOpteeOsUuid);
+  os_info.set_revision(allocator, std::move(os_rev));
+  os_info.set_is_global_platform_compliant(true);
+
+  completer.Reply(std::move(os_info));
+}
+
+OpteeController::CallResult OpteeController::CallWithMessage(const optee::Message& message,
+                                                             RpcHandler rpc_handler) {
+  CallResult call_result{.return_code = tee_smc::kSmc32ReturnUnknownFunction,
+                         .peak_smc_call_duration = zx::duration::infinite_past()};
+  union {
+    zx_smc_parameters_t params;
+    RpcFunctionResult rpc_result;
+  } func_call;
+  func_call.params = tee_smc::CreateSmcFunctionCall(optee::kCallWithArgFuncId,
+                                                    static_cast<uint32_t>(message.paddr() >> 32),
+                                                    static_cast<uint32_t>(message.paddr()));
+
+  // create Wait context for thread handling
+  auto cur = CommandQueueInit();
+  // remove our Wait context from list and signal waiting context.
+  auto deferred_action = fit::deferred_action([&]() { this->CommandQueueSignal(cur); });
+
+  while (true) {
+    union {
+      zx_smc_result_t raw;
+      CallWithArgResult response;
+      RpcFunctionArgs rpc_args;
+    } result;
+
+    const auto start = zx::clock::get_monotonic();
+    zx_status_t status = zx_smc_call(secure_monitor_.get(), &func_call.params, &result.raw);
+    const auto duration = zx::clock::get_monotonic() - start;
+
+    if (duration > call_result.peak_smc_call_duration) {
+      call_result.peak_smc_call_duration = duration;
+    }
+
+    if (status != ZX_OK) {
+      LOG(ERROR, "unable to invoke SMC");
+      return call_result;
+    }
+
+    if (result.response.status == kReturnEThreadLimit) {
+      CommandQueueWait(cur);
+    } else if (optee::IsReturnRpc(result.response.status)) {
+      rpc_handler(result.rpc_args, &func_call.rpc_result);
+    } else {
+      call_result.return_code = result.response.status;
+      break;
+    }
+  }
+
+  return call_result;
+}
+
+static constexpr zx_driver_ops_t driver_ops = []() {
+  zx_driver_ops_t ops = {};
+  ops.version = DRIVER_OPS_VERSION;
+  ops.bind = OpteeController::Create;
+  return ops;
+}();
+
+}  // namespace optee
+
+ZIRCON_DRIVER(optee, optee::driver_ops, "zircon", "0.1");

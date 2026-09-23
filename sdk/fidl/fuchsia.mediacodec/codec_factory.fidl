@@ -1,0 +1,815 @@
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+@available(added=7)
+library fuchsia.mediacodec;
+
+using fuchsia.media;
+using fuchsia.math;
+using zx;
+
+// CreateDecoder_Params
+//
+// Input parameters for creating a decoder (audio or video).
+//
+
+/// Whether buffers need to be secure.  If not specified, the default is OFF.
+///
+/// This enum may have additional values added later; code handling this type
+/// should be written with this in mind.  For example, in C++, having a
+/// "default" case in any switch statement on this type will avoid compilation
+/// warnings/errors when a new value is added.
+//
+// Later we can add DYNAMIC, as needed.
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type SecureMemoryMode = strict enum : uint32 {
+    // Normal memory.  This is the default if a field of this type is not set.
+    OFF = 0;
+    // Secure memory.
+    ON = 1;
+};
+
+type CreateDecoder_Params = table {
+    /// Input mime type for a decoder.
+    ///
+    /// The recognized mime types for now:
+    /// video/h264
+    /// video/vp9
+    /// audio/aac
+    ///   input_details.oob_bytes must be an AudioSpecificConfig() as defined
+    ///   by AAC spec.
+    /// audio/sbc
+    ///   input_details.oob_bytes must be Codec Specific Information Elements
+    ///   for SBC as defined by the A2DP spec.
+    1: input_details fuchsia.media.FormatDetails;
+
+    // The settings below nail down more details.
+
+    /// This must be true in order for the client to be permitted to put a
+    /// timestamp on an input packet, which is in turn required to get any
+    /// timestamps on any output packets.
+    ///
+    /// It is always legal to provide separate Access Units (henceforth AUs) to a
+    /// decoder, but this boolean must be true for a decoder to accept and
+    /// propagate timestamp values.
+    ///
+    /// This must be true when creating a video encoder, or the CodecFactory
+    /// channel will close.
+    ///
+    /// If not set, interpreted as false.
+    2: promise_separate_access_units_on_input bool;
+
+    // "require" fields:
+    //
+    // Specifying any of these "require" fields can result in failure to get a
+    // Codec if there's no suitable codec.  None of these correspond to any
+    // required features of a codec server.
+    //
+    // TODO(dustingreen): implement filtering codecs based on these fields.
+
+    /// Require that the selected codec be capable of accepting input where
+    /// AUs are not separated into separate packets.
+    ///
+    /// This does not imply that the decoder can find the start of the first AU;
+    /// for that see require_can_find_start.  This does not imply that the decoder
+    /// can re-sync on its own if the stream data is damaged; for that see
+    /// require_can_re_sync.
+    ///
+    /// If both promise_separate_access_units_on_input and
+    /// require_can_stream_bytes_input are true, the CodecFactory channel will
+    /// close.
+    ///
+    /// If this is false, the client must feed separate AUs on the fuchsia.ui.input.  This
+    /// must be false for a video encoder, and if true the CodecFactory channel
+    /// will close.
+    ///
+    /// Unless a client demands a decoder capable of taking concatenated AUs
+    /// (require_can_stream_bytes_input true), the client must feed a decoder
+    /// separate AUs.  This means the client cannot have parts of two separate AUs
+    /// in the same packet, unless require_can_stream_bytes_input is true.
+    ///
+    /// If not set, interpreted as false.
+    3: require_can_stream_bytes_input bool;
+
+    /// A decoder is allowed to be capable of streaming bytes but not capable of
+    /// searching for the start of the first usable AU.  To require both, set both
+    /// require_can_stream_bytes_input and require_can_find_start.  Setting
+    /// require_can_find_start without require_can_stream_bytes_input is invalid.
+    ///
+    /// With require_can_stream_bytes_input true but require_can_find_start false,
+    /// the client must start the first packet with the start of an AU, but can
+    /// send a stream of bytes after that.
+    ///
+    /// If not set, interpreted as false.
+    4: require_can_find_start bool;
+
+    /// On problematic input data, all decoders are expected to at least be able to
+    /// close the channel rather than getting stuck in a failed and/or broken
+    /// state.
+    ///
+    /// A decoder returned from a request with require_can_re_sync is potentially
+    /// able to handle damaged input without closing the Codec channel.  Such a
+    /// Codec is encouraged, but not required, to also satisfy requirements of
+    /// require_report_all_detected_errors.
+    ///
+    /// If not set, interpreted as false.
+    5: require_can_re_sync bool;
+
+    /// Sometimes a client would rather fail an overall use of a decoder than fail
+    /// to notice data corruption.  For such scenarios, the client can specify
+    /// require_report_all_detected_errors.  For any codec returned from a
+    /// request with require_report_all_detected_errors set, on detection of
+    /// any input data corruption the codec will report in one or more of these
+    /// ways:
+    ///   * closing the Codec channel
+    ///   * OnStreamFailed()
+    ///   * error_detected_before
+    ///   * error_detected_during
+    ///
+    /// If false, a codec may silently skip past corrupted input data.
+    ///
+    /// No decoder can detect all corruption, because some corruption can look like
+    /// valid stream data.  This requirement is only to request a codec that
+    /// is written to attempt to detect _and report_ input stream corruption.
+    ///
+    /// This flag is not intended to be 100% bulletproof.  If a client needs robust
+    /// assurance that _all_ detectable stream corruption is _always_ detected,
+    /// this flag is not enough of a guarantee to achieve that.  Since some stream
+    /// corruption is inherently non-detectable in any case, such a client should
+    /// consider using stronger techniques upstream to ensure that corruption can
+    /// be detected with the needed probability very close to 1.
+    ///
+    /// This flag being true doesn't imply anything about whether the codec will
+    /// discard damaged data vs. producing corresponding damaged output.  Only that
+    /// the codec will set error_detected_* bools to true when appropriate.
+    ///
+    /// Regardless of this setting, not all timestamp_ish values provided on input
+    /// are guaranteed to show up on output.
+    ///
+    /// If not set, interpreted as false.
+    6: require_report_all_detected_errors bool;
+
+    /// If true, require that the returned codec is HW-accelerated.  See also
+    /// `require_sw`.
+    ///
+    /// If not set, interpreted as false.
+    7: require_hw bool;
+
+    /// permit_lack_of_split_header_handling
+    ///
+    /// This field is a temporary field that will be going away.
+    ///
+    /// TODO(dustingreen): Remove this field once we're down to zero codecs with
+    /// problems handling split headers.
+    ///
+    /// By default, a Codec instance is required to handle "split headers", meaning
+    /// that a client is allowed to deliver parts of an AU one byte at a time,
+    /// including parts near the beginning of the AU, and the codec is required to
+    /// tolerate and handle that properly.  However, unfortunately not all codecs
+    /// properly support split headers.  If a client is willing to permit such a
+    /// codec to be used, the client can set this to true.  Clients are not
+    /// encouraged to set this, but setting it may be necessary to find a codec for
+    /// some formats _for now_.  If a client sets this to true, the client should
+    /// deliver data of each AU with many contiguous non-split bytes from the start
+    /// of each AU.  The client is not strictly required to deliver one AU at a
+    /// time, only to ensure that either all the AU bytes are in a single packet or
+    /// that many bytes at the start of each AU are in a single packet.
+    ///
+    /// The specification for how a client should use this and how a client should
+    /// behave if setting this to true is intentionally vague, because lack of
+    /// support for header splitting is not ideal, and is expected to be
+    /// temporary, and all codecs should handle split headers in the long run.
+    /// The main intent of this field is to avoid giving an innocent client using
+    /// default value of false here a codec that can't properly handle split
+    /// headers.  This is not an attempt at a mechanism to fully work around a
+    /// codec that doesn't handle split headers.
+    ///
+    /// If not set, interpreted as false.
+    //
+    // TODO(dustingreen): In the near term, wire this up so that SoftAAC2.cpp
+    // used for ADTS is not selected when this field is false, even if there is
+    // no other suitable codec.  In the long term, fix or work around the header
+    // handling behavior of SoftAAC2 when used in ADTS mode (and any other
+    // similar issues in other codecs) and remove this field.
+    8: permit_lack_of_split_header_handling bool;
+
+    /// If set to ON, the decoder must support secure buffers on output, and
+    /// must reject non-secure buffers on output.
+    ///
+    /// If set to OFF or not set, the created decoder will reject secure buffers
+    /// on output by closing the StreamProcessor channel.
+    ///
+    /// If secure_input_mode ON, secure_output_mode must also be ON.
+    9: secure_output_mode SecureMemoryMode;
+
+    /// If set to ON, the decoder must support secure buffers on input and must
+    /// reject non-secure buffers on input.
+    ///
+    /// If set to OFF or not set, the created decoder will reject secure buffers
+    /// on input by closing the StreamProcessor channel.
+    ///
+    /// If secure_input_mode ON, secure_output_mode must also be ON.
+    10: secure_input_mode SecureMemoryMode;
+
+    /// If true, require that the returned codec is entirely SW-based, not
+    /// HW-accelerated (other than possibly using vector CPU instructions).
+    /// This can be useful for testing purposes or other special scenarios, but
+    /// is not recommended for performance-sensitive scenarios.  Also, some
+    /// builds may lack a SW-based decoder for some formats.  See also
+    /// `require_hw`.
+    ///
+    /// If not set, interpreted as false.
+    11: require_sw bool;
+
+    /// If set to true, require that the created codec supports dynamic buffers.
+    /// See also
+    /// `[fuchsia.mediacodec/DetailedCodecDescription.supports_dynamic_buffers]`.
+    ///
+    /// Support for dynamic buffers doesn't imply support for non-sysmem
+    /// buffers.
+    @available(added=32)
+    12: require_supports_dynamic_buffers bool;
+
+    /// This field is only meaningful for video decoders. If this is set to
+    /// true, require_supports_dynamic_buffers must also be set to true.
+    ///
+    /// The default when this field isn't set is false, which avoids buffer
+    /// reallocation on mid-stream dimensions changes as long as (a) the decoder
+    /// implements re-use of existing buffers and (b) the new image size in
+    /// bytes still fits within the existing buffer size in bytes.
+    ///
+    /// Dimensions changes, both up and down, are extremely common in practice
+    /// for nearly all streaming scenarios (RTC or not). It's quite common for a
+    /// stream to lower dimensions to help ride out network conditions and/or an
+    /// image complexity spike, then raise the dimensions back up once
+    /// conditions improve. By keeping the larger buffers (only allocating new
+    /// buffers when the image size in bytes (or in width and height considered
+    /// separately) exceeds the high-water mark seen so far), this lowers the
+    /// risk of jank for most mid-stream dimension switches.
+    ///
+    /// When this is set to true, _some_ HW video decoders may be able to avoid
+    /// buffer reallocation in some cases by using the same ImageFormat.size
+    /// with a compensating ImageFormat.display_rect. However, not all HW video
+    /// decoders can do this (not all allow specifying a large stride for a
+    /// narrow image for HW video decoder output).
+    ///
+    /// A video decoder may use force_new_buffers_for_new_dimensions as part of
+    /// determining how the video decoder sets sysmem constraints, and this in
+    /// turn may impact how a small frame in a larger buffer is formatted and
+    /// how its ImageFormat.size is reported to the client. Video decoders are
+    /// strongly encouraged to fill out ImageFormat.valid_size to be the
+    /// bitstream-specified coded size, regardless of how the ImageFormat.size
+    /// is determined. Video decoders must report a consistent (with the
+    /// bitstream) and correct ImageFormat.display_rect regardless of how
+    /// ImageFormat.size is determined.
+    ///
+    /// true: a given buffer has fixed dimensions (ImageFormat.size) and stride
+    /// (ImageFormat.bytes_per_row) for lifetime of the buffer; if current
+    /// buffers don't have sufficient dimensions (width and height considered
+    /// separately) and sufficient bytes_per_row, new buffers will be requested
+    /// by the video decoder.
+    ///
+    /// false: a given buffer can be re-used to hold any image dimensions (any
+    /// ImageFormat.size) that are small enough to fit in the buffer (and
+    /// consistent with aggregated sysmem constraints); the bytes_per_row can
+    /// also change when the buffer is re-used (consistent with aggregated
+    /// sysmem constraints) - if current buffers are too small (in bytes), new
+    /// buffers will be requested
+    @available(added=32)
+    13: force_new_buffers_for_new_dimensions bool;
+
+    /// If set to a value obtained from
+    /// `[fuchsia.mediacodec/DetailedCodecDescription.codec_specifier]`, the
+    /// create request will create the specified codec or fail. The client
+    /// should still set other fields in this table as appropriate, so that the
+    /// codec factory can ensure that the codec will meet the client's
+    /// requirements (and to convey oob_bytes as needed). More than one codec
+    /// reported by from `[fuchsia.mediacodec/DetailedCodecDescription]` can
+    /// have the same codec_specifier iff the underlying implementation is the
+    /// same. A codec implementation may change its codec_specifier(s) each
+    /// boot, whether updated to a new implementation version or not. A
+    /// codec_specifier value is unique per boot and codec implementation.
+    @available(added=32)
+    14: codec_specifier string:CODEC_FACTORY_MAX_CODEC_SPECIFIER_LENGTH;
+};
+
+/// Parameters used to request an encoder.
+type CreateEncoder_Params = table {
+    /// The format of the uncompressed input data.
+    ///
+    /// This field should be a raw mime_type (e.g. 'video/raw') and uncompressed
+    /// format details for the encoder to use when reading buffers.
+    ///
+    /// To be elibigible an encoder must support the input format.
+    1: input_details fuchsia.media.FormatDetails;
+
+    /// If true, require that the returned codec is HW-accelerated.
+    ///
+    /// If not set, interpreted as false.
+    2: require_hw bool;
+
+    /// If set to a value obtained from
+    /// `[fuchsia.mediacodec/DetailedCodecDescription.codec_specifier]`, the
+    /// create request will create the specified codec or fail. The client
+    /// should still set other fields in this table as appropriate, so that the
+    /// codec factory can ensure that the codec will meet the client's
+    /// requirements (and to convey oob_bytes as needed). More than one codec
+    /// reported by from `[fuchsia.mediacodec/DetailedCodecDescription]` can
+    /// have the same codec_specifier iff the underlying implementation is the
+    /// same. A codec implementation may change its codec_specifier(s) each
+    /// boot, whether updated to a new implementation version or not.
+    @available(added=32)
+    3: codec_specifier string:CODEC_FACTORY_MAX_CODEC_SPECIFIER_LENGTH;
+};
+
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type CodecType = strict enum {
+    DECODER = 0;
+    ENCODER = 1;
+};
+
+/// Constrain the mime_type to a size that won't cause problems. Most will be substantially shorter.
+const CODEC_FACTORY_MAX_MIME_TYPE_LENGTH uint32 = 256;
+
+/// Constrain the codec_specifier to a size that won't cause problems. Most will be substantially
+/// shorter.
+@available(added=32)
+const CODEC_FACTORY_MAX_CODEC_SPECIFIER_LENGTH uint32 = 256;
+
+/// More than this many calls to AttachLifetimeTracking()
+/// without a Create{X}() call will result in CodecFactory channel closing from
+/// the server end.
+const CODEC_FACTORY_LIFETIME_TRACKING_EVENTPAIR_PER_CREATE_MAX uint32 = 16;
+
+/// Constrain the length of the vector indicated via `OnCodecList`, and constrain the max items in
+/// any vector within the response from `GetDetailedCodecDescriptions`.  The overall enforced limit
+/// for codec caps information is the max channel message size however, since nested vectors each of
+/// max size could otherwise exceed the max channel message size.
+const CODEC_FACTORY_CODEC_LIST_SIZE_MAX uint32 = 256;
+
+/// Deprecated.
+///
+/// Rather than listening for OnCodecList, clients needing codec information prior to just
+/// requesting a codec with CodecFactory.CreateDecoder or CodecFactory.CreateEncoder should instead
+/// use GetDetailedCodecDescriptions to get the DetailedCodecDescription table instead, which has
+/// per-profile-entry equivalents of all these fields.  Clients with no real need for codec
+/// information prior to requesting a codec can call CodecFactory.CreateDecoder or
+/// CodecFactory.CreateEncoder with relevant requirements set in that request, and then
+/// StreamProcessor.Sync to see if a codec was actually created successfully.
+///
+/// In contrast to OnCodecList which uses FIDL structs (due to ordering of historical events),
+/// GetDetailedCodecDescriptions uses FIDL tables so is not expected to need to be deprecated, since
+/// we can add new table fields as needed, and gradually deprecate old table fields if appropriate,
+/// without deprecating the whole thing.
+///
+/// Per-codec servers do not need to fill out this struct or send OnCodecList, as the main
+/// CodecFactory will construct the OnCodecList info from the GetDetailedCodecDescriptions info, so
+/// that each codec can (optionally) stop sending OnCodecList immediately, rather than having to
+/// wait for all clients to stop listening to OnCodecList, which may take a while.  All codecs _do_
+/// need to implement GetDetailedCodecDescriptions however.
+@available(added=7, deprecated=11)
+type CodecDescription = struct {
+    /// Decoder or encoder.
+    codec_type CodecType;
+    /// The mime type of the compressed format.  For decoders this is the mime
+    /// type of the input.  For encoders, this is the mime type of the output.
+    mime_type string:CODEC_FACTORY_MAX_MIME_TYPE_LENGTH;
+
+    /// For each of these fields, the default is the most-capable setting, but
+    /// if a codec doesn't support the most-capable behavior, then the codec
+    /// must override the default.
+    @allow_deprecated_struct_defaults
+    can_stream_bytes_input bool = true;
+    @allow_deprecated_struct_defaults
+    can_find_start bool = true;
+    @allow_deprecated_struct_defaults
+    can_re_sync bool = true;
+    @allow_deprecated_struct_defaults
+    will_report_all_detected_errors bool = true;
+    @allow_deprecated_struct_defaults
+    is_hw bool = true;
+    @allow_deprecated_struct_defaults
+    split_header_handling bool = true;
+};
+
+/// Specification of the supported parameters of a given video decoder.
+///
+/// Fields in this table with the same name as fields in CodecDescription have the same meaning as
+/// the fields in the CodecDescription struct when the corresponding field in this table is set.
+///
+/// When a corresponding field is un-set, each of these fields is interpreted according to the
+/// corresponding doc comment on the field in this table (doc comments on fields in the
+/// CodecDescription struct re. struct field defaults are not relevant to the interpretation of
+/// un-set fields of this table).
+///
+/// For video decoders, the following is always required:
+///   * Handling split input payload (distinct from split header), when an input frame is too large
+///     for a single input buffer.  The next portion (possibly the remainder) of the timstamped
+///     input chunk is delivered in the next input packet.
+///
+/// For audio decoders, the following is always required:
+///   * Concatenation of multiple compressed audio chunks via the input is always permitted.
+@available(added=11)
+type DecoderProfileDescription = table {
+    /// The codec profile that this decoder supports. If the client wants to use this
+    /// profile, the requirements specified in this table must be adhered to.
+    1: profile fuchsia.media.CodecProfile;
+
+    /// The minimum image size this decoder supports for the given |profile|.
+    /// Decoders must set this field, and this field must specify a size that is
+    /// >= the min size defined for the profile in the codec spec.
+    ///
+    /// This size refers to the pixel layout in memory, not the display_rect which can be smaller
+    /// than the fuchsia.Images2.ImageFormat.size / fuchsia.sysmem.ImageFormat2.coded_width/height.
+    2: min_image_size fuchsia.math.SizeU;
+
+    /// The maximum image size this decoder supports for the given |profile|.
+    ///
+    /// Decoders must set this field, and this field must specify a size that is <= the max size
+    /// defined for the profile in the codec spec.
+    ///
+    /// This size refers to the pixel layout in memory, not the display_rect which can be smaller
+    /// than the fuchsia.Images2.ImageFormat.size / fuchsia.sysmem.ImageFormat2.coded_width/height.
+    ///
+    /// By setting this field, a decoder is not required to fail to decode a stream that specifies a
+    /// size that is larger than the profile of the stream would normally allow. The decoder may or
+    /// may not fail to decode a stream which is not a listed profile or not within the size bounds
+    /// of a listed profile.
+    3: max_image_size fuchsia.math.SizeU;
+
+    /// This |profile| entry can apply to encrypted input data. If require_encryption is false or
+    /// unset, this |profile| entry can also apply to unencrypted input data.
+    ///
+    /// This will be un-set (even when allow_input_protection or require_input_protection are true)
+    /// until Fuchsia supports decryption as part of decode (in contrast to it being a separate step
+    /// involving protected memory in between).  When allow_encryption is false/un-set but
+    /// allow_input_protection is true, a client setting up DRM decode should set up decryption as a
+    /// separate step prior to decode with protected memory in between the decrypt and decode.
+    4: allow_encryption bool;
+
+    /// This |profile| entry applies only when input data is encrypted.  This |profile| entry does
+    /// not apply for unencrypted input data.  Un-set is interepted as false.
+    ///
+    /// If this is set to true and there is no profile with require_encryption false in the same
+    /// DetailedCodecDescription, then this decoder only supports encrypted input.
+    ///
+    /// This will be un-set until Fuchsia supports decryption as part of decode (even when
+    /// allow_input_protection or require_input_protection are true).  See also allow_encryption,
+    /// allow_input_protection, require_input_protection.
+    5: require_encryption bool;
+
+    /// This |profile| entry can apply when input data delivered via protected memory.  Whether to
+    /// protect input and which protected "heap" to use (if protecting input) is determined during
+    /// sysmem constraints aggregation and via DRM mechanisms.  See also require_input_protection,
+    /// allow_encryption, require_encryption.
+    6: allow_input_protection bool;
+
+    /// This |profile| entry applies only when input data is delivered via protected memory. Whether
+    /// to protect input and which protected "heap" to use (if protecting input) is determined
+    /// during sysmem constraints aggregation, and by separate DRM mechanisms.
+    ///
+    /// If this is set to true and there is no profile with require_input_protection false in the
+    /// same DetailedCodecDescription, then this decoder only supports protected input.
+    ///
+    /// Output protection is negotiated separately during output buffer constraints aggregation in
+    /// sysmem, and via DRM mechanisms.
+    ///
+    /// See also allow_input_protection, allow_encryption, require_encryption.
+    7: require_input_protection bool;
+
+    /// If set to true, the decoder can handle an input chunk payload (containing compressed data)
+    /// that's split across a packet boundary (between header and payload, or between payload
+    /// bytes), and the decoder can also handle more than one input chunk containing compressed
+    /// input data in a single input packet. See also split_header_handling to determine if the
+    /// decoder can also handle split headers.
+    ///
+    /// Un-set means false.
+    ///
+    /// While this field always indicates whether it's ok to split an input chunk across a packet
+    /// boundary or not, and this field being set always implies it's ok to have a single input
+    /// packet with bytes from more than one input chunk including when the input chunks contain
+    /// compressed input data, there is some additional somewhat-subtle meaning that differs between
+    /// video and audio decoders.
+    ///
+    /// Audio decoders are always required to permit more than one input chunk in a single input
+    /// packet, including mulitple input chunks which each contain compressed input data (not just
+    /// prepended "context" headers), regardless of this field being set or unset.  For audio
+    /// decoders, this field only indicates whether splitting an input chunk across packets is
+    /// allowed.
+    ///
+    /// Audio decoders shouldn't set split_header_handling to true unless they also set
+    /// can_stream_bytes_input to true, since allowing splitting header bytes is meaningless unless
+    /// it's allowed to split an input chunk.
+    ///
+    /// For video decoders, if this field is un-set or false, the decoder may not be able to handle
+    /// bytes of more than one input chunk in a single input packet.  However, for all decoders
+    /// (both video and audio) it's always ok for preceding "context" headers such as the h264 SPS
+    /// and PPS headers to be in the same input packet as the following input chunk containing
+    /// compressed input data such as an h264 slice (for example).  A video decoder is always
+    /// required to permit continuation of an input chunk in the next packet, with the split between
+    /// header byte and compressed input data byte or between two compressed input data bytes (but
+    /// not necessarily between two header bytes; see also split_header_handling).
+    ///
+    /// It's expected to be fairly common for a decoder to set can_stream_bytes_input to true, but
+    /// leave split_header_handling un-set or set split_header_handling to false, due to parsing
+    /// limitations in the HW, FW, or driver.  Decoders which set can_stream_bytes_input false or
+    /// leave can_stream_bytes_input un-set may be forcing input data to be re-packed in some
+    /// scenarios.  Profiles which set allow_encryption are encouraged to also set
+    /// can_stream_bytes_input if feasible, as re-packing input data can be more difficult in some
+    /// scenarios involving encryption.
+    8: can_stream_bytes_input bool;
+
+    /// If set to true, the decoder can scan forward at the start of a stream to find the start of
+    /// the first fully-present input chunk, even if the input data starts at a byte that's in the
+    /// middle of a chunk.
+    ///
+    /// For both video and audio decoders, setting this field to true also indicates the ability to
+    /// handle (skip or only partly use) any input chunks that are not possible to decode (or not
+    /// possible to fully decode) due to lack of referenced prior data.
+    ///
+    /// If un-set or false, the decoder may not be able to scan forward to sync up with the input
+    /// stream unless the input stream starts with the beginning of a suitable chunk.
+    9: can_find_start bool;
+
+    /// If set to true, the decoder can resynchronize with the input stream (eventually) despite a
+    /// missing input chunk, and can handle partial input chunks without failing the stream or the
+    /// StreamProcessor control connection.
+    10: can_re_sync bool;
+
+    /// If set to true, the decoder makes efforts to indicate partial or detected-as-missing or
+    /// detected-as-corrupt input chunks by setting error_detected_before and/or
+    /// error_detected_during as appropriate.  Even when this field is set to true, it is worth
+    /// noting that in general it is not possible for a decoder to detect all possible data
+    /// corruptions, as codecs generally aren't inclined to include error detection bits within the
+    /// stream.  This is not a replacment for a real (as in robust with high probability against
+    /// random bit flips and bit insertion/deletion) data integrity check.
+    11: will_report_all_detected_errors bool;
+
+    /// If set to true, the decoder can handle the bytes of any header being split across packet
+    /// boundaries.  If false or un-set, the decoder requires all header bytes of a header to be
+    /// within the same packet.
+    ///
+    /// Starting a new packet at the spec-defined boundary between two headers that are officially
+    /// in separate input chunks is always permitted.
+    ///
+    /// For purposes of this field, headers like the h264 SPS and PPS headers are considered
+    /// separate input chunks, and so such headers that have their own input chunk can be delivered
+    /// in a separate packet regardless of the setting of this field, and a subsequent h264 slice
+    /// header can be in yet another packet.
+    ///
+    /// It is always permissible regardless of the setting of this field for "context" headers (such
+    /// as h264 SPS and PPS headers) to be delivered in the same packet as the subsequent chunk
+    /// which conveys compressed image data (such as an h264 slice).
+    ///
+    /// Splitting a single header between oob_bytes and the stream data is never supported (as in,
+    /// never to be relied on by clients), not even when this field is set to true.
+    ///
+    /// See also can_stream_bytes_input.
+    ///
+    /// Video decoders with can_stream_bytes_input true but split_header_handling false can handle
+    /// continuing an chunk in the next packet when split between header and payload or between
+    /// payload bytes, and can handle bytes of more than one input chunk in a single input packet,
+    /// but cannot handle splitting a header across packets. Video decoders with
+    /// can_stream_bytes_input false and split_header_handling true cannot tolerate bytes of more
+    /// than one input chunk in a single packet, but can tolerate continuation of an input chunk in
+    /// a following packet regardless of where the split occurs (such as in the middle of an h264
+    /// SPS, PPS, or slice header).
+    ///
+    /// Audio decoders shouldn't set split_header_handling to true unless they also set
+    /// can_stream_bytes_input to true, since for an audio decoder, allowing splitting header bytes
+    /// is meaningless (for audio decoders) unless also allowing splitting an input chunk.
+    12: split_header_handling bool;
+};
+
+@available(added=11)
+type EncoderProfileDescription = table {
+    1: profile fuchsia.media.CodecProfile;
+
+    // TODO(https://fxbug.dev/42073478): Add additional table fields to indicate more detailed per-codec-profile
+    // encoder caps.
+};
+
+@available(added=11)
+@strict_audit(bug="https://fxbug.dev/467128527", state="PENDING_REVIEW")
+type ProfileDescriptions = strict union {
+    /// A list of |DecoderProfileDescription| that describe what codec profiles this
+    /// decoder supports along with requirements that must be adhered to if the client
+    /// is to use the decoder. The CodecFactory guarantees to the client that each
+    /// |DecoderProfileDescription| within |decoder_profile_descriptions| will have an
+    /// unique |profile|.
+    1: decoder_profile_descriptions
+            vector<DecoderProfileDescription>:CODEC_FACTORY_CODEC_LIST_SIZE_MAX;
+    2: encoder_profile_descriptions
+            vector<EncoderProfileDescription>:CODEC_FACTORY_CODEC_LIST_SIZE_MAX;
+};
+
+/// Clients needing codec information prior to just requesting a codec with
+/// CodecFactory.CreateDecoder or CodecFactory.CreateEncoder should use GetDetailedCodecDescriptions
+/// to get this table, which has details re. the codec and the profile entries supported by the
+/// codec.
+///
+/// Clients with no real need for codec information prior to requesting a codec can simply use
+/// CodecFactory.CreateDecoder or CodecFactory.CreateEncoder with relevant requirements set in that
+/// request, and then call StreamProcessor.Sync (round trip) to see if a codec was created
+/// successfully.
+@available(added=11)
+type DetailedCodecDescription = table {
+    /// Decoder or encoder.
+    1: codec_type CodecType;
+
+    /// The mime type of the compressed format.  For decoders this is the mime
+    /// type of the input.  For encoders, this is the mime type of the output.
+    2: mime_type string:CODEC_FACTORY_MAX_MIME_TYPE_LENGTH;
+
+    /// If this decoder/encoder uses underlying hardware to perform its operations.
+    3: is_hw bool;
+
+    /// A list of profile descriptions that describe what codec profiles this
+    /// encoder/decoder supports along with requirements for using each profile.
+    4: profile_descriptions ProfileDescriptions;
+
+    /// If set to true, dynamic buffers are supported by the codec. See also
+    /// `[fuchsia.mediacodec/StreamProcessor.AddBuffer]` and
+    /// `[fuchsia.mediacodec/StreamProcessor.RemoveBuffer]` which are required
+    /// to use dynamic buffers.
+    ///
+    /// Regardless of whether `AddBuffer` and `RemoveBuffer` are used (vs.
+    /// `SetInputBufferPartialSettings` / `SetOutputBufferPartialSettings`), see
+    /// `[fuchsia.mediacodec/StreamProcessor.EnableOldOutputBuffers]` and
+    /// `[fuchsia.mediacodec/StreamProcessor.EnableSameOutputBufferConcurrentlyInFlight]`
+    /// which are only permitted when `supports_dynamic_buffers` is true. Both
+    /// of those are required to achieve full bitstream spec compliance with
+    /// some video bitstream formats such as VP9 (when show_existing_frame is
+    /// used in unusual ways).
+    ///
+    /// This does not imply support for non-sysmem-provided VMOs.
+    @available(added=32)
+    5: supports_dynamic_buffers bool;
+
+    /// Having more than this many input buffers added and not yet completely
+    /// removed under the latest buffer_lifetime_ordinal will result in async
+    /// StreamProcessor channel closure.
+    @available(added=32)
+    6: dynamic_buffers_input_max uint32;
+    /// Having more than this many output buffers added and not yet completely
+    /// removed under the latest buffer_lifetime_ordinal will result in async
+    /// StreamProcessor channel closure.
+    @available(added=32)
+    7: dynamic_buffers_output_max uint32;
+    /// This field is set when a codec both supports dynamic buffers and is a
+    /// video decoder. Adding this many buffers to a video decoder's output, and
+    /// ensuring that the buffers will be usable by the decoder prior to the
+    /// whole pipeline blocking on lack of availability of usable output buffers
+    /// in the decoder, will ensure that the decoder doesn't get stuck waiting
+    /// for an available output buffer. See also
+    /// `[fuchsia.mediacodec/StreamBufferConstraints.buffer_count_for_server_current]`
+    /// which may occasionally indicate a lower number of output buffers needed,
+    /// based on headers of the bitstream. However, implementers of clients may
+    /// wish to first check if the relevant headers in relevant streams are
+    /// actually set, since this can be rare in practice unfortunately, making
+    /// paying attention to buffer_count_for_server_current potentially not
+    /// actually worthwhile, depending on the expected streams' headers.
+    @available(added=32)
+    8: dynamic_buffers_video_decoder_output_safe uint32;
+
+    /// Optionally set
+    /// `[fuchsia.mediacodec/CreateDecoder_Params.codec_specifier]` to this
+    /// string to require an instance of this specific codec. The created codec
+    /// will still be checked against other requirements specified there for the
+    /// codec to be created successfully.
+    ///
+    /// This is only valid and specific per boot, not across boots. This allows
+    /// a discovered codec to be requested without any ambiguity, but is
+    /// intentionally not a way for clients to hard code which specific codec
+    /// implementation they want to connect to, as codec selection is by
+    /// properties / capabilities, not by specific codec implementation.
+    @available(added=32)
+    9: codec_specifier string:CODEC_FACTORY_MAX_CODEC_SPECIFIER_LENGTH;
+};
+
+// CodecFactory
+//
+/// The purpose of the media::CodecFactory interface is to create
+/// media::StreamProcessor instances for decoders and encoders.
+///
+/// The interface methods don't attempt to homogenize all codec types,
+/// preferring to have a separate dedicated message for decoders.
+@discoverable
+open protocol CodecFactory {
+    /// Driver-based local CodecFactory(s) will send this once shortly after the
+    /// main CodecFactory connects to the driver-local CodecFactory.
+    ///
+    /// For now, the main CodecFactory will not send this.
+    ///
+    /// A SW-based local CodecFactory(s) will not send this event.
+    ///
+    /// Each codec in the list must be separately-described, for clean aggregation.
+    //
+    // TODO(https://fxbug.dev/42073593): Remove OnCodecList when possible.
+    @available(added=7, deprecated=11, note="use GetDetailedCodecDescriptions()")
+    strict -> OnCodecList(struct {
+        codecs vector<CodecDescription>:CODEC_FACTORY_CODEC_LIST_SIZE_MAX;
+    });
+
+    // Requests:
+
+    /// A client should call |GetDetailedCodecDescriptions()| to get a list of
+    /// codecs supported either by software implementations or by underlying hardware.
+    @available(added=11)
+    strict GetDetailedCodecDescriptions() -> (table {
+        1: codecs vector<DetailedCodecDescription>:CODEC_FACTORY_CODEC_LIST_SIZE_MAX;
+    });
+
+    /// CreateDecoder:
+    ///
+    /// decoder_params - See CreateDecoder_Params comments for required
+    /// and optional parameters for creating a decoder.
+    ///
+    /// decoder - a Codec.NewRequest() which will hopefully be connected to
+    /// a Codec server, or the Codec channel will get closed if no suitable
+    /// codec can be found.  We don't return any additional Codec-specific
+    /// status here because finding the Codec is allowed to be fully async, so
+    /// we don't necessarily yet know on return from this method which Codec
+    /// will be selected, if any.
+    ///
+    /// Rough sequence to create a decoder:
+    ///
+    /// factory = ConnectToEnvironmentService(CodecFactory);
+    /// CreateDecoder_Params params;
+    /// [fill out params]
+    /// CreateDecoder(params, decoder_request);
+    ///
+    /// See use_media_decoder code for more detail.
+    strict CreateDecoder(resource struct {
+        decoder_params CreateDecoder_Params;
+        decoder server_end:fuchsia.media.StreamProcessor;
+    });
+
+    /// CreateEncoder:
+    ///
+    /// encoder_params - See CreateEncoder_Params comments for required
+    /// and optional parameters for creating a decoder.
+    ///
+    /// encoder - a Codec.NewRequest() which will hopefully be connected to
+    /// a Codec server, or the Codec channel will get closed if no suitable
+    /// codec can be found.  We don't return any additional Codec-specific
+    /// status here because finding the Codec is allowed to be fully async, so
+    /// we don't necessarily yet know on return from this method which Codec
+    /// will be selected, if any.
+    strict CreateEncoder(resource struct {
+        encoder_params CreateEncoder_Params;
+        encoder server_end:fuchsia.media.StreamProcessor;
+    });
+
+    /// AttachLifetimeTracking:
+    ///
+    /// Attach an eventpair endpoint to the next Create{X}(), so that the
+    /// codec_end will be closed when the number of buffers allocated reaches
+    /// 'buffers_remaining'.  Multiple eventpair endpoints can be attached per
+    /// create, with an enforced limit of
+    /// CODEC_FACTORY_LIFETIME_TRACKING_EVENTPAIR_PER_CREATE_MAX.
+    ///
+    /// The lifetime signalled by this event is intended to track all resources
+    /// used by the codec, including sysmem-allocated buffers created internally
+    /// by the codec.  The sysmem buffer collections visible to the client, for
+    /// input and output buffers, are not included in the resources tracked
+    /// here, because those can be tracked separately via
+    /// fuchsia.sysmem.BufferCollection.AttachLifetimeTracking().  It is
+    /// permitted to send a duplicate of codec_end to both this
+    /// AttachLifetimeTracking() and also to
+    /// fuchsia.sysmem.BufferCollection.AttachLifetimeTracking().
+    /// The ZX_EVENTPAIR_PEER_CLOSED will happen when both/all lifetimes are
+    /// fully over.  This conveniently avoids needing multiple separate async
+    /// waits by the client.
+    ///
+    /// In the case of server process crashes, or failure of a codec to plumb
+    /// codec_end to sysmem, ZX_EVENTPAIR_PEER_CLOSED signalled on the peer of
+    /// codec_end may occur shortly before all resources are freed.
+    ///
+    /// A maximum of CODEC_FACTORY_LIFETIME_TRACKING_EVENTPAIR_PER_CREATE_MAX
+    /// calls to AttachLifetimeTracking() are allowed
+    /// before any Create{X}().  There is no way to cancel an attach short of
+    /// closing the CodecFactory channel.  Closing the client end of the
+    /// eventpair doesn't subtract from the number of pending attach(es).  For
+    /// this reason, it can be good to only send attach message(s) immediately
+    /// before the relevant Create{X}(), when it's known by the client that both
+    /// the attach message(s) and the Create{X}() messages will be sent.
+    ///
+    /// Closing the client's end doesn't result in any action by the server.
+    /// If the server listens to events from the client end at all, it is for
+    /// debug logging only.
+    ///
+    /// The server intentionally doesn't "trust" any bits signalled by the
+    /// client.  This mechanism intentionally uses only ZX_EVENTPAIR_PEER_CLOSED
+    /// which can't be triggered early, and is only triggered when all handles
+    /// to codec_end are closed.  No meaning is associated with any of the other
+    /// signal bits, and clients should functionally ignore any other signal
+    /// bits on either end of the eventpair or its peer.
+    ///
+    /// The codec_end may lack ZX_RIGHT_SIGNAL or ZX_RIGHT_SIGNAL_PEER, but must
+    /// have ZX_RIGHT_DUPLICATE (and must have ZX_RIGHT_TRANSFER to transfer
+    /// without causing CodecFactory channel failure).
+    strict AttachLifetimeTracking(resource struct {
+        codec_end zx.Handle:EVENTPAIR;
+    });
+};

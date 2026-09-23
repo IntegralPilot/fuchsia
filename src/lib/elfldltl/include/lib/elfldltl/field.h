@@ -1,0 +1,190 @@
+// Copyright 2021 The Fuchsia Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef SRC_LIB_ELFLDLTL_INCLUDE_LIB_ELFLDLTL_FIELD_H_
+#define SRC_LIB_ELFLDLTL_INCLUDE_LIB_ELFLDLTL_FIELD_H_
+
+#include <lib/stdcompat/bit.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+#include <utility>
+
+namespace elfldltl {
+
+// This wraps an unsigned integer type T, which might need byte-swapping.
+// If kSwap is false, this is a fancy way to just define a plain integer.
+// If kSwap is true, then assignments, extractions, and comparisons (only
+// == and != are supported, not all inequalities) perform byte-swapping.
+// The type is constexpr friendly and safely default (zero) constructible.
+// But it's usually used only via a pointer to memory holding data from an
+// ELF file or target process memory.
+template <typename T, bool kSwap>
+class UnsignedField;
+
+// This is like UnsignedField but for signed integer types.
+// Note that T is the corresponding unsigned integer type, not
+// the signed integer type.  The SignedField<T> object behaves
+// for implicit conversions like the signed integer type.
+
+template <typename T, bool kSwap>
+class SignedField;
+
+template <typename T, bool kSwap>
+class FieldStorage {
+ public:
+  using value_type = T;
+
+  static_assert(std::is_integral_v<value_type>);
+  static_assert(std::is_unsigned_v<value_type>);
+
+  using Unsigned = FieldStorage<T, kSwap>;
+  using Signed = SignedField<T, kSwap>;
+
+  constexpr FieldStorage() = default;
+
+  constexpr FieldStorage(const FieldStorage&) = default;
+
+  explicit constexpr FieldStorage(value_type x) : value_(Convert(x)) {}
+
+  explicit constexpr FieldStorage(std::array<std::byte, sizeof(value_type)> bytes)
+      : value_(Convert(bytes)) {}
+
+  explicit constexpr FieldStorage(std::array<char, sizeof(value_type)> bytes)
+      : value_(Convert(bytes)) {}
+
+  constexpr FieldStorage& operator=(const FieldStorage&) = default;
+
+  constexpr FieldStorage& operator=(value_type x) {
+    value_ = Convert(x);
+    return *this;
+  }
+
+  constexpr value_type get() const { return Convert(value_); }
+
+ private:
+  template <typename Byte, typename = std::enable_if_t<sizeof(Byte) == 1>>
+  static constexpr value_type Convert(std::array<Byte, sizeof(value_type)> bytes) {
+    auto [first, last] = [&bytes]() {
+      if constexpr (std::endian::native == std::endian::little) {
+        return std::make_pair(bytes.crbegin(), bytes.crend());
+      } else if constexpr (std::endian::native == std::endian::big) {
+        return std::make_pair(bytes.cbegin(), bytes.cend());
+      }
+    }();
+    value_type x{};
+    for (auto it = first; it != last; ++it) {
+      x <<= 8;
+      x |= std::bit_cast<uint8_t>(*it);
+    }
+    return x;
+  }
+
+  static constexpr value_type Convert(value_type val) {
+    if constexpr (kSwap) {
+      return cpp23::byteswap(val);
+    } else {
+      return val;
+    }
+  }
+
+  value_type value_{};
+};
+
+template <typename T, bool kSwap>
+class UnsignedField final : public FieldStorage<T, kSwap> {
+ public:
+  using Storage = FieldStorage<T, kSwap>;
+  using typename Storage::value_type;
+
+  using Storage::get;
+  using Storage::Storage;
+
+  constexpr UnsignedField(const UnsignedField&) = default;
+
+  // Allow implicit conversion.
+  constexpr UnsignedField(value_type x) : Storage{x} {}
+
+  constexpr UnsignedField& operator=(const UnsignedField&) = default;
+
+  constexpr UnsignedField& operator=(value_type x) {
+    Storage::operator=(x);
+    return *this;
+  }
+
+  constexpr value_type operator()() const { return get(); }
+
+  constexpr operator value_type() const { return get(); }
+};
+
+template <typename T, bool kSwap>
+class SignedField final : public FieldStorage<T, kSwap> {
+ public:
+  using Storage = FieldStorage<T, kSwap>;
+
+  using value_type = std::make_signed_t<T>;
+
+  using Storage::Storage;
+
+  constexpr SignedField(value_type value) : Storage{std::bit_cast<T>(value)} {}
+
+  constexpr SignedField(const SignedField&) = default;
+
+  constexpr SignedField& operator=(const SignedField&) = default;
+
+  constexpr SignedField& operator=(value_type x) {
+    Storage::operator=(std::bit_cast<T>(x));
+    return *this;
+  }
+
+  constexpr value_type get() const { return std::bit_cast<value_type>(Storage::get()); }
+
+  constexpr value_type operator()() const { return get(); }
+
+  constexpr operator value_type() const { return get(); }
+};
+
+// This is like UnsignedField but for enum types defined with a specified
+// underlying unsigned integer type.  The underlying type of the actual field
+// to access (before possible byte-swapping) can be given as an explicit
+// template argument if in case it differs from the enum's underlying type.
+template <typename T, bool kSwap, typename Uint = std::underlying_type_t<T>>
+class EnumField final {
+ public:
+  using value_type = T;
+  static_assert(std::is_enum_v<value_type>);
+
+  constexpr EnumField() = default;
+
+  constexpr EnumField(const EnumField&) = default;
+
+  constexpr EnumField(value_type x) : value_(static_cast<Uint>(x)) {}
+
+  constexpr EnumField& operator=(const EnumField&) = default;
+
+  constexpr EnumField& operator=(value_type x) {
+    value_ = static_cast<Uint>(x);
+    return *this;
+  }
+
+  constexpr bool operator==(const EnumField& other) { return value_ == other.value_; }
+  constexpr bool operator!=(const EnumField& other) { return value_ != other.value_; }
+
+  constexpr bool operator==(value_type other) { return *this == EnumField{other}; }
+  constexpr bool operator!=(value_type other) { return *this != EnumField{other}; }
+
+  constexpr value_type get() const { return static_cast<value_type>(value_.get()); }
+
+  constexpr value_type operator()() const { return get(); }
+
+  constexpr operator value_type() const { return get(); }
+
+ private:
+  UnsignedField<Uint, kSwap> value_;
+};
+
+}  // namespace elfldltl
+
+#endif  // SRC_LIB_ELFLDLTL_INCLUDE_LIB_ELFLDLTL_FIELD_H_

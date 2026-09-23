@@ -1,0 +1,171 @@
+# Copyright 2020 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/python/python_action.gni")
+import("//tools/cmc/build/cmc.gni")
+
+# Declares that any components that are dependent on this target (directly or
+# indirectly) should have certain contents in their component manifest
+# includes.
+#
+# See:
+# https://fuchsia.dev/fuchsia-src/development/components/build#component-manifest-includes
+#
+# Parameters
+#
+#   includes (required)
+#     Contents of component manifest includes to expect in dependant components.
+#     Type: list of strings
+#
+#   enforce (optional)
+#     If true and dependent components don't have the includes in their
+#     manifest, fail to build.
+#     Disabling this can be useful during a multi-repo transition, though only
+#     if the transition is done quickly and enforcement is disabled for a very
+#     brief period of time.
+#     Type: boolean
+#     Default: true
+#
+#   deps
+#   testonly
+#   visibility
+template("expect_includes") {
+  group(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "check_includes",
+                             "includes",
+                             "testonly",
+                             "visibility",
+                           ])
+    includes_cml = []
+    foreach(include, includes) {
+      ext = get_path_info(include, "extension")
+      assert(ext == "cml", "Unexpected include extension for " + include)
+      includes_cml += [ "//" + rebase_path(include, "//") ]
+    }
+    metadata = {
+      if (!defined(invoker.enforce) || invoker.enforce) {
+        cmc_expected_includes_cml = includes_cml
+      }
+
+      # Used by the fuchsia_test_component_manifest() template.
+      test_component_manifest_cml = [
+        {
+          include = includes_cml
+        },
+      ]
+    }
+  }
+}
+
+# Collects expected includes from deps.
+# Expected includes from transitive deps on `expect_includes` will be
+# collected. Those can then be passed to `cmc check-includes`.
+#
+# Parameters
+#
+#   manifest (required)
+#     [file] The path to the cml file that will be checked.
+#
+#   deps
+#   testonly
+#   visibility
+template("collect_expected_includes") {
+  generated_file(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "manifest",
+                             "metadata",
+                             "testonly",
+                             "visibility",
+                           ])
+    outputs = [ "$target_out_dir/${target_name}_expected_includes" ]
+    data_keys = [ "cmc_expected_includes_cml" ]
+    walk_keys = [ "expect_includes_barrier" ]
+  }
+}
+
+# Checks that a component manifest file has all expected includes.
+#
+# Parameters
+#
+#   manifest (required)
+#     [file] The path to the cml file that will be checked.
+#
+#   deps
+#   testonly
+#   visibility
+template("cmc_check_includes") {
+  assert(defined(invoker.manifest),
+         "must provide manifest to cmc_check_includes")
+
+  _expected_includes_label = "${target_name}_expected_includes"
+  collect_expected_includes(_expected_includes_label) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "metadata",
+                             "testonly",
+                             "visibility",
+                           ])
+  }
+
+  cmc_label = "//tools/cmc:install($host_toolchain)"
+  cmc_out_path = "${root_build_dir}/host-tools/cmc"
+
+  _expected_includes_label = ":" + _expected_includes_label
+
+  python_action(target_name) {
+    forward_variables_from(invoker,
+                           [
+                             "applicable_licenses",
+                             "deps",
+                             "inputs",
+                             "testonly",
+                             "visibility",
+                           ])
+    binary_label = "//tools/cmc/build:check_includes_script"
+    if (!defined(deps)) {
+      deps = []
+    }
+    deps += [
+      _expected_includes_label,
+      cmc_label,
+    ]
+    _expected_includes_outputs = get_target_outputs(_expected_includes_label)
+    assert(_expected_includes_outputs == [ _expected_includes_outputs[0] ],
+           "$_expected_includes_label should have yielded exactly one output")
+    _fromfile = _expected_includes_outputs[0]
+    inputs = [
+      invoker.manifest,
+      _fromfile,
+      cmc_out_path,
+    ]
+    outputs = [ "$target_out_dir/$target_name.gn_stamp" ]
+    depfile = "$target_gen_dir/$target_name.d"
+
+    # As this action only writes an empty stamp file, there's no need to run
+    # the check for any output dir leaks in the file.
+    check_for_output_dir_leaks = false
+
+    args = [
+             "--cmc-path",
+             rebase_path(cmc_out_path, root_build_dir),
+             "--stamp",
+             rebase_path(outputs[0], root_build_dir),
+             "--manifest-metadata",
+             rebase_path(invoker.manifest, root_build_dir),
+             "--fromfile",
+             rebase_path(_fromfile, root_build_dir),
+             "--depfile",
+             rebase_path(depfile, root_build_dir),
+           ] + cmc_include_paths
+  }
+}

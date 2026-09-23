@@ -1,0 +1,144 @@
+# Copyright 2023 The Fuchsia Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+import("//build/toolchain/toolchain_environment.gni")
+
+_user_basic = "//build/toolchain/zircon:user.basic_$current_cpu"
+
+# Refer to a compiling target that must be compiled for the basic machine ABI.
+#
+# This redirects to a list of source_set() or library targets that must be
+# compiled for the basic machine ABI. When possible, it uses the same variant
+# as is currently being built. When the current variant requires the Fuchsia
+# Compiler ABI, this will do generic variant selection as if it were a
+# loadable_module() target.
+#
+# In the user.basic environment only, a "$target_name.select" target is also
+# defined that's used to perform variant selection.  When $select is true, the
+# main target always just redirects to this target in the user.basic toolchain.
+# (The `.select` subtarget is not available directly in other toolchains.)
+#
+# Parameters
+#
+#   * public_deps
+#     - Required: This is a list of plain labels (no toolchain)
+#     - Type: list(label_without_toolchain)
+#
+#   * fuchsia
+#     - Optional: Always use the user.basic (Fuchsia) target, even on Linux.
+#     - Type: bool
+#     - Default: false
+#
+#   * select
+#     - Optional: Always do variant selection.
+#     - Type: bool
+#     - Default: false
+#
+#   * exclude_toolchain_tags
+#     - Optional: Used by variant selection.  See variant_target().
+#     - Type: list(string)
+#
+#   * visibility, testonly
+#     - Optional: Usual GN meanings.
+#
+template("user_basic_redirect") {
+  select = defined(invoker.select) && invoker.select
+  always_fuchsia = defined(invoker.fuchsia) && invoker.fuchsia
+
+  exclude_tags = []
+  if (defined(invoker.exclude_toolchain_tags)) {
+    exclude_tags = invoker.exclude_toolchain_tags
+  }
+
+  needs_abi = toolchain_variant.tags + [ "needs-compiler-abi" ] -
+              [ "needs-compiler-abi" ] != toolchain_variant.tags
+  no_abi = toolchain_variant.tags + [ "no-compiler-abi" ] -
+           [ "no-compiler-abi" ] != toolchain_variant.tags
+
+  if (!always_fuchsia && is_linux) {
+    # For Linux tests, the equivalent of user.basic is the linux_$cpu toolchain
+    # (as opposed to the host toolchain), and excluding instrumentation-runtime
+    # variants.
+    exclude_tags += [ "instrumentation-runtime" ]
+    no_abi = !is_host
+    needs_abi = is_host
+    _user_basic = "//build/toolchain:linux_$current_cpu"
+  }
+
+  if (toolchain_variant.tags + exclude_tags - exclude_tags !=
+      toolchain_variant.tags) {
+    # This variant is excluded, so select a different one.
+    select = true
+  }
+  if (needs_abi) {
+    select = true
+  }
+
+  if (select) {
+    # The current variant won't work in user.basic so redirect to the primary
+    # user.basic toolchain and do variant selection there.
+    group_deps = [ ":$target_name.select" ]
+    deps_tc = _user_basic
+    not_needed(invoker, [ "public_deps" ])
+    not_needed([ "no_abi" ])
+  } else if (no_abi) {
+    # This is already a basic machine ABI compatible toolchain.
+    assert(!needs_abi)
+    group_deps = invoker.public_deps
+    deps_tc = ""
+  } else {
+    # The current variant doesn't require the compiler ABI, so the same variant
+    # should work in the user.basic environment too.
+    assert(!needs_abi)
+    group_deps = invoker.public_deps
+    deps_tc = _user_basic + toolchain_variant.suffix
+  }
+
+  if (deps_tc != "") {
+    if (current_toolchain == shlib_toolchain ||
+        toolchain_variant.is_pic_default) {
+      deps_tc += "-shared"
+    }
+    deps_tc = "($deps_tc)"
+  }
+
+  common = {
+    forward_variables_from(invoker,
+                           [
+                             "visibility",
+                             "testonly",
+                           ])
+    if (defined(visibility)) {
+      visibility += [
+        ":$target_name",
+        ":$target_name.select",
+      ]
+    }
+  }
+
+  group(target_name) {
+    forward_variables_from(common, "*")
+    public_deps = []
+    foreach(label, group_deps) {
+      public_deps += [ label + deps_tc ]
+    }
+  }
+
+  if ("${toolchain_environment}_${current_cpu}" ==
+      get_label_info(_user_basic, "name")) {
+    # When user_basic_redirect() is evaluated in an incompatible toolchain it
+    # will redirect to this target to do generic variant selection in the right
+    # environment context.
+    select_target = "$target_name.select"
+    variant_target("group") {
+      target_name = select_target
+      variant_selector_target_type = "loadable_module"
+      variant_shared_redirection = current_toolchain == shlib_toolchain ||
+                                   toolchain_variant.is_pic_default
+      forward_variables_from(common, "*")
+      exclude_toolchain_tags = exclude_tags
+      public_deps = invoker.public_deps
+    }
+  }
+}
