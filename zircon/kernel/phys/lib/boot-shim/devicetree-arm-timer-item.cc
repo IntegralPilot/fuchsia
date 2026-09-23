@@ -13,14 +13,6 @@
 
 namespace boot_shim {
 
-// Interrupt list for secure, non-secure, virtual and hypervisor timers, in that order.
-// See https://www.kernel.org/doc/Documentation/devicetree/bindings/arm/arch_timer.txt
-static constexpr size_t kSecureIrqIndex = 0;
-static constexpr size_t kNonSecureIrqIndex = 1;
-static constexpr size_t kVirtualIrqIndex = 2;
-// Not needed for the item, but is sole purpose is completion.
-// static constexpr size_t kHypervisorIrqIndex = 3;
-
 devicetree::ScanState ArmDevicetreeTimerItem::OnNode(const devicetree::NodePath& path,
                                                      const devicetree::PropertyDecoder& decoder) {
   if (path == "/") {
@@ -28,10 +20,13 @@ devicetree::ScanState ArmDevicetreeTimerItem::OnNode(const devicetree::NodePath&
   }
 
   auto set_payload = [this]() {
+    auto irq = [this](std::optional<size_t> index) {
+      return index && *index < irq_.num_entries() ? irq_.GetIrqConfig(*index).irq : 0;
+    };
     this->set_payload(zbi_dcfg_arm_generic_timer_driver_t{
-        .irq_phys = irq_.GetIrqConfig(kNonSecureIrqIndex).irq,
-        .irq_virt = irq_.GetIrqConfig(kVirtualIrqIndex).irq,
-        .irq_sphys = irq_.GetIrqConfig(kSecureIrqIndex).irq,
+        .irq_phys = irq(physical_irq_),
+        .irq_virt = irq(virtual_irq_),
+        .irq_sphys = irq(secure_irq_),
         .freq_override = static_cast<uint32_t>(frequency_.value_or(0)),
     });
   };
@@ -53,6 +48,35 @@ devicetree::ScanState ArmDevicetreeTimerItem::OnNode(const devicetree::NodePath&
       std::find_first_of(kCompatibleDevices.begin(), kCompatibleDevices.end(), compatibles->begin(),
                          compatibles->end()) != kCompatibleDevices.end()) {
     found_timer_ = true;
+    if (auto names_property = decoder.FindProperty("interrupt-names")) {
+      auto names = names_property->AsStringList();
+      if (!names) {
+        OnError("Invalid timer interrupt-names");
+        return devicetree::ScanState::kDone;
+      }
+      secure_irq_.reset();
+      physical_irq_.reset();
+      virtual_irq_.reset();
+      size_t index = 0;
+      for (auto name : *names) {
+        std::optional<size_t>* entry = nullptr;
+        if (name == "sec-phys") {
+          entry = &secure_irq_;
+        } else if (name == "phys") {
+          entry = &physical_irq_;
+        } else if (name == "virt") {
+          entry = &virtual_irq_;
+        }
+        if (entry) {
+          if (entry->has_value()) {
+            OnError("Duplicate timer interrupt name");
+            return devicetree::ScanState::kDone;
+          }
+          *entry = index;
+        }
+        ++index;
+      }
+    }
     auto interrupt = decoder.FindProperty("interrupts");
     if (!interrupt) {
       OnError("'timer' node did not contain interrupt information.");

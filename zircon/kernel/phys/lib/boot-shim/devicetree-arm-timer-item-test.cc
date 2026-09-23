@@ -208,4 +208,24 @@ TEST_F(ArmDevicetreeTimerItemTest, MissingNode) {
   }
 }
 
+TEST(ArmDevicetreeNamedTimer, NamesDetermineInterruptOrder) {
+  auto dt = LoadDtb("arm_timer_named.dtb");
+  ASSERT_TRUE(dt.is_ok());
+  boot_shim::DevicetreeBootShim<boot_shim::ArmDevicetreeTimerItem> shim("test", dt->fdt());
+  ASSERT_TRUE(shim.Init());
+  auto config = shim.Get<boot_shim::ArmDevicetreeTimerItem>().payload();
+  ASSERT_TRUE(config);
+  EXPECT_EQ(config->irq_phys, 28u);
+  EXPECT_EQ(config->irq_virt, 26u);
+  EXPECT_EQ(config->irq_sphys, 29u);
+}
+
+TEST(ArmDevicetreeNamedTimer, RejectsDuplicateNames) {
+  auto dt = LoadDtb("arm_timer_duplicate_names.dtb");
+  ASSERT_TRUE(dt.is_ok());
+  boot_shim::DevicetreeBootShim<boot_shim::ArmDevicetreeTimerItem> shim("test", dt->fdt());
+  ASSERT_TRUE(shim.Init());
+  EXPECT_FALSE(shim.Get<boot_shim::ArmDevicetreeTimerItem>().payload());
+}
+
 }  // namespace

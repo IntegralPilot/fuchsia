@@ -938,6 +938,9 @@ class ArmDevicetreeTimerItem
   }
 
  private:
+  std::optional<size_t> secure_irq_ = 0;
+  std::optional<size_t> physical_irq_ = 1;
+  std::optional<size_t> virtual_irq_ = 2;
   bool found_timer_ = false;
   DevicetreeIrqResolver irq_;
   // Optional, maps to frequency override.
