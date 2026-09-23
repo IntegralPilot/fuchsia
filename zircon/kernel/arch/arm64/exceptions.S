@@ -504,6 +504,10 @@ iframe.sync_exception.el1 arm64_el1_exception_sync_current_sp_elx
 
 iframe.async_exception.el1 arm64_el1_exception_irq_current_sp_elx, arm64_irq
 
+#ifdef EXPERIMENTAL_APPLE
+iframe.async_exception.el1 arm64_el1_exception_fiq_current_sp_elx, arm64_fiq
+#endif
+
 iframe.async_exception.el1 arm64_el1_exception_serror_current_sp_elx, \
                            arm64_serror_exception
 
@@ -511,12 +515,20 @@ iframe.sync_exception.el0 arm64_el1_exception_sync_lower_a64
 
 iframe.async_exception.el0 arm64_el1_exception_irq_lower_a64, arm64_irq
 
+#ifdef EXPERIMENTAL_APPLE
+iframe.async_exception.el0 arm64_el1_exception_fiq_lower_a64, arm64_fiq
+#endif
+
 iframe.async_exception.el0 arm64_el1_exception_serror_lower_a64, \
                            arm64_serror_exception
 
 iframe.sync_exception32.el0 arm64_el1_exception_sync_lower_a32
 
 iframe.async_exception32.el0 arm64_el1_exception_irq_lower_a32, arm64_irq
+
+#ifdef EXPERIMENTAL_APPLE
+iframe.async_exception32.el0 arm64_el1_exception_fiq_lower_a32, arm64_fiq
+#endif
 
 iframe.async_exception32.el0 arm64_el1_exception_serror_lower_a32, \
                              arm64_serror_exception

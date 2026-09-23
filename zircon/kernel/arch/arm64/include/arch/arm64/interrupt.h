@@ -13,14 +13,23 @@
 
 // override of some routines
 
-// Clear/set both I and A bits to prevent arbitrary nesting of IRQ and SError.
+// Apple delivers architectural timer interrupts as FIQs. In that build, F must
+// follow I across every interrupt exclusion region. Other builds mask I and A.
 inline void arch_enable_ints() {
   ktl::atomic_signal_fence(ktl::memory_order_seq_cst);
+#ifdef EXPERIMENTAL_APPLE
+  __asm__ volatile("msr daifclr, #7" ::: "memory");
+#else
   __asm__ volatile("msr daifclr, #6" ::: "memory");
+#endif
 }
 
 inline void arch_disable_ints() {
+#ifdef EXPERIMENTAL_APPLE
+  __asm__ volatile("msr daifset, #7" ::: "memory");
+#else
   __asm__ volatile("msr daifset, #6" ::: "memory");
+#endif
   ktl::atomic_signal_fence(ktl::memory_order_seq_cst);
 }
 

@@ -14,6 +14,9 @@
 #include <dev/hw_rng/qcom_rng/init.h>
 #include <dev/hw_watchdog/generic32/init.h>
 #include <dev/init.h>
+#ifdef EXPERIMENTAL_APPLE
+#include <dev/interrupt/apple_aic3.h>
+#endif
 #include <dev/interrupt/arm_gicv2_init.h>
 #include <dev/interrupt/arm_gicv3_init.h>
 #include <dev/power/iris/init.h>
@@ -40,9 +43,20 @@ void ArmGicInitLate(const ktl::monostate& no_config) {}
 }  // namespace
 
 void PlatformDriverHandoffEarly(const ArchPhysHandoff& arch_handoff) {
-  // Configure the GIC first so that the remaining drivers can freely register
-  // interrupt handlers.
+#ifdef EXPERIMENTAL_APPLE
+  ZX_ASSERT_MSG(arch_handoff.apple_aic3_driver,
+                "Experimental Apple kernel requires an AIC3 record");
+  ZX_ASSERT_MSG(arch_handoff.generic_timer_driver,
+                "AIC3 requires architectural timer configuration");
+#endif
+  // Configure the interrupt controller before the remaining drivers.
   ktl::visit([](const auto& config) { ArmGicInitEarly(config); }, arch_handoff.gic_driver);
+
+#ifdef EXPERIMENTAL_APPLE
+  if (arch_handoff.apple_aic3_driver) {
+    AppleAic3InitEarly();
+  }
+#endif
 
   if (arch_handoff.generic32_watchdog_driver) {
     generic_32bit_watchdog_early_init(*arch_handoff.generic32_watchdog_driver.to_std());
@@ -80,6 +94,12 @@ void PlatformDriverHandoffEarly(const ArchPhysHandoff& arch_handoff) {
 void PlatformDriverHandoffPostVm(const ArchPhysHandoff& arch_handoff) {
   // Initialize the GIC post VM so it can map its own mmio registers
   ktl::visit([](const auto& config) { ArmGicInitPostVm(config); }, arch_handoff.gic_driver);
+
+#ifdef EXPERIMENTAL_APPLE
+  if (arch_handoff.apple_aic3_driver) {
+    AppleAic3InitPostVm(*arch_handoff.apple_aic3_driver.to_std());
+  }
+#endif
 
   if (arch_handoff.generic_timer_driver) {
     ArmGenericTimerInitPostVm(*arch_handoff.generic_timer_driver.to_std());
@@ -144,3 +164,7 @@ void PlatformDriverHandoffLate(const ArchPhysHandoff& arch_handoff) {
     iris_power_init(arch_handoff.iris_power_driver.data(), arch_handoff.iris_power_driver.size());
   }
 }
+
+#ifdef EXPERIMENTAL_APPLE
+void platform_fiq(iframe_t* iframe) { AppleAic3HandleFiq(); }
+#endif

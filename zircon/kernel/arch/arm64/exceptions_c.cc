@@ -546,8 +546,8 @@ extern "C" void arm64_sync_exception(iframe_t* iframe, uint exception_flags, uin
 }
 
 /* called from assembly */
-extern "C" void arm64_irq(iframe_t* iframe, uint exception_flags);
-extern "C" void arm64_irq(iframe_t* iframe, uint exception_flags) {
+template <void (*Handle)(iframe_t*)>
+static void HandleInterrupt(iframe_t* iframe, uint exception_flags) {
   LTRACEF("iframe %p, flags %#x\n", iframe, exception_flags);
   bool is_user = exception_flags & ARM64_EXCEPTION_FLAG_LOWER_EL;
 
@@ -562,7 +562,7 @@ extern "C" void arm64_irq(iframe_t* iframe, uint exception_flags) {
   int_handler_start(&state);
 
   kcounter_add(exceptions_irq, 1);
-  platform_irq(iframe);
+  Handle(iframe);
 
   bool do_preempt = int_handler_finish(&state);
 
@@ -575,6 +575,10 @@ extern "C" void arm64_irq(iframe_t* iframe, uint exception_flags) {
   if (unlikely(is_user)) {
     arch_iframe_process_pending_signals(iframe);
   }
+}
+
+extern "C" void arm64_irq(iframe_t* iframe, uint exception_flags) {
+  HandleInterrupt<platform_irq>(iframe, exception_flags);
 }
 
 /* called from assembly */
@@ -696,3 +700,11 @@ bool arch_install_exception_context(Thread* thread, const arch_exception_context
 }
 
 void arch_remove_exception_context(Thread* thread) { arch_reset_suspended_general_regs(thread); }
+
+#ifdef EXPERIMENTAL_APPLE
+void platform_fiq(iframe_t* iframe);
+
+extern "C" void arm64_fiq(iframe_t* iframe, uint exception_flags) {
+  HandleInterrupt<platform_fiq>(iframe, exception_flags);
+}
+#endif

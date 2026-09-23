@@ -61,6 +61,8 @@ struct ArchPhysHandoff {
   std::variant<std::monostate, zbi_dcfg_arm_gic_v2_driver_t, zbi_dcfg_arm_gic_v3_driver_t>
       gic_driver;
 
+  stdbind::optional<zbi_dcfg_apple_aic3_t> apple_aic3_driver;
+
   // (ZBI_TYPE_KERNEL_DRIVER, ZBI_KERNEL_DRIVER_ARM_PSCI) payload.
   stdbind::optional<zbi_dcfg_arm_psci_driver_t> psci_driver;
 

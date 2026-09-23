@@ -168,6 +168,7 @@ void HandoffPrep::ArchSummarizeMiscZbiItem(const zbi_header_t& header,
           SaveForMexec(header, payload);
           break;
         case ZBI_KERNEL_DRIVER_ARM_GIC_V2:
+          ZX_ASSERT_MSG(!arch_handoff.apple_aic3_driver, "Conflicting AIC and GIC records");
           // Defer to the newer hardware: v3 configs win out over v2.
           ZX_ASSERT(payload.size() >= sizeof(zbi_dcfg_arm_gic_v2_driver_t));
           if (!ktl::holds_alternative<zbi_dcfg_arm_gic_v3_driver_t>(arch_handoff.gic_driver)) {
@@ -177,9 +178,22 @@ void HandoffPrep::ArchSummarizeMiscZbiItem(const zbi_header_t& header,
           SaveForMexec(header, payload);
           break;
         case ZBI_KERNEL_DRIVER_ARM_GIC_V3:
+          ZX_ASSERT_MSG(!arch_handoff.apple_aic3_driver, "Conflicting AIC and GIC records");
           ZX_ASSERT(payload.size() >= sizeof(zbi_dcfg_arm_gic_v3_driver_t));
           arch_handoff.gic_driver =
               *reinterpret_cast<const zbi_dcfg_arm_gic_v3_driver_t*>(payload.data());
+          SaveForMexec(header, payload);
+          break;
+        case ZBI_KERNEL_DRIVER_APPLE_AIC3:
+#ifndef EXPERIMENTAL_APPLE
+          ZX_PANIC("Apple AIC requires an experimental Apple kernel");
+#endif
+          ZX_ASSERT_MSG(ktl::holds_alternative<ktl::monostate>(arch_handoff.gic_driver) &&
+                            !arch_handoff.apple_aic3_driver,
+                        "Conflicting interrupt-controller records");
+          ZX_ASSERT(payload.size() == sizeof(zbi_dcfg_apple_aic3_t));
+          arch_handoff.apple_aic3_driver =
+              *reinterpret_cast<const zbi_dcfg_apple_aic3_t*>(payload.data());
           SaveForMexec(header, payload);
           break;
         case ZBI_KERNEL_DRIVER_ARM_PSCI:
